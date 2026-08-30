@@ -87,10 +87,12 @@ race with the nightly, the next hour retries.
 
 `Personal Production Nightly` (cron `30 10 * * *`, plus `workflow_dispatch`)
 runs the same composer with `--ring production`: fork branch `production` =
-upstream main + every open **non-draft** btli PR — **no extras** (nothing
-hand-pinned reaches prod) and no dev tag. Draft status is the promotion
-gate: mark a PR draft to keep it out of production while staging still
-carries it. Each run mints an immutable, canonical `production-YYYYMMDD` tag
+upstream main + every open **non-draft** btli PR plus numeric pins from
+`extras-production.txt`, and no dev tag. Draft status gates the automatic
+stream: `filter_drafts()` runs before the extras union, so a numeric production
+extra bypasses it (both current pins are non-draft). The current bot-owned pins
+also resolve mutable `refs/pull/N/head` refs. Each run mints an immutable,
+canonical `production-YYYYMMDD` tag
 pin (same rerun/no-op semantics as `nightly-*`) plus a deprecated same-name
 compatibility branch slated for removal in v0.12.0, which homelab's
 `build-omnigent-production.yml` resolves at 11:10 UTC to build and
@@ -179,12 +181,23 @@ successor, neither side reaches the automatic stream: the original fails the
 open-state filter and the successor fails the `btli` author filter. Pin the
 successor number manually in each intended ring's extras manifest. Record its
 reviewed head SHA in the trailing comment because this is an **open**, bot-owned
-ref: `refs/pull/N/head` can move. The `stage.py` comment describing extras as
-frozen pins applies only to closed PRs whose pull refs no longer advance.
+ref: `refs/pull/N/head` can move. The SHA is informational only: no tool compares
+it today; enforcement is a planned follow-up. The `stage.py` comment describing
+extras as frozen pins applies only to closed PRs whose pull refs no longer
+advance. If the bot force-pushes the ref, the recorded rerere preimage stops
+matching: the merge aborts, the bot pin appears under **Skipped PRs** with a
+merge conflict, and the nightly stays green. Re-record the resolution per
+[Conflict resolutions](#conflict-resolutions-rr-cache), or remove the pin.
+
+If a pinned successor closes unmerged as `Superseded by #M`, move the pin to M,
+refresh the reviewed-head comment, and re-record the rr-cache resolution if the
+new head conflicts.
 
 Remove a bot successor's line as soon as it merges upstream. Leaving it behind
-is inert but misleading: the already-merged extra remains in reports with
-`minted: false`.
+reports `minted: false` only after a merge-commit landing, when the pinned head
+is already an ancestor. After a squash merge, the head is not an ancestor; the
+stale extra can mint and reapply landed content, or conflict and silently skip
+on a still-green nightly.
 
 An extra that can't be resolved gets one of two distinct outcomes, because
 a deleted ref and an unreachable server are different problems:
