@@ -17,3 +17,5 @@
 # 1234              # keep the composer hotfix until upstream merges it
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
+5825  # supersedes #5198; omni-resolve-agent[bot]; reviewed head ee335038a6b4b8e4d854f5d07fa53b798518b679
+5828  # supersedes #4849; omni-resolve-agent[bot]; reviewed head b2f40a270cf1ed402baa10ca08c86904cc807e61

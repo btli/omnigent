@@ -174,6 +174,18 @@ of open PRs and extras, deduped by PR number (the open entry wins),
 sorted ascending — the same ordering rule as always. **Remove an entry
 once the change lands upstream.**
 
+When `omni-resolve-agent[bot]` closes a contributor PR and opens an upstream
+successor, neither side reaches the automatic stream: the original fails the
+open-state filter and the successor fails the `btli` author filter. Pin the
+successor number manually in each intended ring's extras manifest. Record its
+reviewed head SHA in the trailing comment because this is an **open**, bot-owned
+ref: `refs/pull/N/head` can move. The `stage.py` comment describing extras as
+frozen pins applies only to closed PRs whose pull refs no longer advance.
+
+Remove a bot successor's line as soon as it merges upstream. Leaving it behind
+is inert but misleading: the already-merged extra remains in reports with
+`minted: false`.
+
 An extra that can't be resolved gets one of two distinct outcomes, because
 a deleted ref and an unreachable server are different problems:
 
