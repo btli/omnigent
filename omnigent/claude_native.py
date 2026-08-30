@@ -63,7 +63,7 @@ from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
-from omnigent import model_catalog
+from omnigent import model_catalog, model_catalog_store
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -82,10 +82,12 @@ from omnigent._wrapper_labels import (
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
+    CLAUDE_MODEL_ALIASES,
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    normalized_model_id,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -200,9 +202,29 @@ _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
-#: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
-#: still unresolved when it expires keep their bare rows (the cache's
-#: revalidation retries them later). Startup dominates each run and
+_CLAUDE_AUTH_FAILURE_PATTERN = re.compile(
+    # Numeric statuses need HTTP/status syntax; bare numbers also occur in
+    # retry delays and IP ports.
+    r"(?:(?:^|[^a-z0-9])https?(?:/\d+(?:\.\d+)?)?"
+    r"(?:[\s_:/=-]+(?:error|status|code))?[\s_:/=-]+(?:401|403)\b|"
+    r"(?:^|[^a-z0-9])status(?:[\s_-]*code)?[\s_:/=-]+(?:401|403)\b|"
+    r"\b(?:401\s+unauthori[sz]ed|403\s+forbidden)\b|"
+    r"unauthori[sz]ed|forbidden|auth(?:entication)?[ _-]+error|"
+    r"authentication(?:[\s_-]+\w+){0,2}[\s_-]+(?:failed|required)|"
+    r"(?:invalid|expired)\s+(?:x[-_]?api[-_]?key|api[ _-]?key)|"
+    r"(?:x[-_]?api[-_]?key|api[ _-]?key)(?:\s+\w+){0,2}\s+(?:invalid|expired)|"
+    r"invalid\s+(?:token|credentials)|"
+    r"(?:login|sign[ -]?in)\s+required|not\s+(?:logged|signed)\s+in|"
+    r"not\s+authenticated|run\s+/login|"
+    # "expired" needs an auth-ish noun: a bare "token ... expired" also
+    # matches rate-limit token buckets.
+    r"(?:oauth|auth(?:entication)?|login|api|access|refresh|session)"
+    r"\s+tokens?(?:\s+\w+){0,2}\s+expired|"
+    r"credentials?(?:\s+\w+){0,2}\s+expired|session\s+expired)",
+    re.IGNORECASE,
+)
+#: Wall-clock cap for the per-alias resolution fan-out as a whole. Startup
+#: dominates each run and
 #: stretches with box load (measured 0.7s–17s for the same command), so the
 #: concurrency covers a whole alias set in one wave and the budget fits one
 #: slow wave.
@@ -229,16 +251,9 @@ _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
 # rejects).  See https://code.claude.com/docs/en/model-config#override-model-ids-per-version
-_ANTHROPIC_DEFAULT_FABLE_MODEL_ENV = "ANTHROPIC_DEFAULT_FABLE_MODEL"
-_ANTHROPIC_DEFAULT_OPUS_MODEL_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
-_ANTHROPIC_DEFAULT_SONNET_MODEL_ENV = "ANTHROPIC_DEFAULT_SONNET_MODEL"
-_ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
-_UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
-    "fable": _ANTHROPIC_DEFAULT_FABLE_MODEL_ENV,
-    "opus": _ANTHROPIC_DEFAULT_OPUS_MODEL_ENV,
-    "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
-    "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
-}
+_UCODE_CLAUDE_TIER_TO_ENV = dict(ALIAS_MODEL_ENV_VARS)
+# Capability-descending launch fallback policy. Vocabulary ordering is not policy.
+_CLAUDE_TIER_FALLBACK_ORDER: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -430,6 +445,43 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
+def claude_config_serves_canonical_ids(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether a launch config accepts canonical Anthropic model ids."""
+    return claude_config is None or _serves_canonical_anthropic_ids(claude_config)
+
+
+def claude_config_uses_databricks(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
+    """Whether the launch config carries the Databricks gateway contract."""
+    if claude_config is None:
+        return False
+    return claude_config.env.get(
+        _CLAUDE_CODE_USE_GATEWAY_ENV
+    ) == "1" and _DATABRICKS_CODING_AGENT_HEADER in claude_config.env.get(
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV, ""
+    )
+
+
+def is_canonical_claude_pin(model: str) -> bool:
+    """Whether *model* is recognized and already uses Claude's canonical spelling."""
+    if model != model.strip() or model != model.lower():
+        return False
+    bare = model.removesuffix("[1m]")
+    if bare in CLAUDE_MODEL_ALIASES:
+        return True
+    parts = bare.split("-")
+    if not parts or parts[0] != "claude":
+        return False
+    model_parts = parts[1:]
+    tiers = [part for part in model_parts if part in CLAUDE_MODEL_ALIASES]
+    return (
+        len(tiers) == 1
+        and any(part.isdigit() for part in model_parts)
+        and all(part.isdigit() or part in CLAUDE_MODEL_ALIASES for part in model_parts)
+    )
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -442,6 +494,34 @@ def _claude_family(token: str) -> str | None:
 
     alias = claude_model_alias(token, {})
     return alias.partition("[")[0] if alias else None
+
+
+def resolve_claude_catalog_model(
+    rows: list[dict[str, object]],
+    model: str,
+) -> str | None:
+    """Resolve an equivalent provider spelling to a catalog launch token.
+
+    Exact picker ids and wire models remain unchanged. Provider-prefixed ids
+    are compared with the shared Claude vocabulary normalization, then folded
+    onto the matching row's wire model so the launch uses a spelling this
+    catalog actually enumerated.
+    """
+    if model_catalog_store.catalog_contains(rows, model):
+        return model
+    normalized = normalized_model_id(model)
+    if not normalized:
+        return None
+    matches: set[str] = set()
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        wire_model = str(row.get("model") or "").strip()
+        if any(
+            candidate and normalized_model_id(candidate) == normalized
+            for candidate in (row_id, wire_model)
+        ):
+            matches.add(wire_model or row_id)
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def claude_catalog_serves_model(
@@ -467,9 +547,7 @@ def claude_catalog_serves_model(
         own login).
     :returns: ``True`` when the launch can run *model* against this catalog.
     """
-    from omnigent.model_catalog_store import catalog_contains
-
-    if catalog_contains(rows, model):
+    if model_catalog_store.catalog_contains(rows, model):
         return True
     if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
         return False
@@ -478,6 +556,193 @@ def claude_catalog_serves_model(
     family = _claude_family(model)
     return family is not None and any(
         _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
+    )
+
+
+def _claude_catalog_tier_rank(
+    row: dict[str, object],
+    tier: str,
+) -> tuple[bool, tuple[int, ...], tuple[int, ...], bool, str, str, str, str]:
+    """Rank a tier's alias first, then newest standard-context model.
+
+    Generation semantics span both id shapes: the modern
+    ``claude-<tier>-G-m`` carries the generation after the tier token,
+    while the legacy ``claude-G[-x]-<tier>-<date>`` carries it before,
+    with a release date that must only break ties within a generation —
+    a dated Claude 3 id must never outrank Claude 4.x.
+    """
+    row_id = str(row.get("id") or "").strip()
+    row_model = str(row.get("model") or "").strip()
+    launch_model = row_model or row_id
+    normalized = normalized_model_id(launch_model)
+    # Generation digits are anchored to the tier token: the modern
+    # ``claude-<tier>-G-m`` carries them after it; the legacy
+    # ``claude-G[-x]-<tier>-<date>`` carries them between the claude token
+    # and the tier. Digits from provider qualifiers the shared
+    # normalization does not strip (``v2-system.ai....``) never count.
+    head, _, tail = normalized.rpartition(tier)
+    claude_head = head[head.rfind("claude") :] if "claude" in head else ""
+    tail_groups = re.findall(r"\d+", tail)
+    # Six-plus digit groups are a release date, a tiebreak only.
+    version = [-int(part) for part in tail_groups if len(part) < 6][:3]
+    if not version:
+        version = [-int(part) for part in re.findall(r"\d+", claude_head) if len(part) < 6][:3]
+    generation = tuple(version + [0] * (3 - len(version)))
+    release_date = tuple(
+        -int(part) for part in (*re.findall(r"\d+", claude_head), *tail_groups) if len(part) >= 6
+    ) or (0,)
+    return (
+        row_id.lower() != tier,
+        generation,
+        release_date,
+        launch_model.lower().endswith("[1m]"),
+        launch_model.lower(),
+        row_id.lower(),
+        launch_model,
+        row_id,
+    )
+
+
+def _claude_catalog_tier_model(rows: list[dict[str, object]], tier: str) -> str | None:
+    """Return the catalog's deterministic launch spelling for one Claude tier."""
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        row_model = str(row.get("model") or "").strip()
+        family_token = row_model or row_id
+        if _claude_family(family_token) != tier:
+            continue
+        lower_token = family_token.lower()
+        if (
+            lower_token not in CLAUDE_MODEL_ALIASES
+            and "claude" not in lower_token
+            and row_id.lower() != tier
+        ):
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+    selected = min(candidates, key=lambda row: _claude_catalog_tier_rank(row, tier))
+    return str(selected.get("model") or selected.get("id") or "").strip() or None
+
+
+def claude_model_fold_notice(
+    requested_model: str,
+    candidate: str,
+    launch_model: str,
+    claude_config: ClaudeNativeUcodeConfig | None = None,
+) -> str | None:
+    """Build (and WARN-log) the visible notice for an equivalent-spelling fold.
+
+    :param requested_model: The pin as the operator spelled it.
+    :param candidate: The spelling that matched the catalog (the request
+        itself, or its configured picker-id resolution).
+    :param launch_model: The spelling the launch will pin.
+    :param claude_config: Provider config used to verify a custom-slot picker
+        resolution.
+    :returns: The session-notice text, or ``None`` when nothing visible
+        changed.
+    """
+    if launch_model == candidate:
+        custom_model = (
+            claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+            if claude_config is not None
+            else None
+        )
+        if requested_model != _UCODE_CLAUDE_CUSTOM_TIER or custom_model == candidate:
+            return None
+        reason = "the saved picker option now resolves to a different configured model"
+    # Markers are compared against the candidate — the spelling the launch
+    # was resolved from — so a picker id's configured [1m] option does not
+    # read as a context change of its own resolution.
+    elif candidate.lower().endswith("[1m]") != launch_model.lower().endswith("[1m]"):
+        reason = "the equivalent catalog model uses a different [1m] context marker"
+    elif candidate == requested_model:
+        reason = "the equivalent catalog model uses the host's verified spelling"
+    else:
+        return None
+    _logger.warning(
+        "native-claude: substituting requested model %r with %r: %s",
+        requested_model,
+        launch_model,
+        reason,
+    )
+    return (
+        f"Requested Claude model {requested_model!r} was substituted with "
+        f"{launch_model!r} because {reason}."
+    )
+
+
+def resolve_claude_native_catalog_selection(
+    requested_model: str,
+    rows: list[dict[str, object]],
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, str | None]:
+    """Resolve an explicit Claude launch request against the host catalog.
+
+    Available requests retain their exact resolved spelling. An unavailable
+    Claude tier steps down through Fable, Opus, Sonnet, and Haiku, never across
+    vendors. When no lower Claude tier is available, the existing actionable
+    launch error is preserved.
+
+    :param requested_model: Persisted picker id or concrete Claude model id.
+    :param rows: The host's current launch catalog.
+    :param claude_config: Resolved provider config for the terminal.
+    :returns: ``(launch_model, notice)``; ``notice`` is set only on substitution.
+    :raises click.ClickException: If the request cannot stay in the Claude family.
+    """
+    resolved_request = (
+        resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
+    )
+    requested_alias = requested_model.strip().lower()
+    alias_base = requested_alias.removesuffix("[1m]")
+    requested_tier = (
+        alias_base
+        if alias_base in CLAUDE_MODEL_ALIASES
+        and requested_alias in {alias_base, f"{alias_base}[1m]"}
+        else None
+    )
+    for candidate in dict.fromkeys((requested_model, resolved_request)):
+        exact_match = model_catalog_store.catalog_contains(rows, candidate)
+        catalog_model = resolve_claude_catalog_model(rows, candidate)
+        if catalog_model is not None:
+            if exact_match or (
+                is_canonical_claude_pin(candidate)
+                and claude_config_serves_canonical_ids(claude_config)
+            ):
+                launch_model = candidate
+            else:
+                launch_model = catalog_model
+            return launch_model, claude_model_fold_notice(
+                requested_model,
+                candidate,
+                launch_model,
+                claude_config,
+            )
+
+    if requested_tier in _CLAUDE_TIER_FALLBACK_ORDER:
+        start = _CLAUDE_TIER_FALLBACK_ORDER.index(requested_tier)
+        for tier in _CLAUDE_TIER_FALLBACK_ORDER[start:]:
+            substitute = _claude_catalog_tier_model(rows, tier)
+            if substitute is None:
+                continue
+            reason = "the requested Claude model is absent from this host's current model list"
+            _logger.warning(
+                "native-claude: substituting unavailable requested model %r with %r: %s",
+                requested_model,
+                substitute,
+                reason,
+            )
+            notice = (
+                f"Requested Claude model {requested_model!r} is unavailable on this host. "
+                f"Launched with {substitute!r} instead because {reason}."
+            )
+            return substitute, notice
+
+    raise click.ClickException(
+        f"the requested model {requested_model!r} is not in this host's current "
+        "model list — it may have changed since the pick. Launchable model ids: "
+        f"{model_catalog_store.launchable_ids_text(rows)}. Pick again from the model menu."
     )
 
 
@@ -868,8 +1133,8 @@ async def _resolve_claude_model_alias(
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param alias: The alias exactly as the harness printed it.
-    :returns: Whichever of ``{"model": …, "label": …}`` resolved; empty on
-        any failure (the alias keeps its bare row).
+    :returns: Whichever of ``{"model": …, "label": …}`` resolved.
+    :raises CatalogRefreshError: When the harness cannot resolve the alias.
     """
     command, launch_args, env = _claude_model_probe_invocation(
         claude_config,
@@ -885,12 +1150,20 @@ async def _resolve_claude_model_alias(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    except OSError:
-        _logger.debug("Claude alias resolution could not launch for %r", alias, exc_info=True)
-        return {}
+    except OSError as exc:
+        kind = (
+            model_catalog_store.CatalogRefreshFailureKind.CLI_ABSENT
+            if isinstance(exc, FileNotFoundError)
+            else model_catalog_store.CatalogRefreshFailureKind.OTHER
+        )
+        _logger.debug("Claude alias resolution could not launch for %r (%s)", alias, kind.value)
+        raise model_catalog_store.CatalogRefreshError(
+            kind,
+            "Claude model alias resolution could not launch the CLI",
+        ) from None
     try:
         async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
-            stdout, _stderr = await process.communicate()
+            stdout, stderr = await process.communicate()
     except (TimeoutError, asyncio.CancelledError) as exc:
         if process.returncode is None:
             process.kill()
@@ -899,10 +1172,13 @@ async def _resolve_claude_model_alias(
         if isinstance(exc, asyncio.CancelledError):
             raise
         _logger.debug("Claude alias resolution timed out for %r", alias)
-        return {}
+        raise model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model alias resolution timed out",
+        ) from None
     if process.returncode != 0:
         _logger.debug("Claude alias resolution exited %s for %r", process.returncode, alias)
-        return {}
+        raise _claude_probe_process_error(stderr) from None
     return _parse_claude_current_model(stdout.decode(errors="replace"))
 
 
@@ -911,15 +1187,15 @@ async def _resolve_claude_model_aliases(
     aliases: Sequence[str],
 ) -> dict[str, dict[str, str]]:
     """
-    Resolve every printed alias concurrently, best-effort.
+    Resolve every printed alias concurrently.
 
-    Bounded fan-out under one overall budget: whatever resolved in time is
-    kept and the rest stay bare, so a hung harness cannot stretch the
-    probe indefinitely.
+    Bounded fan-out runs under one overall budget. A failed resolution makes
+    the live refresh non-authoritative instead of persisting partial rows.
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param aliases: The harness-printed aliases.
     :returns: Non-empty resolutions keyed by alias.
+    :raises CatalogRefreshError: When any alias cannot be resolved.
     """
     if not aliases:
         return {}
@@ -933,6 +1209,11 @@ async def _resolve_claude_model_aliases(
     try:
         async with asyncio.timeout(_CLAUDE_ALIAS_RESOLUTION_BUDGET_S):
             await asyncio.gather(*tasks.values())
+    except model_catalog_store.CatalogRefreshError:
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        raise
     except TimeoutError:
         for task in tasks.values():
             task.cancel()
@@ -943,6 +1224,10 @@ async def _resolve_claude_model_aliases(
             done,
             len(tasks),
         )
+        raise model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model alias resolution timed out",
+        ) from None
     return {
         alias: task.result()
         for alias, task in tasks.items()
@@ -988,6 +1273,20 @@ class ClaudeModelProbe:
     default_label: str | None = None
 
 
+def _claude_probe_process_error(stderr: bytes) -> model_catalog_store.CatalogRefreshError:
+    """Classify a failed Claude subprocess without retaining its output."""
+    failure_text = stderr.decode(errors="replace")
+    if _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
+        return model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            "Claude model catalog authentication failed",
+        )
+    return model_catalog_store.CatalogRefreshError(
+        model_catalog_store.CatalogRefreshFailureKind.OTHER,
+        "Claude model catalog probe exited unsuccessfully",
+    )
+
+
 def _parse_claude_enumeration_aliases(stdout: str) -> list[str]:
     """Extract the alias list from a stream-json enumeration run.
 
@@ -1017,7 +1316,7 @@ def _parse_claude_enumeration_aliases(stdout: str) -> list[str]:
 
 async def probe_claude_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
-) -> ClaudeModelProbe | None:
+) -> ClaudeModelProbe:
     """
     Ask Claude Code itself which models it would offer, and its default.
 
@@ -1031,8 +1330,8 @@ async def probe_claude_model_options(
 
     :param claude_config: The resolved native launch config
         (:func:`resolve_native_claude_config`), or ``None``.
-    :returns: The probe result, or ``None`` when the probe failed (callers
-        fall back to the configured/static rows).
+    :returns: The probe result.
+    :raises CatalogRefreshError: With a sanitized structured failure kind.
     """
     command, launch_args, env = _claude_model_probe_invocation(
         claude_config, ("--output-format", "stream-json", "--verbose")
@@ -1047,26 +1346,40 @@ async def probe_claude_model_options(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    except OSError:
-        _logger.warning("Claude model probe could not launch the claude CLI", exc_info=True)
-        return None
+    except OSError as exc:
+        kind = (
+            model_catalog_store.CatalogRefreshFailureKind.CLI_ABSENT
+            if isinstance(exc, FileNotFoundError)
+            else model_catalog_store.CatalogRefreshFailureKind.OTHER
+        )
+        _logger.warning("Claude model probe could not launch the claude CLI (%s)", kind.value)
+        raise model_catalog_store.CatalogRefreshError(
+            kind,
+            "Claude model catalog could not launch the CLI",
+        ) from None
     try:
         async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
             stdout, stderr = await process.communicate()
-    except (TimeoutError, asyncio.CancelledError):
+    except (TimeoutError, asyncio.CancelledError) as exc:
         if process.returncode is None:
             process.kill()
         with contextlib.suppress(Exception):
             await process.wait()
-        _logger.warning("Claude model probe timed out; keeping configured rows only")
-        return None
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        _logger.warning("Claude model probe timed out; keeping cached rows if available")
+        raise model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        ) from None
     if process.returncode != 0:
+        failure = _claude_probe_process_error(stderr)
         _logger.warning(
-            "Claude model probe exited %s: %s",
+            "Claude model probe exited %s (%s)",
             process.returncode,
-            stderr.decode(errors="replace").strip()[-500:],
+            failure.kind.value,
         )
-        return None
+        raise failure from None
     text = stdout.decode(errors="replace")
     aliases = _parse_claude_enumeration_aliases(text)
     # The enumeration run's own init event names what a bare launch runs —
@@ -1076,6 +1389,11 @@ async def probe_claude_model_options(
     # model), which is exactly what the harness's ``default`` alias does —
     # listing it again would duplicate that row.
     aliases = [alias for alias in aliases if alias != "default"]
+    if not aliases and not default_resolution.get("model"):
+        raise model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+            "Claude model catalog enumeration returned no models",
+        )
     resolutions = await _resolve_claude_model_aliases(claude_config, aliases)
     alias_rows: list[dict[str, object]] = []
     seen_models: set[object] = set()
@@ -1116,7 +1434,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
 
 async def claude_model_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
-) -> list[dict[str, object]] | None:
+) -> list[dict[str, object]]:
     """
     The harness-truth catalog: probe rows with one truthful ``isDefault``.
 
@@ -1131,11 +1449,10 @@ async def claude_model_catalog(
     ``settings.json`` pin, say) and the endpoint can serve it.
 
     :param claude_config: The resolved launch config, or ``None``.
-    :returns: Catalog rows, or ``None`` when the probe failed.
+    :returns: Catalog rows.
+    :raises CatalogRefreshError: When no authoritative rows can be refreshed.
     """
     probe = await probe_claude_model_options(claude_config)
-    if probe is None:
-        return None
     rows = list(probe.alias_rows)
     if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
         rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
@@ -1181,41 +1498,39 @@ async def claude_model_catalog(
                     "isDefault": True,
                 }
             )
+    if not out:
+        raise model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+            "Claude model catalog refresh returned no launchable models",
+        )
     return out
+
+
+async def claude_launch_catalog_result(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> model_catalog_store.CatalogResult:
+    """
+    Return an authoritative catalog result for Claude launch selection.
+
+    Fresh hits return immediately. Stale hits and misses synchronously join a
+    single-flight probe so only the launch path waits for freshness provenance.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: Catalog rows with freshness and any sanitized refresh error.
+    """
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    return await model_catalog_store.ensure_authoritative_catalog_result(
+        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
 
 
 async def claude_launch_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]] | None:
-    """
-    The shared catalog for this launch config: read the store, probe on miss.
-
-    The store read is what keeps launches fast once the host's boot probe
-    (or a previous launch) has run; a cold miss pays one probe and persists
-    the answer for every later consumer.
-
-    :param claude_config: The resolved launch config, or ``None``.
-    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
-    """
-    from omnigent import model_catalog_store
-
+    """Return shared rows immediately, refreshing stale hits in the background."""
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
-    )
-
-
-def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
-    """
-    Whether this config's stored catalog is past the freshness TTL.
-
-    :param claude_config: The resolved launch config, or ``None``.
-    :returns: ``True`` when the store holds only a stale entry.
-    """
-    from omnigent import model_catalog_store
-
-    return model_catalog_store.catalog_is_stale(
-        "claude-native", claude_catalog_fingerprint(claude_config)
     )
 
 
