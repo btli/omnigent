@@ -163,7 +163,9 @@ def commit_ident(ring: Ring = STAGING) -> list[str]:
 
 
 class StageError(RuntimeError):
-    pass
+    def __init__(self, *args: object, git_lock_failure: bool = False):
+        super().__init__(*args)
+        self.git_lock_failure = git_lock_failure
 
 
 def _is_git_lock_failure(stderr: str) -> bool:
@@ -638,7 +640,10 @@ def merge_prs(
         if merge.returncode != 0:
             what = f"branch {branch}" if source == "extra-branch" else f"PR #{num}"
             if _is_git_lock_failure(merge.stderr):
-                raise StageError(f"merge of {what} failed on a Git lock: {merge.stderr.strip()}")
+                raise StageError(
+                    f"merge of {what} failed on a Git lock: {merge.stderr.strip()}",
+                    git_lock_failure=True,
+                )
             # Only a genuine content conflict (unmerged index entries) is
             # skippable; anything else is a broken workspace — fail loud.
             if not git(cwd, "ls-files", "-u").stdout.strip():
@@ -959,25 +964,14 @@ def stage(
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
 
+    infrastructure_error = None
     try:
         applied, skipped = merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
     except StageError as error:
-        if not staging_only or not _is_git_lock_failure(str(error)):
+        if not staging_only or not error.git_lock_failure:
             raise
-        staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
-        return {
-            "date": datestamp,
-            "upstream_sha": upstream_sha,
-            "staging_sha": staging_sha,
-            "remote_staging_sha": remote_ref(cwd, fork, f"refs/heads/{ring.branch}"),
-            "staging_only": True,
-            "blocked": [],
-            "infrastructure_error": str(error),
-            "pushed": False,
-            "causes": [],
-            "applied": [],
-            "skipped": [],
-        }
+        applied, skipped = [], []
+        infrastructure_error = str(error)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
     # An extra we could not even reach is an infrastructure failure, not a
@@ -988,7 +982,7 @@ def stage(
         if p.get("reason") == EXTRA_FETCH_FAILED
     ]
 
-    if ring == PRODUCTION:
+    if ring == PRODUCTION and not infrastructure_error:
         assert_production_identity(cwd, staging_sha, upstream_sha, applied)
 
     if staging_only:
@@ -1006,7 +1000,8 @@ def stage(
             "remote_staging_sha": expected_staging,
             "staging_only": True,
             "blocked": blocked,
-            "pushed": not blocked and expected_staging != staging_sha,
+            **({"infrastructure_error": infrastructure_error} if infrastructure_error else {}),
+            "pushed": not blocked and not infrastructure_error and expected_staging != staging_sha,
             "causes": [],
             "applied": applied,
             "skipped": skipped,

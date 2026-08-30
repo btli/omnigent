@@ -142,13 +142,12 @@ def _drop_merge_rr_lock_after_fetch(monkeypatch, ref_fragment: str):
 
     def lock_after_fetch(cwd, *args, **kwargs):
         nonlocal dropped
+        lock = Path(cwd) / ".git" / "rr-cache" / "MERGE_RR.lock"
         result = real_git(cwd, *args, **kwargs)
         if not dropped and args[:1] == ("fetch",) and ref_fragment in args:
-            lock = Path(cwd) / ".git" / "rr-cache" / "MERGE_RR.lock"
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_text("held by background maintenance\n")
             dropped = True
-        lock = Path(cwd) / ".git" / "rr-cache" / "MERGE_RR.lock"
         if dropped and "merge" in args and result.returncode != 0:
             return subprocess.CompletedProcess(
                 args,
