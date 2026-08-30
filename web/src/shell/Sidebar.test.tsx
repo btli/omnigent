@@ -2067,10 +2067,12 @@ describe("Sidebar project sections", () => {
   });
 
   it("keeps New session in the project menu when the pencil requires hover", async () => {
-    // The pencil is limited to fine-pointer hover desktops — the condition
-    // that lets hovering reveal it. Everywhere else (including fine-pointer
-    // touchscreen laptops, where a tap can't reveal the gated overlay) the
-    // same action stays in the kebab at every viewport width.
+    // The pencil is a redundant shortcut for the kebab's always-present "New
+    // session" item, so without a fine hover pointer it is genuinely absent
+    // (display:none via `hidden`), NOT sr-only — an sr-only pencil would stay
+    // focusable and announce a duplicate "New session" alongside the kebab's
+    // item. On hover+fine it is display-flex, revealed on hover/focus by the
+    // overlay's opacity. The kebab (not this pencil) carries the touch a11y path.
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2078,14 +2080,10 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass(
-      "sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:flex",
-      // Keyboard focus un-clips it even without a fine hover pointer, so a
-      // touchscreen-plus-keyboard user gets a visible focus target.
-      "focus-visible:not-sr-only",
-    );
+    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    // Genuinely absent on touch — not merely clipped — so it leaves the a11y
+    // tree and tab order, unlike the kebab.
+    expect(pencil).not.toHaveClass("sr-only", "focus-visible:not-sr-only");
 
     // The menu remains a touch/long-press fallback even when the hover shortcut
     // is eligible, because a touchscreen tap cannot reveal that shortcut first.

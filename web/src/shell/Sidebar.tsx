@@ -4197,11 +4197,12 @@ function ProjectFolderActions({
     // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
     // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* Shortcut revealed on hover wherever a fine hover pointer exists (any
-          width) — the same condition that hides the overlay at rest. Without a
-          fine hover pointer it is sr-only: absent from the row yet reachable by
-          keyboard and assistive tech, since a touch tap can't reveal it and the
-          menu item is the visible fallback. */}
+      {/* A redundant shortcut for the kebab's always-present "New session"
+          item, so it is genuinely absent (not just clipped) wherever no fine
+          hover pointer can reveal it: on touch, folding fully into the kebab
+          instead of leaving a duplicate focus stop for keyboard/AT users. On
+          hover+fine it is display-flex and revealed on hover or keyboard focus
+          by the overlay's opacity. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -4211,7 +4212,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
