@@ -9,6 +9,7 @@
  *
  * Sections:
  *
+ * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
  *   default transcript view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
@@ -36,11 +37,13 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  DownloadIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -57,6 +60,7 @@ import {
   SquareIcon,
   TerminalIcon,
   Trash2Icon,
+  UploadIcon,
   UserCogIcon,
   XIcon,
 } from "lucide-react";
@@ -109,6 +113,7 @@ import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import {
+  isThemeMode,
   normalizeResolvedTheme,
   normalizeThemeMode,
   type ThemeMode,
@@ -163,6 +168,7 @@ import {
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -189,6 +195,12 @@ import {
 } from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getOmnigentThemeSettingsUrl } from "@/lib/host";
+import {
+  applyImportedSettings,
+  collectSettings,
+  downloadSettings,
+  readSettingsFile,
+} from "@/lib/settingsPortability";
 import {
   type CliStatus,
   getCliStatus,
@@ -283,6 +295,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
@@ -736,6 +749,9 @@ function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetAppearance = () => {
     // Reset every appearance preference back to the product default.
@@ -797,6 +813,33 @@ function AppearanceSection() {
     setIsResetDialogOpen(false);
   };
 
+  const exportSettings = () => {
+    const exported = collectSettings();
+    if (exported) downloadSettings(exported);
+  };
+
+  const handleImportFile = async (file: File) => {
+    setImportError(null);
+    try {
+      const imported = await readSettingsFile(file);
+      applyImportedSettings(imported);
+
+      // Apply DOM side-effects so imported settings take effect immediately.
+      // Note: web-theme is stored as plain string by next-themes, not JSON.
+      const themeMode = imported.settings["web-theme"];
+      if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
+      applyDesktopUiFontSize(readUiFontSizePx());
+      applyUiFontFamily(readUiFontFamily());
+      applyThemePalette(readThemePalette());
+      applyCustomTheme(readCustomTheme());
+
+      setIsImportDialogOpen(false);
+      setResetKey((k) => k + 1);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Import failed.");
+    }
+  };
+
   return (
     <Section
       title="Appearance"
@@ -852,7 +895,28 @@ function AppearanceSection() {
         <UiCodeFontWeightControl />
       </div>
 
-      <div className="mt-8 flex items-center justify-end">
+      <div className="mt-8 flex items-center justify-end gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="export-settings-button"
+          onClick={exportSettings}
+        >
+          <DownloadIcon className="size-4" />
+          Export
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="import-settings-button"
+          onClick={() => {
+            setImportError(null);
+            setIsImportDialogOpen(true);
+          }}
+        >
+          <UploadIcon className="size-4" />
+          Import
+        </Button>
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
             <Button
@@ -890,6 +954,53 @@ function AppearanceSection() {
           </DialogContent>
         </Dialog>
       </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json"
+        className="hidden"
+        data-testid="import-settings-file-input"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void handleImportFile(file);
+          e.target.value = "";
+        }}
+      />
+      <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Import settings</DialogTitle>
+            <DialogDescription>
+              Choose an exported Omnigent settings file to apply. This will overwrite your current
+              appearance and preference settings.
+            </DialogDescription>
+          </DialogHeader>
+          {importError && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
+              {importError}
+            </div>
+          )}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" size="sm">
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="default"
+              size="sm"
+              data-testid="import-settings-choose-file"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Choose file
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Section>
   );
 }
@@ -939,6 +1050,53 @@ function AlwaysUseWorktreeControl() {
         componentId="settings.git.always_use_worktree"
       />
     </div>
+  );
+}
+
+/**
+ * Opt-in dispatch for messages sent while the agent is working.
+ */
+function AlwaysSteerControl() {
+  const [value, setValue] = useState(() => readAlwaysSteer());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeAlwaysSteer(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Always steer
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Send follow-ups straight into the running turn instead of queuing them. The agent folds
+          each one into its current work where the harness supports it, otherwise at the next turn.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="always-steer-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.always_steer"
+      />
+    </div>
+  );
+}
+
+/** App-wide behavior settings. */
+function GeneralSection() {
+  return (
+    <Section title="General" description="Configure general Omnigent behavior.">
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Composer</h2>
+        <div className="rounded-xl border border-border bg-card px-4 py-3">
+          <AlwaysSteerControl />
+        </div>
+      </div>
+    </Section>
   );
 }
 
