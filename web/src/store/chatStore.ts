@@ -4217,6 +4217,36 @@ async function hydrateSessionUsage(id: string): Promise<void> {
   ) {
     return;
   }
+  sessionUsageHydrations.add(controller);
+  const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
+  try {
+    const usage = await getSessionUsage(id, { signal: controller.signal });
+    if (
+      usage.id !== id ||
+      controller.signal.aborted ||
+      conversationRegistry.peek(id) !== entry ||
+      entry.getState().abortController !== controller
+    ) {
+      return;
+    }
+    const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
+    // A live cost/model update during the read wins independently for each field.
+    entrySetter(entry)((state) => ({
+      ...(revisions.cost === revisionsBeforeFetch.cost &&
+      state.sessionCostUsd === before.sessionCostUsd
+        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        : {}),
+      ...(revisions.models === revisionsBeforeFetch.models &&
+      state.sessionUsageByModel === before.sessionUsageByModel
+        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        : {}),
+    }));
+  } catch {
+    // Usage is optional display data; retain known totals or leave them unknown.
+  } finally {
+    sessionUsageHydrations.delete(controller);
+  }
+}
 
 // abortableDelay / nextReconnectDelay / awaitReconnectDelay live in
 // streamReconnect.ts so the pacing logic is unit-testable without this
