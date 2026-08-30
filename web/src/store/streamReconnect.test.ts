@@ -32,6 +32,16 @@ describe("streamReconnect pacing", () => {
     expect(nextReconnectDelay(20)).toBe(STREAM_RECONNECT_MAX_MS);
   });
 
+  it("waits the stretched hidden cadence from the very first failed open", () => {
+    // A page hidden EARLY in the backoff ramp must not keep dialing at the
+    // fast foreground cadence until the doubling reaches the hidden cap —
+    // that mid-ramp window still wakes the radio every few seconds.
+    setDocumentHidden(true);
+    expect(nextReconnectDelay(1)).toBe(STREAM_HIDDEN_RECONNECT_MAX_MS);
+    setDocumentHidden(false);
+    expect(nextReconnectDelay(1)).toBe(250);
+  });
+
   it("waits out a stretched hidden delay to its exact deadline", async () => {
     setDocumentHidden(true);
     const controller = new AbortController();
