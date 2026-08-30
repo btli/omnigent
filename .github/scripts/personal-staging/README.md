@@ -186,7 +186,7 @@ planned. The `stage.py` comment describing extras as frozen pins applies only to
 closed PR pull refs. A force-push that changes conflicting content breaks the
 recorded rerere match: the merge aborts, the pin appears under **Skipped PRs**,
 and the nightly stays green. If the conflict text stays byte-identical, the
-changed head lands using the recorded resolution; if the merge is now clean, it
+recorded resolution can still replay and land the changed head; if the merge is now clean, it
 lands silently. Neither silent branch is detected today, and a conflict skip is
 only a symptom, not proof the head moved. Re-record a mismatched resolution per
 [Conflict resolutions](#conflict-resolutions-rr-cache), or remove the pin.
