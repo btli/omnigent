@@ -227,9 +227,11 @@ def test_remove_session_from_project(
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
-# A phone-width viewport: below the 768px `md` breakpoint, so the sidebar is the
-# mobile overlay and the folder header's new-session pencil (`max-md:hidden`)
-# collapses into the kebab.
+# A phone-width viewport, below the 768px `md` breakpoint, so the sidebar
+# renders as the mobile overlay — a genuine layout/width concern. It does NOT
+# by itself hide the folder's new-session pencil: that reveal is gated on input
+# capability (a hover+fine pointer), not width, so tests that need the pencil
+# gone pair this viewport with a `has_touch` context.
 _MOBILE_VIEWPORT = {"width": 390, "height": 780}
 _TABLET_VIEWPORT = {"width": 834, "height": 1112}
 

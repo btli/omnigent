@@ -2083,7 +2083,12 @@ describe("Sidebar project sections", () => {
     expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
     // Genuinely absent on touch — not merely clipped — so it leaves the a11y
     // tree and tab order, unlike the kebab.
-    expect(pencil).not.toHaveClass("sr-only", "focus-visible:not-sr-only");
+    // Separate assertions: toHaveClass with multiple classes only fails when
+    // ALL are present, so a partial regression (e.g. adding just `sr-only`)
+    // would slip past a combined negation while clipping the pencil invisible
+    // on hover+fine.
+    expect(pencil).not.toHaveClass("sr-only");
+    expect(pencil).not.toHaveClass("focus-visible:not-sr-only");
 
     // The menu remains a touch/long-press fallback even when the hover shortcut
     // is eligible, because a touchscreen tap cannot reveal that shortcut first.
