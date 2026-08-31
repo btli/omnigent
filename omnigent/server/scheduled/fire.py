@@ -58,16 +58,16 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server import project_assignment
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
+    resolve_project_session_create,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.schemas import ProjectSessionCreateRequest, SessionEventInput
 from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
@@ -454,8 +454,18 @@ async def _run_fire_for_task(
                 )
                 return
 
+<<<<<<< HEAD
         # Check connected-host workspaces, including the resolved HOME default,
         # against the agent's cwd boundary. A new sandbox has no workspace yet.
+=======
+        # Validate the RESOLVED host/workspace. ``effective.workspace`` is always
+        # an absolute realpath by this point — a caller-supplied path or the
+        # canonicalized default (HOME). Gating on ``effective.workspace`` (not the
+        # stored ``task.workspace``) means the agent's ``os_env.cwd`` boundary is
+        # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
+        # does — an agent that pins an absolute cwd outside HOME records a failed
+        # run instead of silently launching outside its declared boundary.
+>>>>>>> d0e68b9d2 (fix(scheduled): reconcile shared project resolution)
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
@@ -690,20 +700,30 @@ _PERMISSION_MODE_HARNESS = "claude-native"
 
 async def _resolve_owned_fire_project(
     project_store: ProjectStore,
-    project_id: str,
-    task_user_id: str | None,
+    task: ScheduledTask,
 ) -> str | None:
     """Resolve Projects across the two supported single-user owner forms."""
-    owners = (task_user_id,) if task_user_id is not None else (None, RESERVED_USER_LOCAL)
+    owners = (task.user_id,) if task.user_id is not None else (None, RESERVED_USER_LOCAL)
     for owner in owners:
-        resolved = await asyncio.to_thread(
-            project_assignment.resolve_owned_project_id,
-            project_store,
-            project_id,
-            user_id=owner,
+        body = ProjectSessionCreateRequest(
+            agent_id=task.agent_id,
+            project_id=task.project_id,
+            host_id=task.host_id,
+            workspace=task.workspace,
         )
-        if resolved is not None:
-            return resolved
+        try:
+            resolution = await resolve_project_session_create(
+                body=body,
+                user_id=owner,
+                project_store=project_store,
+                warn_on_mismatch=False,
+            )
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                continue
+            raise
+        if resolution.project_id is not None:
+            return resolution.project_id
     return None
 
 
@@ -726,8 +746,7 @@ async def _resolve_fire_project(
     try:
         resolved = await _resolve_owned_fire_project(
             project_store,
-            task.project_id,
-            task.user_id,
+            task,
         )
     except Exception:  # noqa: BLE001 -- lookup failures are unverifiable, not absent
         _logger.warning(
