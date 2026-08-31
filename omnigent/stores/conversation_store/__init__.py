@@ -408,7 +408,6 @@ class ConversationStore(ABC):
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
-        project_id: str | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,

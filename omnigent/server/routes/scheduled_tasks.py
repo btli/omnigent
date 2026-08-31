@@ -26,7 +26,6 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server import project_assignment
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
@@ -274,15 +273,12 @@ def create_scheduled_tasks_router(
                 "Project assignment is not supported by this server",
                 code=ErrorCode.INVALID_INPUT,
             )
-        resolved = await asyncio.to_thread(
-            project_assignment.resolve_owned_project_id,
-            project_store,
-            canonical_project_id,
-            user_id=owner,
+        project = await asyncio.to_thread(
+            project_store.get, canonical_project_id, user_id=owner
         )
-        if resolved is None:
+        if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return resolved
+        return project.id
 
     async def _validate_launch_inputs(
         request: Request,
