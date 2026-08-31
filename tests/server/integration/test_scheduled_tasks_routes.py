@@ -1033,9 +1033,7 @@ async def test_update_agent_and_project_in_the_same_patch(
     from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
-    project = SqlAlchemyProjectStore(db_uri).create(
-        "a" * 32, "Automation", "alice@example.com"
-    )
+    project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "Automation", "alice@example.com")
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
     ).json()
