@@ -55,6 +55,7 @@ class _FakeConversation:
 @dataclass
 class _FakeProject:
     id: str
+    config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
