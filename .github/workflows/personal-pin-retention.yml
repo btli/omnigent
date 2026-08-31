@@ -1,0 +1,122 @@
+# Retires aged personal-ring pins on the btli fork.
+#
+# The staging and production nightlies each mint an immutable dated pin —
+# a `<ring>-YYYYMMDD[-rerunN]` tag, a same-name compatibility branch, and a
+# dated prerelease — plus a PEP 440 `vX.Y.Z.devYYYYMMDD` tag on staging.
+# Nothing resolves a pin after the homelab has built it, so they accumulate
+# forever: this prunes every pin dated more than `keep_days` back, keeping a
+# floor of the newest few per family so a stalled ring can never be stripped
+# bare. Floating refs (`production-latest`, `nightly-latest`), `pr-demos-*`,
+# release tags and `archive/*` are outside the matched families entirely.
+#
+# Ordering: runs after the whole nightly chain (staging 10:00, production
+# 10:30, dev-rebase 10:45) and after the homelab has resolved today's
+# production pin at 11:10 UTC, so a prune can never race a pin being
+# consumed.
+#
+# Trust boundary: the test gate installs third-party dev deps and holds no
+# write token; the prune job runs the stdlib-only pruner with contents:write
+# and never checks out or executes merged-PR code (the pruner comes from the
+# workflow ref's own checkout).
+name: Personal Pin Retention
+
+on:
+  schedule:
+    # 12:20 UTC — clear of the 10:00/10:30/10:45 composes and the homelab's
+    # 11:10 pin poll. Off :00 like the other personal rings.
+    - cron: "20 12 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report the plan without deleting anything"
+        type: boolean
+        default: false
+      keep_days:
+        description: "Retention window in days (pins dated before it retire)"
+        type: string
+        default: "14"
+      keep_per_family:
+        description: "Newest pins kept per family regardless of age"
+        type: string
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-pin-retention
+  cancel-in-progress: false
+
+jobs:
+  # Secretless gate: `uv run` installs third-party dev deps, so this job
+  # never holds a write token. The repo's pytest testpaths never collect
+  # .github/scripts/**, hence the explicit invocation.
+  test-pruner:
+    if: github.repository == 'btli/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Test the pin pruner
+        run: uv run --frozen --group dev python -m pytest .github/scripts/personal-staging/test_prune_pins.py
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal pin retention — test-pruner job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  prune:
+    needs: test-pruner
+    # Accident prevention for non-main dispatches (schedule always runs main);
+    # a dispatched ref executes its own workflow copy, so this is not a
+    # security boundary — same rationale as personal-staging.yml.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Retire aged pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # All three are empty on schedule runs; the defaults live in
+          # prune_pins.py, so the schedule is always the armed 14/5 policy.
+          DRY_RUN: ${{ inputs.dry_run }}
+          KEEP_DAYS: ${{ inputs.keep_days || '14' }}
+          KEEP_PER_FAMILY: ${{ inputs.keep_per_family || '5' }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            set -- --dry-run
+          fi
+          python3 .github/scripts/personal-staging/prune_pins.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --keep-days "$KEEP_DAYS" \
+            --keep-per-family "$KEEP_PER_FAMILY" \
+            --report prune-report.json "$@"
+
+      - name: Upload the prune report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prune-report
+          path: prune-report.json
+          if-no-files-found: ignore
