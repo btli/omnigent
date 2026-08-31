@@ -132,7 +132,10 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. 10s matches every other native bridge: a tmux
+# server starved by parallel worker boots on a large worktree can stall
+# past 5s while still healthy, and a shorter budget kills the delivery.
+_TMUX_SEND_TIMEOUT_S = 10.0
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
 # first message so keystrokes typed during Claude's boot aren't dropped.
@@ -1391,6 +1394,7 @@ def build_hook_settings(
     api_key_helper: str | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
+    launch_bypass_permissions: bool = False,
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
@@ -1420,6 +1424,11 @@ def build_hook_settings(
     :param launch_permission_mode: Effective launch permission mode from
         ``--permission-mode``. Mirrored into ``permissions.defaultMode``
         for the same re-exec hardening.
+    :param launch_bypass_permissions: ``True`` when this launch requests
+        bypass mode (``--dangerously-skip-permissions`` or
+        ``--permission-mode bypassPermissions``), which sets
+        ``skipDangerousModePermissionPrompt`` so the one-time acceptance
+        dialog never blocks a host-spawned terminal.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
     :param subagent_router_dir: Directory where the runner advertises its
@@ -1673,6 +1682,14 @@ def build_hook_settings(
         settings["model"] = launch_model
     if launch_permission_mode:
         settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_bypass_permissions:
+        # Bypass mode shows a one-time "Bypass Permissions mode" acceptance
+        # dialog. Like the trust/onboarding gates it fires no
+        # PermissionRequest hook, so a host-spawned terminal has nobody to
+        # answer it and the session hangs with a blank web UI. Claude checks
+        # the org policy (``disableBypassPermissionsMode``) BEFORE this
+        # consent gate, so a managed host still strips bypass regardless.
+        settings["skipDangerousModePermissionPrompt"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -1832,6 +1849,7 @@ def augment_claude_args(
         api_key_helper=api_key_helper,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
         launch_effort=_arg_value(claude_args, "--effort"),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
@@ -1887,6 +1905,21 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
+    """Return whether ``args`` launch Claude Code in bypass-permissions mode.
+
+    Both spellings count: the standalone ``--dangerously-skip-permissions``
+    flag, and ``--permission-mode bypassPermissions`` (the form
+    ``permission_mode: bypassPermissions`` in a worker bundle becomes).
+
+    :param args: Claude CLI args, e.g. ``("--dangerously-skip-permissions",)``.
+    :returns: ``True`` when this launch requests bypass mode.
+    """
+    return "--dangerously-skip-permissions" in args or (
+        _arg_value(args, "--permission-mode") == "bypassPermissions"
+    )
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
