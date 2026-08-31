@@ -19,7 +19,6 @@ from omnigent.db.db_models import InvalidUuidError
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import project_assignment
 from omnigent.server.app import create_app
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -594,19 +593,19 @@ async def test_assignment_and_project_delete_race_is_visible_in_both_orders(
             "/v1/scheduled-tasks", json=_create_body(name="second"), headers=_headers()
         )
     ).json()
-    original_resolver = project_assignment.resolve_owned_project_id
+    original_get = SqlAlchemyProjectStore.get
 
-    def _resolve_then_delete(
+    def _get_then_delete(
         project_store: SqlAlchemyProjectStore,
         project_id: str,
         *,
         user_id: str | None,
-    ) -> str | None:
-        resolved = original_resolver(project_store, project_id, user_id=user_id)
+    ) -> object | None:
+        resolved = original_get(project_store, project_id, user_id=user_id)
         assert project_store.delete(project_id, user_id=user_id) is True
         return resolved
 
-    monkeypatch.setattr(project_assignment, "resolve_owned_project_id", _resolve_then_delete)
+    monkeypatch.setattr(SqlAlchemyProjectStore, "get", _get_then_delete)
     accepted = await auth_client.patch(
         f"/v1/scheduled-tasks/{second_task['id']}",
         json={"project_id": deleted_after_validation.id},
