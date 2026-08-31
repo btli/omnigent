@@ -7519,6 +7519,58 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("settles an approval resolved before its buffered card reaches the store", async () => {
+    useChatStore.setState({ conversationId: "conv_fast_elicitation", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_fast_elicitation",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    sink.push(sse("response.created", { id: "resp_fast", status: "in_progress", output: [] }));
+    sink.push(delta("A"));
+    await tick();
+
+    sink.push(
+      sse("response.elicitation_request", {
+        elicitation_id: "elic_fast",
+        params: {
+          mode: "form",
+          message: "Approve fast operation?",
+          phase: "codex_mcp_elicitation",
+          policy_name: "codex_native_mcp_elicitation",
+          content_preview: "",
+        },
+      }),
+    );
+    sink.push(
+      sse("response.elicitation_resolved", {
+        elicitation_id: "elic_fast",
+      }),
+    );
+    await tick();
+
+    expect(manual.pending()).toBe(true);
+    manual.fire();
+
+    const card = useChatStore
+      .getState()
+      .blocks.find(
+        (block): block is ElicitationBlock =>
+          block.type === "elicitation" && block.elicitationId === "elic_fast",
+      );
+    expect(card?.status).toBe("responded");
+    expect(card?.response).toEqual({ action: "auto_resolved" });
+
+    controller.abort();
+  });
+
   it("appends live command output to the running tool card", async () => {
     useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
     const sink = pushableStream();
