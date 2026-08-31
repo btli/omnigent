@@ -112,7 +112,6 @@ def test_file_and_unfile_session_single_user(db_uri: str) -> None:
     assert conv.id in [s["id"] for s in unfiled.json()["data"]]
 
 
-
 def test_omitting_project_id_leaves_membership_unchanged(db_uri: str) -> None:
     """A PATCH that doesn't mention project_id must not clear the filing."""
     _ensure_agent(db_uri)
