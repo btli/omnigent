@@ -241,9 +241,7 @@ def create_scheduled_tasks_router(
                 "Project assignment is not supported by this server",
                 code=ErrorCode.INVALID_INPUT,
             )
-        project = await asyncio.to_thread(
-            project_store.get, canonical_project_id, user_id=owner
-        )
+        project = await asyncio.to_thread(project_store.get, canonical_project_id, user_id=owner)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return project.id
