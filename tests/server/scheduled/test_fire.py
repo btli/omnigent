@@ -618,6 +618,38 @@ async def test_fire_missing_project_runs_unfiled_and_conditionally_self_heals_ta
 
 
 @pytest.mark.asyncio
+async def test_fire_stamps_labels_while_self_healing_missing_project() -> None:
+    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    project_id = "a" * 32
+    task = _task(project_id=project_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    conv_store = FakeConversationStore()
+    deps = _deps(
+        store,
+        project_store=FakeProjectStore([None, None]),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", name=PI_NATIVE_AGENT_NAME)}),
+    )
+
+    async def _launch(conv: Any, effective: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": PI_NATIVE_AGENT_NAME,
+    }
+    assert store._rows["task_1"].project_id is None
+    assert store.compare_and_set_calls == [
+        {"id": "task_1", "expected_project_id": project_id, "project_id": None}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fire_self_heal_zero_rows_runs_normally_and_preserves_concurrent_assignment(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
