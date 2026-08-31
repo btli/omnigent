@@ -1026,6 +1026,32 @@ async def test_update_agent_switch_keeps_settings_resent_in_the_same_patch(
     assert patched.json()["permission_mode"] == "acceptEdits"
 
 
+async def test_update_agent_and_project_in_the_same_patch(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Agent switching and project filing are applied atomically."""
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    project = SqlAlchemyProjectStore(db_uri).create(
+        "a" * 32, "Automation", "alice@example.com"
+    )
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    target_agent = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": target_agent, "project_id": project.id},
+        headers=_headers(),
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["agent_id"] == target_agent
+    assert patched.json()["project_id"] == project.id
+
+
 async def test_update_agent_switch_gates_permission_mode_on_the_new_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
