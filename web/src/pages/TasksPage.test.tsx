@@ -390,6 +390,17 @@ describe("Project filtering", () => {
     expect(screen.queryByTestId("task-project-chip")).toBeNull();
   });
 
+  it("renders a nonempty Project slice when the cached All slice is empty", async () => {
+    const inA = task({ id: "a", name: "First automation", projectId: "p_a" });
+    setTaskQueries({ all: { data: [] }, project: { data: [inA] } });
+    renderPage();
+
+    await chooseProjectFilter("Project A");
+
+    expect(screen.getByText("First automation")).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-empty-state")).toBeNull();
+  });
+
   it("prefills create from a selected first-class Project", async () => {
     setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
     renderPage();
