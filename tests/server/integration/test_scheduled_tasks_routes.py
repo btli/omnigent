@@ -14,6 +14,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from starlette.requests import Request
 
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.db.utils import builtin_agent_id
@@ -268,21 +269,25 @@ async def test_malformed_project_id_maps_to_not_found() -> None:
 
 
 async def test_direct_invalid_uuid_keeps_upstream_internal_error(auth_app: FastAPI) -> None:
-    @auth_app.get("/_test/direct-invalid-uuid")
-    async def _raise_invalid_uuid() -> None:
-        raise InvalidUuidError("malformed test id")
-
-    transport = httpx.ASGITransport(app=auth_app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/_test/direct-invalid-uuid")
+    assert InvalidUuidError not in auth_app.exception_handlers
+    handler = auth_app.exception_handlers[Exception]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/unrelated",
+            "query_string": b"",
+            "headers": [],
+            "server": ("test", 80),
+        }
+    )
+    response = await handler(request, InvalidUuidError("malformed test id"))
 
     assert response.status_code == 500
-    assert response.json() == {
-        "error": {
-            "code": "internal_error",
-            "message": "An internal error occurred.",
-        }
-    }
+    assert response.body == (
+        b'{"error":{"code":"internal_error","message":"An internal error occurred."}}'
+    )
 
 
 async def test_assignment_404s_for_missing_malformed_and_other_users_project(
