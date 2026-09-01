@@ -180,6 +180,128 @@ jobs:
         if: failure()
         run: echo "## Personal staging nightly — integrate job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
 
+  seed-staleness-monitor:
+    name: monitor composition regressions
+    needs: integrate
+    if: always() && needs.integrate.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout detector
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download current merge report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: merge-report
+          path: reports/current
+
+      - name: Compare with previous successful composition
+        id: compare
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const runs = (await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'personal-staging.yml', branch: context.ref.replace('refs/heads/', ''),
+              per_page: 100,
+            })).data.workflow_runs
+              .filter(run => run.run_number < context.runNumber)
+              .sort((a, b) => b.run_number - a.run_number);
+            let report;
+            for (const run of runs) {
+              const artifacts = (await github.rest.actions.listWorkflowRunArtifacts({
+                owner, repo, run_id: run.id, per_page: 100,
+              })).data.artifacts;
+              report = artifacts.find(item => item.name === 'merge-report' && !item.expired);
+              if (report) break;
+            }
+            if (report) {
+              const archive = await github.rest.actions.downloadArtifact({
+                owner, repo, artifact_id: report.id, archive_format: 'zip',
+              });
+              fs.writeFileSync('previous.zip', Buffer.from(archive.data));
+              core.setOutput('has_baseline', 'true');
+            } else {
+              core.info('no prior report artifact -- using an empty first-run baseline');
+              core.setOutput('has_baseline', 'false');
+            }
+
+      - name: Run detector
+        env:
+          HAS_BASELINE: ${{ steps.compare.outputs.has_baseline }}
+        run: |
+          if [ "$HAS_BASELINE" = "true" ]; then
+            unzip -q previous.zip -d reports/previous
+          else
+            mkdir -p reports/previous
+            printf '{"applied":[],"skipped":[]}\n' > reports/previous/merge-report.json
+          fi
+          python3 .github/scripts/personal-staging/detect_staleness.py \
+            reports/previous/merge-report.json reports/current/merge-report.json \
+            --output staleness.json
+
+      - name: Update tracking issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('staleness.json', 'utf8'));
+            const { owner, repo } = context.repo;
+            const LABEL = 'staging-seed-stale-nightly';
+            const title = 'Personal staging composition regression (nightly)';
+            const existing = (await github.rest.issues.listForRepo({
+              owner, repo, state: 'all', labels: LABEL, per_page: 100,
+            })).data.find(issue => issue.title === title && !issue.pull_request);
+            if (!result.skipped_pins.length && !result.regressions.length) {
+              if (existing?.state === 'open') {
+                await github.rest.issues.createComment({ owner, repo, issue_number: existing.number,
+                  body: `No pin regressions or skipped pins remain in [run #${context.runNumber}](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}). Closing.` });
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed' });
+              }
+              return;
+            }
+            try { await github.rest.issues.getLabel({ owner, repo, name: LABEL }); }
+            catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({ owner, repo, name: LABEL, color: 'b60205',
+                description: 'Nightly personal staging composition has a skipped pin' });
+            }
+            const edgeIds = new Set([...result.regressions, ...result.new_pins].map(item => item.pr));
+            const ongoing = result.skipped_pins
+              .filter(item => !edgeIds.has(item.pr))
+              .map(item => ({ pr: item.pr, current: item, ongoing: true }));
+            const findings = [...result.regressions, ...result.new_pins, ...ongoing];
+            const code = value => {
+              const text = String(value);
+              const runs = text.match(/`+/g) ?? [];
+              const longest = Math.max(0, ...runs.map(run => run.length));
+              const fence = '`'.repeat(longest + 1);
+              const padding = text.startsWith('`') || text.endsWith('`') ? ' ' : '';
+              return `${fence}${padding}${text}${padding}${fence}`;
+            };
+            const lines = findings.map(item => {
+              const kind = result.regressions.includes(item) ? 'applied → skipped' : 'new pin skipped on first run';
+              const status = item.ongoing ? 'still skipped' : kind;
+              const seeded = item.previous_rerere_paths?.length ? `; prior rerere paths: ${item.previous_rerere_paths.map(code).join(', ')}` : '';
+              const paths = item.current.conflict_paths?.map(code).join(', ') || code(item.current.reason || 'unknown');
+              return `- **#${item.pr}**: ${status}; current conflict: ${paths}${seeded}`;
+            });
+            const body = [`High-severity staging composition regression in [run #${context.runNumber}](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}):`, '', ...lines].join('\n');
+            if (existing) {
+              if (existing.state === 'closed') await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'open' });
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+            }
+            else await github.rest.issues.create({ owner, repo, title, body, labels: [LABEL] });
+
   # Secretless: this job executes third-party gradle/build code from the
   # merged PRs, so it gets no secrets, no persisted git credentials, and
   # read-only access to the shared gradle cache (a poisoned cache write
