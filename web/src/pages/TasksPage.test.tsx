@@ -401,6 +401,17 @@ describe("Project filtering", () => {
     expect(screen.queryByTestId("tasks-empty-state")).toBeNull();
   });
 
+  it("uses narrowed Project copy when All is still loading", async () => {
+    setTaskQueries({ all: { data: undefined, isLoading: true }, project: { data: [] } });
+    renderPage();
+    expect(screen.getByText("Loading automations…")).toBeInTheDocument();
+
+    await chooseProjectFilter("Project A");
+
+    expect(screen.getByText("No automations in Project A")).toBeInTheDocument();
+    expect(screen.queryByText("No automations yet")).toBeNull();
+  });
+
   it("prefills create from a selected first-class Project", async () => {
     setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
     renderPage();
