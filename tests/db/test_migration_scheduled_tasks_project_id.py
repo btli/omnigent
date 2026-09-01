@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.script import ScriptDirectory
@@ -282,3 +286,55 @@ def test_project_assignment_migration_downgrade_round_trip(tmp_path: Path) -> No
 def test_single_alembic_head_at_project_id_revision(tmp_path: Path) -> None:
     config = _build_alembic_config(f"sqlite:///{tmp_path / 'heads.db'}")
     assert ScriptDirectory.from_config(config).get_heads() == ["a5363b7c9d2e"]
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "sqlite", "mysql"])
+def test_project_index_ddl_matches_backend(monkeypatch: pytest.MonkeyPatch, dialect: str) -> None:
+    script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
+    revision = script.get_revision("a5363b7c9d2e")
+    assert revision is not None
+    migration = revision.module
+
+    events: list[tuple[str, bool]] = []
+    in_autocommit = False
+    create_index = Mock(
+        side_effect=lambda *args, **kwargs: events.append(("create", in_autocommit))
+    )
+    drop_index = Mock(side_effect=lambda *args, **kwargs: events.append(("drop", in_autocommit)))
+    batch_op = SimpleNamespace(drop_column=Mock())
+
+    @contextmanager
+    def autocommit_block():
+        nonlocal in_autocommit
+        in_autocommit = True
+        try:
+            yield
+        finally:
+            in_autocommit = False
+
+    @contextmanager
+    def batch_alter_table(*args: object, **kwargs: object):
+        yield batch_op
+
+    monkeypatch.setattr(
+        migration.op, "get_bind", lambda: SimpleNamespace(dialect=SimpleNamespace(name=dialect))
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "get_context",
+        lambda: SimpleNamespace(autocommit_block=autocommit_block),
+    )
+    monkeypatch.setattr(migration.op, "add_column", Mock())
+    monkeypatch.setattr(migration.op, "create_index", create_index)
+    monkeypatch.setattr(migration.op, "drop_index", drop_index)
+    monkeypatch.setattr(migration.op, "batch_alter_table", batch_alter_table)
+
+    migration.upgrade()
+    migration.downgrade()
+
+    expected_concurrent = dialect == "postgresql"
+    assert events == [("create", expected_concurrent), ("drop", expected_concurrent)]
+    assert (
+        create_index.call_args.kwargs.get("postgresql_concurrently", False) is expected_concurrent
+    )
+    assert drop_index.call_args.kwargs.get("postgresql_concurrently", False) is expected_concurrent
