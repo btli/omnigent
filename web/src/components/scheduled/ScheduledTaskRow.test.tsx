@@ -80,7 +80,7 @@ describe("next-run text (server-sourced, relative delta)", () => {
 
 describe("Project chip", () => {
   it("renders a resolved Project name", () => {
-    renderRow(task({ projectId: "p_a" }), { projectName: "Project A" });
+    renderRow(task({ projectId: "p_a" }), { project: { name: "Project A" } });
     expect(screen.getByTestId("task-project-chip")).toHaveTextContent("Project A");
   });
 
