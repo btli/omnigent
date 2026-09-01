@@ -23,6 +23,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { ProjectLabel } from "@/components/ProjectLabel";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
@@ -76,8 +77,10 @@ export function TasksPage() {
     () => (projects ?? []).filter((project) => project.id !== null),
     [projects],
   );
-  const projectNames = useMemo(
-    () => new Map(assignableProjects.map((project) => [project.id as string, project.name])),
+  // Keyed by id to the WHOLE summary (not just the name) so consumers can
+  // render the project's emoji icon alongside its name.
+  const projectsById = useMemo(
+    () => new Map(assignableProjects.map((project) => [project.id as string, project])),
     [assignableProjects],
   );
   const tasks = taskQuery.data;
@@ -306,7 +309,7 @@ export function TasksPage() {
                   value={`project:${project.id}`}
                   disabled={projectsError}
                 >
-                  {project.name}
+                  <ProjectLabel name={project.name} icon={project.icon} />
                 </SelectItem>
               ))}
             </SelectContent>
@@ -347,7 +350,7 @@ export function TasksPage() {
         />
       ) : rawSlice.length === 0 && projectFilter.kind === "project" ? (
         <EmptyState
-          message={`No automations in ${projectNames.get(projectFilter.projectId) ?? "this Project"}`}
+          message={`No automations in ${projectsById.get(projectFilter.projectId)?.name ?? "this Project"}`}
           showSuggestions={false}
           onPickSuggestion={openFromSuggestion}
         />
@@ -372,9 +375,9 @@ export function TasksPage() {
             <ScheduledTaskRow
               key={task.id}
               task={task}
-              projectName={
+              project={
                 projectFilter.kind === "all" && task.projectId
-                  ? projectNames.get(task.projectId)
+                  ? projectsById.get(task.projectId)
                   : undefined
               }
               now={now}
