@@ -257,7 +257,7 @@ export function CreateScheduledTaskDialog({
   }, [open, initialName, initialPrompt, editingTask]);
 
   useEffect(() => {
-    if (!open || projectsLoading || projects === undefined) return;
+    if (!open || projects === undefined) return;
     if (projectSelectionInitializedRef.current) return;
     const requested = editingTask?.projectId ?? initialProjectId ?? null;
     const selection = assignableProjects.some((project) => project.id === requested)
@@ -266,7 +266,7 @@ export function CreateScheduledTaskDialog({
     setPickedProject(selection);
     initialProjectSelectionRef.current = selection;
     projectSelectionInitializedRef.current = true;
-  }, [assignableProjects, editingTask, initialProjectId, open, projects, projectsLoading]);
+  }, [assignableProjects, editingTask, initialProjectId, open, projects]);
 
   const hostOptions = hosts ?? [];
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
