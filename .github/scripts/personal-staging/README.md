@@ -220,6 +220,16 @@ a deleted ref and an unreachable server are different problems:
 
 ## Conflict resolutions (`rr-cache/`)
 
+### Stale-seed detector
+
+After each nightly and hourly composition, a best-effort monitor compares the
+new merge report with the latest successful run's report. It opens or updates a
+single `staging-seed-stale` issue when a PR changes from applied to skipped, or
+when a newly introduced extra is skipped on its first run. Seed-assisted prior
+merges are identified in the issue from their `rerere_paths`. The issue closes
+automatically after a clean comparison. The monitor is deliberately separate
+from `stage.py` and can never gate composition, pushes, tags, or builds.
+
 A PR whose merge conflicts with an earlier train member is normally
 skipped. `.github/scripts/personal-staging/rr-cache/` holds committed
 resolutions in git's own rr-cache layout (one `<40-hex>/` directory with

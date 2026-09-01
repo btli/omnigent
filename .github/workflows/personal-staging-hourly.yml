@@ -192,6 +192,114 @@ jobs:
             --upstream-remote upstream --fork-remote origin \
             --report merge-report.json
 
+      - name: Upload merge report
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: merge-report
+          path: merge-report.json
+
       - name: Report failure
         if: failure()
         run: echo "## Personal staging hourly — compose job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  seed-staleness-monitor:
+    name: monitor composition regressions
+    needs: compose
+    if: always() && needs.compose.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout detector
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download current merge report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: merge-report
+          path: reports/current
+
+      - name: Compare with previous successful composition
+        id: compare
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner, repo, workflow_id: 'personal-staging-hourly.yml', branch: context.ref.replace('refs/heads/', ''),
+              status: 'success', per_page: 100,
+            });
+            const prior = runs.find(run => run.id !== context.runId);
+            if (!prior) {
+              core.info('no prior successful run -- skipping until a baseline exists');
+              core.setOutput('has_baseline', 'false');
+              return;
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner, repo, run_id: prior.id, per_page: 100,
+            });
+            const report = artifacts.find(item => item.name === 'merge-report' && !item.expired);
+            if (!report) {
+              core.info(`run ${prior.id} has no unexpired merge-report -- skipping`);
+              core.setOutput('has_baseline', 'false');
+              return;
+            }
+            const archive = await github.rest.actions.downloadArtifact({
+              owner, repo, artifact_id: report.id, archive_format: 'zip',
+            });
+            fs.writeFileSync('previous.zip', Buffer.from(archive.data));
+            core.setOutput('has_baseline', 'true');
+
+      - name: Run detector
+        if: steps.compare.outputs.has_baseline == 'true'
+        run: |
+          unzip -q previous.zip -d reports/previous
+          python3 .github/scripts/personal-staging/detect_staleness.py \
+            reports/previous/merge-report.json reports/current/merge-report.json \
+            --output staleness.json
+
+      - name: Update tracking issue
+        if: steps.compare.outputs.has_baseline == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('staleness.json', 'utf8'));
+            const { owner, repo } = context.repo;
+            const LABEL = 'staging-seed-stale';
+            const title = 'Personal staging composition regression';
+            const existing = (await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: LABEL, per_page: 100,
+            })).data.find(issue => issue.title === title && !issue.pull_request);
+            const findings = [...result.regressions, ...result.new_pins];
+            if (!findings.length) {
+              if (existing) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: existing.number,
+                  body: `Recovered in [run #${context.runNumber}](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}). Closing.` });
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed' });
+              }
+              return;
+            }
+            try { await github.rest.issues.getLabel({ owner, repo, name: LABEL }); }
+            catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({ owner, repo, name: LABEL, color: 'b60205',
+                description: 'Personal staging composition regressed from a prior successful run' });
+            }
+            const lines = findings.map(item => {
+              const kind = result.regressions.includes(item) ? 'applied → skipped' : 'new pin skipped on first run';
+              const seeded = item.previous_rerere_paths?.length ? `; prior rerere paths: ${item.previous_rerere_paths.map(p => `\`${p}\``).join(', ')}` : '';
+              const paths = item.current.conflict_paths?.map(p => `\`${p}\``).join(', ') || item.current.reason || 'unknown';
+              return `- **#${item.pr}**: ${kind}; current conflict: ${paths}${seeded}`;
+            });
+            const body = [`High-severity staging composition regression in [run #${context.runNumber}](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}):`, '', ...lines].join('\n');
+            if (existing) await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+            else await github.rest.issues.create({ owner, repo, title, body, labels: [LABEL] });
