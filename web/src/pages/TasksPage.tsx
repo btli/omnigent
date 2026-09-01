@@ -214,9 +214,9 @@ export function TasksPage() {
     setManualOpen(true);
   }
 
-  const allTasks = projectFilter.kind === "all" ? taskQuery.data : lastAllTasks.current;
-  const hasAnyGlobally = (allTasks ?? []).length > 0;
   const rawSlice = tasks ?? [];
+  const allTasks = projectFilter.kind === "all" ? taskQuery.data : lastAllTasks.current;
+  const hasAnyGlobally = rawSlice.length > 0 || (allTasks ?? []).length > 0;
   const taskError = taskQuery.isError && taskQuery.data === undefined;
   const taskLoading = taskQuery.isLoading && taskQuery.data === undefined;
   const allSucceeded =
@@ -351,7 +351,7 @@ export function TasksPage() {
           <Loader2Icon className="size-4 animate-spin" />
           Loading automations…
         </div>
-      ) : !hasAnyGlobally ? (
+      ) : rawSlice.length === 0 && !hasAnyGlobally ? (
         <EmptyState
           variant="global"
           message="No automations yet"
