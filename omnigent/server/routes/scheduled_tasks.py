@@ -195,7 +195,7 @@ def _canonical_project_id(project_id: str) -> str:
     try:
         return uuid_to_bytes(project_id).hex()
     except InvalidUuidError:
-        raise InvalidUuidError("Not found.") from None
+        raise OmnigentError("Not found.", code=ErrorCode.NOT_FOUND) from None
 
 
 def create_scheduled_tasks_router(
