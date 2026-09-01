@@ -310,6 +310,17 @@ describe("project folder header context menu", () => {
     expect(header).not.toHaveClass("md:select-none", "md:[-webkit-touch-callout:none]");
   });
 
+  it("keeps the row highlighted while a menu is open", () => {
+    // A right-click opens the context menu in a portal, so :hover drops off the
+    // header — the row stays highlighted off the open menu's `data-state` instead.
+    renderSidebar();
+
+    expect(folderHeader()).toHaveClass(
+      "group-has-[[data-state=open]]/header:bg-muted",
+      "group-has-[[data-state=open]]/header:text-foreground",
+    );
+  });
+
   it("opens after a stationary touch long-press", () => {
     vi.useFakeTimers();
     try {

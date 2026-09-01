@@ -212,6 +212,12 @@ const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
 const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
+// Keep a project-folder row highlighted while its actions menu is open (kebab
+// or header context menu, both flagged `data-state=open` inside `group/header`).
+// A right-click opens the context menu in a portal, dropping `:hover` from the
+// header, so the hover highlight alone would leave the row un-highlighted.
+const SIDEBAR_OPEN_MENU_HIGHLIGHT =
+  "group-has-[[data-state=open]]/header:bg-muted group-has-[[data-state=open]]/header:text-foreground dark:group-has-[[data-state=open]]/header:bg-muted/50";
 // Active highlight also wins on hover so active items don't lose their
 // background and flash when the mouse enters them.
 const SIDEBAR_ACTIVE_HIGHLIGHT =
@@ -1999,7 +2005,6 @@ function ConversationList({
                     <ConversationSection
                       title="Pinned"
                       conversations={sections.pinned}
-                      count={sections.pinned.length}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Pinned")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
@@ -2021,7 +2026,6 @@ function ConversationList({
               vanish when switching to Shared or Archived. */}
                 <SectionGroup
                   title="Projects"
-                  count={sections.projectGroups.length}
                   collapsed={effectiveCollapsedSections.includes("Projects")}
                   onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
                   afterHeader={
@@ -2099,7 +2103,6 @@ function ConversationList({
                     <ConversationSection
                       title="Sessions"
                       conversations={sections.sessions}
-                      count={sections.sessions.length}
                       emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
@@ -2294,14 +2297,11 @@ function projectMarkerState(conversations: Conversation[]): SessionState | null 
 
 // The shared collapsible header used by every sidebar section and section
 // group, so they all align and animate identically (icon · title ·
-// hover-chevron · collapsed badges). Exported for direct unit tests of the
-// collapsed badge cluster — the app itself never co-renders a count pill and
-// a state marker (folders carry only markers; groups and lists only counts).
-export function SectionHeader({
+// hover-chevron · collapsed marker).
+function SectionHeader({
   title,
   icon,
   marker,
-  count,
   active = false,
   hasAction,
   actionHoverOnly,
@@ -2315,9 +2315,6 @@ export function SectionHeader({
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
-  /** When collapsed, how many rows the section hides — shown as a count pill
-      so a collapsed section can't read as an empty one. */
-  count?: number;
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders header controls overlaid at the right
@@ -2342,24 +2339,22 @@ export function SectionHeader({
   /** Suppresses the header context menu while another interaction owns it. */
   contextMenuDisabled?: boolean;
 }) {
-  const showCount = collapsed && count != null && count > 0;
   const showsMarker = collapsed && marker != null;
-  // Right-edge offset of the badge cluster when no header control is painted:
-  // a marker (the rightmost badge when present) matches the rows' badge slot
-  // (-mr-1 trims an icon folder's px-2 to the right-1 edge; mr-1 pushes a
-  // padless header out to it); a lone count pill sits in the Inbox badge's
-  // column. One media condition governs the whole header-control matrix:
-  // overlays hide (and stop hit-testing) only on md+ displays whose PRIMARY
-  // pointer is a fine, hover-capable one — `hover:hover` alone is not enough,
-  // since a convertible with a coarse primary pointer can still report it, and
-  // its first tap would be captured by the header underneath before any hover
-  // state exists. Everywhere else the controls stay painted and clickable, so
-  // with `hasAction` the cluster reserves the full mr-14 control column,
-  // returning to this rest offset (or clearing the always-visible Sessions
-  // filter with mr-7) only under that same condition. Hover-only actions keep
-  // this rest offset at every capability. On fine-pointer touchscreen laptops
-  // a screen tap still hit-tests before hover applies, so
-  // the folder's menu keeps its "New session" fallback at every breakpoint.
+  // Right-edge offset of the marker when no header control is painted: it
+  // matches the rows' badge slot (-mr-1 trims an icon folder's px-2 to the
+  // right-1 edge; mr-1 pushes a padless header out to it). One media condition
+  // governs the whole header-control matrix: overlays hide (and stop
+  // hit-testing) only on md+ displays whose PRIMARY pointer is a fine,
+  // hover-capable one — `hover:hover` alone is not enough, since a convertible
+  // with a coarse primary pointer can still report it, and its first tap would
+  // be captured by the header underneath before any hover state exists.
+  // Everywhere else the controls stay painted and clickable, so with
+  // `hasAction` the cluster reserves the full mr-14 control column, returning
+  // to this rest offset (or clearing the always-visible Sessions filter with
+  // mr-7) only under that same condition. Hover-only actions keep this rest
+  // offset at every capability. On fine-pointer touchscreen laptops a screen
+  // tap still hit-tests before hover applies, so the folder's menu keeps its
+  // "New session" fallback at every breakpoint.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
     ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
@@ -2368,14 +2363,6 @@ export function SectionHeader({
         ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
         : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
-  // A hover-only action reveals at every width on a fine hover pointer (no
-  // `md:`), so the badge it displaces must fade under the same condition — at
-  // every width too — or the revealed kebab paints over a still-visible marker
-  // on a narrow hover desktop. Every other header keeps the width-gated fade,
-  // byte-identical, matching its width-gated reveal.
-  const countFade = actionHoverOnly
-    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-0";
   const markerFade = actionHoverOnly
     ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
     : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
@@ -2399,8 +2386,8 @@ export function SectionHeader({
       aria-current={active ? "page" : undefined}
       onClick={(event) => {
         // A pointer click would otherwise leave the header focus-within,
-        // keeping the hover-revealed controls up and the count pill faded
-        // at rest. Keyboard toggles (detail 0) keep focus for the ring.
+        // keeping the hover-revealed controls up at rest. Keyboard toggles
+        // (detail 0) keep focus for the ring.
         if (event.detail > 0) event.currentTarget.blur();
         onToggleCollapsed();
       }}
@@ -2411,6 +2398,7 @@ export function SectionHeader({
               SIDEBAR_ROW,
               "group flex w-full items-center border-0 text-left text-foreground transition-colors",
               SIDEBAR_HOVER_HIGHLIGHT,
+              contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
             )
           : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
@@ -2447,61 +2435,27 @@ export function SectionHeader({
             : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
         )}
       />
-      {/* Collapsed-state badges — the hidden-row count pill and the hidden
-            rows' aggregate state marker — share one right-pinned cluster so
-            the reservation margin always sits on the cluster's outer edge
-            rather than floating between two independently-margined spans. */}
-      {(showCount || showsMarker) && (
+      {/* A hidden row inside this collapsed section carries a marker — surface
+            the exact same badge a row would show, pinned to the right edge. */}
+      {showsMarker && (
         <span
-          data-testid="section-collapsed-badges"
           className={cn(
-            "ml-auto flex shrink-0 items-center gap-1",
+            "ml-auto flex shrink-0 items-center justify-center transition-opacity",
             hasAction && !actionHoverOnly
               ? cn("mr-14", clusterHoverDesktopMargin)
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
+            // Dot/spinner markers get the fixed size-6 centered box (center
+            // lands 16px from the edge, matching the rows). The "awaiting"
+            // pill keeps its natural width so its label isn't clipped.
+            isDotMarker(marker) && "w-6",
+            // Fade out so the revealed kebab takes the marker's place,
+            // mirroring a row's time/marker slot.
+            hasAction && cn(markerFade, actionFocusFade),
           )}
         >
-          {/* Count pill: without it a collapsed section is indistinguishable
-              from an empty one. Fades under exactly the conditions that reveal
-              the hover-revealed controls over its edge (hover, focus INSIDE
-              the control cluster — not the header button, which would hide
-              the count for keyboard users without revealing anything — an
-              open control menu, or the expanded filter), and only where those
-              controls actually hide at rest. */}
-          {showCount && (
-            <span
-              aria-label={count === 1 ? "1 hidden item" : `${count} hidden items`}
-              data-testid="section-collapsed-count"
-              className={cn(
-                "inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-[var(--sidebar-active)] px-1 font-medium text-10 text-[var(--sidebar-active-foreground)] tabular-nums transition-opacity",
-                hasAction && cn(countFade, actionFocusFade),
-              )}
-            >
-              {count}
-            </span>
-          )}
-          {/* A hidden row inside this collapsed section carries a marker —
-              surface the exact same badge a row would show. */}
-          {collapsed && marker && (
-            <span
-              className={cn(
-                "flex shrink-0 items-center justify-center transition-opacity",
-                // Dot/spinner markers get the fixed size-6 centered box (center
-                // lands 16px from the edge, matching the rows). The "awaiting"
-                // pill keeps its natural width so its label isn't clipped.
-                isDotMarker(marker) && "w-6",
-                // Fade out so the revealed kebab takes the marker's place,
-                // mirroring a row's time/marker slot — under the same reveal
-                // conditions and media gate as the count pill (hover keeps its
-                // historical whole-section scope).
-                hasAction && cn(markerFade, actionFocusFade),
-              )}
-            >
-              <SessionStateBadge state={marker} />
-            </span>
-          )}
+          <SessionStateBadge state={marker} />
         </span>
       )}
     </button>
@@ -2663,7 +2617,6 @@ function SectionGroup({
   title,
   collapsed,
   onToggleCollapsed,
-  count,
   headerAction,
   afterHeader,
   children,
@@ -2671,8 +2624,6 @@ function SectionGroup({
   title: string;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  /** When collapsed, how many child sections the group hides (count pill). */
-  count?: number;
   /** Optional control overlaid at the group header's right edge (e.g. the
       "collapse all projects" toggle). Always shown without hover support and
       hover/focus-revealed on hover-capable desktop displays. */
@@ -2682,14 +2633,11 @@ function SectionGroup({
   afterHeader?: ReactNode;
   children: ReactNode;
 }) {
-  const protectsCollapsedBadge = collapsed && count != null && count > 0;
-
   return (
     <section>
       <div className="group/header relative">
         <SectionHeader
           title={title}
-          count={count}
           hasAction={headerAction != null}
           actionFocusVisible
           collapsed={collapsed}
@@ -2700,19 +2648,14 @@ function SectionGroup({
           // fine, hover-capable primary pointer — phones, touch tablets and
           // coarse-pointer convertibles have no reliable hover, and the "New
           // project" control lives here (the only way to create a project).
-          // On mouse/trackpad desktops it's hover/keyboard-focus-revealed. A
-          // collapsed count pill gates the hidden overlay's pointer events so
-          // clicks reach the header beneath. Reveal on :focus-visible (keyboard) — NOT
-          // :focus-within — so clicking the button with the mouse doesn't leave
-          // it stuck visible: React reuses the same node when it swaps
-          // expand↔revert, so the clicked button keeps focus afterward.
+          // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
+          // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
+          // clicking the button with the mouse doesn't leave it stuck visible:
+          // React reuses the same node when it swaps expand↔revert, so the
+          // clicked button keeps focus afterward.
           <div
             data-header-controls
-            className={cn(
-              "-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-              protectsCollapsedBadge &&
-                "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
-            )}
+            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
           >
             {headerAction}
           </div>
@@ -2728,7 +2671,6 @@ function ConversationSection({
   title,
   icon,
   marker,
-  count,
   active,
   conversations,
   pinnedConversationIds,
@@ -2754,10 +2696,6 @@ function ConversationSection({
   icon?: ReactNode;
   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
   marker?: SessionState | null;
-  /** When collapsed, how many rows the section hides (count pill). Omitted on
-      project folders — a collapsed folder hasn't fetched its own sessions, so
-      its window count would under-report. */
-  count?: number;
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
@@ -2794,7 +2732,7 @@ function ConversationSection({
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
-  const protectsCollapsedBadge = isCollapsed && ((count != null && count > 0) || marker != null);
+  const protectsCollapsedBadge = isCollapsed && marker != null;
   return (
     <section className="group/section relative">
       {title && (
@@ -2806,7 +2744,6 @@ function ConversationSection({
             title={title}
             icon={icon}
             marker={marker}
-            count={count}
             active={active}
             hasAction={headerAction != null}
             actionHoverOnly={actionHoverOnly}
