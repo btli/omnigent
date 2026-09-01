@@ -10,7 +10,7 @@
  * endpoint.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -55,7 +55,6 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 ];
 
 export function TasksPage() {
-  const allQuery = useScheduledTasks({ kind: "all" });
   const [projectFilterValue, setProjectFilterValue] = useState("all");
   const projectFilter = useMemo<ScheduledTaskProjectFilter>(() => {
     if (projectFilterValue === "unfiled") return { kind: "unfiled" };
@@ -65,8 +64,12 @@ export function TasksPage() {
     }
     return { kind: "all" };
   }, [projectFilterValue]);
-  const selectedQuery = useScheduledTasks(projectFilter);
-  const taskQuery = projectFilter.kind === "all" ? allQuery : selectedQuery;
+  const taskQuery = useScheduledTasks(projectFilter);
+  const lastAllTasks = useRef<ScheduledTask[] | undefined>(undefined);
+  if (projectFilter.kind === "all" && taskQuery.data !== undefined) {
+    lastAllTasks.current = taskQuery.data;
+  }
+  const refetchAllAfterProjectReset = useRef(false);
   const {
     data: projects,
     isLoading: projectsLoading,
@@ -115,10 +118,16 @@ export function TasksPage() {
       taskQuery.error instanceof ScheduledTaskApiError &&
       taskQuery.error.status === 404
     ) {
+      refetchAllAfterProjectReset.current = true;
       setProjectFilterValue("all");
-      void allQuery.refetch();
     }
-  }, [allQuery, projectFilter, taskQuery.error]);
+  }, [projectFilter, taskQuery.error]);
+
+  useEffect(() => {
+    if (projectFilter.kind !== "all" || !refetchAllAfterProjectReset.current) return;
+    refetchAllAfterProjectReset.current = false;
+    void taskQuery.refetch();
+  }, [projectFilter.kind, taskQuery]);
 
   function openManual() {
     setPrefill(null);
@@ -205,21 +214,21 @@ export function TasksPage() {
     setManualOpen(true);
   }
 
-  const hasAnyGlobally = (allQuery.data ?? []).length > 0;
+  const allTasks = projectFilter.kind === "all" ? taskQuery.data : lastAllTasks.current;
+  const hasAnyGlobally = (allTasks ?? []).length > 0;
   const rawSlice = tasks ?? [];
-  const taskError =
-    (allQuery.isError && allQuery.data === undefined) ||
-    (taskQuery.isError && taskQuery.data === undefined);
-  const taskLoading =
-    (allQuery.isLoading && allQuery.data === undefined) ||
-    (taskQuery.isLoading && taskQuery.data === undefined);
-  const allSucceeded = !allQuery.isError && !allQuery.isLoading && allQuery.data !== undefined;
+  const taskError = taskQuery.isError && taskQuery.data === undefined;
+  const taskLoading = taskQuery.isLoading && taskQuery.data === undefined;
+  const allSucceeded =
+    projectFilter.kind === "all" &&
+    !taskQuery.isError &&
+    !taskQuery.isLoading &&
+    taskQuery.data !== undefined;
   const showSuggestions =
     projectFilter.kind === "all" && filter === "all" && search.trim() === "" && allSucceeded;
 
   function retryTasks() {
-    void allQuery.refetch();
-    if (projectFilter.kind !== "all") void taskQuery.refetch();
+    void taskQuery.refetch();
   }
 
   return (
