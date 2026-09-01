@@ -147,8 +147,10 @@ beforeEach(() => {
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
   vi.mocked(conversationHooks.useProjects).mockReturnValue({
+    // Project A carries an emoji icon; Project B deliberately has none, so the
+    // shared cases below cover both the emoji and the folder-fallback paths.
     data: [
-      { id: "p_a", name: "Project A" },
+      { id: "p_a", name: "Project A", icon: "📊" },
       { id: "p_b", name: "Project B" },
       { id: null, name: "Legacy only" },
     ],
@@ -505,6 +507,47 @@ describe("Project filtering", () => {
       expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
     );
     expect(allRefetch).toHaveBeenCalled();
+  });
+});
+
+describe("Project emoji icons", () => {
+  it("shows each project's emoji (or the folder fallback) in the filter options", async () => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
+    // The emoji is aria-hidden, so the option's accessible NAME stays the plain
+    // project name — the same selector the rest of the suite relies on.
+    const optionA = await screen.findByRole("option", { name: "Project A" });
+    expect(within(optionA).getByTestId("project-label-icon")).toHaveTextContent("📊");
+    const optionB = screen.getByRole("option", { name: "Project B" });
+    expect(within(optionB).getByTestId("project-label-fallback")).toBeInTheDocument();
+    expect(within(optionB).queryByTestId("project-label-icon")).toBeNull();
+  });
+
+  it("shows the selected project's emoji in the filter trigger", async () => {
+    setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
+    renderPage();
+    await chooseProjectFilter("Project A");
+    const trigger = screen.getByTestId("tasks-project-filter");
+    expect(trigger).toHaveTextContent("📊");
+    expect(trigger).toHaveTextContent("Project A");
+  });
+
+  it("shows the project emoji in the row chip", () => {
+    setTasks([task({ id: "a", projectId: "p_a" })]);
+    renderPage();
+    const chip = screen.getByTestId("task-project-chip");
+    expect(within(chip).getByTestId("project-label-icon")).toHaveTextContent("📊");
+    expect(chip).toHaveTextContent("Project A");
+  });
+
+  it("renders the folder fallback (not a blank gap) for an emoji-less project's chip", () => {
+    setTasks([task({ id: "b", projectId: "p_b" })]);
+    renderPage();
+    const chip = screen.getByTestId("task-project-chip");
+    expect(within(chip).getByTestId("project-label-fallback")).toBeInTheDocument();
+    expect(within(chip).queryByTestId("project-label-icon")).toBeNull();
+    expect(chip).toHaveTextContent("Project B");
   });
 });
 
