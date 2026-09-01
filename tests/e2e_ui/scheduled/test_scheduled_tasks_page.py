@@ -18,6 +18,7 @@ never exercised.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 
 import httpx
@@ -889,3 +890,120 @@ def test_automation_project_emoji_rendering(
     _pick_select_option(page, "tasks-project-filter", "All projects")
     expect(row).to_be_visible(timeout=30_000)
     expect(_row_by_name(page, "Unfiled automation")).to_be_visible()
+
+
+@pytest.mark.nightly
+def test_automation_project_emoji_rendering_demo_paced(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The emoji-rendering journey, held on each surface long enough to watch.
+
+    Same coverage as ``test_automation_project_emoji_rendering``, with a dwell
+    after each visual state so a screen recording of the run is reviewable.
+    Dwell length comes from ``OMNIGENT_E2E_DEMO_PACE_MS`` (default 0, so plain
+    runs stay as fast as the sibling test).
+    """
+    pace_ms = int(os.environ.get("OMNIGENT_E2E_DEMO_PACE_MS", "0"))
+
+    def dwell() -> None:
+        if pace_ms:
+            page.wait_for_timeout(pace_ms)
+
+    emoji_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Growth Metrics", "config": {"icon": "📊"}},
+        timeout=10.0,
+    )
+    emoji_project.raise_for_status()
+    plain_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Ops Runbook"},
+        timeout=10.0,
+    )
+    plain_project.raise_for_status()
+    plain_project_id = plain_project.json()["id"]
+
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    _create_task(live_server, agent_id, "Morning triage", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+    # A row filed into the emoji-less Project anchors the folder-fallback pill.
+    resp = httpx.post(
+        f"{live_server}/v1/scheduled-tasks",
+        json={
+            "name": "Runbook sweep",
+            "prompt": "Do the thing.",
+            "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+            "project_id": plain_project_id,
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+    page.goto(f"{live_server}/tasks")
+    dwell()
+
+    # Scenario 1: create an automation through the dialog, filing it into the
+    # emoji Project from the task-project-trigger select.
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill("Weekly metrics digest")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the growth dashboards.")
+    dwell()
+    page.get_by_test_id("task-project-trigger").click()
+    emoji_option = page.get_by_role("option", name="Growth Metrics", exact=True)
+    expect(emoji_option).to_contain_text("📊")
+    expect(
+        page.get_by_role("option", name="Ops Runbook", exact=True).get_by_test_id(
+            "project-label-fallback"
+        )
+    ).to_be_visible()
+    dwell()
+    emoji_option.click()
+    expect(page.get_by_test_id("task-project-trigger")).to_contain_text("📊")
+    dwell()
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    # Scenario 2: row pills — emoji on the filed row, folder fallback on the
+    # emoji-less Project's row — then the filter listbox showing both.
+    emoji_row = _row_by_name(page, "Weekly metrics digest")
+    expect(emoji_row).to_be_visible(timeout=30_000)
+    emoji_chip = emoji_row.get_by_test_id("task-project-chip")
+    expect(emoji_chip).to_contain_text("📊")
+    expect(emoji_chip).to_contain_text("Growth Metrics")
+    plain_row = _row_by_name(page, "Runbook sweep")
+    plain_chip = plain_row.get_by_test_id("task-project-chip")
+    expect(plain_chip).to_contain_text("Ops Runbook")
+    expect(plain_chip.get_by_test_id("project-label-fallback")).to_be_visible()
+    dwell()
+    page.get_by_test_id("tasks-project-filter").click()
+    filter_emoji_option = page.get_by_role("option", name="Growth Metrics", exact=True)
+    expect(filter_emoji_option).to_contain_text("📊")
+    expect(
+        page.get_by_role("option", name="Ops Runbook", exact=True).get_by_test_id(
+            "project-label-fallback"
+        )
+    ).to_be_visible()
+    dwell()
+
+    # Scenario 3: narrow to each Project, then Unfiled, then back to All.
+    filter_emoji_option.click()
+    expect(page.get_by_test_id("tasks-project-filter")).to_contain_text("📊")
+    expect(emoji_row).to_be_visible(timeout=30_000)
+    expect(plain_row).to_be_hidden()
+    expect(_row_by_name(page, "Morning triage")).to_be_hidden()
+    dwell()
+    _pick_select_option(page, "tasks-project-filter", "Ops Runbook")
+    expect(plain_row).to_be_visible(timeout=30_000)
+    expect(emoji_row).to_be_hidden()
+    dwell()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(_row_by_name(page, "Morning triage")).to_be_visible(timeout=30_000)
+    expect(emoji_row).to_be_hidden()
+    expect(plain_row).to_be_hidden()
+    dwell()
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+    expect(emoji_row).to_be_visible(timeout=30_000)
+    expect(plain_row).to_be_visible()
+    expect(_row_by_name(page, "Morning triage")).to_be_visible()
+    dwell()
