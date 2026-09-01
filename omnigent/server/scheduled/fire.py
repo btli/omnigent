@@ -600,13 +600,13 @@ async def _resolve_owned_fire_project(
 ) -> str | None:
     """Resolve Projects across the two supported single-user owner forms."""
     owners = (task.user_id,) if task.user_id is not None else (None, RESERVED_USER_LOCAL)
+    body = ProjectSessionCreateRequest(
+        agent_id=task.agent_id,
+        project_id=task.project_id,
+        host_id=task.host_id,
+        workspace=task.workspace,
+    )
     for owner in owners:
-        body = ProjectSessionCreateRequest(
-            agent_id=task.agent_id,
-            project_id=task.project_id,
-            host_id=task.host_id,
-            workspace=task.workspace,
-        )
         try:
             resolution = await resolve_project_session_create(
                 body=body,
@@ -640,10 +640,7 @@ async def _resolve_fire_project(
         )
         return None
     try:
-        resolved = await _resolve_owned_fire_project(
-            project_store,
-            task,
-        )
+        resolved = await _resolve_owned_fire_project(project_store, task)
     except Exception:  # noqa: BLE001 -- lookup failures are unverifiable, not absent
         _logger.warning(
             "scheduled fire: task %s project %s could not be verified; "
