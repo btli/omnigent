@@ -11,7 +11,7 @@ from typing import Any
 def compare_reports(
     previous: dict[str, Any], current: dict[str, Any]
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return applied-to-skipped regressions and first-run skipped extras."""
+    """Return new regression edges and the current skipped-pin level."""
     previously_applied = {entry["pr"]: entry for entry in previous.get("applied", [])}
     previously_seen = {
         entry["pr"] for section in ("applied", "skipped") for entry in previous.get(section, [])
@@ -32,7 +32,10 @@ def compare_reports(
         if entry.get("source") == "extra" and pr not in previously_seen:
             new_pins.append({"pr": pr, "current": entry})
 
-    return {"regressions": regressions, "new_pins": new_pins}
+    skipped_pins = [
+        entry for entry in current.get("skipped", []) if entry.get("source") == "extra"
+    ]
+    return {"regressions": regressions, "new_pins": new_pins, "skipped_pins": skipped_pins}
 
 
 def main() -> None:
