@@ -361,7 +361,21 @@ describe("filtering + search", () => {
 });
 
 describe("Project filtering", () => {
-  it("keeps the All query mounted and renders the selected server slice", async () => {
+  it("mounts only one scheduled-task polling subscription", async () => {
+    setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
+    renderPage();
+    vi.mocked(hooks.useScheduledTasks).mockClear();
+
+    await chooseProjectFilter("Project A");
+
+    expect(hooks.useScheduledTasks).toHaveBeenCalledTimes(1);
+    expect(hooks.useScheduledTasks).toHaveBeenLastCalledWith({
+      kind: "project",
+      projectId: "p_a",
+    });
+  });
+
+  it("switches the subscription to the selected server slice", async () => {
     const inA = task({ id: "a", name: "In A", projectId: "p_a" });
     const inB = task({ id: "b", name: "In B", projectId: "p_b" });
     setTaskQueries({ all: { data: [inA, inB] }, project: { data: [inA] } });
