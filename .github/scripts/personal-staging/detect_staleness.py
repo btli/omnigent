@@ -19,8 +19,12 @@ def compare_reports(
 
     regressions = []
     new_pins = []
+    skipped_pins = []
     for entry in current.get("skipped", []):
         pr = entry["pr"]
+        is_extra = entry.get("source") == "extra"
+        if is_extra:
+            skipped_pins.append(entry)
         if pr in previously_applied:
             regressions.append(
                 {
@@ -29,12 +33,9 @@ def compare_reports(
                     "current": entry,
                 }
             )
-        if entry.get("source") == "extra" and pr not in previously_seen:
+        if is_extra and pr not in previously_seen:
             new_pins.append({"pr": pr, "current": entry})
 
-    skipped_pins = [
-        entry for entry in current.get("skipped", []) if entry.get("source") == "extra"
-    ]
     return {"regressions": regressions, "new_pins": new_pins, "skipped_pins": skipped_pins}
 
 
