@@ -1329,7 +1329,7 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     // Collapsed Sessions hides its rows AND the pagination affordance.
     expect(screen.queryByText("conv_mine")).toBeNull();
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: /^Sessions/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
   });
 
@@ -1680,9 +1680,8 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
     closeProjectsMenu();
 
-    // Re-expanding the group brings it back. (Collapsed headers append the
-    // hidden-row count to their accessible name.)
-    fireEvent.click(screen.getByRole("button", { name: /^Projects/ }));
+    // Re-expanding the group brings it back.
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
     openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
   });
