@@ -589,9 +589,11 @@ async def test_fire_project_config_does_not_override_launch_fields() -> None:
     assert created["agent_id"] == "ag_1"
     assert created["host_id"] == "host_1"
     assert created["workspace"] == "/repo"
+    assert conv_store.conversations["conv_1"].git_branch is None
     assert launched[0].agent_id == "ag_1"
     assert launched[0].host_id == "host_1"
     assert launched[0].workspace == "/repo"
+    assert launched[0].base_branch is None
     assert store.runs[0]["status"] == "running"
 
 
