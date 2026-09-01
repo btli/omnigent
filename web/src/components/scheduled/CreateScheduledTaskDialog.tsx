@@ -22,6 +22,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
+import { ProjectLabel } from "@/components/ProjectLabel";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePicker } from "@/shell/WorkspacePicker";
@@ -479,7 +480,7 @@ export function CreateScheduledTaskDialog({
                     value={project.id as string}
                     data-testid={`task-project-option-${project.id}`}
                   >
-                    {project.name}
+                    <ProjectLabel name={project.name} icon={project.icon} />
                   </SelectItem>
                 ))}
               </SelectContent>
