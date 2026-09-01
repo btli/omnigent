@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.db.utils import builtin_agent_id
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -260,9 +261,28 @@ async def test_create_and_patch_reject_explicit_null_but_empty_string_unfiles(
     assert cleared.json()["project_id"] is None
 
 
-async def test_malformed_project_id_preserves_invalid_uuid_error() -> None:
-    with pytest.raises(InvalidUuidError, match=r"^Not found\.$"):
+async def test_malformed_project_id_maps_to_not_found() -> None:
+    with pytest.raises(OmnigentError, match=r"^Not found\.$") as exc_info:
         scheduled_tasks_routes._canonical_project_id("malformed")
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+
+
+async def test_direct_invalid_uuid_keeps_upstream_internal_error(auth_app: FastAPI) -> None:
+    @auth_app.get("/_test/direct-invalid-uuid")
+    async def _raise_invalid_uuid() -> None:
+        raise InvalidUuidError("malformed test id")
+
+    transport = httpx.ASGITransport(app=auth_app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/_test/direct-invalid-uuid")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "An internal error occurred.",
+        }
+    }
 
 
 async def test_assignment_404s_for_missing_malformed_and_other_users_project(
