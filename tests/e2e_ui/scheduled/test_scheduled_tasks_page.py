@@ -21,6 +21,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -820,3 +821,71 @@ def test_scheduled_task_edit_prefills_permission_mode(
     expect(dialog).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("task-permission-control")).to_be_visible()
     expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
+
+
+@pytest.mark.nightly
+def test_automation_project_emoji_rendering(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Project emojis show in the chip, filter options, and trigger.
+
+    Seeds one Project WITH a chosen emoji (``config.icon``) and one without,
+    creates an automation filed into the emoji Project through the dialog
+    (proving the aria-hidden emoji keeps option accessible names plain), and
+    walks the filter: the emoji renders in the row chip, the filter option,
+    and the filter trigger; the emoji-less Project's option shows the folder
+    fallback; and the filter still narrows correctly, including Unfiled.
+    """
+    emoji_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Emoji Project", "config": {"icon": "📊"}},
+        timeout=10.0,
+    )
+    emoji_project.raise_for_status()
+    plain_project = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Plain Project"},
+        timeout=10.0,
+    )
+    plain_project.raise_for_status()
+
+    # An unfiled automation seeded over REST anchors the Unfiled filter leg.
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    _create_task(live_server, agent_id, "Unfiled automation", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill("Emoji automation")
+    page.get_by_test_id("task-prompt-input").fill("Summarize dashboards.")
+    # The emoji is aria-hidden, so the shared name-only option pick still works.
+    _pick_select_option(page, "task-project-trigger", "Emoji Project")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    row = _row_by_name(page, "Emoji automation")
+    expect(row).to_be_visible(timeout=30_000)
+    chip = row.get_by_test_id("task-project-chip")
+    expect(chip).to_contain_text("📊")
+    expect(chip).to_contain_text("Emoji Project")
+
+    # Filter options: emoji for the emoji Project, folder fallback otherwise.
+    page.get_by_test_id("tasks-project-filter").click()
+    emoji_option = page.get_by_role("option", name="Emoji Project", exact=True)
+    expect(emoji_option).to_contain_text("📊")
+    plain_option = page.get_by_role("option", name="Plain Project", exact=True)
+    expect(plain_option.get_by_test_id("project-label-fallback")).to_be_visible()
+    emoji_option.click()
+
+    # The trigger mirrors the selected option — emoji included — and narrows.
+    expect(page.get_by_test_id("tasks-project-filter")).to_contain_text("📊")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(_row_by_name(page, "Unfiled automation")).to_be_hidden()
+
+    _pick_select_option(page, "tasks-project-filter", "Plain Project")
+    expect(page.get_by_text("No automations in Plain Project")).to_be_visible()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(_row_by_name(page, "Unfiled automation")).to_be_visible(timeout=30_000)
+    expect(row).to_be_hidden()
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(_row_by_name(page, "Unfiled automation")).to_be_visible()
