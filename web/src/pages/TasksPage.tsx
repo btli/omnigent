@@ -351,7 +351,7 @@ export function TasksPage() {
           <Loader2Icon className="size-4 animate-spin" />
           Loading automations…
         </div>
-      ) : rawSlice.length === 0 && !hasAnyGlobally ? (
+      ) : rawSlice.length === 0 && allTasks !== undefined && !hasAnyGlobally ? (
         <EmptyState
           variant="global"
           message="No automations yet"
