@@ -556,6 +556,46 @@ async def test_fire_sets_project_once_in_initial_insert_without_followup_write()
 
 
 @pytest.mark.asyncio
+async def test_fire_project_config_does_not_override_launch_fields() -> None:
+    project_id = "a" * 32
+    project_store = FakeProjectStore(
+        [
+            _FakeProject(
+                project_id,
+                config={
+                    "agent_id": "project_agent",
+                    "workspace": "/project/workspace",
+                    "git": {"branch": "obsolete-project-branch"},
+                },
+            )
+        ]
+    )
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id=project_id)})
+    launched: list[ScheduledTask] = []
+
+    async def _launch(conv: Any, effective: ScheduledTask) -> None:
+        launched.append(effective)
+
+    on_fire = build_on_fire(
+        _deps(store, project_store=project_store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    created = conv_store.created[0]
+    assert created["project_id"] == project_id
+    assert created["agent_id"] == "ag_1"
+    assert created["host_id"] == "host_1"
+    assert created["workspace"] == "/repo"
+    assert launched[0].agent_id == "ag_1"
+    assert launched[0].host_id == "host_1"
+    assert launched[0].workspace == "/repo"
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
 async def test_fire_resolves_local_project_for_null_owner_task() -> None:
     project_id = "a" * 32
     project_store = FakeProjectStore([None, _FakeProject(project_id)])
