@@ -344,24 +344,28 @@ export function TasksPage() {
         </div>
       ) : !hasAnyGlobally ? (
         <EmptyState
+          variant="global"
           message="No automations yet"
           showSuggestions={showSuggestions}
           onPickSuggestion={openFromSuggestion}
         />
       ) : rawSlice.length === 0 && projectFilter.kind === "project" ? (
         <EmptyState
+          variant="narrowed"
           message={`No automations in ${projectsById.get(projectFilter.projectId)?.name ?? "this Project"}`}
           showSuggestions={false}
           onPickSuggestion={openFromSuggestion}
         />
       ) : rawSlice.length === 0 && projectFilter.kind === "unfiled" ? (
         <EmptyState
+          variant="narrowed"
           message="No unfiled automations"
           showSuggestions={false}
           onPickSuggestion={openFromSuggestion}
         />
       ) : filtered.length === 0 ? (
         <EmptyState
+          variant="narrowed"
           message="No automations found"
           showSuggestions={false}
           onPickSuggestion={openFromSuggestion}
@@ -409,16 +413,18 @@ export function TasksPage() {
   );
 }
 
-function EmptyState({
+export function EmptyState({
+  variant,
   message,
   showSuggestions,
   onPickSuggestion,
 }: {
+  variant: "global" | "narrowed";
   message: string;
   showSuggestions: boolean;
   onPickSuggestion: (s: ScheduledTaskSuggestion) => void;
 }) {
-  const globalEmpty = message === "No automations yet";
+  const globalEmpty = variant === "global";
   return (
     <div className="py-8" data-testid="tasks-empty-state">
       {globalEmpty ? (
