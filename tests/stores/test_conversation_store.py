@@ -5622,6 +5622,7 @@ def test_set_conversation_project_files_and_unfiles(
 def test_create_conversation_sets_project_id_in_initial_metadata_without_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
+    """Regression guard for pre-existing first-class Project creation."""
     project_id = "a" * 32
     conv = conversation_store.create_conversation(project_id=project_id)
     assert conv.project_id == project_id
@@ -5635,6 +5636,7 @@ def test_project_name_filter_finds_pointer_only_session(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
+    """Regression guard for pre-existing Project-name pointer filtering."""
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
     project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "Pointer only", None)
