@@ -235,7 +235,7 @@ jobs:
             const { owner, repo } = context.repo;
             const runs = (await github.rest.actions.listWorkflowRuns({
               owner, repo, workflow_id: 'personal-staging-hourly.yml', branch: context.ref.replace('refs/heads/', ''),
-              per_page: 20,
+              per_page: 100,
             })).data.workflow_runs
               .filter(run => run.run_number < context.runNumber)
               .sort((a, b) => b.run_number - a.run_number);
