@@ -1875,18 +1875,6 @@ def create_app(
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
-    @app.exception_handler(InvalidUuidError)
-    async def _handle_invalid_uuid(
-        request: Request,  # noqa: ARG001
-        exc: InvalidUuidError,
-    ) -> JSONResponse:
-        """Map an explicitly validated malformed id to the standard 404 body."""
-        _logger.debug("Malformed id mapped to 404: %s", exc)
-        return JSONResponse(
-            status_code=404,
-            content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
-        )
-
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
         request: Request,
