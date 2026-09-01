@@ -19,6 +19,10 @@ never exercised.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 
 import httpx
@@ -892,10 +896,69 @@ def test_automation_project_emoji_rendering(
     expect(_row_by_name(page, "Unfiled automation")).to_be_visible()
 
 
+def _online_host_ids(base_url: str) -> list[str]:
+    """Host ids currently ONLINE on the spawned server (``status == 'online'``)."""
+    resp = httpx.get(f"{base_url}/v1/hosts", timeout=5.0)
+    resp.raise_for_status()
+    return [h["host_id"] for h in resp.json()["hosts"] if h.get("status") == "online"]
+
+
+@pytest.fixture
+def connected_host(live_server: str) -> Iterator[str]:
+    """Bring a real connected host online against the spawned server.
+
+    A scheduled fire launches on the owner's online CONNECTED host — the
+    ``omnigent host`` tunnel — not the e2e runner. With none, the fire records a
+    ``no_online_host`` failure and creates no session, so there is nothing to
+    file. Spawning ``omnigent host`` against the local server registers one, so a
+    manual Run now resolves it, creates the session, and stamps it with the
+    task's project. Yields the online host id; the daemon is torn down after.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("OMNIGENT_RUNNER")
+        and k
+        not in {
+            "OMNIGENT_HOST_ID",
+            "OMNIGENT_HOST_TOKEN",
+            "OMNIGENT_HOST_NAME",
+            "RUNNER_SERVER_URL",
+            "OMNIGENT_REMOTE_AUTH_TOKEN",
+        }
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "omnigent.cli", "host", live_server, "--non-interactive"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        deadline = time.monotonic() + 60.0
+        host_ids: list[str] = []
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"omnigent host exited early (code {proc.returncode})")
+            host_ids = _online_host_ids(live_server)
+            if host_ids:
+                break
+            time.sleep(1.0)
+        assert host_ids, "connected host never came online for the scheduled fire"
+        yield host_ids[0]
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 @pytest.mark.nightly
 def test_automation_project_emoji_rendering_demo_paced(
     page: Page,
     live_server: str,
+    connected_host: str,
 ) -> None:
     """The emoji-rendering journey, held on each surface long enough to watch.
 
@@ -916,6 +979,7 @@ def test_automation_project_emoji_rendering_demo_paced(
         timeout=10.0,
     )
     emoji_project.raise_for_status()
+    emoji_project_id = emoji_project.json()["id"]
     plain_project = httpx.post(
         f"{live_server}/v1/projects",
         json={"name": "Ops Runbook"},
@@ -1006,4 +1070,47 @@ def test_automation_project_emoji_rendering_demo_paced(
     expect(emoji_row).to_be_visible(timeout=30_000)
     expect(plain_row).to_be_visible()
     expect(_row_by_name(page, "Morning triage")).to_be_visible()
+    dwell()
+
+    # Scenario 4: fire the emoji Project's automation and prove the spawned
+    # session lands in that Project — the backend half of the feature, which has
+    # no other on-screen evidence. Run now launches on the connected host, so the
+    # fire creates a real session stamped with the task's project_id.
+    emoji_row.hover()
+    emoji_row.get_by_test_id("task-row-menu").click()
+    expect(page.get_by_test_id("task-run-now")).to_be_visible()
+    dwell()
+    page.get_by_test_id("task-run-now").click()
+
+    # The fire is async (POST returns 202). Wait for the run to create a session,
+    # then confirm over REST it is filed under the emoji Project (the sessions
+    # filter matches by project NAME, exactly as the sidebar folder query does).
+    def _fired_session() -> dict | None:
+        listed = httpx.get(
+            f"{live_server}/v1/sessions",
+            params={"project": "Growth Metrics"},
+            timeout=5.0,
+        ).json()
+        rows = listed.get("data", [])
+        return rows[0] if rows else None
+
+    waited = 0
+    while _fired_session() is None and waited < 150:
+        page.wait_for_timeout(200)
+        waited += 1
+    session = _fired_session()
+    assert session is not None, "Run now did not create a session for the emoji Project"
+    assert session["project_id"] == emoji_project_id, (
+        f"fired session filed under {session['project_id']!r}, "
+        f"not the emoji Project {emoji_project_id!r}"
+    )
+
+    # And it shows in the sidebar, nested under the emoji Project's folder.
+    sidebar = page.get_by_role("complementary", name="Conversations")
+    sidebar.get_by_test_id("project-list-actions").click()
+    page.get_by_test_id("expand-all-projects").click()
+    expect(sidebar.get_by_text("Weekly metrics digest")).to_be_visible(timeout=30_000)
+    # Hold on the destination — the fired session nested under the emoji Project —
+    # long enough for a reviewer to read it.
+    dwell()
     dwell()
