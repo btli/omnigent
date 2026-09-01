@@ -14,6 +14,35 @@ down_revision = "ga1b2c3d4e5f"
 branch_labels = None
 depends_on = None
 
+_INDEX_NAME = "ix_scheduled_tasks_project_id"
+_INDEX_COLUMNS = ["workspace_id", "user_id", "project_id", "created_at", "id"]
+
+
+def _create_project_index() -> None:
+    if op.get_bind().dialect.name != "postgresql":
+        op.create_index(_INDEX_NAME, "scheduled_tasks", _INDEX_COLUMNS, unique=False)
+        return
+    with op.get_context().autocommit_block():
+        op.create_index(
+            _INDEX_NAME,
+            "scheduled_tasks",
+            _INDEX_COLUMNS,
+            unique=False,
+            postgresql_concurrently=True,
+        )
+
+
+def _drop_project_index() -> None:
+    if op.get_bind().dialect.name != "postgresql":
+        op.drop_index(_INDEX_NAME, table_name="scheduled_tasks")
+        return
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            _INDEX_NAME,
+            table_name="scheduled_tasks",
+            postgresql_concurrently=True,
+        )
+
 
 def upgrade() -> None:
     """Add the nullable Project pointer and filtered-list index."""
@@ -21,17 +50,12 @@ def upgrade() -> None:
         "scheduled_tasks",
         sa.Column("project_id", Uuid16(), nullable=True),
     )
-    op.create_index(
-        "ix_scheduled_tasks_project_id",
-        "scheduled_tasks",
-        ["workspace_id", "user_id", "project_id", "created_at", "id"],
-        unique=False,
-    )
+    _create_project_index()
 
 
 def downgrade() -> None:
     """Remove Project assignment while preserving task and run rows."""
-    op.drop_index("ix_scheduled_tasks_project_id", table_name="scheduled_tasks")
+    _drop_project_index()
     sqlite = op.get_bind().dialect.name == "sqlite"
     with op.batch_alter_table(
         "scheduled_tasks", recreate="always" if sqlite else "auto"
