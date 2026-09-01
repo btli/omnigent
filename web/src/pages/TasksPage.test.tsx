@@ -10,7 +10,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TasksPage } from "./TasksPage";
+import { EmptyState, TasksPage } from "./TasksPage";
 import * as hooks from "@/hooks/useScheduledTasks";
 import * as conversationHooks from "@/hooks/useConversations";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
@@ -169,6 +169,26 @@ function renderPage() {
     </MemoryRouter>,
   );
 }
+
+describe("EmptyState", () => {
+  it("keeps the rich global layout when its display copy changes", () => {
+    render(
+      <EmptyState
+        variant="global"
+        message="Start your first automation"
+        showSuggestions={false}
+        onPickSuggestion={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Start your first automation")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Create a task to run an agent session automatically on a recurring schedule.",
+      ),
+    ).toBeInTheDocument();
+  });
+});
 
 describe("TasksPage list", () => {
   it("renders the title, subtitle and task rows with schedule text", () => {
