@@ -1,8 +1,5 @@
-// Shared presentational label for a project: the project's chosen emoji icon
-// (`config.icon`, surfaced as `ProjectSummary.icon`) when set, else the default
-// FolderIcon glyph — matching the sidebar's folder rendering. The glyph is
-// `aria-hidden` so the accessible name stays the plain project name (Radix
-// Select options and their trigger mirror keep name-only matching).
+// Renders a Project's chosen emoji or a folder fallback while keeping the glyph
+// decorative so controls retain the Project name as their accessible name.
 
 import { FolderIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
