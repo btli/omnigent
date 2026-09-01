@@ -605,6 +605,7 @@ async def _resolve_owned_fire_project(
         project_id=task.project_id,
         host_id=task.host_id,
         workspace=task.workspace,
+        git=None,
     )
     for owner in owners:
         try:
