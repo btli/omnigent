@@ -9,7 +9,7 @@
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CreateScheduledTaskDialog,
@@ -170,8 +170,9 @@ beforeEach(() => {
     isPending: false,
   } as unknown as ReturnType<typeof scheduledHooks.useUpdateScheduledTask>);
   vi.mocked(conversationsHook.useProjects).mockReturnValue({
+    // Project A carries an emoji icon; Project B has none (folder fallback).
     data: [
-      { id: "p_a", name: "Project A" },
+      { id: "p_a", name: "Project A", icon: "📊" },
       { id: "p_b", name: "Project B" },
       { id: null, name: "Legacy only" },
     ],
@@ -362,6 +363,17 @@ describe("CreateScheduledTaskDialog Project picker", () => {
     expect(await screen.findByTestId("task-project-option-p_a")).toBeInTheDocument();
     expect(screen.getByTestId("task-project-option-p_b")).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "Legacy only" })).toBeNull();
+  });
+
+  it("shows each project's emoji (or folder fallback) in the selector options", async () => {
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+    // Emoji is aria-hidden — the option's accessible name stays "Project A".
+    const optionA = await screen.findByRole("option", { name: "Project A" });
+    expect(within(optionA).getByTestId("project-label-icon")).toHaveTextContent("📊");
+    const optionB = screen.getByRole("option", { name: "Project B" });
+    expect(within(optionB).getByTestId("project-label-fallback")).toBeInTheDocument();
+    expect(within(optionB).queryByTestId("project-label-icon")).toBeNull();
   });
 
   it("project selection does not change agent, host, or workspace", async () => {
