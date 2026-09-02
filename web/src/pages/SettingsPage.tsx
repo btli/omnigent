@@ -229,6 +229,7 @@ import {
 } from "@/lib/codeWrapPreferences";
 import {
   TERMINAL_EXTRA_KEYS_DEFAULT,
+  isTerminalExtraKeysMode,
   readTerminalExtraKeysMode,
   terminalExtraKeysModes,
   writeTerminalExtraKeysMode,
@@ -675,10 +676,9 @@ function TerminalThemeControl() {
 function TerminalExtraKeysControl() {
   const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
   const labelId = useId();
-  const choose = useCallback((next: string) => {
-    if (!terminalExtraKeysModes.includes(next as TerminalExtraKeysMode)) return;
-    setMode(next as TerminalExtraKeysMode);
-    writeTerminalExtraKeysMode(next as TerminalExtraKeysMode);
+  const choose = useCallback((next: TerminalExtraKeysMode) => {
+    setMode(next);
+    writeTerminalExtraKeysMode(next);
   }, []);
   return (
     <ThemeSubsection
@@ -688,7 +688,9 @@ function TerminalExtraKeysControl() {
     >
       <Select
         value={mode}
-        onValueChange={choose}
+        onValueChange={(next) => {
+          if (isTerminalExtraKeysMode(next)) choose(next);
+        }}
         componentId="settings.appearance.terminal_extra_keys"
         valueHasNoPii
       >
