@@ -2437,6 +2437,27 @@ function SectionHeader({
         <span className="relative flex size-4 shrink-0 items-center justify-center">
           <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
             {icon}
+          </span>
+          <ChevronRightIcon
+            className={cn(
+              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+              !collapsed && "rotate-90",
+              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            )}
+          />
+        </span>
+      ) : null}
+      <span className="min-w-0 truncate">{title}</span>
+      {/* Trailing chevron, rotating on expand. Headers without a leading icon
+            reveal it on desktop hover/focus; icon headers show it only on mobile
+            (no hover) since desktop swaps the folder for the chevron above. */}
+      <ChevronRightIcon
+        className={cn(
+          "size-3.5 shrink-0 transition-[transform,opacity]",
+          !collapsed && "rotate-90",
+          icon
+            ? "md:hidden"
+            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
 =======
   return (
     <h2>
@@ -2471,30 +2492,7 @@ function SectionHeader({
                 "hidden md:flex [@media(hover:hover)]:md:group-hover:opacity-100 [@media(hover:hover)]:md:group-focus-visible:opacity-100",
               )}
             />
->>>>>>>
           </span>
-<<<<<<<
-          <ChevronRightIcon
-            className={cn(
-              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-              !collapsed && "rotate-90",
-              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-            )}
-          />
-        </span>
-      ) : null}
-      <span className="min-w-0 truncate">{title}</span>
-      {/* Trailing chevron, rotating on expand. Headers without a leading icon
-            reveal it on desktop hover/focus; icon headers show it only on mobile
-            (no hover) since desktop swaps the folder for the chevron above. */}
-      <ChevronRightIcon
-        className={cn(
-          "size-3.5 shrink-0 transition-[transform,opacity]",
-          !collapsed && "rotate-90",
-          icon
-            ? "md:hidden"
-            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-=======
         ) : null}
         <span className="min-w-0 truncate">{title}</span>
         {/* Without hover, the trailing caret stays visible at every width. */}
