@@ -388,10 +388,15 @@ function stopChild(child) {
  * *we* actually start it — a server that was already running is left to its
  * own lifecycle.
  *
+ * When `onLine` is given, forward the fresh server's startup log lines to it
+ * while it boots (Option B: tail the daemon's own logfile — we don't own the
+ * process). A reused server has no fresh startup, so it gets one status line.
+ *
  * @param {string} cliPath
+ * @param {(line: string) => void} [onLine]
  * @returns {Promise<{ ok: boolean, url?: string, alreadyRunning?: boolean, error?: string }>}
  */
-async function startLocalServer(cliPath) {
+async function startLocalServer(cliPath, onLine) {
   // Reuse a server that's already running — but health-verify it (pidfile +
   // pid + /health), not just pid-liveness, since we're about to navigate the
   // window to this URL: a stale pidfile (dead/reused pid, hung server) must NOT
@@ -400,14 +405,32 @@ async function startLocalServer(cliPath) {
   // ownership claim.
   const existing = await cli.localServerHealthy();
   if (existing) {
+    if (onLine) onLine("Server already running — connecting…");
     return { ok: true, url: existing.url, alreadyRunning: true };
   }
-  const res = await cli.startLocalServer(cliPath);
-  if (res.ok) {
-    ownedLocalServer = { url: res.url, port: res.port, pid: res.pid };
-    return { ok: true, url: res.url };
+  // Tail the daemon's boot logfile alongside the start so lines stream live as
+  // it boots. `omnigent server --background` blocks until the server is healthy
+  // or fails, so it IS the authoritative "boot finished" signal: abort the tail
+  // the moment it resolves rather than letting the tail poll on its own. This
+  // keeps a failed start from waiting on the tail (no ~60s stall), and the
+  // startedAt floor makes the tail ignore any stale log from a prior crash. A
+  // tail failure must never fail the start, so it's isolated with catch.
+  const startedAtMs = Date.now();
+  const controller = onLine ? new AbortController() : null;
+  const tail = controller
+    ? cli.tailLocalServerLog(onLine, { signal: controller.signal, startedAtMs }).catch(() => {})
+    : Promise.resolve();
+  try {
+    const res = await cli.startLocalServer(cliPath);
+    if (res.ok) {
+      ownedLocalServer = { url: res.url, port: res.port, pid: res.pid };
+      return { ok: true, url: res.url };
+    }
+    return { ok: false, error: res.error };
+  } finally {
+    controller?.abort();
+    await tail; // let it drain the final lines and close its watcher
   }
-  return { ok: false, error: res.error };
 }
 
 /**
