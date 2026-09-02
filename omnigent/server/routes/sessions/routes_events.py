@@ -167,6 +167,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
+    _resolve_harness,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
     _stop_session_via_runner,
@@ -1248,9 +1249,14 @@ def register_events_routes(
                         "codex_reauth_required"
                         if data.get("reauth_required") is True
                         # The store-enriched detail keeps a harness-neutral
-                        # code; a forwarder-sent detail keeps codex's.
+                        # code; a forwarder-sent detail keeps codex's own
+                        # code unless the session is claude-native, whose
+                        # forwarder carries its StopFailure reason the same way.
                         else (
-                            "codex_turn_error" if body.data.get("output") else "native_turn_error"
+                            "codex_turn_error"
+                            if body.data.get("output")
+                            and _resolve_harness(conv) != "claude-native"
+                            else "native_turn_error"
                         )
                     ),
                     message=output.strip(),
