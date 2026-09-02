@@ -1,3 +1,23 @@
+# Retires aged personal-ring pins on the btli fork.
+#
+# The staging and production nightlies each mint an immutable dated pin —
+# a `<ring>-YYYYMMDD[-rerunN]` tag, a same-name compatibility branch, and a
+# dated prerelease — plus a PEP 440 `vX.Y.Z.devYYYYMMDD` tag on staging.
+# Nothing resolves a pin after the homelab has built it, so they accumulate
+# forever: this prunes every pin dated more than `keep_days` back, keeping a
+# floor of the newest few per family so a stalled ring can never be stripped
+# bare. Floating refs (`production-latest`, `nightly-latest`), `pr-demos-*`,
+# release tags and `archive/*` are outside the matched families entirely.
+#
+# Ordering: runs after the whole nightly chain (staging 10:00, production
+# 10:30, dev-rebase 10:45) and after the homelab has resolved today's
+# production pin at 11:10 UTC, so a prune can never race a pin being
+# consumed.
+#
+# Trust boundary: the test gate installs third-party dev deps and holds no
+# write token; the prune job runs the stdlib-only pruner with contents:write
+# and never checks out or executes merged-PR code (the pruner comes from the
+# workflow ref's own checkout).
 name: Personal Pin Retention
 
 on:
@@ -60,6 +80,9 @@ jobs:
 
   prune:
     needs: test-pruner
+    # Accident prevention for non-main dispatches (schedule always runs main);
+    # a dispatched ref executes its own workflow copy, so this is not a
+    # security boundary — same rationale as personal-staging.yml.
     if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
