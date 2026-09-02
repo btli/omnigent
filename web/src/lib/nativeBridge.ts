@@ -159,6 +159,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   updates?: ElectronUpdateBridge;
   /** Current server origin + managed/recent choices, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
+  /** Format a server using the shell's workspace-aware display rule. */
+  serverDisplayLabel?: (url: string) => string;
+  /** Compute the shell's workspace identity, including Databricks `o`. */
+  workspaceIdentityKey?: (url: string) => string | null;
   /** Re-point this window to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
   /** Return this window to the shell's "connect to server" setup page. */
@@ -328,6 +332,8 @@ export interface ElectronUpdateBridge {
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /** Full mounted server URL. Optional on older desktop shells. */
+  currentServerUrl?: string;
   /**
    * Server URLs supplied through macOS Managed Preferences. Optional because a
    * newer server-served SPA can run inside a desktop shell that predates MDM.
@@ -715,6 +721,26 @@ export async function getServerPicker(): Promise<ServerPickerInfo | null> {
   } catch (err) {
     console.warn("[nativeBridge] electron getServerPicker failed:", err);
     return null;
+  }
+}
+
+/** Workspace identity using the Electron shell's canonical rule when present. */
+export function workspaceIdentityKey(url: string): string | null {
+  const electron = electronApi();
+  try {
+    return electron?.workspaceIdentityKey?.(url) ?? new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Compact workspace-aware server label, with an origin-only fallback. */
+export function serverDisplayLabel(url: string): string {
+  const electron = electronApi();
+  try {
+    return electron?.serverDisplayLabel?.(url) ?? new URL(url).host;
+  } catch {
+    return url;
   }
 }
 
