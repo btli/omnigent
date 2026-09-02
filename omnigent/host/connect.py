@@ -117,6 +117,7 @@ from omnigent.process_logging import (
     env_truthy,
     open_process_log_file,
     process_log_dir,
+    should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
@@ -3897,7 +3898,10 @@ def run_host_process(
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
-    host_log_path = configure_process_logging("host")
+    host_log_path = configure_process_logging(
+        "host",
+        log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
+    )
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
