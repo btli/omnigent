@@ -148,6 +148,14 @@ import {
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
 import {
+  TERMINAL_EXTRA_KEYS_DEFAULT,
+  isTerminalExtraKeysMode,
+  readTerminalExtraKeysMode,
+  terminalExtraKeysModes,
+  writeTerminalExtraKeysMode,
+  type TerminalExtraKeysMode,
+} from "@/lib/terminalExtraKeysPreferences";
+import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
@@ -360,6 +368,12 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
+const terminalExtraKeysLabels: Record<TerminalExtraKeysMode, string> = {
+  auto: "Auto (touch devices)",
+  on: "Always",
+  off: "Never",
+};
+
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -473,6 +487,47 @@ function TerminalThemeControl() {
           body: iconCardBody(card.icon, card.label),
         }))}
       />
+    </ThemeSubsection>
+  );
+}
+
+/** Extra-keys row (Esc / Tab / Ctrl / arrows) under the terminal on touch devices. */
+function TerminalExtraKeysControl() {
+  const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
+  const labelId = useId();
+  const choose = useCallback((next: TerminalExtraKeysMode) => {
+    setMode(next);
+    writeTerminalExtraKeysMode(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Extra keys row"
+      helper="Show Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal for on-screen keyboards."
+    >
+      <Select
+        value={mode}
+        onValueChange={(next) => {
+          if (isTerminalExtraKeysMode(next)) choose(next);
+        }}
+        componentId="settings.appearance.terminal_extra_keys"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          data-testid="terminal-extra-keys-select"
+          className="w-full sm:w-56"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {terminalExtraKeysModes.map((value) => (
+            <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
+              {terminalExtraKeysLabels[value]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
     </ThemeSubsection>
   );
 }
@@ -843,6 +898,7 @@ function AppearanceSection() {
     setTheme("system");
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+    writeTerminalExtraKeysMode(TERMINAL_EXTRA_KEYS_DEFAULT);
 
     writeThemePalette(DEFAULT_PALETTE);
     applyThemePalette(DEFAULT_PALETTE);
@@ -877,6 +933,7 @@ function AppearanceSection() {
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
           "omnigent:terminal-theme",
+          "omnigent:terminal-extra-keys",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
@@ -959,6 +1016,8 @@ function AppearanceSection() {
         )}
 
         <TerminalThemeControl />
+
+        <TerminalExtraKeysControl />
 
         <ColorThemeControl />
 
