@@ -75,8 +75,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
-import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
-import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { onNativeSidebarDrag } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -1918,21 +1917,6 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
-  // True only while the chat/terminal surface is the frontmost thing on screen.
-  // Drives both native overlays so neither floats over an opened drawer.
-  const surfaceFrontmost = useSurfaceFrontmost(
-    showTerminal ? terminalSurfaceEl : containerEl,
-    !!conversationId,
-  );
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!surfaceFrontmost);
-  }, [surfaceFrontmost]);
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    return () => setNativeServerSwitcherHidden(true);
-  }, []);
   // Keys the transcript so a warm switch (no hydration remount) still re-runs
   // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
   // prop, which leads the mirrored blocks by a commit (see the switchTo effect).
@@ -2073,7 +2057,6 @@ function MainAgentSurface({
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
-          onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
         {isShown && (
