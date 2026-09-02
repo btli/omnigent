@@ -98,6 +98,22 @@ def test_collect_sweeps_a_half_pin_branch():
     assert (pins[0].has_branch, pins[0].has_tag) == (True, False)
 
 
+def test_dev_pin_never_attaches_or_deletes_a_same_named_release():
+    old_dev = "v0.9.0.dev20260810"
+    pins = prune.collect(
+        tags=[old_dev, "v0.12.0.dev20260830"],
+        branches=[],
+        releases=[{"id": 42, "tag_name": old_dev}],
+    )
+    pruned = prune.plan(pins, TODAY, keep_per_family=1)
+    assert [p.name for p in pruned.delete] == [old_dev]
+    assert pruned.delete[0].release_id is None
+
+    gh = FakeGh()
+    prune.execute(pruned, gh)
+    assert gh.calls == [f"tag:{old_dev}"]
+
+
 def test_cutoff_is_inclusive_of_the_window_edge():
     pins = prune.collect(
         tags=[f"nightly-2026081{d}" for d in (5, 6, 7, 8)],

@@ -83,7 +83,7 @@ jobs:
     # Accident prevention for non-main dispatches (schedule always runs main);
     # a dispatched ref executes its own workflow copy, so this is not a
     # security boundary — same rationale as personal-staging.yml.
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

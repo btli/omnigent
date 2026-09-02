@@ -144,7 +144,7 @@ def collect(tags: list[str], branches: list[str], releases: list[dict]) -> list[
             order=order,
             has_tag=tag or bool(prev and prev.has_tag),
             has_branch=(not tag) or bool(prev and prev.has_branch),
-            release_id=release_ids.get(name),
+            release_id=release_ids.get(name) if family in BRANCHED_FAMILIES else None,
         )
 
     for name in tags:
