@@ -106,7 +106,11 @@ _LEVEL_COLORS = {
 }
 _REDACTED = "[REDACTED]"
 _QUOTED_OR_NONSPACE_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
-_AUTHORIZATION_VALUE = r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:bearer\s+)?\S+)'
+# The scheme word (``Bearer``, ``Basic``, …) is part of the header value, so
+# the credential after it is redacted rather than the scheme alone.
+_AUTHORIZATION_VALUE = (
+    r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:(?:bearer|basic|digest|token)\s+)?\S+)'
+)
 _AUTHORIZATION_PATTERN = re.compile(
     rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
 )

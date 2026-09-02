@@ -32,6 +32,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -42,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -58,6 +60,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
+from omnigent.process_logging import redact_log_text
 
 if TYPE_CHECKING:
     import httpx
@@ -172,9 +175,43 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # the handoff deterministic where the old fixed sleep raced it.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
-# actually left the input box (re-sending Enter while it hasn't)
-# before failing loud.
-_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+# actually left the input box (re-sending Enter while it hasn't) before
+# failing loud. OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S overrides the default.
+_SUBMIT_VERIFY_TIMEOUT_ENV = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
+_SUBMIT_VERIFY_TIMEOUT_DEFAULT_S = 30.0
+# A stray huge override must not make the retry loop effectively unbounded.
+_SUBMIT_VERIFY_TIMEOUT_MAX_S = 600.0
+
+
+def _submit_verify_timeout_from_env() -> float:
+    """Read the submit-verify budget override, falling back on bad values."""
+    raw = os.environ.get(_SUBMIT_VERIFY_TIMEOUT_ENV)
+    if raw is None:
+        return _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        _logger.warning(
+            "Ignoring invalid %s=%r; using %gs",
+            _SUBMIT_VERIFY_TIMEOUT_ENV,
+            raw,
+            _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S,
+        )
+        return _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S
+    if value > _SUBMIT_VERIFY_TIMEOUT_MAX_S:
+        _logger.warning(
+            "Clamping %s=%r to %gs",
+            _SUBMIT_VERIFY_TIMEOUT_ENV,
+            raw,
+            _SUBMIT_VERIFY_TIMEOUT_MAX_S,
+        )
+        return _SUBMIT_VERIFY_TIMEOUT_MAX_S
+    return value
+
+
+_SUBMIT_VERIFY_TIMEOUT_S = _submit_verify_timeout_from_env()
 # UserPromptSubmit is the terminal's delivery acknowledgement. Composer
 # state alone is ambiguous because an in-pane restart also clears it.
 _DELIVERY_ACK_TIMEOUT_S = 10.0
@@ -570,6 +607,12 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_detail: Sanitized, capped failure text from a
+        ``StopFailure`` hook event — the ``error`` code and
+        ``last_assistant_message`` the provider reported, e.g.
+        ``"model_not_found: There's an issue with the selected model."``.
+        ``None`` for all other events or when the payload carried no usable
+        detail.
     """
 
     event_cursor: int
@@ -591,6 +634,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2956,6 +3000,148 @@ def _normalize_background_task(raw: object) -> _JsonObject | None:
     return out or None
 
 
+# Bound provider failure text before forwarding it to a parent session.
+_HOOK_FAILURE_DETAIL_MAX_CHARS = 500
+# Bracket-free on purpose: the detail lands inside a ``[System: …]`` frame.
+_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER = "… (truncated)"
+# Stands in when the raw bound cut away everything the provider said (one
+# oversized token), so the operator still learns detail existed.
+_HOOK_FAILURE_DETAIL_REMOVED_SENTINEL = (
+    f"Provider detail removed at safety limit {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+)
+# Keep the opening of a traceback and its final, actionable line.
+_HOOK_FAILURE_DETAIL_HEAD_CHARS = 150
+_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR = f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} "
+_HOOK_FAILURE_DETAIL_TAIL_CHARS = (
+    _HOOK_FAILURE_DETAIL_MAX_CHARS
+    - _HOOK_FAILURE_DETAIL_HEAD_CHARS
+    - len(_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR)
+)
+# Bound the scanning work on raw provider text (the cap above is far smaller).
+_HOOK_FAILURE_DETAIL_RAW_LIMIT = _HOOK_FAILURE_DETAIL_MAX_CHARS * 8
+_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
+_HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
+# CSI, OSC (BEL- or ST-terminated), DCS/SOS/PM/APC strings, and the
+# remaining short escapes (charset designators, keypad modes, …).
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|[PX^_].*?(?:\x1b\\|$)"
+    r"|[ -/]*[0-~])",
+    re.DOTALL,
+)
+
+
+def _bound_hook_failure_text(text: str) -> tuple[str, bool]:
+    """
+    Keep the head and tail of overlong provider text, on token boundaries.
+
+    :param text: Raw provider text of any length.
+    :returns: The bounded text and whether anything was cut. The token
+        bisected by each cut is dropped with it, so no credential prefix or
+        suffix can survive below the redactor's length floors.
+    """
+    if len(text) <= _HOOK_FAILURE_DETAIL_RAW_LIMIT:
+        return text, False
+    head = re.sub(r"\S+$", "", text[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS])
+    tail = re.sub(r"^\S+", "", text[-_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS:])
+    return f"{head} {tail}", True
+
+
+def _canonicalize_hook_failure_detail(text: str) -> str:
+    """
+    Fold provider text into the one shape the redactor and the reader see.
+
+    NFKC composes compatibility forms (fullwidth letters, ligatures) so a
+    credential spelled in lookalike code points still matches; control,
+    format (zero-width, bidi), surrogate, and private-use characters are
+    dropped; every whitespace run collapses to one space so a value cannot
+    straddle a line break and dodge the per-line scanners.
+
+    :param text: ANSI-free provider text.
+    :returns: Single-line canonical text, possibly empty.
+    """
+    folded: list[str] = []
+    for char in unicodedata.normalize("NFKC", text):
+        if char.isspace():
+            folded.append(" ")
+        elif unicodedata.category(char)[0] != "C":
+            folded.append(char)
+    return re.sub(r" {2,}", " ", "".join(folded)).strip()
+
+
+def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
+    """Fit sanitized detail and its truncation marker inside the global cap."""
+    if len(text) <= _HOOK_FAILURE_DETAIL_MAX_CHARS and not raw_truncated:
+        return text
+    suffix = f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    if len(text) + len(suffix) <= _HOOK_FAILURE_DETAIL_MAX_CHARS:
+        return text + suffix
+    head = text[:_HOOK_FAILURE_DETAIL_HEAD_CHARS].rstrip()
+    tail = text[-_HOOK_FAILURE_DETAIL_TAIL_CHARS:].lstrip()
+    return f"{head}{_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR}{tail}"
+
+
+def _finish_hook_failure_detail(canonical: str, *, raw_truncated: bool) -> str:
+    """
+    Redact, neutralize, and cap canonical failure text.
+
+    Brackets are translated only after the shared redactor has run, so
+    neither the provider's text nor the redaction marker itself carries a
+    ``]`` that could close the model-visible frame the detail lands in.
+    """
+    redacted = redact_log_text(canonical).translate(_HOOK_FAILURE_FRAME_TRANSLATION)
+    return _cap_hook_failure_detail(redacted, raw_truncated=raw_truncated)
+
+
+def _sanitize_hook_failure_detail(text: str) -> str | None:
+    """
+    Scrub and cap untrusted hook failure text for a parent session ``output``.
+
+    The contract is deliberately narrow: the text is canonicalized to one
+    line and scanned by the shared log redactor as the whitespace-separated
+    tokens a reader sees. It targets accidental echoes of real credentials,
+    not a provider composing lookalike anchors on purpose.
+
+    :param text: Raw failure text from a ``StopFailure`` hook payload.
+    :returns: Sanitized detail, or ``None`` when nothing usable remains.
+    """
+    bounded, raw_truncated = _bound_hook_failure_text(text)
+    canonical = _canonicalize_hook_failure_detail(_ANSI_ESCAPE_RE.sub("", bounded))
+    if not canonical:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL if raw_truncated else None
+    return _finish_hook_failure_detail(canonical, raw_truncated=raw_truncated)
+
+
+def _hook_failure_detail(payload: _JsonObject) -> str | None:
+    """
+    Build a sanitized failure detail from a ``StopFailure`` hook payload.
+
+    Each field is bounded and canonicalized on its own (an unusable field
+    drops out instead of leaving a dangling separator), then the fields are
+    joined before the single redaction pass so a credential split across
+    the field boundary is scanned whole.
+
+    :param payload: ``StopFailure`` hook payload.
+    :returns: Sanitized ``"<error>: <last assistant message>"`` detail, or
+        ``None`` when the payload carried none.
+    """
+    parts: list[str] = []
+    raw_truncated = False
+    for key in ("error", "last_assistant_message"):
+        value = payload.get(key)
+        if not isinstance(value, str):
+            continue
+        bounded, truncated = _bound_hook_failure_text(value)
+        canonical = _canonicalize_hook_failure_detail(_ANSI_ESCAPE_RE.sub("", bounded))
+        if canonical:
+            parts.append(canonical)
+        raw_truncated = raw_truncated or truncated
+    if not parts:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL if raw_truncated else None
+    return _finish_hook_failure_detail(": ".join(parts), raw_truncated=raw_truncated)
+
+
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     """
     Convert one complete hook JSONL line into a hook record.
@@ -3058,6 +3244,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_detail: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        failure_detail = _hook_failure_detail(payload)
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -3102,6 +3291,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_detail=failure_detail,
     )
 
 
@@ -3356,26 +3546,18 @@ def inject_user_message(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        if not _draft_in_input_box(pane, needle):
-            break
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            last_enter = time.monotonic()
-    else:
-        raise RuntimeError(
-            f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-            "(the draft is still in the input box). The message was not delivered."
-        )
+    # A draft still sitting there means the Enter was swallowed into the
+    # paste as a newline, so it is re-sent until the box clears.
+    _verify_draft_submitted(
+        info["socket_path"],
+        info["tmux_target"],
+        needle,
+        failure_message=(
+            "Claude Code did not accept the submitted message within "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S:g}s — your text is still in its input box; open "
+            "the terminal and press Enter to send it. The message was not delivered."
+        ),
+    )
     if require_delivery_ack:
         _wait_for_user_prompt_submit_ack(
             bridge_dir,
@@ -3535,28 +3717,18 @@ def inject_slash_command(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
-        # Re-send only while the command verifiably still sits in the box —
-        # a one-poll-stale retry can at worst hit the empty composer (no-op)
-        # or our own confirm dialog (the intended answer), never a foreign
-        # surface. The command leaving the box is the submit signal; the
-        # dialog replacing the composer counts, since submission pops it.
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        last_enter = time.monotonic()
-        submitted = False
-        while time.monotonic() < deadline:
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-                submitted = True
-                break
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                last_enter = time.monotonic()
-        if not submitted:
-            raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
-            )
+        # The command leaving the box is the submit signal; the dialog
+        # replacing the composer counts, since submission pops it.
+        _verify_draft_submitted(
+            socket_path,
+            tmux_target,
+            needle,
+            failure_message=(
+                "Claude Code did not accept the slash command within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S:g}s — it is still in its input box; open the "
+                "terminal and press Enter to send it. The command was not delivered."
+            ),
+        )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
 
@@ -4303,6 +4475,44 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     return bool(needle) and needle in tail
+
+
+def _verify_draft_submitted(
+    socket_path: str,
+    tmux_target: str,
+    needle: str,
+    *,
+    failure_message: str,
+) -> None:
+    """
+    Re-send Enter while the draft verifiably remains in the input box.
+
+    The box clearing is the only accepted proof of delivery: an empty
+    capture (a tmux hiccup mid-repaint) proves nothing and keeps polling
+    instead of passing as "cleared". Enter is re-sent only in a poll that
+    just saw the draft, so a retry can at worst hit the empty composer or
+    our own confirm dialog, never a foreign surface of the started turn.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param needle: Marker from :func:`_submit_needle`.
+    :param failure_message: Error text raised when the budget expires.
+    :raises RuntimeError: If the draft is still in the box (or its state
+        could not be observed) after :data:`_SUBMIT_VERIFY_TIMEOUT_S`.
+    """
+    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+    last_enter = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target)
+        if not pane.strip():
+            continue
+        if not _draft_in_input_box(pane, needle):
+            return
+        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = time.monotonic()
+    raise RuntimeError(failure_message)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
