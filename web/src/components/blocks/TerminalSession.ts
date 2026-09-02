@@ -16,6 +16,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { SHIFT_ENTER_CSI_U } from "./terminalExtraKeysModel";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -185,8 +186,8 @@ export type TerminalActivityListener = () => void;
 /** Listener for user keyboard input sent to the terminal. */
 export type TerminalInputListener = () => void;
 
-/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
-export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
+// The constant lives with the pure key model; re-exported for existing callers.
+export { SHIFT_ENTER_CSI_U };
 
 /**
  * Return the terminal bytes to send for a browser key event.
@@ -754,10 +755,8 @@ export class TerminalSession {
   }
 
   /**
-   * Send raw terminal input as exactly one binary frame, bypassing the input
-   * transform. Row keys and mouse reports use this so they are never rewritten
-   * by a sticky modifier and never consume one. Same bookkeeping as a typed
-   * keystroke; dropped while the socket is not open.
+   * Send raw input as exactly one binary frame, bypassing the input transform
+   * (row keys and mouse reports must never be rewritten by a sticky modifier).
    */
   sendInput(data: string): void {
     this.onInput?.();
