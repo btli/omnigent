@@ -489,6 +489,13 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("shows matching arrows for the two swipe directions", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByText(/Swipe left/).textContent).toBe("Swipe left ←");
+    expect(screen.getByText(/Swipe right/).textContent).toBe("Swipe right →");
+  });
+
   it("opens the embedded host's theme settings in a new tab", () => {
     mocks.isEmbedded = true;
     const url = "https://workspace.example.com/settings/user/preferences";
