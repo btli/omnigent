@@ -166,7 +166,7 @@ interface ElectronDesktopApi extends NativeShellApi {
    * shell delivers it "banner-safe": status values that would trigger the
    * in-page UpdateBanner (available/downloaded/error-security) are collapsed to
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
-  */
+   */
   updates?: ElectronUpdateBridge;
   /** Format a server using the shell's workspace-aware display rule. */
   serverDisplayLabel?: (url: string) => string;
