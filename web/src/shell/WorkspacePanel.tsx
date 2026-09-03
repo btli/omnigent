@@ -573,7 +573,7 @@ interface WorkspacePanelProps {
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
   inert?: boolean;
   /**
-   * Props for the left-edge resize handle (onMouseDown/onKeyDown + ARIA),
+   * Props for the left-edge resize handle (pointer handlers/onKeyDown + ARIA),
    * from ``useResizableInlinePanel().handleProps``.
    */
   handleProps: React.HTMLAttributes<HTMLDivElement> & { tabIndex: number };
@@ -763,7 +763,11 @@ function WorkspacePanelImpl({
   const effectiveHandleProps = pending
     ? {
         ...handleProps,
-        onMouseDown: undefined,
+        onPointerDown: undefined,
+        onPointerMove: undefined,
+        onPointerUp: undefined,
+        onPointerCancel: undefined,
+        onLostPointerCapture: undefined,
         onKeyDown: undefined,
         "aria-disabled": true,
         tabIndex: -1,
@@ -840,7 +844,20 @@ function WorkspacePanelImpl({
     ),
   };
   return (
-    <aside
+    <>
+      {/* The resize target is a real flex gutter. Its bounded slivers stay
+          outside both scroll containers. */}
+      {!maximized && handleProps.hidden !== true && (
+        <div
+          {...effectiveHandleProps}
+          data-workspace-panel-resize-gutter
+          className={cn(
+            "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+            pending && "cursor-default hover:bg-transparent active:bg-transparent",
+          )}
+        />
+      )}
+      <aside
       aria-label="Workspace"
       inert={inert}
       // The resize hook can starve the rail to width 0 while it stays mounted;
@@ -874,17 +891,7 @@ function WorkspacePanelImpl({
           ? undefined
           : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
       }
-    >
-      {/* Left-edge horizontal resize handle — suppressed while maximized. */}
-      {!maximized && (
-        <div
-          {...effectiveHandleProps}
-          className={cn(
-            "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-            pending && "cursor-default hover:bg-transparent active:bg-transparent",
-          )}
-        />
-      )}
+      >
       {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
       {/* Tab strip: the static nav tabs + divider stay pinned on the left at
           every rail width, and ONLY the file-tabs region scrolls (it owns the
@@ -1118,7 +1125,8 @@ function WorkspacePanelImpl({
           )
         )}
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }
 
