@@ -10203,6 +10203,37 @@ def test_claude_catalog_serves_model(
     )
 
 
+@pytest.mark.parametrize(
+    ("config", "label"),
+    [
+        (None, "Claude Code's own login"),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={
+                    "ANTHROPIC_BASE_URL": "https://user:secret@gateway.example:8443/anthropic?sig=1"
+                },
+                api_key_helper="printf sk-key",
+            ),
+            "the gateway at https://gateway.example:8443",
+        ),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example/v1"},
+                api_key_helper=None,
+            ),
+            "the Bedrock endpoint at https://bedrock.example",
+        ),
+    ],
+)
+def test_claude_launch_endpoint_label_names_where_inference_goes(
+    config: claude_native.ClaudeNativeUcodeConfig | None, label: str
+) -> None:
+    """
+    The label names only the endpoint's origin: no path, userinfo, or query.
+    """
+    assert claude_native.claude_launch_endpoint_label(config) == label
+
+
 # ── Bare --resume picker: host scoping and concise errors ────────────
 
 

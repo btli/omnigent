@@ -14,6 +14,8 @@ import {
 import {
   type CSSProperties,
   type ReactElement,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -33,7 +35,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { TerminalView } from "@/components/blocks/TerminalView";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -49,6 +50,10 @@ import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 import { Button } from "../components/ui/button";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 function WorkspaceTabTooltip({
   label,
@@ -526,15 +531,17 @@ function RailTerminalView({
   }
   return (
     <div key={terminal.id} className="flex h-full min-h-0 flex-col">
-      <TerminalView
-        sessionId={conversationId}
-        terminalId={terminal.id}
-        readOnly={readOnly}
-        focusOnConnect={autoFocus}
-        directAttachUrl={terminal.directAttachUrl}
-        onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
-        onActivity={() => markTerminalActive(terminal.id)}
-      />
+      <Suspense fallback={null}>
+        <TerminalView
+          sessionId={conversationId}
+          terminalId={terminal.id}
+          readOnly={readOnly}
+          focusOnConnect={autoFocus}
+          directAttachUrl={terminal.directAttachUrl}
+          onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+          onActivity={() => markTerminalActive(terminal.id)}
+        />
+      </Suspense>
     </div>
   );
 }
