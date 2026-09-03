@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   ArrowUpIcon,
@@ -61,6 +62,7 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
@@ -3638,14 +3640,20 @@ export function Composer({
               />
             )}
             <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
-              <ComposerModelEffortLabel
-                showModels={showModels}
-                showEffort={showEffort}
+              <ComposerModelSource
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
-                harnessLabel={harnessLabel}
-              />
+              >
+                <ComposerModelEffortLabel
+                  showModels={showModels}
+                  showEffort={showEffort}
+                  modelPickerKind={modelPickerKind}
+                  codexModelOptions={codexModelOptions}
+                  costRoutingEligible={costRoutingEligible}
+                  harnessLabel={harnessLabel}
+                />
+              </ComposerModelSource>
               <ComposerConfigGear
                 harnessLabel={harnessLabel}
                 showModels={showModels}
@@ -4627,11 +4635,11 @@ function ComposerConfigGear({
           {summary.length > 0 && (
             <TooltipContent
               side="top"
-              className="flex-col items-start gap-0.5 px-3 py-2"
+              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
               {summary.map((row) => (
-                <span key={row.label} className="text-muted-foreground">
+                <span key={row.label} className="max-w-72 truncate text-muted-foreground">
                   {row.label}:{" "}
                   <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
@@ -4679,7 +4687,10 @@ function useSessionConfigSummary({
 }): { label: string; value: string }[] {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const { effectiveModel, modelLabel } = useResolvedComposerModel(
+    modelPickerKind,
+    codexModelOptions,
+  );
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -4695,6 +4706,12 @@ function useSessionConfigSummary({
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
+  }
+  if (!routingOn) {
+    const source =
+      findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
+      codexModelOptions.find((option) => option.source)?.source;
+    rows.push(...modelConfigurationSourceRows(source));
   }
   return rows;
 }
@@ -4803,6 +4820,59 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+
+/** Compact, inspectable provenance beside the composer's model label. */
+function ComposerModelSource({
+  modelPickerKind,
+  codexModelOptions,
+  costRoutingEligible,
+  children,
+}: {
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+  children: ReactNode;
+}) {
+  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const source =
+    findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
+    codexModelOptions.find((option) => option.source)?.source;
+  const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  if (routingOn || !source) return children;
+
+  const rows = modelConfigurationSourceRows(source);
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            tabIndex={0}
+            data-testid="composer-model-source"
+            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className="flex max-w-80 flex-col items-start gap-1 px-3 py-2"
+          data-testid="composer-model-source-tooltip"
+        >
+          <span className="font-medium text-background dark:text-popover-foreground">
+            Model configuration
+          </span>
+          {rows.map((row) => (
+            <span key={row.label} className="max-w-72 truncate text-muted-foreground">
+              {row.label}:{" "}
+              <span className="text-background dark:text-popover-foreground">{row.value}</span>
+            </span>
+          ))}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 /**
