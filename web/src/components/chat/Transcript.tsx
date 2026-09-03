@@ -290,7 +290,8 @@ function TranscriptImpl({
                 {/* Terminal-first spin-up cue; self-gates to null off the
                 spin-up window, and only when not already showing Working…. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-                {/* MCP-server startup band (codex-native). */}
+                {/* MCP-server startup band (codex-native); clears once the
+                round settles (failures stay in host logs, not the chat). */}
                 <McpStartupIndicator />
               </>
             )}
