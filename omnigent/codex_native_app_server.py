@@ -494,6 +494,40 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+#: JSON-RPC internal-error code codex returns when its thread-store fails.
+_CODEX_INTERNAL_ERROR_CODE = -32603
+
+#: Substring in codex's ``-32603`` message when its thread-store cannot
+#: load/resume a thread's rollout — stable across the wrapper phrasings
+#: different codex versions use (``failed to read thread: …`` vs
+#: ``error resuming thread: …``).
+_CODEX_THREAD_STORE_ERROR = "thread-store internal error"
+
+
+def is_unreadable_thread_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure means codex cannot load the thread.
+
+    Codex answers ``-32603`` with a ``thread-store internal error`` when it
+    cannot load or resume a thread's rollout JSONL — e.g. a large transcript
+    whose multibyte character straddles a read-buffer boundary is rejected as
+    invalid UTF-8 (``failed to read thread: …``), or a rollout record it
+    cannot resume (``error resuming thread: …``). Retrying never resumes such
+    a thread, unlike a refused resume (``-32600``, another writer holds the
+    thread) that clears once the holder exits.
+
+    :param exc: The exception raised by the resume request, e.g. a
+        :class:`CodexAppServerResponseError`.
+    :returns: ``True`` when only a fresh thread can carry the session on.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INTERNAL_ERROR_CODE
+        and exc.message is not None
+        and _CODEX_THREAD_STORE_ERROR in exc.message
+    )
+
+
 class CodexAppServerClient:
     """JSON-RPC client for a Codex app-server.
 
@@ -862,10 +896,15 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     Persistent (unlike the hermetic discovery's temp dir) so Codex's own
     ``models_cache.json`` ETag handling makes repeat probes cheap; keyed by
     the override set so a provider change never replays another provider's
-    cache. The account's real ``auth.json`` is symlinked in, the same way
-    a session launch links it: the credential decides which models the
-    account's catalog lists (login-gated entries, the account default), so
-    a credential-less probe answers for a catalog no session will see.
+    cache.
+
+    Materialized by the same bridge a session launch uses, in its minimal
+    shape. Both halves matter: the credential decides which models the
+    account's catalog lists (login-gated entries, the account default), and
+    the provider tables decide whether Codex loads its config at all, since
+    an override naming a ``model_provider`` the home does not define fails
+    config load outright. Minimal keeps the probe from starting the user's
+    MCPs, hooks and plugins.
 
     :param config_overrides: The probe's ``-c`` overrides.
     :returns: The created ``CODEX_HOME`` directory.
@@ -873,13 +912,11 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    real_auth = _codex_home_config_source_from_env() / "auth.json"
-    probe_auth = home / "auth.json"
-    if real_auth.exists():
-        with contextlib.suppress(OSError):
-            if probe_auth.is_symlink() or probe_auth.exists():
-                probe_auth.unlink()
-            probe_auth.symlink_to(real_auth)
+    # The bridge skips files that already exist, and config.toml is copied
+    # (not symlinked), so drop the copy to re-read an edited source config.
+    with contextlib.suppress(OSError):
+        (home / "config.toml").unlink(missing_ok=True)
+    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
     return home
 
 
