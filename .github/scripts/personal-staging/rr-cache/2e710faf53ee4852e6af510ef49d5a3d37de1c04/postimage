@@ -146,26 +146,5 @@ export function writeUiFontFamily(name: string): void {
  * This is the single source of the DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
-  const root = getStyleRoot();
-  if (!root) return;
-  if (root === document.documentElement) {
-    uiFontFamilyPreference.apply(name);
-    return;
-  }
-
-  const documentRoot = document.documentElement;
-  const previousValue = documentRoot.style.getPropertyValue("--ui-font-family");
-  const previousPriority = documentRoot.style.getPropertyPriority("--ui-font-family");
   uiFontFamilyPreference.apply(name);
-  const appliedValue = documentRoot.style.getPropertyValue("--ui-font-family");
-  if (appliedValue) {
-    root.style.setProperty("--ui-font-family", appliedValue);
-  } else {
-    root.style.removeProperty("--ui-font-family");
-  }
-  if (previousValue) {
-    documentRoot.style.setProperty("--ui-font-family", previousValue, previousPriority);
-  } else {
-    documentRoot.style.removeProperty("--ui-font-family");
-  }
 }
