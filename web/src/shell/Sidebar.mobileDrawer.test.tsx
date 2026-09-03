@@ -57,28 +57,10 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 const originalMatchMedia = window.matchMedia;
-
-function stubViewportWidth(width: number): void {
-  window.matchMedia = ((query: string) => ({
-    matches: (() => {
-      const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-      if (min) return width >= parseFloat(min[1]);
-      const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-      if (max) return width <= parseFloat(max[1]);
-      return false;
-    })(),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
-}
 
 function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   return {
@@ -133,7 +115,7 @@ function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: st
 }
 
 beforeEach(() => {
-  stubViewportWidth(375);
+  stubMatchMedia({ width: 375 });
   mockConversations([conv("conv_a")]);
 });
 
