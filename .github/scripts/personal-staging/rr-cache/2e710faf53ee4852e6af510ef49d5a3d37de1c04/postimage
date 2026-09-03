@@ -148,10 +148,24 @@ export function writeUiFontFamily(name: string): void {
 export function applyUiFontFamily(name: string): void {
   const root = getStyleRoot();
   if (!root) return;
-  const normalized = normalizeUiFontFamily(name);
-  if (!normalized) {
-    root.style.removeProperty("--ui-font-family");
+  if (root === document.documentElement) {
+    uiFontFamilyPreference.apply(name);
     return;
   }
-  root.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
+
+  const documentRoot = document.documentElement;
+  const previousValue = documentRoot.style.getPropertyValue("--ui-font-family");
+  const previousPriority = documentRoot.style.getPropertyPriority("--ui-font-family");
+  uiFontFamilyPreference.apply(name);
+  const appliedValue = documentRoot.style.getPropertyValue("--ui-font-family");
+  if (appliedValue) {
+    root.style.setProperty("--ui-font-family", appliedValue);
+  } else {
+    root.style.removeProperty("--ui-font-family");
+  }
+  if (previousValue) {
+    documentRoot.style.setProperty("--ui-font-family", previousValue, previousPriority);
+  } else {
+    documentRoot.style.removeProperty("--ui-font-family");
+  }
 }
