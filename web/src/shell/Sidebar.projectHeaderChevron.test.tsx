@@ -66,6 +66,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -123,27 +124,7 @@ function stubInputScenario(
   coarsePrimary = anyCoarse,
   anyHover = canHover,
 ) {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    configurable: true,
-    value: (query: string) => ({
-      matches: query.split(/\s+and\s+/).every((condition) => {
-        const normalized = condition.trim();
-        if (normalized === "(pointer: coarse)") return coarsePrimary;
-        if (normalized === "(any-pointer: coarse)") return anyCoarse;
-        if (normalized === "(hover: hover)") return canHover;
-        if (normalized === "(any-hover: hover)") return anyHover;
-        const min = normalized.match(/^\(min-width: ([\d.]+)px\)$/);
-        if (min) return width >= parseFloat(min[1]);
-        const max = normalized.match(/^\(max-width: ([\d.]+)px\)$/);
-        if (max) return width <= parseFloat(max[1]);
-        return false;
-      }),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    }),
-  });
+  stubMatchMedia({ width, anyCoarse, coarsePrimary, canHover, anyHover });
 }
 
 beforeEach(() => {
@@ -188,8 +169,8 @@ describe("project folder header icon/chevron", () => {
     // Only a hover-capable desktop fades the folder out of its icon slot.
     const folderWrapper = folder.parentElement as HTMLElement;
     expect(folderWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-0",
+      "fine-hover:md:group-hover:opacity-0",
+      "fine-hover:md:group-focus-visible:opacity-0",
     );
     expect(folderWrapper).not.toHaveClass("md:group-hover:opacity-0");
 
@@ -202,8 +183,8 @@ describe("project folder header icon/chevron", () => {
       "hidden",
       "md:flex",
       "opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+      "fine-hover:md:group-hover:opacity-100",
+      "fine-hover:md:group-focus-visible:opacity-100",
     );
     expect(swap).not.toHaveClass("md:group-hover:opacity-100");
 
@@ -228,7 +209,7 @@ describe("project folder header icon/chevron", () => {
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
     const trailing = chevrons.find((c) => !classOf(c).includes("absolute")) as HTMLElement;
     expect(trailing).toBeTruthy();
-    expect(trailing).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:hidden");
+    expect(trailing).toHaveClass("fine-hover:md:hidden");
     expect(trailing).not.toHaveClass("md:hidden");
   });
 
@@ -310,9 +291,9 @@ describe("project folder header icon/chevron", () => {
     const [chevron] = chevrons;
     expect(classOf(chevron)).not.toMatch(/\babsolute\b/);
     expect(chevron).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+      "fine-hover:md:opacity-0",
+      "fine-hover:md:group-hover:opacity-100",
+      "fine-hover:md:group-focus-visible:opacity-100",
     );
     expect(chevron).not.toHaveClass("md:opacity-0");
   });

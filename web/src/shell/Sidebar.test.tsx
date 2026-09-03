@@ -169,6 +169,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -287,27 +288,7 @@ function stubViewportWidth(
   canHover = false,
   anyHover = canHover,
 ) {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    configurable: true,
-    value: (query: string) => ({
-      matches: query.split(/\s+and\s+/).every((condition) => {
-        const normalized = condition.trim();
-        if (normalized === "(pointer: coarse)") return coarsePrimary;
-        if (normalized === "(any-pointer: coarse)") return anyCoarse;
-        if (normalized === "(hover: hover)") return canHover;
-        if (normalized === "(any-hover: hover)") return anyHover;
-        const min = normalized.match(/^\(min-width: ([\d.]+)px\)$/);
-        if (min) return width >= parseFloat(min[1]);
-        const max = normalized.match(/^\(max-width: ([\d.]+)px\)$/);
-        if (max) return width <= parseFloat(max[1]);
-        return false;
-      }),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    }),
-  });
+  stubMatchMedia({ width, anyCoarse, coarsePrimary, canHover, anyHover });
 }
 
 beforeEach(() => {
@@ -539,18 +520,14 @@ describe("Sidebar session list", () => {
     // as desktop; only desktop hover widens it for the revealed controls.
     expect(row).toHaveClass("pr-2");
     expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
-    expect(row.className).toContain(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pr-20",
-    );
+    expect(row.className).toContain("fine-hover:md:group-hover:pr-20");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
     // narrowing the reserve on the selected row while the marker stayed put.
-    expect(row.className).toContain(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pr-20",
-    );
+    expect(row.className).toContain("fine-hover:md:group-has-[:focus-visible]:pr-20");
     expect(row.className).not.toContain("md:group-focus-within:pr-20");
     expect(row.className).not.toMatch(/(?:^|\s)md:pr-20(?:\s|$)/);
-    expect(row.className).not.toContain("[@media((hover:hover)_and_(pointer:fine))]:md:pr-20");
+    expect(row.className).not.toMatch(/(?:^|\s)fine-hover:md:pr-20(?:\s|$)/);
   });
 
   it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
@@ -605,15 +582,15 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
-    expect(slot).toHaveClass("[@media(not_((hover:hover)_and_(pointer:fine)))]:md:right-20");
+    expect(slot).toHaveClass("no-fine-hover:md:right-20");
     const row = screen.getByRole("link", { name: /Running row/ });
-    expect(row.className).toContain("[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-27");
+    expect(row.className).toContain("no-fine-hover:md:pr-27");
     // The fades and the hover reserve are gated the same way as the reveals,
     // so a tap's sticky :hover or a keyboard focus on the persistent controls
     // neither hides the badge nor collapses the reserve under it.
     expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-0",
+      "fine-hover:md:group-hover:opacity-0",
+      "fine-hover:md:group-has-[:focus-visible]:opacity-0",
     );
     expect(slot).not.toHaveClass(
       "md:group-hover:opacity-0",
@@ -953,10 +930,10 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "fine-hover:md:opacity-0",
+      "fine-hover:md:group-hover/header:opacity-100",
+      "fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+      "fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
@@ -2062,7 +2039,7 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    expect(pencil).toHaveClass("hidden", "fine-hover:flex");
     // Genuinely absent on touch — not merely clipped — so it leaves the a11y
     // tree and tab order, unlike the kebab.
     // Separate assertions: toHaveClass with multiple classes only fails when
@@ -2079,11 +2056,7 @@ describe("Sidebar project sections", () => {
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    for (const hiddenClass of [
-      "hidden",
-      "md:hidden",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
-    ]) {
+    for (const hiddenClass of ["hidden", "md:hidden", "fine-hover:md:hidden"]) {
       expect(menuItem).not.toHaveClass(hiddenClass);
     }
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
@@ -2104,11 +2077,7 @@ describe("Sidebar project sections", () => {
     const kebab = screen.getByTestId("project-actions");
     // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
     // width — no md gate that would drop it on a narrow hover desktop.
-    expect(kebab).toHaveClass(
-      "sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:flex",
-    );
+    expect(kebab).toHaveClass("sr-only", "fine-hover:not-sr-only", "fine-hover:flex");
     // Never display:none — that would strip it from the a11y tree and tab order
     // on touch, where the long-press contextmenu isn't reliably dispatched.
     expect(kebab).not.toHaveClass("hidden");
@@ -2162,8 +2131,8 @@ describe("Sidebar project sections", () => {
     // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
     // hover, at every width for a fine hover pointer.
     expect(revealWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+      "fine-hover:opacity-0",
+      "fine-hover:group-hover/header:opacity-100",
     );
     for (const cls of revealWrapper.classList) {
       expect(cls).not.toMatch(/:md:opacity-0$/);
@@ -2173,8 +2142,8 @@ describe("Sidebar project sections", () => {
     // narrow hover desktop doesn't let an invisible control swallow the tap.
     const outerBox = kebab.closest("div[class*=absolute]")!;
     expect(outerBox).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+      "fine-hover:pointer-events-none",
+      "fine-hover:group-hover/header:pointer-events-auto",
     );
     for (const cls of outerBox.classList) {
       expect(cls).not.toMatch(/:md:pointer-events-none$/);
@@ -2252,12 +2221,12 @@ describe("Sidebar collapsed project marker", () => {
     // the rows' right edge.
     expect(slot).toHaveClass("-mr-1");
     expect(slot).not.toHaveClass("mr-14");
-    expect(slot).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    expect(slot).not.toHaveClass("fine-hover:md:-mr-1");
     // The hover-driven fades track the fine-hover reveal (hover only exists on
     // fine), so they stay pointer-gated with no md.
     expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+      "fine-hover:group-hover/section:opacity-0",
+      "fine-hover:group-has-[[data-state=open]]/header:opacity-0",
     );
     // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
     // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
@@ -2265,7 +2234,7 @@ describe("Sidebar collapsed project marker", () => {
     // it. Asserted separately below (it must NOT carry the pointer/hover gate).
     expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
     expect(slot).not.toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      "fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
     // No width-gated fade survives for a hover-only action — that mismatch is
     // the narrow-hover overlap regression.
@@ -2300,9 +2269,7 @@ describe("Sidebar collapsed project marker", () => {
     expect(markerGroup).toHaveClass("group/header");
     expect(markerGroup).toContainElement(trigger);
     expect(markerGroup).toContainElement(slot);
-    expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
-    );
+    expect(slot).toHaveClass("fine-hover:group-has-[[data-state=open]]/header:opacity-0");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
@@ -2412,9 +2379,7 @@ describe("Sidebar pin marker visibility", () => {
     const pinButton = within(pinned).getByTestId("quick-pin-conversation");
     // Hover-gated like every other row (no persistent opacity-100 marker) —
     // only where hover exists — and the control unpins.
-    expect(pinButton.className).toContain(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-    );
+    expect(pinButton.className).toContain("fine-hover:md:opacity-0");
     expect(pinButton).toHaveAttribute("aria-label", "Unpin conversation");
   });
 
@@ -2425,9 +2390,7 @@ describe("Sidebar pin marker visibility", () => {
     const pinButton = screen.getByTestId("quick-pin-conversation");
     // Unpinned: hover-gated reveal (opacity-0 until group-hover), gated on
     // hover capability so touch tablets keep the control visible.
-    expect(pinButton.className).toContain(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-    );
+    expect(pinButton.className).toContain("fine-hover:md:opacity-0");
   });
 });
 
