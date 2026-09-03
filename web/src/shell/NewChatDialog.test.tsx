@@ -61,6 +61,7 @@ import {
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 describe("ComposerAddMenu", () => {
   it("groups real actions and opens the existing attachment picker only after selection", () => {
@@ -993,26 +994,6 @@ function mockAgents(agents: AvailableAgent[]) {
   useAvailableAgentsMock.mockReturnValue({
     data: agents,
   } as unknown as ReturnType<typeof useAvailableAgents>);
-}
-
-// Evaluate both width-query poles against an explicit browser viewport.
-function stubViewportWidth(width: number): void {
-  window.matchMedia = ((query: string) => ({
-    matches: (() => {
-      const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-      if (min) return width >= parseFloat(min[1]);
-      const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-      if (max) return width <= parseFloat(max[1]);
-      return false;
-    })(),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
 }
 
 // Shared mock setup for the landing-screen tests: one online host (host_1,
@@ -5354,7 +5335,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
 function forceMobileViewport(): () => void {
   const real = window.matchMedia;
-  stubViewportWidth(375);
+  stubMatchMedia({ width: 375 });
   return () => {
     window.matchMedia = real;
   };
