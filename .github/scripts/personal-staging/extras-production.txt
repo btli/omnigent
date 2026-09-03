@@ -9,6 +9,4 @@
 # upstream. Bot-authored pins are never covered by the open-PR stream;
 # remove them once merged upstream, or replace them when superseded.
 5825  # supersedes #5198; omni-resolve-agent[bot]; reviewed head ee335038a6b4b8e4d854f5d07fa53b798518b679
-6319  # draft fix/unified-touch-input (btli) force-promoted into production; supersedes #5828 (#4849 lineage); remove once marked ready or merged upstream
 5955  # supersedes #5181; omni-resolve-agent[bot]; reviewed head 5eb6872d373839432e5618132e174184c88db7e1
-6136  # draft feat/terminal-extra-keys (btli) force-promoted into production; remove once marked ready or merged upstream
