@@ -3114,16 +3114,23 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only (the
-        # in-browser consent flow needs the accounts login page). Wires
-        # the full /oauth/* surface including the token endpoint. See
+        # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
+        # modes (both own a server-minted session cookie). Header mode has
+        # no server-mintable identity and is excluded. See
         # designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
+        _is_github_oidc = (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "oidc"
+            and auth_provider._oidc_config is not None
+            and getattr(auth_provider._oidc_config, "provider_type", None) == "github"
+        )
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and auth_provider._source in ("accounts", "oidc")
+            and not _is_github_oidc
             and device_grant_store is not None
         ):
             from omnigent.server.routes.device_auth import create_device_auth_router
@@ -3152,6 +3159,15 @@ def create_app(
             # No device flow, but login-issued refresh grants still need
             # their token/revoke endpoints — in OIDC mode and in accounts
             # mode without the flag alike.
+            if _is_github_oidc and env_var_is_truthy(
+                "OMNIGENT_DEVICE_GRANT_ENABLED", default=False
+            ):
+                _logger.warning(
+                    "device-grant: GitHub OAuth does not support prompt=login / "
+                    "max_age=0, so the anti-phishing re-auth gate cannot be enforced. "
+                    "Device-grant flow skipped for this deployment; only "
+                    "/oauth/token + /oauth/revoke are mounted."
+                )
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(

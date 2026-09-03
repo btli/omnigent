@@ -404,6 +404,12 @@ _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+# Runner-owned labels on a child session that make sub-agent result delivery
+# durable across a runner restart. The dispatch id is stamped when a turn is
+# sent to the child; the delivered id is the receipt the parent's
+# ``sys_read_inbox`` drain writes once it has consumed that turn's result.
+SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
+SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -1512,6 +1518,11 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Parents whose restart-recovery scan completed in this process, plus a
+# per-parent lock so an init racing a sys_read_inbox drain cannot run two
+# scans that both pass the registry check and queue one result twice.
+_subagent_recovery_done: set[str] = set()
+_subagent_recovery_locks: dict[str, asyncio.Lock] = {}
 
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
@@ -1548,6 +1559,15 @@ def recover_subagent_ordinals(
     _subagent_ordinal_counters[key] = max_ordinal
 
 
+def new_subagent_work_id() -> str:
+    """
+    Mint the id of one sub-agent dispatch, e.g. ``"subagent_a1b2c3d4e5f6"``.
+
+    :returns: A fresh dispatch id.
+    """
+    return f"subagent_{uuid.uuid4().hex[:12]}"
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -1556,6 +1576,7 @@ def register_subagent_work(
     title: str,
     wrapper_label: str | None = None,
     created_by: str | None = None,
+    work_id: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -1573,6 +1594,8 @@ def register_subagent_work(
         label, e.g. ``"claude-code-native-ui"``.
     :param created_by: Human actor that dispatched this child turn, if
         known from the parent turn context.
+    :param work_id: Dispatch id already stamped on the child session,
+        e.g. ``"subagent_a1b2c3d4e5f6"``; ``None`` mints a new one.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -1586,7 +1609,7 @@ def register_subagent_work(
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
         child_session_id=child_session_id,
-        work_id=f"subagent_{uuid.uuid4().hex[:12]}",
+        work_id=work_id or new_subagent_work_id(),
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
@@ -1699,6 +1722,155 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
         if (entry := _subagent_work_by_child.get(child_id)) is not None
     ]
     return sorted(entries, key=lambda entry: entry.created_at)
+
+
+def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
+    """
+    Return the dispatch id of a child turn whose result the parent never drained.
+
+    :param labels: Child session labels, e.g.
+        ``{"omnigent.subagent.dispatch_id": "subagent_a1b2c3d4e5f6"}``.
+    :returns: The dispatch id when the delivered-id receipt is missing or
+        names an earlier turn; ``None`` for a drained turn, or for a child
+        created before dispatch ids were stamped.
+    """
+    dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return None
+    if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+        return None
+    return dispatch_id
+
+
+class _SubagentRecoveryReadError(Exception):
+    """A sessions API read needed by restart recovery returned a non-200."""
+
+
+async def _get_recovery_page(
+    server_client: httpx.AsyncClient, path: str, params: dict[str, str]
+) -> Any:
+    """
+    Read one page of a sessions API listing for restart recovery.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param path: Sessions API path, e.g. ``"/v1/sessions/conv_p/child_sessions"``.
+    :param params: Query parameters, e.g. ``{"limit": "1000"}``.
+    :returns: The decoded JSON page.
+    :raises _SubagentRecoveryReadError: When the server returns a non-200.
+    """
+    response = await server_client.get(path, params=params, timeout=10.0)
+    if response.status_code != 200:
+        raise _SubagentRecoveryReadError(f"{path} returned {response.status_code}")
+    return response.json()
+
+
+async def _list_child_sessions(
+    server_client: httpx.AsyncClient, parent_id: str
+) -> list[_JsonObject]:
+    """
+    Return every child-session summary of a parent, following pagination.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param parent_id: Parent session id, e.g. ``"conv_parent123"``.
+    :returns: Child summaries as returned by the sessions API.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    children: list[_JsonObject] = []
+    params: dict[str, str] = {"limit": "1000"}
+    while True:
+        page = await _get_recovery_page(
+            server_client, f"/v1/sessions/{parent_id}/child_sessions", params
+        )
+        children.extend(page.get("data", []))
+        if not page.get("has_more") or not page.get("last_id"):
+            return children
+        params["after"] = page["last_id"]
+
+
+async def _fetch_latest_assistant_text(
+    server_client: httpx.AsyncClient, session_id: str
+) -> str | None:
+    """
+    Return the newest assistant message text of a session, reading newest first.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_child456"``.
+    :returns: Joined text blocks of the newest assistant message (empty when
+        that message carries no text, matching live delivery), or ``None``
+        when the transcript holds no assistant message.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    params: dict[str, str] = {"limit": "100", "order": "desc"}
+    while True:
+        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
+        for item in page.get("data", []):
+            if item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            return "\n".join(
+                block["text"]
+                for block in item.get("content", [])
+                if block.get("type") in {"output_text", "text"} and block.get("text")
+            )
+        if not page.get("has_more") or not page.get("last_id"):
+            return None
+        params["after"] = page["last_id"]
+
+
+async def _recover_subagent_results_from_server(
+    *,
+    server_client: httpx.AsyncClient,
+    parent_id: str,
+    schedule_wake: Callable[[_SubagentWorkEntry], None],
+) -> None:
+    """
+    Re-queue terminal child results whose delivery receipt is missing.
+
+    A child turn is stamped with a dispatch id when it is sent, and the
+    parent's ``sys_read_inbox`` drain writes that id back as the delivered
+    id. A terminal child whose two ids differ was never drained, so its
+    result is rebuilt from the child transcript and queued again under the
+    same dispatch id, letting the eventual drain close the loop.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param parent_id: Parent session whose inbox was recreated, e.g.
+        ``"conv_parent123"``.
+    :param schedule_wake: Callback that posts the parent wake notice.
+    :raises _SubagentRecoveryReadError: When a server read returns a
+        non-200; the caller retries on the next drain.
+    """
+    for child in await _list_child_sessions(server_client, parent_id):
+        child_id = child.get("id")
+        status = child.get("current_task_status")
+        if not isinstance(child_id, str) or not isinstance(status, str):
+            continue
+        if status not in _SUBAGENT_TERMINAL_STATUSES:
+            continue
+        if (
+            get_subagent_work(child_id) is not None
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        labels = child.get("labels")
+        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        if dispatch_id is None:
+            continue
+        output: str | None = None
+        if status == "failed":
+            error = child.get("last_task_error")
+            message = error.get("message") if isinstance(error, dict) else None
+            output = message if isinstance(message, str) else None
+        else:
+            output = await _fetch_latest_assistant_text(server_client, child_id)
+        entry = register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
+            title=str(child.get("session_name") or ""),
+            work_id=dispatch_id,
+        )
+        ack = mark_subagent_work_terminal(child_id, status=status, output=output)
+        if ack.delivered_now:
+            schedule_wake(entry)
 
 
 def mark_subagent_work_terminal(
@@ -3420,6 +3592,9 @@ def create_runner_app(
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
+        # A fresh queue can mean a fresh runner process rather than a fresh
+        # session: re-queue results the previous process never drained.
+        await _recover_undrained_subagent_results(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -3760,6 +3935,8 @@ def create_runner_app(
                 msg_body = {
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
+                    # Recovery has no live server dispatch carrying renderer state.
+                    "browser_renderer_available": False,
                 }
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(msg_body, session_id),
@@ -4017,6 +4194,8 @@ def create_runner_app(
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
+        _subagent_recovery_done.discard(session_id)
+        _subagent_recovery_locks.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
@@ -4487,6 +4666,47 @@ def create_runner_app(
             agent=agent,
             title=snapshot.sub_agent_name or "",
         )
+
+    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+        """
+        Re-queue terminal child results lost with a runner process restart.
+
+        The parent inbox is a process-local queue, so a result queued before
+        a restart but not yet drained would otherwise vanish. Runs once per
+        parent per process; a scan that fails on a server read is retried
+        before the next ``sys_read_inbox`` drain. The inbox is created here
+        when missing: after a reconnect the server can dispatch a pending
+        message before it re-initializes the session, and that turn's drain
+        must still see the recovered results.
+
+        :param parent_id: Parent session whose inbox was recreated, e.g.
+            ``"conv_parent123"``.
+        :returns: None.
+        """
+        if parent_id in _subagent_recovery_done:
+            return
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
+        async with lock:
+            if parent_id in _subagent_recovery_done:
+                return
+            try:
+                await _recover_subagent_results_from_server(
+                    server_client=server_client,
+                    parent_id=parent_id,
+                    schedule_wake=_schedule_subagent_wake,
+                )
+            except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
+                _logger.warning(
+                    "Failed to recover undrained sub-agent results for %s",
+                    parent_id,
+                    exc_info=True,
+                    extra={"session_id": parent_id},
+                )
+                return
+            _subagent_recovery_done.add(parent_id)
+
+    app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
@@ -6970,6 +7190,16 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
+        # Request-driven harnesses should not advertise browser tools when no
+        # renderer is subscribed. Native harnesses ignore this per-turn list
+        # and keep their session-scoped relay surface; their calls still use
+        # the prompt no-renderer failure below. An absent hint from an older
+        # server preserves the previous advertised surface. Only the spec
+        # surface is filtered; request-supplied tools remain caller-owned.
+        if msg_body.get("browser_renderer_available") is False:
+            from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
+
+            _spec_tools = strip_browser_tool_schemas(_spec_tools)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
@@ -9465,8 +9695,11 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+        download: bool = False,
+    ) -> Response:
         await _require_os_env(session_id)
+        if download:
+            return await _fs_download(session_id, environment_id, relative_path)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -10042,6 +10275,68 @@ def create_runner_app(
             content={"meta_text": format_skill_meta_text(skill, arguments)},
         )
 
+    async def _fs_download(
+        session_id: str,
+        environment_id: str,
+        path: str,
+    ) -> StreamingResponse:
+        """Serve a file's complete bytes as an attachment.
+
+        The read path inlines content in a JSON envelope, so it caps at
+        ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
+        no cap; ``open_download`` binds that descriptor to what the sandbox
+        can read before a byte is served.
+
+        :param session_id: Session identifier.
+        :param environment_id: Environment resource id.
+        :param path: Path within the environment, or an absolute path.
+        :returns: The file streamed with ``Content-Disposition: attachment``.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If nothing the caller may see exists
+            at the path.
+        """
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        await _ensure_session_registered(session_id)
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            # Stop at the size announced in Content-Length so a file growing
+            # underneath the download cannot overrun the response.
+            remaining = size
+            try:
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
+                    if not chunk:
+                        # Ending short of Content-Length would hand the client
+                        # a silently incomplete file; abort the transfer instead.
+                        raise RuntimeError(f"{resolved.name} shrank during download")
+                    remaining -= len(chunk)
+                    yield chunk
+            finally:
+                fobj.close()
+
+        # Same header Starlette's FileResponse builds: a plain quoted filename
+        # when it is URL-safe, else the RFC 5987 encoded form.
+        quoted = urllib.parse.quote(resolved.name)
+        disposition = (
+            f'attachment; filename="{resolved.name}"'
+            if quoted == resolved.name
+            else f"attachment; filename*=utf-8''{quoted}"
+        )
+        return StreamingResponse(
+            _chunks(),
+            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     async def _fs_list_or_read(
         session_id: str,
         environment_id: str,
@@ -10382,6 +10677,11 @@ def create_runner_app(
                     status_code=200,
                     content={"error": {"code": -32000, "message": "Missing tool name"}},
                 )
+
+            if tool_name == "sys_read_inbox":
+                # A scan that failed at initialization must not leave the
+                # drain reporting an empty inbox; this is a no-op once done.
+                await _recover_undrained_subagent_results(session_id)
 
             if "__" in tool_name:
                 if mcp_manager is None:
@@ -10807,6 +11107,8 @@ def create_runner_app(
                     msg_body: _JsonObject = {
                         "agent_id": agent_id,
                         "model": agent_id or "",
+                        # Catch-up has no live server dispatch carrying renderer state.
+                        "browser_renderer_available": False,
                     }
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),
