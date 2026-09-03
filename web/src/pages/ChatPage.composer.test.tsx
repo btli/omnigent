@@ -230,10 +230,18 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+// A coarse pointer at a desktop width: the width queries keep answering as a
+// 1280px viewport so `useIsMobileViewport` stays false and the test exercises
+// the coarse-pointer branch alone rather than the mobile branch.
 function forceDesktopCoarsePointer(): () => void {
   const original = window.matchMedia;
   window.matchMedia = ((query: string) => ({
-    matches: query.includes("pointer: coarse"),
+    matches:
+      query.includes("pointer: coarse") ||
+      (() => {
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        return min !== null && 1280 >= parseFloat(min[1]);
+      })(),
     media: query,
     onchange: null,
     addListener: () => {},
@@ -512,6 +520,35 @@ describe("Composer growth layout", () => {
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
+});
+
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
+// These suites assert desktop composer behavior (mount autofocus,
+// Enter-sends, hover affordances); tests that need a mobile width re-pin it
+// themselves.
+beforeEach(() => {
+  stubViewportWidth(1280);
 });
 
 describe("Composer send shortcut", () => {
@@ -3313,6 +3350,15 @@ describe("Composer reply quotes", () => {
     expect(document.activeElement).toBe(ta);
     expect(ta.selectionStart).toBe(ta.value.length);
     expect(ta.selectionEnd).toBe(ta.value.length);
+  });
+
+  // The mobile boundary is the canonical layout predicate (not provably at
+  // md+), not the historical bespoke 767px — 767.5px sits between the two,
+  // so this test pins the migrated boundary: suppression must apply there.
+  it("suppresses mount autofocus at 767.5px (below the canonical md boundary)", () => {
+    stubViewportWidth(767.5);
+    render(<Composer {...composerProps()} />);
+    expect(document.activeElement).not.toBe(textarea());
   });
 
   it("appends on mobile without opening the software keyboard", () => {
