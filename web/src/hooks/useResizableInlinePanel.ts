@@ -6,7 +6,11 @@
 // while the inline panel starts at a compact sidebar width.
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
+import {
+  arrowResizeDelta,
+  createResizableWidthStore,
+  useResizableWidthSnapshot,
+} from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -201,19 +205,11 @@ export function useResizableInlinePanel(
   }, []);
 
   const resizeEnabled = enabled && persistEnabled && resolvedWidth !== 0;
-  // Cancellation restores the pre-drag width: onMove writes the live store on
-  // every pointermove, so an abort (Escape, blur, session switch) must undo
-  // those writes.
-  const dragStartWidth = useRef<number | null>(null);
   const resizeDrag = useResizeDrag({
     enabled: resizeEnabled,
     overlay: true,
-    onStart: useCallback(() => {
-      dragStartWidth.current = widthStore.getSnapshot();
-    }, []),
-    onCancel: useCallback(() => {
-      widthStore.set(dragStartWidth.current);
-    }, []),
+    onStart: widthStore.beginDrag,
+    onCancel: widthStore.rollbackDrag,
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
       widthStore.set(
@@ -234,20 +230,12 @@ export function useResizableInlinePanel(
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!resizeEnabled) return;
-      const step = 20;
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        widthStore.set(
-          (prev) => clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
-          true,
-        );
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        widthStore.set(
-          (prev) => clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
-          true,
-        );
-      }
+      const delta = arrowResizeDelta(e, "ArrowLeft");
+      if (delta === null) return;
+      widthStore.set(
+        (prev) => clamp((prev ?? resolvedWidth) + delta, minWidthRef.current, reservedRef.current),
+        true,
+      );
     },
     [resizeEnabled, resolvedWidth],
   );

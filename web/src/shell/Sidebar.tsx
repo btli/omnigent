@@ -209,7 +209,7 @@ import { TooltipArrow } from "radix-ui/tooltip";
 // them (right-20 clears the control column) and never fades — a tap's sticky
 // :hover or a keyboard focus must not drop the state there.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:opacity-0 [@media(not_((hover:hover)_and_(pointer:fine)))]:md:right-20";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0 no-fine-hover:md:right-20";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -221,6 +221,20 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
+// A session row's quick controls (pin, archive, kebab): hidden on mobile (the
+// chat header and the kebab's items cover those actions), shown from `md` up.
+// On a fine-hover display they fade until the row is hovered, a control is
+// keyboard-focused or the kebab menu is open; without fine hover (touch
+// tablets) they stay painted, matching the section headers' gating.
+// `md:inline-flex` (not `md:block`) keeps the Button base's flex centering.
+// Row title padding by trailing-badge kind: [rest, persistent touch-tablet].
+const ROW_TITLE_RESERVE = {
+  none: "pr-2 no-fine-hover:md:pr-20",
+  dot: "pr-8 no-fine-hover:md:pr-27",
+  awaiting: "pr-29 no-fine-hover:md:pr-48",
+} as const;
+const ROW_CONTROL_CLASS =
+  "hidden text-muted-foreground transition-opacity md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
 const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
@@ -2382,15 +2396,15 @@ function SectionHeader({
   // "New session" fallback at every breakpoint.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
-    ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
+    ? "fine-hover:md:mr-7"
     : showsMarker
       ? icon
-        ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
-        : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
+        ? "fine-hover:md:-mr-1"
+        : "fine-hover:md:mr-1"
+      : "fine-hover:md:mr-2";
   const markerFade = actionHoverOnly
-    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
+    ? "fine-hover:group-hover/section:opacity-0 fine-hover:group-has-[[data-state=open]]/header:opacity-0"
+    : "fine-hover:md:group-hover/section:opacity-0 fine-hover:md:group-has-[[data-state=open]]/header:opacity-0";
   // The hover-only control's focus reveal (`focus-visible:not-sr-only`) is
   // ungated by pointer type, so a coarse-pointer tablet with a keyboard can
   // land focus on it. Its focus fade must therefore fire at every pointer type
@@ -2400,10 +2414,10 @@ function SectionHeader({
   const actionFocusFade = actionFocusVisible
     ? actionHoverOnly
       ? "group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+      : "fine-hover:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
     : actionHoverOnly
       ? "group-has-[[data-header-controls]:focus-within]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+      : "fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       type="button"
@@ -2435,14 +2449,14 @@ function SectionHeader({
         // rather than trailing the name. Without fine hover (mobile, touch
         // tablets) the folder icon and the trailing chevron below stay visible.
         <span className="relative flex size-4 shrink-0 items-center justify-center">
-          <span className="flex md:transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-0">
+          <span className="flex md:transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-focus-visible:opacity-0">
             {icon}
           </span>
           <ChevronRightIcon
             className={cn(
               "absolute size-3.5 opacity-0 transition-[transform,opacity]",
               !collapsed && "rotate-90",
-              "hidden md:flex [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+              "hidden md:flex fine-hover:md:group-hover:opacity-100 fine-hover:md:group-focus-visible:opacity-100",
             )}
           />
         </span>
@@ -2456,8 +2470,8 @@ function SectionHeader({
           "size-3.5 shrink-0 transition-[transform,opacity]",
           !collapsed && "rotate-90",
           icon
-            ? "[@media((hover:hover)_and_(pointer:fine))]:md:hidden"
-            : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+            ? "fine-hover:md:hidden"
+            : "fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-focus-visible:opacity-100",
         )}
       />
       {/* A hidden row inside this collapsed section carries a marker — surface
@@ -2680,7 +2694,7 @@ function SectionGroup({
           // clicked button keeps focus afterward.
           <div
             data-header-controls
-            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity fine-hover:md:opacity-0 fine-hover:md:has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100"
           >
             {headerAction}
           </div>
@@ -2800,8 +2814,8 @@ function ConversationSection({
                 // other header keeps the width-gated reveal.
                 protectsCollapsedBadge &&
                   (actionHoverOnly
-                    ? "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:pointer-events-auto"
-                    : "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto"),
+                    ? "fine-hover:pointer-events-none fine-hover:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto fine-hover:group-hover/header:pointer-events-auto fine-hover:group-has-[[data-state=open]]/header:pointer-events-auto fine-hover:has-[[aria-expanded=true]]:pointer-events-auto"
+                    : "fine-hover:md:pointer-events-none fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto fine-hover:md:group-hover/header:pointer-events-auto fine-hover:md:group-has-[[data-state=open]]/header:pointer-events-auto fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto fine-hover:md:has-[[aria-expanded=true]]:pointer-events-auto"),
               )}
             >
               {headerAction && (
@@ -2814,8 +2828,8 @@ function ConversationSection({
                   className={cn(
                     "flex items-center transition-opacity",
                     actionHoverOnly
-                      ? "[@media((hover:hover)_and_(pointer:fine))]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:opacity-100"
-                      : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                      ? "fine-hover:opacity-0 fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:group-hover/header:opacity-100 fine-hover:group-has-[[data-state=open]]/header:opacity-100 fine-hover:has-[[aria-expanded=true]]:opacity-100"
+                      : "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
                   {headerAction}
@@ -3575,7 +3589,13 @@ function ConversationRow({
     },
     disabled: !dragEnabled,
   });
-  const rowGestureListeners = gesture.listeners(dragListeners);
+  // `gesture.listeners` is stable across renders; memoize the composed object
+  // so a row render doesn't rebuild the handler set.
+  const bindRowGestureListeners = gesture.listeners;
+  const rowGestureListeners = useMemo(
+    () => bindRowGestureListeners(dragListeners),
+    [bindRowGestureListeners, dragListeners],
+  );
   const justDraggedRef = useRef(false);
   const wasDraggingRef = useRef(false);
   useEffect(() => {
@@ -3658,11 +3678,6 @@ function ConversationRow({
     if (nextArchived) showArchivedToast();
   }
 
-  function runUnarchive() {
-    const nextArchived = !isArchived;
-    archive.mutate({ id: conversation.id, archived: nextArchived });
-  }
-
   function confirmLeave() {
     // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
     // gated on the row NOT being owned by the viewer, which is only decidable
@@ -3734,21 +3749,16 @@ function ConversationRow({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
-        // Mobile drops the pin + kebab (see the trailing controls below), so it
-        // reserves only what the badge needs — the same width desktop uses at
-        // rest, before hover reveals the controls.
+        // Rest reserve: mobile drops the controls, so the row reserves only
+        // what the badge needs — the same width a fine-hover desktop uses
+        // before hover reveals the controls. Without fine hover at md+ (touch
+        // tablets) the controls stay painted with the badge shifted left of
+        // them, so that reserve is persistent: the control column (pr-20)
+        // plus the badge's own width when one is present.
         !selectionMode &&
-          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
-        // Hover-incapable md+ devices (touch tablets) keep the controls
-        // persistently visible with the badge shifted left of them, so the
-        // reserve is persistent too: controls (pr-20) plus the badge's own
-        // width when one is present.
-        !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-48"
-            : hasTrailingIndicator
-              ? "[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-27"
-              : "[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-20"),
+          ROW_TITLE_RESERVE[
+            sessionState?.kind === "awaiting" ? "awaiting" : hasTrailingIndicator ? "dot" : "none"
+          ],
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3757,8 +3767,8 @@ function ConversationRow({
         // Gated on fine hover like the reveals themselves: without it the
         // persistent touch-tablet reserve above stays put.
         !selectionMode &&
-          `[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pr-20 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pr-20`,
-        !selectionMode && menuOpen && "[@media((hover:hover)_and_(pointer:fine))]:md:pr-20",
+          `fine-hover:md:group-hover:pr-20 fine-hover:md:group-has-[:focus-visible]:pr-20`,
+        !selectionMode && menuOpen && "fine-hover:md:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -4036,8 +4046,8 @@ function ConversationRow({
               // touchscreen laptop, ahead of the row's tap/swipe), so they go
               // inert until the same hover/focus/open state that reveals them —
               // the section headers' controls use the identical gate.
-              "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
-              "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+              "fine-hover:md:pointer-events-none",
+              "fine-hover:md:group-hover:pointer-events-auto fine-hover:md:group-has-[:focus-visible]:pointer-events-auto fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
             )}
           >
             {/* Archived rows omit the pin entirely: pinning is meaningless there
@@ -4049,28 +4059,10 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
                 data-testid="quick-pin-conversation"
-                className={cn(
-                  // Desktop-only quick affordance: hidden on mobile (the kebab's
-                  // Pin item below covers that), hover/focus-revealed from `md`
-                  // up on hover-capable displays and persistently visible where
-                  // hover doesn't exist (touch tablets), matching the section
-                  // headers' capability gating. Pinned rows no longer keep a
-                  // persistent pin marker, since
-                  // the "Pinned" section header (and pinned-first ordering inside
-                  // a project) already conveys the pinned state. Revealed glyph:
-                  // unpin if pinned, pin otherwise.
-                  //
-                  // `md:inline-flex` (not `md:block`): the Button base is
-                  // `inline-flex` and relies on it for `items-center
-                  // justify-center` to center the icon. `md:block` would override
-                  // that display and collapse the centering, leaving the glyph
-                  // pinned to the top-left of the button — so keep the flex
-                  // display when revealing it.
-                  "text-muted-foreground transition-opacity",
-                  "hidden md:inline-flex",
-                  "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-                  "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:opacity-100",
-                )}
+                // Pinned rows keep no persistent marker: the "Pinned" section
+                // header already conveys the state, so the glyph is unpin when
+                // pinned, pin otherwise.
+                className={ROW_CONTROL_CLASS}
                 onClick={(e) => {
                   // Keep the toggle click off the surrounding Link (no navigation).
                   e.preventDefault();
@@ -4101,21 +4093,12 @@ function ConversationRow({
                     size="icon-xs"
                     aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
                     data-testid="quick-archive-conversation"
-                    className={cn(
-                      "text-muted-foreground transition-opacity",
-                      "hidden md:inline-flex",
-                      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-                      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:opacity-100",
-                    )}
+                    className={ROW_CONTROL_CLASS}
                     onClick={(e) => {
                       // Keep the toggle click off the surrounding Link (no navigation).
                       e.preventDefault();
                       e.stopPropagation();
-                      if (!isArchived) {
-                        runArchive();
-                      } else {
-                        runUnarchive();
-                      }
+                      runArchive();
                     }}
                   >
                     {isArchived ? (
@@ -4136,16 +4119,7 @@ function ConversationRow({
                   size="icon-xs"
                   aria-label="Conversation actions"
                   data-testid="conversation-actions"
-                  // The chat header owns these actions on mobile. On
-                  // hover-capable desktop the row trigger appears on hover,
-                  // focus, or while its menu is open; without hover (touch
-                  // tablets) it stays visible — there is no hover to reveal it.
-                  className={cn(
-                    "text-muted-foreground transition-opacity",
-                    "hidden md:inline-flex",
-                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-100",
-                    "[@media((hover:hover)_and_(pointer:fine))]:md:aria-expanded:opacity-100",
-                  )}
+                  className={ROW_CONTROL_CLASS}
                   onClick={(e) => {
                     // Keep the trigger click from bubbling into the Link.
                     e.preventDefault();
@@ -4403,7 +4377,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="hidden text-muted-foreground fine-hover:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -4802,7 +4776,7 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+          className="sr-only text-muted-foreground focus-visible:not-sr-only fine-hover:not-sr-only fine-hover:flex"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
