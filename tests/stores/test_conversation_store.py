@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -546,6 +547,53 @@ def test_append_leaves_created_by_none_for_agent_items(
     assert persisted.created_by is None
     [read_back] = conversation_store.list_items(conv.id).data
     assert read_back.created_by is None
+
+
+def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
+    """append() routes every item's payload through _encode_item_data_batch
+    exactly once, passing all payloads in item order — so a subclass whose
+    encode is a per-call RPC can collapse the page into a single call.
+
+    Guards the managed store's per-import CMK cost: one encrypt call per append,
+    not one per item.
+    """
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.batch_calls: list[list[str]] = []
+
+        def _encode_item_data_batch(self, data_jsons: list[str]) -> list[str]:
+            # Record the page, then defer to the identity default so the data
+            # still round-trips through the plaintext column.
+            self.batch_calls.append(list(data_jsons))
+            return super()._encode_item_data_batch(data_jsons)
+
+    store = RecordingStore(db_uri)
+    conv = store.create_conversation()
+    texts = [f"item-{i}" for i in range(5)]
+    persisted = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_batch",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for text in texts
+        ],
+    )
+
+    # Exactly one batched encode call carrying all five payloads, in order.
+    assert len(store.batch_calls) == 1
+    encoded_page = store.batch_calls[0]
+    assert len(encoded_page) == 5
+    assert [json.loads(payload)["content"][0]["text"] for payload in encoded_page] == texts
+
+    # Data round-trips: persisted order and read-back both match the input.
+    assert [item.data.content[0]["text"] for item in persisted] == texts
+    read_back = store.list_items(conv.id).data
+    assert [item.data.content[0]["text"] for item in read_back] == texts
 
 
 def test_append_function_call_items(
@@ -1150,6 +1198,137 @@ def test_list_items_cursor_scoped_to_conversation(
     assert after_page.data == []
     before_page = conversation_store.list_items(conv.id, before=other_items[1].id)
     assert before_page.data == []
+
+
+def _captured_item_statement_limits(store: SqlAlchemyConversationStore, run) -> list[int]:
+    """
+    Capture the LIMIT value of every ``conversation_items`` SELECT that
+    ``run()`` sends to the database.
+
+    Values are read from the statement objects at the engine boundary — the
+    same place a backend sees them — so the assertion holds for exactly what
+    each SQL statement asked for, not what the store returned.
+    """
+    limits: list[int] = []
+
+    def _before(conn, clauseelement, multiparams, params, execution_options):
+        limit_clause = getattr(clauseelement, "_limit_clause", None)
+        if limit_clause is None:
+            return
+        value = getattr(limit_clause, "value", None)
+        if isinstance(value, int) and "conversation_items" in str(clauseelement):
+            limits.append(value)
+
+    event.listen(store._conv_engine, "before_execute", _before)
+    try:
+        run()
+    finally:
+        event.remove(store._conv_engine, "before_execute", _before)
+    return limits
+
+
+def _append_n_messages(conversation_store: SqlAlchemyConversationStore, conv_id: str, n: int):
+    """Helper: append ``n`` small messages and return the persisted items."""
+    return conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_bulk",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"bulk-{i}"}],
+                ),
+            )
+            for i in range(n)
+        ],
+    )
+
+
+# The deployed managed-Postgres backend served item reads fine at
+# ``limit<=400`` and 500'd at ``limit>=500`` on a large conversation. Reads
+# above this row count are therefore proven to be unservable there; no single
+# SQL statement may ask for more.
+_DEPLOYED_SAFE_READ_ROWS = 400
+
+
+def test_list_items_large_page_reads_in_bounded_statements(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A large requested page must never become one oversized SQL read.
+
+    A deployed managed-Postgres backend failed a single big-page read of a
+    large conversation (500 at ``limit>=500``) while serving the same rows
+    fine in smaller statements — which broke every ``limit=1000`` caller,
+    most visibly claude-native cold resume. The page must be assembled from
+    bounded per-statement reads, while the returned page stays identical:
+    complete, ordered, and correctly flagged ``has_more``.
+    """
+    conv = conversation_store.create_conversation()
+    items = _append_n_messages(conversation_store, conv.id, 550)
+
+    pages = []
+    limits = _captured_item_statement_limits(
+        conversation_store,
+        lambda: pages.append(conversation_store.list_items(conv.id, limit=500)),
+    )
+    [page] = pages
+
+    assert limits, "expected at least one conversation_items SELECT"
+    oversized = [lim for lim in limits if lim > _DEPLOYED_SAFE_READ_ROWS]
+    assert not oversized, (
+        f"list_items sent statements asking for {oversized} rows — beyond the "
+        f"{_DEPLOYED_SAFE_READ_ROWS}-row reads the deployed backend is proven "
+        f"to serve; a big-conversation page must be stitched from bounded reads"
+    )
+
+    # The stitched page is byte-for-byte what one big read used to return.
+    assert [it.id for it in page.data] == [it.id for it in items[:500]]
+    assert page.has_more is True
+    assert page.first_id == items[0].id
+    assert page.last_id == items[499].id
+
+    # And the follow-up cursor page picks up exactly where it left off.
+    rest = conversation_store.list_items(conv.id, limit=500, after=page.last_id)
+    assert [it.id for it in rest.data] == [it.id for it in items[500:]]
+    assert rest.has_more is False
+
+
+def test_list_items_large_page_desc_and_cursor_cross_chunks(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Chunked assembly preserves ordering/cursor semantics in ``desc`` order
+    and with an ``after`` cursor that lands mid-conversation.
+    """
+    conv = conversation_store.create_conversation()
+    items = _append_n_messages(conversation_store, conv.id, 450)
+
+    desc_page = conversation_store.list_items(conv.id, limit=430, order="desc")
+    assert [it.id for it in desc_page.data] == [it.id for it in reversed(items)][:430]
+    assert desc_page.has_more is True
+
+    after_page = conversation_store.list_items(conv.id, limit=430, after=items[9].id)
+    assert [it.id for it in after_page.data] == [it.id for it in items[10:440]]
+    assert after_page.has_more is True
+
+
+def test_list_items_small_page_stays_single_statement(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Pages at or under the per-statement cap keep the single-SELECT shape —
+    the chunking is strictly a big-page fallback, not a per-page overhead.
+    """
+    conv = conversation_store.create_conversation()
+    _append_n_messages(conversation_store, conv.id, 12)
+
+    limits = _captured_item_statement_limits(
+        conversation_store,
+        lambda: conversation_store.list_items(conv.id, limit=10),
+    )
+    assert limits == [11], limits  # limit + 1 sentinel row, one statement
 
 
 # ── Conversation ID / response ID lookups ────────────

@@ -23,16 +23,45 @@ def commit(sha: str, login: str = "omni-resolve-agent[bot]"):
     }
 
 
-def decide(*, reviews, commits, head="new", head_repository=REPOSITORY):
+def dismissal_event(
+    *,
+    review_id=1,
+    actor="omni-resolve-agent[bot]",
+    commit_id="new",
+    dismissal_message=None,
+):
+    return {
+        "event": "review_dismissed",
+        "actor": {"login": actor},
+        "dismissed_review": {
+            "review_id": review_id,
+            "state": "approved",
+            "dismissal_commit_id": commit_id,
+            "dismissal_message": dismissal_message,
+        },
+    }
+
+
+def decide(
+    *,
+    reviews,
+    commits,
+    timeline=None,
+    head="new",
+    head_repository=REPOSITORY,
+    author="contributor",
+):
     return approval_decision(
         repository=REPOSITORY,
-        author="contributor",
+        author=author,
         head_repository=head_repository,
         head_sha=head,
         maintainers=MAINTAINERS,
+        trusted_authors=TRUSTED,
         trusted_successors=TRUSTED,
         reviews=reviews,
         commits=commits,
+        timeline=timeline or [],
     )
 
 
@@ -40,6 +69,16 @@ def test_current_head_approval_passes():
     decision = decide(reviews=[review("APPROVED", "new")], commits=[commit("new")])
     assert decision.approved
     assert "Current head approved" in decision.reason
+
+
+def test_trusted_automation_author_passes_without_review():
+    decision = decide(
+        author="omni-resolve-agent[bot]",
+        reviews=[],
+        commits=[commit("new")],
+    )
+    assert decision.approved
+    assert "trusted automation" in decision.reason
 
 
 def test_approval_survives_trusted_same_repo_successor_commits():
@@ -51,7 +90,53 @@ def test_approval_survives_trusted_same_repo_successor_commits():
     assert "only trusted automation committed" in decision.reason
 
 
-def test_approval_does_not_survive_untrusted_or_fork_updates():
+def test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it():
+    decision = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event()],
+    )
+    assert decision.approved
+    assert "only trusted automation committed" in decision.reason
+
+
+def test_trusted_fork_push_preserves_approval():
+    decision = decide(
+        reviews=[review("APPROVED", "old")],
+        commits=[commit("old"), commit("new")],
+        head_repository="contributor/omnigent",
+    )
+    assert decision.approved
+    assert "only trusted automation committed" in decision.reason
+    assert "fork head" in decision.reason
+
+
+def test_auto_dismissed_fork_approval_accepts_human_push_token_actor():
+    decision = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event(actor="fork-push-token-owner")],
+        head_repository="contributor/omnigent",
+    )
+    assert decision.approved
+
+
+def test_dismissed_approval_requires_a_trusted_matching_dismissal_event():
+    manual = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event(actor="maintainer", dismissal_message="withdrawn")],
+    )
+    wrong_commit = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event(commit_id="other")],
+    )
+    assert not manual.approved
+    assert not wrong_commit.approved
+
+
+def test_approval_does_not_survive_untrusted_updates():
     untrusted = decide(
         reviews=[review("APPROVED", "old")],
         commits=[commit("old"), commit("new", "contributor")],
@@ -59,13 +144,13 @@ def test_approval_does_not_survive_untrusted_or_fork_updates():
     assert not untrusted.approved
     assert "untrusted commit" in untrusted.reason
 
-    fork = decide(
+    untrusted_fork = decide(
         reviews=[review("APPROVED", "old")],
-        commits=[commit("old"), commit("new")],
+        commits=[commit("old"), commit("new", "contributor")],
         head_repository="contributor/omnigent",
     )
-    assert not fork.approved
-    assert "fork-head update" in fork.reason
+    assert not untrusted_fork.approved
+    assert "untrusted commit" in untrusted_fork.reason
 
 
 def test_approval_does_not_survive_rewritten_history():
@@ -93,6 +178,7 @@ def test_maintainer_authored_pr_still_passes():
         head_repository=REPOSITORY,
         head_sha="new",
         maintainers=MAINTAINERS,
+        trusted_authors=TRUSTED,
         trusted_successors=TRUSTED,
         reviews=[],
         commits=[commit("new", "maintainer")],

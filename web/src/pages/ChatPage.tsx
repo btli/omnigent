@@ -1,5 +1,4 @@
 import {
-  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   createContext,
@@ -75,7 +74,10 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
-import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import {
+  serverSwitcherHiddenForSurface,
+  useSurfaceFrontmost,
+} from "@/hooks/useNativeServerSwitcher";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
@@ -142,7 +144,10 @@ import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
 export type { MentionItem, MentionState };
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
+import { useGithubInfo } from "@/hooks/useGithub";
+import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
@@ -155,6 +160,7 @@ import {
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -164,6 +170,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -1465,9 +1472,12 @@ interface SessionLayoutProps {
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
-      {/* `relative`: positions MainAgentSurface's persistent terminal
-          overlay (absolute inset-0) against the main column. */}
-      <div className="relative flex min-w-0 flex-1 flex-col">{mainAgent}</div>
+      {/* `relative`: positions MainAgentSurface's persistent terminal overlay
+          and the composer's file-drop overlay (both absolute inset-0) against
+          the main column. */}
+      <div data-chat-surface className="relative flex min-w-0 flex-1 flex-col">
+        {mainAgent}
+      </div>
     </div>
   );
 }
@@ -1927,7 +1937,7 @@ function MainAgentSurface({
   );
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!surfaceFrontmost);
+    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(surfaceFrontmost));
   }, [surfaceFrontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;
@@ -2039,14 +2049,13 @@ function MainAgentSurface({
     if (!mountTerminal || !conversationId) return;
     setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
   }, [mountTerminal, conversationId, terminalReadOnly]);
-  // Render from a derived list that already includes the active session,
-  // so a fresh session's surface mounts in the same commit (the effect
-  // above persists it one commit later) and its readOnly snapshot tracks
-  // a late permission hydrate while it is the active session.
-  const renderedTerminals =
-    mountTerminal && conversationId
-      ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
-      : warmTerminals;
+  // Derive from warmTerminals only — the effect above adds the active session
+  // after the first paint, so xterm (a lazy chunk) never loads on the initial
+  // render. Previously the active session was included here same-commit to
+  // avoid the one-frame delay; that optimization is removed so the terminal
+  // chunk defers until after first paint. Returning to an already-warm
+  // background session is still same-commit (it's already in warmTerminals).
+  const renderedTerminals = warmTerminals;
   const handleTerminalResume = useCallback(async () => {
     if (!conversationId) throw new Error("Session is not available");
     if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
@@ -2495,6 +2504,21 @@ function historyLoadThreshold(el: HTMLElement): number {
 /** Finger travel before a touch drag counts as "show me what's above". */
 const TOUCH_DRAG_SLOP_PX = 8;
 
+/**
+ * Follow-up pages one gesture may chain beyond the page it fetched itself.
+ *
+ * Settled tool-heavy turns mount folded behind "Worked for" rows, so a fetched
+ * page can land with near-zero height: scrollTop never crosses the load
+ * threshold and the moved cursor would otherwise re-feed the next fetch until
+ * history ran out — one small drag used to page in the entire transcript. A
+ * fresh gesture grants a fresh budget, so older history stays reachable at a
+ * reader-paced rate instead of a runaway loop.
+ */
+const PREPEND_CHAIN_PAGES_PER_GESTURE = 2;
+
+/** Quiet gap after which the next wheel-up tick counts as a new gesture. */
+const WHEEL_GESTURE_QUIET_MS = 300;
+
 export function HistoryAutoLoader({
   scrollElement,
 }: {
@@ -2531,6 +2555,11 @@ export function HistoryAutoLoader({
   const scrolledUpRef = useRef(false);
   const lastScrollTopRef = useRef<number | null>(null);
   const touchStartYRef = useRef<number | null>(null);
+  // Whether the current touch sequence already granted its gesture budget.
+  const touchGestureSpentRef = useRef(false);
+  const lastWheelUpAtRef = useRef(Number.NEGATIVE_INFINITY);
+  // Prepend-fed fetches left before the chain must wait for a fresh gesture.
+  const chainBudgetRef = useRef(PREPEND_CHAIN_PAGES_PER_GESTURE);
 
   // Position across a prepend is held by native scroll anchoring, not by this
   // component. Writing scrollTop here instead used to interrupt the reader's
@@ -2544,11 +2573,13 @@ export function HistoryAutoLoader({
     // Baseline from where the pane currently sits, so the reader's very first
     // upward scroll already has something to compare against.
     lastScrollTopRef.current = el.scrollTop;
-    // Arming has to re-run the paging effect itself: a pane with no scroll
-    // range fires no scroll event, so nothing else would notice the gesture.
-    const armScrollUp = () => {
-      if (scrolledUpRef.current) return;
+    // A gesture has to re-run the paging effect itself: a pane with no scroll
+    // range fires no scroll event, so nothing else would notice it. It also
+    // refills the chain budget — every fresh ask for what's above buys a
+    // bounded amount of prepend-fed follow-up, never the whole history.
+    const noteUpwardGesture = () => {
       scrolledUpRef.current = true;
+      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
       setScrollRevision((revision) => revision + 1);
     };
     const handleScroll = () => {
@@ -2557,25 +2588,38 @@ export function HistoryAutoLoader({
       // Only an upward move counts. The open's scroll-to-bottom and a
       // prepend's native anchor correction both move scrollTop DOWN the
       // document (larger), so neither can arm paging on its own.
-      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
+      if (previous !== null && el.scrollTop < previous - 0.5) {
+        scrolledUpRef.current = true;
+        chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
+      }
       // Every scroll re-runs the paging effect, armed or not: staying near the
       // top has to keep paging, not just the moment the reader arrives there.
       setScrollRevision((revision) => revision + 1);
     };
     // Wheel/trackpad up, and a touch drag downward (which reveals what is
     // above). These fire whether or not the pane has anywhere to scroll.
+    // Both emit many events per physical gesture, so the budget refill keys
+    // on the gesture's start — one touch sequence grants once, and a wheel
+    // burst grants again only after a quiet gap — keeping the bound truly
+    // per-gesture even when pages settle mid-drag.
     const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) armScrollUp();
+      if (event.deltaY >= 0) return;
+      const now = performance.now();
+      const newGesture = now - lastWheelUpAtRef.current > WHEEL_GESTURE_QUIET_MS;
+      lastWheelUpAtRef.current = now;
+      if (newGesture) noteUpwardGesture();
     };
     const handleTouchStart = (event: TouchEvent) => {
       touchStartYRef.current = event.touches[0]?.clientY ?? null;
+      touchGestureSpentRef.current = false;
     };
     const handleTouchMove = (event: TouchEvent) => {
       const start = touchStartYRef.current;
       const current = event.touches[0]?.clientY;
-      if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
-        armScrollUp();
-      }
+      if (start === null || current === undefined || current <= start + TOUCH_DRAG_SLOP_PX) return;
+      if (touchGestureSpentRef.current) return;
+      touchGestureSpentRef.current = true;
+      noteUpwardGesture();
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     el.addEventListener("wheel", handleWheel, { passive: true });
@@ -2606,6 +2650,7 @@ export function HistoryAutoLoader({
       generationRef.current = historyGeneration;
       // A new window is a new open: require a fresh upward scroll.
       scrolledUpRef.current = false;
+      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
       lastScrollTopRef.current = el.scrollTop;
     }
 
@@ -2625,6 +2670,16 @@ export function HistoryAutoLoader({
       el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
+    }
+
+    // A prepend re-feeding the chain spends gesture budget: without a bound,
+    // folded (height-neutral) pages would re-feed fetches until history ran
+    // out. A real-height prepend passes here too until its async anchor
+    // scroll lands; that upward-scroll refill keeps scroll-range paging
+    // unchanged. Once spent, the chain waits for the reader's next gesture.
+    if (itemsChanged && !scrollPositionChanged) {
+      if (chainBudgetRef.current <= 0) return;
+      chainBudgetRef.current -= 1;
     }
 
     void state.loadMoreHistory();
@@ -2665,12 +2720,15 @@ const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
  * whenever any content sits above the anchor, so older history stays reachable
  * by scroll-up without a viewport-fill loop.
  *
- * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
- * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
- * once the reply alone exceeds the viewport the spacer collapses to 0 and
- * normal stick-to-bottom following resumes. The "content-bottom" edge is the
- * spacer's own top, whose position is fixed by the content above it and so is
- * independent of the height we set — the measurement can't feed back on itself.
+ * Height = clientHeight − (anchor-top → spacer-top) − top gap − the column's
+ * trailing padding, clamped to ≥ 0: a short reply leaves empty space below
+ * (anchor stays pinned at top); once the reply alone exceeds the viewport the
+ * spacer collapses to 0 and normal stick-to-bottom following resumes. The
+ * trailing padding scrolls below the spacer, so reserving it again would leave
+ * the document taller than the viewport — a phantom scroll range that paints a
+ * scrollbar over a fully-visible transcript. Every measured edge is fixed by
+ * content outside the height we set — the measurement can't feed back on
+ * itself.
  */
 export function LatestTurnSpacer({
   scrollElement,
@@ -2743,11 +2801,22 @@ export function LatestTurnSpacer({
     // rect diffs are scroll-invariant (both edges shift together), and the
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
-    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
+    const spacerRect = spacerEl.getBoundingClientRect();
+    const anchorToEnd = spacerRect.top - anchor.getBoundingClientRect().top;
+    // The content column's trailing padding sits below the spacer and scrolls
+    // with it; leaving it out of the reservation keeps the document from
+    // outgrowing the viewport by that padding (a phantom scroll range that
+    // paints a scrollbar thumb over a fully-visible transcript).
+    const trailing = spacerEl.parentElement
+      ? Math.max(0, spacerEl.parentElement.getBoundingClientRect().bottom - spacerRect.bottom)
+      : 0;
     const viewport = scrollEl.clientHeight;
     const next = Math.max(
       0,
-      Math.min(viewport - anchorToEnd - topGapPx, viewport * MAX_RESERVED_VIEWPORT_FRACTION),
+      Math.min(
+        viewport - anchorToEnd - topGapPx - trailing,
+        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
+      ),
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
@@ -4009,6 +4078,13 @@ function ComposerStatusLine({
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
 
+  // PR link → opens the workspace rail's GitHub tab. Shares the info query's
+  // cache with the GitHub panel, so opening the tab is instant.
+  const github = useGithubInfo(conversationId ?? undefined);
+  const openGithubTab = useOpenGithubTab();
+  const prNumber = github.data?.pr?.number ?? null;
+  const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
+
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
   // Hidden on sub-agent sessions — the header's child-session slot owns the
@@ -4028,7 +4104,8 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
+  if (!showBranch && !showPr && !showPlanMode && !showGoal && !showRing && !showHostBadge)
+    return null;
 
   return (
     <div
@@ -4051,6 +4128,18 @@ function ComposerStatusLine({
               {gitBranch}
             </span>
           </span>
+        )}
+        {showPr && (
+          <button
+            type="button"
+            data-testid="composer-pr-link"
+            onClick={() => openGithubTab?.()}
+            title="View this PR in the GitHub tab"
+            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <GithubMono size={14} aria-hidden />
+            <span className="tabular-nums underline underline-offset-2">#{prNumber}</span>
+          </button>
         )}
       </div>
       {/* Right: model/effort and context ring, never shrinks. */}
@@ -4152,8 +4241,14 @@ function SubagentComposerTray({ label }: { label: string }) {
  * corner radius (CSS can't animate to an `auto` size), growing upward out of an
  * absolute layer over a hidden spacer so the composer below never shifts. A
  * count-only edge (older runner, no per-shell detail) stays a plain tally.
+ *
+ * The whole pill floats as an overlay pinned just above the composer (its form
+ * is `relative`, this is `bottom-full`) rather than taking a flow row — a
+ * reserved row would butt against the transcript's bottom overflow edge and
+ * clip the last line. Only the pill itself takes pointer events so the
+ * transcript underneath stays interactive.
  */
-function BackgroundTaskPill() {
+export function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const [open, setOpen] = useState(false);
@@ -4177,96 +4272,104 @@ function BackgroundTaskPill() {
   const showCard = open && canExpand;
 
   return (
-    <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div className="relative">
-        {/* Reserves the collapsed footprint so the absolute, upward-growing
+    // Floats above the composer instead of taking a flow row: a reserved row
+    // would butt against the transcript's bottom overflow edge and clip its
+    // last line. Pinned to the composer's top (bottom-full) and re-applying the
+    // form's px-4/md:px-6 inset so the pill lines up with the composer card.
+    // pointer-events-none lets the transcript underneath stay scrollable /
+    // selectable — only the pill itself re-enables them.
+    <div className="pointer-events-none absolute inset-x-0 bottom-full px-4 md:px-6">
+      <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
+        <div className="pointer-events-auto relative">
+          {/* Reserves the collapsed footprint so the absolute, upward-growing
             card never shoves the composer. */}
-        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-            <span>
-              {bgCount} background task{bgCount === 1 ? "" : "s"}
-            </span>
+          <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+            <div className="flex items-center gap-1.5 whitespace-nowrap">
+              <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {bgCount} background task{bgCount === 1 ? "" : "s"}
+              </span>
+            </div>
           </div>
-        </div>
-        <div
-          role="status"
-          data-testid="background-task-pill"
-          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
-          tabIndex={canExpand ? 0 : undefined}
-          // Hover opens ONLY for a real mouse. On touch, opening on emulated
-          // hover triggers iOS's "first tap reveals hover, second tap clicks"
-          // heuristic — which swallows the first tap inconsistently. Touch opens
-          // via onClick instead, so the first tap always lands.
-          onPointerEnter={(e) => {
-            if (e.pointerType === "mouse" && canExpand) setOpen(true);
-          }}
-          onPointerLeave={(e) => {
-            if (e.pointerType === "mouse") setOpen(false);
-          }}
-          // Tap/click: open and focus the pill so onBlur can close it on
-          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
-          // non-button element otherwise won't focus it).
-          onClick={(e) => {
-            if (!canExpand) return;
-            setOpen(true);
-            e.currentTarget.focus({ preventScroll: true });
-          }}
-          onFocus={() => canExpand && setOpen(true)}
-          onBlur={(e) => {
-            // Close when focus leaves the pill entirely (tap/click outside,
-            // Tab away); staying open if it moves to a child.
-            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
-          }}
-          style={box ? { width: box.width, height: box.height } : undefined}
-          className={cn(
-            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
-            showCard && "z-10 shadow-menu",
-          )}
-        >
           <div
-            ref={contentRef}
-            // Cap at Tailwind's `md` container (28rem/448px), but never wider
-            // than the viewport minus a margin so it can't overflow on a narrow
-            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
-            // pill sits at px-1) so the card's right edge, ring included, stays
-            // inside the composer rather than overhanging it.
-            style={
-              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
-            }
-            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
-          >
-            {showCard ? (
-              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
-                {bgTasks.map((task, i) => {
-                  const label = task.description || task.command || "Background shell";
-                  const cmd = task.command && task.command !== label ? task.command : null;
-                  return (
-                    <li key={task.id ?? i} className="flex items-start gap-2">
-                      <SquareTerminalIcon
-                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
-                        aria-hidden="true"
-                      />
-                      <div className="min-w-0">
-                        <div className="truncate text-foreground">{label}</div>
-                        {cmd ? (
-                          <div className="truncate font-mono text-xs text-muted-foreground">
-                            {cmd}
-                          </div>
-                        ) : null}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : (
-              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
-                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-                <span>
-                  {bgCount} background task{bgCount === 1 ? "" : "s"}
-                </span>
-              </div>
+            role="status"
+            data-testid="background-task-pill"
+            aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+            tabIndex={canExpand ? 0 : undefined}
+            // Hover opens ONLY for a real mouse. On touch, opening on emulated
+            // hover triggers iOS's "first tap reveals hover, second tap clicks"
+            // heuristic — which swallows the first tap inconsistently. Touch opens
+            // via onClick instead, so the first tap always lands.
+            onPointerEnter={(e) => {
+              if (e.pointerType === "mouse" && canExpand) setOpen(true);
+            }}
+            onPointerLeave={(e) => {
+              if (e.pointerType === "mouse") setOpen(false);
+            }}
+            // Tap/click: open and focus the pill so onBlur can close it on
+            // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+            // non-button element otherwise won't focus it).
+            onClick={(e) => {
+              if (!canExpand) return;
+              setOpen(true);
+              e.currentTarget.focus({ preventScroll: true });
+            }}
+            onFocus={() => canExpand && setOpen(true)}
+            onBlur={(e) => {
+              // Close when focus leaves the pill entirely (tap/click outside,
+              // Tab away); staying open if it moves to a child.
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+            }}
+            style={box ? { width: box.width, height: box.height } : undefined}
+            className={cn(
+              "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+              showCard && "z-10 shadow-menu",
             )}
+          >
+            <div
+              ref={contentRef}
+              // Cap at Tailwind's `md` container (28rem/448px), but never wider
+              // than the viewport minus a margin so it can't overflow on a narrow
+              // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+              // pill sits at px-1) so the card's right edge, ring included, stays
+              // inside the composer rather than overhanging it.
+              style={
+                showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+              }
+              className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+            >
+              {showCard ? (
+                <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                  {bgTasks.map((task, i) => {
+                    const label = task.description || task.command || "Background shell";
+                    const cmd = task.command && task.command !== label ? task.command : null;
+                    return (
+                      <li key={task.id ?? i} className="flex items-start gap-2">
+                        <SquareTerminalIcon
+                          className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                          aria-hidden="true"
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-foreground">{label}</div>
+                          {cmd ? (
+                            <div className="truncate font-mono text-xs text-muted-foreground">
+                              {cmd}
+                            </div>
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                  <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {bgCount} background task{bgCount === 1 ? "" : "s"}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -4856,8 +4959,6 @@ export function Composer({
   // "recall replaced the value" (keep cursor).
   const recallingRef = useRef(false);
 
-  const [isDragActive, setIsDragActive] = useState(false);
-
   const addFiles = (incoming: File[]) => {
     // Reject unsupported types (only images, PDF, and text/code) and
     // oversized files up front — before the upload — with a friendly
@@ -4873,33 +4974,14 @@ export function Composer({
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(false);
-    const dropped = Array.from(e.dataTransfer.files);
-    if (dropped.length > 0) addFiles(dropped);
-  };
-
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    // Only clear the active state when the pointer leaves the container
-    // itself, not when it moves between child elements inside it.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setIsDragActive(false);
-  };
+  // Files dropped anywhere in the chat column attach here, not just on the
+  // composer box. Scoped to the column so the sidebar and workspace rail keep
+  // their own drag behavior; with no such ancestor the card is the target.
+  const [dropTarget, setDropTarget] = useState<HTMLElement | null>(null);
+  const bindComposerCard = useCallback((el: HTMLDivElement | null) => {
+    setDropTarget(el?.closest<HTMLElement>("[data-chat-surface]") ?? el);
+  }, []);
+  const isDragActive = useFileDropTarget(dropTarget, addFiles);
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -5168,7 +5250,10 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn("chat-composer-form px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
+      className={cn(
+        "chat-composer-form relative px-4 md:px-6",
+        isTerminalFirst ? "pb-1.5" : "pb-3",
+      )}
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -5186,9 +5271,9 @@ export function Composer({
         }}
       />
       {/* Background tasks that outlive the turn show as a pill, not the
-          "Working…" shimmer. Sits above the queued/sub-agent trays: those dock
-          onto the composer card with a negative margin, so nothing may come
-          between them and the card. Self-gates to null otherwise. */}
+          "Working…" shimmer. Floats as an overlay above the composer (the form
+          is `relative`) rather than a flow row, so it never clips the
+          transcript's last line. Self-gates to null otherwise. */}
       <BackgroundTaskPill />
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
@@ -5217,10 +5302,13 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+      {/* Drop cue, spanning the chat column this composer belongs to. */}
+      {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
       <div
+        ref={bindComposerCard}
         // Opaque card edge for transcript clearance; status shelf below is translucent.
         data-composer-card
         className={cn(
@@ -5228,16 +5316,7 @@ export function Composer({
           CHAT_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
-        onDrop={handleDrop}
-        onDragOver={handleDragOver}
-        onDragEnter={handleDragEnter}
-        onDragLeave={handleDragLeave}
       >
-        {isDragActive && (
-          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-ui font-medium text-ring">Drop files here</span>
-          </div>
-        )}
         {/* Slash-command suggestions — floats above the composer box */}
         {menuOpen && (
           <SlashCommandMenu
