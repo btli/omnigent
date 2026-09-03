@@ -4388,6 +4388,41 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_codex_c
     assert error["message"] == "You've hit your usage limit."
 
 
+async def test_post_external_session_status_failed_keeps_wire_output_with_native_code_for_claude(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A claude-native forwarder's ``output`` keeps the harness-neutral code.
+
+    The claude-native forwarder carries its StopFailure reason on the wire the
+    same way codex does; labelling that ``codex_turn_error`` would misattribute
+    the failure to the wrong harness.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(
+        client,
+        name="claude-native-ui",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+
+    detail = "model_not_found: There's an issue with the selected model (claude-fable-5)."
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "failed", "output": detail}},
+    )
+    assert resp.status_code == 202, resp.text
+    error = published[0][1]["error"]
+    assert error is not None
+    assert error["code"] == "native_turn_error"
+    assert error["message"] == detail
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
