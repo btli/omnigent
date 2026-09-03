@@ -3519,19 +3519,17 @@ function ConversationRow({
   const showDraftIndicator = hasDraft && !isActive;
   const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
 
-  const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
+  const gestureEnabled = !selectionMode && !isEditing;
+  const dragEnabled = gestureEnabled && isOwner && !isArchived;
   const swipeActions = useSwipeActions();
+  const hasSwipeLeft = swipeActions.left !== "none";
+  const hasSwipeRight = swipeActions.right !== "none";
   // No capability gate here: the recognizer branches per-event on the active
   // sequence's `pointerType` (it only ever claims touch pointers), so it stays
   // attached even when `hasTouch` reads false — `maxTouchPoints` is a
   // point-in-time affordance signal that never re-notifies when a digitizer
   // attaches, and gating event handling on it left first touches dead.
-  const swipeEnabled =
-    !selectionMode &&
-    isOwner &&
-    !isEditing &&
-    (swipeActions.left !== "none" || swipeActions.right !== "none");
-  const gestureEnabled = !selectionMode && !isEditing;
+  const swipeEnabled = gestureEnabled && isOwner && (hasSwipeLeft || hasSwipeRight);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const rowLinkRef = useRef<HTMLAnchorElement>(null);
   const touchContextMenuRef = useRef(false);
@@ -3860,9 +3858,9 @@ function ConversationRow({
   // never reached the browser as `pan-y pan-left`.
   const swipeTouchAction = !swipeEnabled
     ? undefined
-    : swipeActions.left !== "none" && swipeActions.right !== "none"
+    : hasSwipeLeft && hasSwipeRight
       ? "pan-y"
-      : swipeActions.left !== "none"
+      : hasSwipeLeft
         ? "pan-y pan-left"
         : "pan-y pan-right";
 

@@ -1622,6 +1622,23 @@ describe("right-click context menu", () => {
   });
 });
 
+// The swipe's committed outcome: archive is a single mutate with no dialog;
+// delete opens the confirm dialog and mutates nothing.
+function expectCommitted(action: string) {
+  if (action === "archive") {
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  } else {
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  }
+}
+
+function expectNothingCommitted() {
+  expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  expect(screen.queryByText("Delete conversation?")).toBeNull();
+}
+
 describe("touch swipe actions", () => {
   // jsdom has no real touch, so drive the gesture with pointer events. The row
   // handlers gate on a primary, non-mouse pointer (see useRowSwipe); default
@@ -2042,13 +2059,7 @@ describe("touch swipe actions", () => {
 
     swipeRow(dx, 50);
 
-    if (action === "archive") {
-      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-      expect(screen.queryByText("Delete conversation?")).toBeNull();
-    } else {
-      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
-      expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    }
+    expectCommitted(action);
   });
 
   it.each([
@@ -2066,13 +2077,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
 
-    if (action === "archive") {
-      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-      expect(screen.queryByText("Delete conversation?")).toBeNull();
-    } else {
-      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
-      expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    }
+    expectCommitted(action);
   });
 
   it("commits when the final release-only segment crosses the distance threshold", () => {
@@ -2108,13 +2113,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_050);
 
-    if (action === "archive") {
-      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-      expect(screen.queryByText("Delete conversation?")).toBeNull();
-    } else {
-      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
-      expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    }
+    expectCommitted(action);
   });
 
   it.each([
@@ -2128,8 +2127,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 + dy }, 1_050);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expectNothingCommitted();
   });
 
   it.each([
@@ -2144,13 +2142,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 100 + Math.sign(dx) * 20, clientY: 100 }, 1_500);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
 
-    if (action === "archive") {
-      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-      expect(screen.queryByText("Delete conversation?")).toBeNull();
-    } else {
-      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
-      expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    }
+    expectCommitted(action);
   });
 
   it("uses the release-time direction and snapshot action after a reversal", () => {
@@ -2177,8 +2169,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 45, clientY: 100 }, 1_350);
     pointerEventAt("pointerUp", li, { clientX: 50, clientY: 100 }, 1_400);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expectNothingCommitted();
   });
 
   it("does not create a flick from an unusable pointer-up coordinate", () => {
@@ -2214,8 +2205,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_500);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_510);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expectNothingCommitted();
   });
 
   it.each([-50, 50] as const)("does not commit a noisy slow short swipe at %dpx", (dx) => {
@@ -2230,8 +2220,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_400);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_400);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expectNothingCommitted();
   });
 
   it.each([-40, 40] as const)("does not commit a slow short drag at %dpx", (dx) => {
@@ -2240,8 +2229,7 @@ describe("touch swipe actions", () => {
 
     swipeRow(dx, 500);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expectNothingCommitted();
   });
 
   it("does not treat fast vertical-dominant travel as a flick", () => {
@@ -2253,8 +2241,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 140, clientY: 160 }, 1_025);
     pointerEventAt("pointerUp", li, { clientX: 140, clientY: 160 }, 1_050);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(screen.queryByText("Delete conversation?")).toBeNull();
+    expectNothingCommitted();
   });
 
   it("resets an armed swipe when pointer capture is unexpectedly lost", () => {
