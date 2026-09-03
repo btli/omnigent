@@ -422,11 +422,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("md:pr-20");
+    expect(rowLink).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("md:pr-20");
+    expect(rowLink).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -493,6 +493,23 @@ describe("quick pin/unpin hover button", () => {
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
       "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
     );
+  });
+
+  it("keeps the hover-faded row controls inert on a fine-pointer display", () => {
+    // Opacity alone leaves a faded control tappable (a touchscreen laptop's
+    // finger lands on the invisible kebab ahead of the row), so the control
+    // cluster is pointer-events-none under the same fine-hover gate that fades
+    // it, and comes back with the same hover / focus / open-menu reveals.
+    renderSidebar();
+
+    const cluster = screen.getByTestId("conversation-row-controls");
+    expect(cluster).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+    );
+    expect(cluster).not.toHaveClass("pointer-events-none", "md:pointer-events-none");
   });
 
   it("keeps the session-row pin and kebab visible without hover on a touch tablet", () => {

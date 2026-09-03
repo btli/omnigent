@@ -206,14 +206,14 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
-// right-1 edge: on hover-capable desktop it fades on hover so the pin + kebab
-// take its place; on mobile those controls are gone, so the badge simply holds
-// the right edge. Hover-incapable md+ devices (touch tablets) keep the
-// controls persistently visible instead, so the badge shifts left of them
-// (right-20 clears the pin + archive + kebab column) rather than losing the
-// state.
+// right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
+// archive + kebab take its place; on mobile those controls are gone, so the
+// badge simply holds the right edge. Without fine hover at md+ (touch tablets)
+// the controls are persistently visible instead, so the badge shifts left of
+// them (right-20 clears the control column) and never fades — a tap's sticky
+// :hover or a keyboard focus must not drop the state there.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 [@media(not_((hover:hover)_and_(pointer:fine)))]:md:right-20";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:opacity-0 [@media(not_((hover:hover)_and_(pointer:fine)))]:md:right-20";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -3897,8 +3897,11 @@ function ConversationRowImpl({
         // `focus-within` also fires for a plain click, which shrank the reserve
         // on the selected row while the marker stayed put, sliding the title
         // under it.
-        !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
-        !selectionMode && menuOpen && "md:pr-20",
+        // Gated on fine hover like the reveals themselves: without it the
+        // persistent touch-tablet reserve above stays put.
+        !selectionMode &&
+          `[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pr-20 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pr-20`,
+        !selectionMode && menuOpen && "[@media((hover:hover)_and_(pointer:fine))]:md:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -4167,7 +4170,19 @@ function ConversationRowImpl({
             gap to its left. Hidden entirely while selecting (bulk mode owns the
             row controls). */}
         {!selectionMode && (
-          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+          <div
+            data-testid="conversation-row-controls"
+            className={cn(
+              "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+              // While hover-faded on a fine-pointer display the controls must
+              // not hit-test either (opacity alone leaves them tappable on a
+              // touchscreen laptop, ahead of the row's tap/swipe), so they go
+              // inert until the same hover/focus/open state that reveals them —
+              // the section headers' controls use the identical gate.
+              "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
+              "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+            )}
+          >
             {/* Archived rows omit the pin entirely: pinning is meaningless there
                 (archive outranks pin), so there's no pin action even on hover. */}
             {!isArchived && (
