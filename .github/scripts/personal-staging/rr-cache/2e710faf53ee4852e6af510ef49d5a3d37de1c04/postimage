@@ -21,8 +21,12 @@
 // document root, so behavior is unchanged.
 
 import { getStyleRoot } from "./host";
+import { loadFontByFamily } from "./webFontLoader";
 
-import { createCssFontFamilyPreference } from "./cssFontFamilyPreference";
+import {
+  createCssFontFamilyPreference,
+  normalizeFontFamily,
+} from "./cssFontFamilyPreference";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
@@ -146,5 +150,16 @@ export function writeUiFontFamily(name: string): void {
  * This is the single source of the DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
-  uiFontFamilyPreference.apply(name);
+  const root = getStyleRoot();
+  if (!root) return;
+  const normalized = normalizeFontFamily(name);
+  if (!normalized) {
+    root.style.removeProperty("--ui-font-family");
+    return;
+  }
+  void loadFontByFamily(normalized, "sans");
+  root.style.setProperty(
+    "--ui-font-family",
+    `${normalized}, ${UI_FONT_FAMILY_FALLBACK}`,
+  );
 }
