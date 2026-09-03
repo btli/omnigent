@@ -49,7 +49,6 @@ import {
   MailIcon,
   MailOpenIcon,
   MessageCircleDashedIcon,
-  MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -63,6 +62,7 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
+  SquarePenIcon,
   Trash2Icon,
   UsersIcon,
   WalletIcon,
@@ -78,7 +78,6 @@ import {
   MeasuringStrategy,
   MouseSensor,
   pointerWithin,
-  TouchSensor,
   useDraggable,
   useDroppable,
   useSensor,
@@ -185,8 +184,17 @@ import {
   useConversationReadState,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import {
+  finishActiveRowGesture,
+  ROW_MENU_SYNTHETIC,
+  ROW_SWIPE_COMMIT_PX,
+  RowGesturePointerSensor,
+  useRowGesture,
+} from "@/hooks/useRowGesture";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
@@ -229,11 +237,14 @@ import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
-// trailing icon edge in every viewport: on desktop it fades on hover so the pin
-// + kebab take its place; on mobile those controls are gone, so the badge holds
-// that edge.
+// right-1 edge: on hover-capable desktop it fades on hover so the pin + kebab
+// take its place; on mobile those controls are gone, so the badge simply holds
+// the right edge. Hover-incapable md+ devices (touch tablets) keep the
+// controls persistently visible instead, so the badge shifts left of them
+// (right-20 clears the pin + archive + kebab column) rather than losing the
+// state.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 [@media(not_((hover:hover)_and_(pointer:fine)))]:md:right-20";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -245,7 +256,6 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
-
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
 const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
@@ -913,7 +923,7 @@ function SidebarImpl({
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
-          "conversations-sidebar flex flex-col bg-card md:select-none",
+          "conversations-sidebar flex flex-col bg-card md:flex-row md:select-none",
           // Mobile (default): a fixed drawer that slides in via translate-x
           // and stops short of the right edge, leaving a tappable strip of the
           // chat behind it. The floating-card treatment below is desktop-only.
@@ -944,7 +954,7 @@ function SidebarImpl({
           // divider — no outer margin or rounding. Width (the user-resizable
           // variable) animates →0 to push main; when closed the border
           // collapses too so nothing lingers.
-          "md:translate-x-0 md:overflow-hidden",
+          "md:translate-x-0",
           // Normal desktop flow: relative panel that pushes main. Suppressed while
           // peeking so its `md:inset-auto`/`md:relative` don't override the
           // floating-card positioning below (same `md:` layer, source order wins).
@@ -954,7 +964,7 @@ function SidebarImpl({
           // ringed and shadowed, sliding+fading in from the left so it reads as an
           // overlay rather than a push.
           peek &&
-            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] md:overflow-hidden ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
           // Click-through while fading in (see peekInteractive above): the
           // click falls through to the header toggle underneath, which pins
           // the sidebar open — what the user aimed for.
@@ -985,17 +995,25 @@ function SidebarImpl({
           when closed also keeps it from being draggable while collapsed.
           Hidden while peeking too — the peek card is a fixed-width flyout, not
           a resizable panel. */}
-        {!peek && (
+        {open && !peek && (
           <div
             {...resizeHandleProps}
-            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+            data-testid="sidebar-resize-handle"
+            // Horizontal anchoring comes from the hook's inline
+            // `insetInlineEnd` (seam + outward sliver) — no `md:right-0`
+            // here, or the class would fight the inline offset.
+            className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
           />
         )}
+        {/* The content wrapper owns clipping while the absolutely positioned
+          handle enlarges the seam without consuming sidebar layout width. */}
+        {/* prettier-ignore */}
+        <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:overflow-hidden">
         {inSettings ? (
           <SettingsSidebarBody onNavClick={onNavClick} />
         ) : (
           <>
-            {/* sidebar-header-row is the hook for the macOS Electron shell, where
+          {/* sidebar-header-row is the hook for the macOS Electron shell, where
           this row shares the window's top strip with the traffic lights: the
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
@@ -1040,7 +1058,7 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1072,7 +1090,7 @@ function SidebarImpl({
                     onNavClick(e);
                   }}
                 >
-                  <MessageCirclePlusIcon
+                  <SquarePenIcon
                     className={cn(
                       "ui-icon",
                       isNewChatPage
@@ -1268,6 +1286,7 @@ function SidebarImpl({
             <SidebarServerPicker />
           </>
         )}
+        </div>
       </aside>
     </>
   );
@@ -1916,7 +1935,7 @@ function ConversationList({
       keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
     }),
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+    useSensor(RowGesturePointerSensor),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const isProject = event.active.data.current?.type === "project-order";
@@ -1954,6 +1973,7 @@ function ConversationList({
         if (from >= 0 && to >= 0 && from !== to) saveOrder.mutate(arrayMove(projects, from, to));
         return;
       }
+      finishActiveRowGesture();
       const dragged = activeDrag;
       setActiveDrag(null);
       if (!dragged) return;
@@ -2226,6 +2246,7 @@ function ConversationList({
           )
         }
         onDragCancel={() => {
+          finishActiveRowGesture(true);
           setActiveDrag(null);
           setDraggedProject(null);
           setOverProject(null);
@@ -2233,7 +2254,7 @@ function ConversationList({
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex flex-col gap-6"
+            className="flex flex-col gap-4"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -2760,38 +2781,38 @@ function SectionHeader({
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
             )
-          : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
     >
       {icon ? (
         // Headers with a leading icon (project folders) swap the folder for a
-        // chevron on desktop hover/focus, so the caret takes the icon's place
-        // rather than trailing the name. Mobile (no hover) keeps the folder
-        // icon and shows the trailing chevron below.
+        // chevron on fine-hover desktop, so the caret takes the icon's place
+        // rather than trailing the name. Without fine hover (mobile, touch
+        // tablets) the folder icon and the trailing chevron below stay visible.
         <span className="relative flex size-4 shrink-0 items-center justify-center">
-          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+          <span className="flex md:transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-0">
             {icon}
           </span>
           <ChevronRightIcon
             className={cn(
               "absolute size-3.5 opacity-0 transition-[transform,opacity]",
               !collapsed && "rotate-90",
-              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              "hidden md:flex [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
             )}
           />
         </span>
       ) : null}
       <span className="min-w-0 truncate">{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
-            reveal it on desktop hover/focus; icon headers show it only on mobile
-            (no hover) since desktop swaps the folder for the chevron above. */}
+            reveal it on fine-hover desktop; icon headers show it only without
+            fine hover, since desktop swaps the folder for the chevron above. */}
       <ChevronRightIcon
         className={cn(
           "size-3.5 shrink-0 transition-[transform,opacity]",
           !collapsed && "rotate-90",
           icon
-            ? "md:hidden"
-            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            ? "[@media((hover:hover)_and_(pointer:fine))]:md:hidden"
+            : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
         )}
       />
       {/* A hidden row inside this collapsed section carries a marker — surface
@@ -2850,28 +2871,22 @@ function SessionFilterMenu({
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
   return (
     <DropdownMenu>
-      <Tooltip disableHoverableContent>
+      <Tooltip>
         <TooltipTrigger asChild>
-          {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
-          <span className="inline-flex shrink-0">
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Filter sessions"
-                data-testid="session-filter"
-                className="text-muted-foreground"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <ListFilterIcon className="size-3.5" />
-              </Button>
-            </DropdownMenuTrigger>
-          </span>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Filter sessions"
+              data-testid="session-filter"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <ListFilterIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
         </TooltipTrigger>
-        <TooltipContent side="bottom" data-noninteractive-tooltip>
-          Filter sessions
-        </TooltipContent>
+        <TooltipContent side="bottom">Filter sessions</TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
         <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
@@ -3046,7 +3061,7 @@ function SectionGroup({
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
     </section>
   );
 }
@@ -3179,7 +3194,7 @@ function ConversationSection({
                 // control itself still reveals it.
                 <div
                   className={cn(
-                    "flex items-center rounded transition-opacity",
+                    "flex items-center transition-opacity",
                     actionHoverOnly
                       ? "[@media((hover:hover)_and_(pointer:fine))]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:opacity-100"
                       : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
@@ -3199,7 +3214,7 @@ function ConversationSection({
       )}
       {afterHeader}
       {!isCollapsed && (
-        <div className="pt-1">
+        <>
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
@@ -3217,7 +3232,7 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
+            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -3235,7 +3250,7 @@ function ConversationSection({
             </ul>
           )}
           {footer}
-        </div>
+        </>
       )}
     </section>
   );
@@ -3915,25 +3930,78 @@ function ConversationRowImpl({
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
 
-  // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
-  // owner-only, like the Move-to-project kebab item), outside selection /
-  // archive / rename modes. Dragging it onto a project folder files it there;
-  // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
-  // routes the drop; the row only advertises itself and its source project +
-  // pinned state via the draggable `data`.
+  const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing && !isProvisionalRow;
+  const swipeActions = useSwipeActions();
+  // No capability gate here: the recognizer branches per-event on the active
+  // sequence's `pointerType` (it only ever claims touch pointers), so it stays
+  // attached even when `hasTouch` reads false — `maxTouchPoints` is a
+  // point-in-time affordance signal that never re-notifies when a digitizer
+  // attaches, and gating event handling on it left first touches dead.
+  const swipeEnabled =
+    !isProvisionalRow &&
+    !selectionMode &&
+    isOwner &&
+    !isEditing &&
+    (swipeActions.left !== "none" || swipeActions.right !== "none");
+  const gestureEnabled = !selectionMode && !isEditing && !isProvisionalRow;
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const rowLinkRef = useRef<HTMLAnchorElement>(null);
+  const touchContextMenuRef = useRef(false);
+  const handleContextMenuOpenChange = useCallback((open: boolean) => {
+    setContextMenuOpen(open);
+    if (!open) {
+      if (!touchContextMenuRef.current) rowLinkRef.current?.focus({ preventScroll: true });
+      touchContextMenuRef.current = false;
+    }
+  }, []);
+  const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
+    touchContextMenuRef.current = true;
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      clientX: point.clientX,
+      clientY: point.clientY,
+    });
+    Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
+    rowLinkRef.current?.dispatchEvent(event);
+  }, []);
+  const runArchiveRef = useRef(runArchive);
+  useEffect(() => {
+    runArchiveRef.current = runArchive;
+  });
+  const handleGestureAction = useCallback((action: Exclude<SwipeAction, "none">) => {
+    if (action === "archive") runArchiveRef.current();
+    else setDeleteOpen(true);
+  }, []);
+  const closeContextMenu = useCallback(() => setContextMenuOpen(false), []);
+  const gesture = useRowGesture({
+    enabled: gestureEnabled,
+    swipeEnabled,
+    dragEnabled,
+    actions: swipeActions,
+    onAction: handleGestureAction,
+    onLongPress: openContextMenuAt,
+    onDragStart: closeContextMenu,
+    onCancel: closeContextMenu,
+  });
+
   const {
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,
     isDragging,
   } = useDraggable({
     id: conversation.id,
-    data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
+    data: {
+      type: "session",
+      label,
+      project: currentProject,
+      isPinned,
+      rowGesture: gesture.dndData,
+    },
+    disabled: !dragEnabled,
   });
-  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
-  // on the same anchor still fires a click); swallow that one click so a drag
-  // doesn't also navigate into the session. Flagged when a drag finishes,
-  // cleared on the next tick (after the click that follows pointer-up).
+  const rowGestureListeners = gesture.listeners(dragListeners);
   const justDraggedRef = useRef(false);
   const wasDraggingRef = useRef(false);
   useEffect(() => {
@@ -3946,7 +4014,6 @@ function ConversationRowImpl({
     }, 0);
     return () => clearTimeout(timer);
   }, [isDragging]);
-  // Merge the drag node ref with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
     (node: HTMLLIElement | null) => {
       rowRef.current = node;
@@ -3954,12 +4021,7 @@ function ConversationRowImpl({
     },
     [setDragNodeRef],
   );
-  // Timestamps of the last two clicks this row received, for the dblclick
-  // rename guard: the list can reorder between the two clicks of a
-  // double-click (an updated_at bump slides another row under the cursor),
-  // and only a row that saw both clicks may enter rename.
   const recentClickTimesRef = useRef<number[]>([]);
-
   if (isEditing) {
     return (
       <li>
@@ -4021,7 +4083,7 @@ function ConversationRowImpl({
     // unmounts. A failed archive reconciles the row back with its own error
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
-    if (nextArchived) showArchiveUndoToast(queryClient, [conversation], navigate);
+    if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
   }
 
   function runUnarchive() {
@@ -4087,8 +4149,14 @@ function ConversationRowImpl({
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
     <Link
+      ref={rowLinkRef}
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      draggable={false}
+      onContextMenu={(e) => {
+        if (isDragging) e.preventDefault();
+      }}
+      onKeyDown={gesture.clearClickSuppression}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -4109,6 +4177,16 @@ function ConversationRowImpl({
               : hasTrailingIndicator
                 ? "pr-8"
                 : "pr-2"),
+        // Hover-incapable md+ devices (touch tablets) keep the controls
+        // persistently visible with the badge shifted left of them, so the
+        // reserve is persistent too: controls (pr-20) plus the badge's own
+        // width when one is present.
+        !selectionMode &&
+          (sessionState?.kind === "awaiting"
+            ? "[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-48"
+            : hasTrailingIndicator
+              ? "[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-27"
+              : "[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-20"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -4122,8 +4200,8 @@ function ConversationRowImpl({
       )}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
+        // Swallow the click that trails a resolved touch gesture or drag.
+        if (gesture.consumeClick() || justDraggedRef.current) {
           e.preventDefault();
           return;
         }
@@ -4185,26 +4263,134 @@ function ConversationRowImpl({
     );
   }
 
+  const renderContextMenu = (trigger: ReactNode) => (
+    <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
+      <ContextMenuTrigger asChild>{trigger}</ContextMenuTrigger>
+      <ContextMenuContent className="min-w-44 touch-pan-y select-none">
+        <ConversationMenuItems
+          components={contextBundle}
+          setMenuOpen={() => {}}
+          {...menuItemProps}
+        />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+
+  const swipingAction: SwipeAction =
+    gesture.dx < 0
+      ? (gesture.actions?.left ?? swipeActions.left)
+      : gesture.dx > 0
+        ? (gesture.actions?.right ?? swipeActions.right)
+        : "none";
+  const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
+  const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
+  const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
+  // Chrome samples touch-action at pointerdown, so a direction granted to the
+  // browser is lost to the recognizer for the whole stream — cede only the
+  // inert horizontal direction, never one with a configured action. CSS pan
+  // directions name the SCROLL direction, the reverse of finger travel
+  // (Chromium requires kPanLeft for deltaX>0, i.e. a rightward finger), so a
+  // left action — fired by a leftward finger = a rightward pan — must
+  // withhold pan-right and may cede pan-left, and vice versa.
+  //
+  // This must be a single composed `touch-action` VALUE, applied inline:
+  // Tailwind's `touch-pan-y` + `touch-pan-left` are same-property utilities
+  // that don't compose — stylesheet order picks one, so the one-sided grant
+  // never reached the browser as `pan-y pan-left`.
+  const swipeTouchAction = !swipeEnabled
+    ? undefined
+    : swipeActions.left !== "none" && swipeActions.right !== "none"
+      ? "pan-y"
+      : swipeActions.left !== "none"
+        ? "pan-y pan-left"
+        : "pan-y pan-right";
+
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
-      onMouseDown={(event) => {
-        // Portaled dialogs bubble through this row but must not start a drag.
-        if (event.currentTarget.contains(event.target as Node)) {
-          dragListeners?.onMouseDown?.(event);
-        }
+      data-testid="conversation-swipe-frame"
+      {...rowGestureListeners}
+      onContextMenuCapture={(e) => {
+        if (!(ROW_MENU_SYNTHETIC in e.nativeEvent)) touchContextMenuRef.current = false;
       }}
-      onTouchStart={(event) => {
-        if (event.currentTarget.contains(event.target as Node)) {
-          dragListeners?.onTouchStart?.(event);
-        }
+      onContextMenu={(e) => {
+        if (ROW_MENU_SYNTHETIC in e.nativeEvent) return;
+        if (ownsPointer || isDragging) e.preventDefault();
       }}
-      className={cn("group relative", isDragging && "opacity-40")}
+      className={cn(
+        "group relative",
+        isSwiping && "mx-1",
+        isDragging && "opacity-40",
+        gesture.phase === "armed" && "z-10 scale-[1.01] shadow-sm",
+        ownsPointer && "touch-none",
+      )}
+      // Keep vertical scrolling native while claiming the horizontal axis for
+      // the swipe: without this the browser can take the horizontal pan (or
+      // back-navigation gesture) and cancel the gesture mid-drag. Only where
+      // a swipe can actually fire, so rows without one keep default behavior.
+      // Inline style, not utility classes — see the swipeTouchAction comment.
+      style={!ownsPointer && swipeTouchAction ? { touchAction: swipeTouchAction } : undefined}
     >
-      {/* Right-click anywhere on the row opens the same actions as the kebab.
+      {/* Clip the hint to the vacated strip so it cannot overlap the moving
+          surface. The threshold also scales the glyph, avoiding a color-only cue. */}
+      {isSwiping && (
+        <div
+          aria-hidden
+          data-testid="conversation-swipe-reveal"
+          className={cn(
+            "pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[var(--radius-otto-sm)]",
+            "transition-colors",
+            swipingAction === "delete"
+              ? swipeCommitted
+                ? "bg-destructive/20 text-destructive"
+                : "bg-destructive/10 text-destructive/70"
+              : swipeCommitted
+                ? "bg-accent text-accent-foreground"
+                : "bg-accent/50 text-accent-foreground/70",
+          )}
+          style={gesture.dx > 0 ? { left: 0, width: gesture.dx } : { right: 0, width: -gesture.dx }}
+        >
+          <span
+            className={cn(
+              "flex items-center transition-transform",
+              swipeCommitted ? "scale-110" : "scale-100",
+            )}
+          >
+            {swipingAction === "delete" ? (
+              <Trash2Icon className="size-4" />
+            ) : isArchived ? (
+              // Archiving toggles, so on an archived row the gesture restores —
+              // mirror the kebab's Unarchive glyph rather than promising a re-archive.
+              <ArchiveRestoreIcon className="size-4" />
+            ) : (
+              <ArchiveIcon className="size-4" />
+            )}
+          </span>
+        </div>
+      )}
+      {/* Inset instead of translating so the title re-truncates and every row
+          control stays inside the panel. */}
+      <div
+        data-testid="conversation-swipe-surface"
+        className={cn(
+          "relative",
+          isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
+          // Transition only at rest, so the row eases back when the gesture
+          // ends but tracks the finger 1:1 while swiping.
+          gesture.dx === 0 && "transition-[margin] duration-200",
+        )}
+        style={
+          gesture.dx !== 0
+            ? gesture.dx < 0
+              ? { marginRight: -gesture.dx }
+              : { marginLeft: gesture.dx }
+            : undefined
+        }
+      >
+        {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
@@ -4213,10 +4399,33 @@ function ConversationRowImpl({
           hovering surfaces the project flyout — the trigger sits innermost so
           both the context menu and the hover card keep their handlers/refs on
           the Link. */}
-      {selectionMode ? (
-        projectFlyoutName ? (
+        {selectionMode ? (
+          projectFlyoutName ? (
+            <HoverCard openDelay={150} closeDelay={0}>
+              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+              <PinnedProjectFlyoutContent
+                title={conversation.title ?? conversation.id}
+                projectName={projectFlyoutName}
+                projectIcon={projectFlyoutIcon}
+                gitBranch={gitBranch}
+                hasError={sessionState?.kind === "error"}
+              />
+            </HoverCard>
+          ) : isMobile ? (
+            rowLink
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+              <SessionTooltipContent
+                conversation={conversation}
+                hostsById={hostsById}
+                hasError={sessionState?.kind === "error"}
+              />
+            </Tooltip>
+          )
+        ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            {renderContextMenu(<HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>)}
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
@@ -4226,270 +4435,202 @@ function ConversationRowImpl({
             />
           </HoverCard>
         ) : isMobile ? (
-          rowLink
+          renderContextMenu(rowLink)
         ) : (
           <Tooltip>
-            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+            {renderContextMenu(
+              <div className="w-full">
+                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+              </div>,
+            )}
             <SessionTooltipContent
               conversation={conversation}
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
             />
           </Tooltip>
-        )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-            projectIcon={projectFlyoutIcon}
-            gitBranch={gitBranch}
-            hasError={sessionState?.kind === "error"}
-          />
-        </HoverCard>
-      ) : isMobile ? (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      ) : (
-        <Tooltip>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <div className="w-full">
-                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-              </div>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <SessionTooltipContent
-            conversation={conversation}
-            hostsById={hostsById}
-            hasError={sessionState?.kind === "error"}
-          />
-        </Tooltip>
-      )}
-      {selectionMode ? (
-        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
-          {isSelected ? (
-            <SquareCheckIcon className="size-4 text-primary" />
-          ) : (
-            <SquareIcon className="size-4 text-muted-foreground" />
-          )}
-        </span>
-      ) : hasSessionIndicator ? (
-        <span
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            "right-1",
-            // The wide "awaiting" pill keeps its natural width; every other
-            // marker (running/starting/unseen dot, or the draft pencil) sits in
-            // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
-          )}
-        >
-          {sessionState !== null ? (
-            <SessionStateBadge state={sessionState} />
-          ) : (
-            <span
-              role="img"
-              aria-label="Draft"
-              data-testid="conversation-draft-indicator"
-              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
-            >
-              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
-            </span>
-          )}
-        </span>
-      ) : null}
-      {!selectionMode && showSharedIndicator && (
-        <span
-          role="img"
-          aria-label="Shared session"
-          title="Shared with you"
-          className={cn(
-            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            hasSessionIndicator ? "right-8" : "right-1",
-          )}
-        >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-        </span>
-      )}
-      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
-          row, so their spacing is defined once (gap-0.5) and stays aligned
-          with the project-folder header actions, which use the same pattern.
-          The kebab is the rightmost child (pinned to right-1); the pin sits a
-          gap to its left. Hidden entirely while selecting (bulk mode owns the
-          row controls). */}
-      {!selectionMode && (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
-              {/* Archived rows omit the pin entirely: pinning is meaningless there
-              (archive outranks pin), so there's no pin action even on hover. */}
-              {!isArchived && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {!isPinned && atPinCap ? "Unpin a session first" : isPinned ? "Unpin" : "Pin"}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                      data-testid="quick-pin-conversation"
-                      aria-disabled={!isPinned && atPinCap}
-                      className={cn(
-                        // Desktop-only quick affordance: hidden on mobile (the kebab's
-                        // Pin item below covers that), hover/focus-revealed from `md`
-                        // up. Pinned rows no longer keep a persistent pin marker, since
-                        // the "Pinned" section header (and pinned-first ordering inside
-                        // a project) already conveys the pinned state. Revealed glyph:
-                        // unpin if pinned, pin otherwise.
-                        //
-                        // `md:inline-flex` (not `md:block`): the Button base is
-                        // `inline-flex` and relies on it for `items-center
-                        // justify-center` to center the icon. `md:block` would override
-                        // that display and collapse the centering, leaving the glyph
-                        // pinned to the top-left of the button — so keep the flex
-                        // display when revealing it.
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        onTogglePinned(conversation.id);
-                      }}
-                    >
-                      {isPinned ? (
-                        <PinOffIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <PinIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-              {/* Archive is owner-only, same as the kebab's Archive item; non-owners
-              don't get the quick affordance and instead see that item disabled
-              with an explanation. */}
-              {isOwner && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                      data-testid="quick-archive-conversation"
-                      className={cn(
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (!isArchived) {
-                          runArchive();
-                        } else {
-                          runUnarchive();
-                        }
-                      }}
-                    >
-                      {isArchived ? (
-                        <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-
-              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-                <DropdownMenuTrigger asChild>
+        )}
+        {selectionMode ? (
+          <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
+            {isSelected ? (
+              <SquareCheckIcon className="size-4 text-primary" />
+            ) : (
+              <SquareIcon className="size-4 text-muted-foreground" />
+            )}
+          </span>
+        ) : hasSessionIndicator ? (
+          <span
+            className={cn(
+              SESSION_STATE_SLOT_CLASS,
+              // The wide "awaiting" pill keeps its natural width; every other
+              // marker (running/starting/unseen dot, or the draft pencil) sits in
+              // the fixed centered box so it lines up under the kebab.
+              isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+            )}
+          >
+            {sessionState !== null ? (
+              <SessionStateBadge state={sessionState} />
+            ) : (
+              <span
+                role="img"
+                aria-label="Draft"
+                data-testid="conversation-draft-indicator"
+                className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
+              >
+                <MessageCircleDashedIcon aria-hidden className="size-3.5" />
+              </span>
+            )}
+          </span>
+        ) : null}
+        {!selectionMode && showSharedIndicator && (
+          <span
+            role="img"
+            aria-label="Shared session"
+            title="Shared with you"
+            className={cn(
+              "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+              hasSessionIndicator ? "right-8" : "right-1",
+            )}
+          >
+            <UsersIcon className="size-3.5" aria-hidden="true" />
+          </span>
+        )}
+        {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
+            row, so their spacing is defined once (gap-0.5) and stays aligned
+            with the project-folder header actions, which use the same pattern.
+            The kebab is the rightmost child (pinned to right-1); the pin sits a
+            gap to its left. Hidden entirely while selecting (bulk mode owns the
+            row controls). */}
+        {!selectionMode && (
+          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+            {/* Archived rows omit the pin entirely: pinning is meaningless there
+                (archive outranks pin), so there's no pin action even on hover. */}
+            {!isArchived && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                data-testid="quick-pin-conversation"
+                aria-disabled={!isPinned && atPinCap}
+                title={!isPinned && atPinCap ? "Unpin a session first" : undefined}
+                className={cn(
+                  // Desktop-only quick affordance: hidden on mobile (the kebab's
+                  // Pin item below covers that), hover/focus-revealed from `md`
+                  // up on hover-capable displays and persistently visible where
+                  // hover doesn't exist (touch tablets), matching the section
+                  // headers' capability gating. Pinned rows no longer keep a
+                  // persistent pin marker, since
+                  // the "Pinned" section header (and pinned-first ordering inside
+                  // a project) already conveys the pinned state. Revealed glyph:
+                  // unpin if pinned, pin otherwise.
+                  //
+                  // `md:inline-flex` (not `md:block`): the Button base is
+                  // `inline-flex` and relies on it for `items-center
+                  // justify-center` to center the icon. `md:block` would override
+                  // that display and collapse the centering, leaving the glyph
+                  // pinned to the top-left of the button — so keep the flex
+                  // display when revealing it.
+                  "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:opacity-100",
+                )}
+                onClick={(e) => {
+                  // Keep the toggle click off the surrounding Link (no navigation).
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onTogglePinned(conversation.id);
+                }}
+              >
+                {isPinned ? (
+                  <PinOffIcon className="size-3.5" data-icon-size="14" />
+                ) : (
+                  <PinIcon className="size-3.5" data-icon-size="14" />
+                )}
+              </Button>
+            )}
+            {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+                don't get the quick affordance and instead see that item disabled
+                with an explanation. */}
+            {isOwner && (
+              <Tooltip disableHoverableContent>
+                <TooltipContent>
+                  <TooltipArrow />
+                  {isArchived ? "Unarchive conversation" : "Archive conversation"}
+                </TooltipContent>
+                <TooltipTrigger asChild>
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon-xs"
-                    aria-label="Conversation actions"
-                    data-testid="conversation-actions"
-                    // Desktop-only: the chat page's own header menu covers these
-                    // per-session actions on mobile, so the row kebab is dropped
-                    // there. From `md` up it stays hidden until hover / keyboard
-                    // focus, with `aria-expanded` keeping it surfaced while the menu
-                    // is open so the trigger doesn't vanish under the cursor.
+                    aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                    data-testid="quick-archive-conversation"
                     className={cn(
                       "text-muted-foreground transition-opacity",
                       "hidden md:inline-flex",
-                      "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                      "md:aria-expanded:opacity-100",
+                      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
+                      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:opacity-100",
                     )}
                     onClick={(e) => {
-                      // Keep the trigger click from bubbling into the Link.
+                      // Keep the toggle click off the surrounding Link (no navigation).
                       e.preventDefault();
                       e.stopPropagation();
+                      if (!isArchived) {
+                        runArchive();
+                      } else {
+                        runUnarchive();
+                      }
                     }}
                   >
-                    <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+                    {isArchived ? (
+                      <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                    ) : (
+                      <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                    )}
                   </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-44">
-                  <ConversationMenuItems
-                    components={dropdownBundle}
-                    setMenuOpen={setMenuOpen}
-                    {...menuItemProps}
-                  />
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      )}
+                </TooltipTrigger>
+              </Tooltip>
+            )}
+
+            <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Conversation actions"
+                  data-testid="conversation-actions"
+                  // The chat header owns these actions on mobile. On
+                  // hover-capable desktop the row trigger appears on hover,
+                  // focus, or while its menu is open; without hover (touch
+                  // tablets) it stays visible — there is no hover to reveal it.
+                  className={cn(
+                    "text-muted-foreground transition-opacity",
+                    "hidden md:inline-flex",
+                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-100",
+                    "[@media((hover:hover)_and_(pointer:fine))]:md:aria-expanded:opacity-100",
+                  )}
+                  onClick={(e) => {
+                    // Keep the trigger click from bubbling into the Link.
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                >
+                  <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-44">
+                <ConversationMenuItems
+                  components={dropdownBundle}
+                  setMenuOpen={setMenuOpen}
+                  {...menuItemProps}
+                />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        )}
+      </div>
       {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
       {shareOpen && (
@@ -4815,7 +4956,7 @@ function ProjectFolderActions({
                 onNavigate(e);
               }}
             >
-              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
+              <SquarePenIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -4856,7 +4997,7 @@ function ProjectFolderMenuItems({
             onNavigate(e);
           }}
         >
-          <MessageCirclePlusIcon className="size-3.5" />
+          <SquarePenIcon className="size-3.5" />
           New session
         </Link>
       </C.Item>
@@ -5240,12 +5381,7 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          // sr-only keeps a focusable/announced trigger where no fine hover can
-          // reveal it (touch/AT). On reveal, not-sr-only zeroes width/height/
-          // padding, so restore the icon-xs box (size-6) — otherwise the ghost
-          // hover highlight collapses to the glyph and mismatches the session /
-          // project-list kebabs.
-          className="sr-only text-muted-foreground focus-visible:not-sr-only focus-visible:size-6 [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex [@media((hover:hover)_and_(pointer:fine))]:size-6"
+          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -5615,7 +5751,7 @@ function BulkActionBar({
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, nonArchivedSelected, navigate);
+    showArchiveUndoToast(queryClient, nonArchivedSelected);
   }
 
   function handleUnarchive() {
@@ -5751,31 +5887,27 @@ function BulkActionBar({
                 if (!open) setMoveSearch("");
               }}
             >
-              <Tooltip disableHoverableContent>
+              <Tooltip>
                 <TooltipTrigger asChild>
-                  {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
-                  <span className="inline-flex shrink-0">
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-xs"
-                        disabled={isBusy || ownedSelected.length === 0}
-                        aria-label="Move to project"
-                        data-testid="bulk-move-to-project"
-                      >
-                        {bulkMove.isPending ? (
-                          <Loader2Icon className="size-3.5 animate-spin" />
-                        ) : (
-                          <FolderInputIcon className="size-3.5" />
-                        )}
-                      </Button>
-                    </DropdownMenuTrigger>
-                  </span>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="shrink-0"
+                      disabled={isBusy || ownedSelected.length === 0}
+                      aria-label="Move to project"
+                      data-testid="bulk-move-to-project"
+                    >
+                      {bulkMove.isPending ? (
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                      ) : (
+                        <FolderInputIcon className="size-3.5" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
                 </TooltipTrigger>
-                <TooltipContent side="bottom" data-noninteractive-tooltip>
-                  Move to project
-                </TooltipContent>
+                <TooltipContent side="bottom">Move to project</TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end" className="w-52">
                 <div className="flex items-center gap-2 border-b px-2 py-1.5">
@@ -5946,20 +6078,6 @@ function BulkActionBar({
       </Dialog>
     </>
   );
-}
-
-/**
- * Returns true on mobile viewports (below the `md` breakpoint of
- * 768px). Used to gate the auto-close-on-navigation behavior — on
- * mobile the sidebar is a full-screen overlay so dismissing on action
- * is what reveals the destination; on desktop the sidebar pushes content
- * aside and staying open is more useful.
- *
- * SSR-safe (returns false when window is undefined).
- */
-export function isMobileViewport(): boolean {
-  if (typeof window === "undefined") return false;
-  return !window.matchMedia("(min-width: 768px)").matches;
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)
