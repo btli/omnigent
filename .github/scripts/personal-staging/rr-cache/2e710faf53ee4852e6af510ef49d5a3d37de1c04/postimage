@@ -21,12 +21,8 @@
 // document root, so behavior is unchanged.
 
 import { getStyleRoot } from "./host";
-import { loadFontByFamily } from "./webFontLoader";
 
-import {
-  createCssFontFamilyPreference,
-  normalizeFontFamily,
-} from "./cssFontFamilyPreference";
+import { createCssFontFamilyPreference } from "./cssFontFamilyPreference";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
@@ -152,14 +148,10 @@ export function writeUiFontFamily(name: string): void {
 export function applyUiFontFamily(name: string): void {
   const root = getStyleRoot();
   if (!root) return;
-  const normalized = normalizeFontFamily(name);
+  const normalized = normalizeUiFontFamily(name);
   if (!normalized) {
     root.style.removeProperty("--ui-font-family");
     return;
   }
-  void loadFontByFamily(normalized, "sans");
-  root.style.setProperty(
-    "--ui-font-family",
-    `${normalized}, ${UI_FONT_FAMILY_FALLBACK}`,
-  );
+  root.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }
