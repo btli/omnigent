@@ -2024,7 +2024,7 @@ describe("Workspace rail maximize", () => {
     stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
-    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true });
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
@@ -2045,7 +2045,7 @@ describe("Workspace rail maximize", () => {
     stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
-    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true });
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
