@@ -207,6 +207,36 @@ class TestSettlePaneReadiness:
         assert captures["n"] == 1
         assert slept == []
 
+    @pytest.mark.parametrize("error_type", [RuntimeError, OSError])
+    def test_trust_fallback_failure_is_observable_and_nonfatal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        error_type: type[Exception],
+    ) -> None:
+        panes = iter(["Trust this folder?", "context: 0% (0/1M)"])
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: next(panes))
+        monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda _seconds: None)
+        sent: list[tuple[str, ...]] = []
+
+        def _fail_send(_socket_path: str, *args: str) -> str:
+            sent.append(args)
+            raise error_type("tmux unavailable")
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _fail_send)
+        escaped: Exception | None = None
+        with caplog.at_level("WARNING", logger=kimi_native_bridge.__name__):
+            try:
+                kimi_native_bridge._settle_pane("/s", "main", timeout_s=30.0)
+            except Exception as exc:  # pragma: no cover - assertion reports the leaked type
+                escaped = exc
+
+        assert escaped is None, f"trust fallback leaked {type(escaped).__name__}"
+        assert "could not accept Kimi trust modal with tmux Enter" in caplog.text, (
+            "trust modal fallback failure was not logged"
+        )
+        assert sent == [("send-keys", "-t", "main", "Enter")]
+
 
 class TestRegistration:
     def test_harness_is_registered(self) -> None:
