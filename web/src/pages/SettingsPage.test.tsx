@@ -489,11 +489,13 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("shows matching arrows for the two swipe directions", () => {
+  it("shows matching arrows and the archive-left/delete-right surface defaults", () => {
     renderPage("/settings/appearance");
 
     expect(screen.getByText(/Swipe left/).textContent).toBe("Swipe left ←");
     expect(screen.getByText(/Swipe right/).textContent).toBe("Swipe right →");
+    expect(screen.getByTestId("swipe-action-left")).toHaveValue("delete");
+    expect(screen.getByTestId("swipe-action-right")).toHaveValue("archive");
   });
 
   it("opens the embedded host's theme settings in a new tab", () => {
