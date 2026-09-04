@@ -1778,7 +1778,7 @@ describe("touch swipe actions", () => {
 
   it("maps the Settings swipe-left selection to the row's left-swipe action", () => {
     chooseSwipeActionInSettings("left", "delete");
-    expect(readSwipeActions()).toEqual({ left: "delete", right: "none" });
+    expect(readSwipeActions()).toEqual({ left: "delete", right: "archive" });
 
     renderSidebar();
     swipeRow(-90);
@@ -1791,7 +1791,7 @@ describe("touch swipe actions", () => {
 
   it("maps the Settings swipe-right selection to the row's right-swipe action", () => {
     chooseSwipeActionInSettings("right", "archive");
-    expect(readSwipeActions()).toEqual({ left: "archive", right: "archive" });
+    expect(readSwipeActions()).toEqual({ left: "delete", right: "archive" });
 
     renderSidebar();
     swipeRow(90);
@@ -1820,10 +1820,10 @@ describe("touch swipe actions", () => {
   });
 
   it("runs the archive path when swiping the archive-configured direction", () => {
-    // Default: swipe-left → archive. Swipe left past the commit threshold.
+    // Default: a rightward finger reveals Archive on the row's left side.
     renderSidebar();
 
-    swipeRow(-90);
+    swipeRow(90);
 
     // Archiving is a single PATCH — the server stops the runner once the flag
     // commits, so a client-side stop would race it (see runArchive).
@@ -1835,11 +1835,10 @@ describe("touch swipe actions", () => {
   });
 
   it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
-    // Map swipe-right → delete, then swipe right.
-    writeSwipeActions({ left: "archive", right: "delete" });
+    // Default: a leftward finger reveals Delete on the row's right side.
     renderSidebar();
 
-    swipeRow(90);
+    swipeRow(-90);
 
     // The confirm dialog opens — delete stays behind it, so no mutation yet.
     expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
@@ -1858,7 +1857,7 @@ describe("touch swipe actions", () => {
     renderSidebar();
     expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
 
-    swipeRow(-90);
+    swipeRow(90);
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
@@ -1917,7 +1916,7 @@ describe("touch swipe actions", () => {
     });
     fireEvent.click(screen.getByTestId("session-filter-archived"));
 
-    const swipe = moveSwipeRow(-90);
+    const swipe = moveSwipeRow(90);
     expectRevealIcons(swipe.li, {
       shows: ".lucide-archive-restore",
       hides: ".lucide-archive",
@@ -1943,7 +1942,7 @@ describe("touch swipe actions", () => {
     const touchAction = () => getComputedStyle(li()).touchAction;
     const first = renderSidebar();
     const li = conversationRow;
-    expect(touchAction()).toBe("pan-y pan-left");
+    expect(touchAction()).toBe("pan-y");
     first.unmount();
 
     writeSwipeActions({ left: "none", right: "delete" });
@@ -1980,9 +1979,10 @@ describe("touch swipe actions", () => {
   });
 
   it("keeps a jittery tap toward an inert direction navigating", () => {
-    // Default mapping leaves swipe-right inert. A 15px rightward wobble is
+    // An explicitly inert swipe-right mapping keeps a 15px rightward wobble
     // under the 25px scroll threshold, so it is still a tap — the trailing
     // click must navigate rather than be suppressed.
+    writeSwipeActions({ left: "delete", right: "none" });
     renderSidebar();
     const li = conversationRow();
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
@@ -1994,7 +1994,7 @@ describe("touch swipe actions", () => {
   });
 
   it("does nothing when swiping a direction mapped to none", () => {
-    // Default: swipe-right → none. Swipe right; nothing should fire.
+    writeSwipeActions({ left: "delete", right: "none" });
     renderSidebar();
 
     swipeRow(90);
@@ -2022,9 +2022,9 @@ describe("touch swipe actions", () => {
   it("keeps the action captured when the gesture began if Settings changes mid-swipe", () => {
     renderSidebar();
 
-    const swipe = moveSwipeRow(-90);
+    const swipe = moveSwipeRow(90);
     expectRevealIcons(swipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
-    act(() => writeSwipeActions({ left: "delete", right: "none" }));
+    act(() => writeSwipeActions({ left: "none", right: "delete" }));
     expectRevealIcons(swipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
     swipe.release();
 
@@ -2038,7 +2038,7 @@ describe("touch swipe actions", () => {
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     act(() => writeSwipeActions({ left: "none", right: "none" }));
-    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 180, clientY: 100 }, 1_500);
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
@@ -2149,9 +2149,9 @@ describe("touch swipe actions", () => {
     const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
-    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
-    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_500);
-    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_700);
+    pointerEventAt("pointerMove", li, { clientX: 120, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 160, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 180, clientY: 100 }, 1_700);
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
@@ -2161,7 +2161,7 @@ describe("touch swipe actions", () => {
     const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
-    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 180, clientY: 100 }, 1_500);
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
@@ -2408,7 +2408,7 @@ describe("touch swipe actions", () => {
   it("fires exactly once at the 72px commit boundary", () => {
     renderSidebar();
 
-    swipeRow(-72);
+    swipeRow(72);
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
@@ -2418,7 +2418,7 @@ describe("touch swipe actions", () => {
     expect(mocks.anyCoarse).toBe(true);
     renderSidebar();
 
-    swipeRow(-90);
+    swipeRow(90);
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
@@ -2430,7 +2430,7 @@ describe("touch swipe actions", () => {
     mocks.anyCoarse = false;
     renderSidebar();
 
-    swipeRow(-90);
+    swipeRow(90);
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
