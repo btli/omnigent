@@ -769,6 +769,22 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content="fix the flaky test")
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter", "Enter"]
 
+    def test_steer_follows_confirmed_submit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=2,
+            content="steer now",
+        )
+        inject_user_message(tmp_path / "bridge", content="steer now", turn_streaming=True)
+        assert [args[-1] for args in sent if args[0] == "send-keys"] == [
+            "Enter",
+            "Enter",
+            "C-s",
+        ]
+
     def test_raises_when_draft_never_submits(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
