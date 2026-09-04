@@ -933,30 +933,50 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.deepEqual(forced.calls, { cacheReads: 0, installs: 0, dialogs: 1 });
   });
 
-  it("preserves canonical loopback HTTP and HTTPS session detection", async () => {
-    const probes = [];
-    const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
-      oidcServerUrlError,
-      omnigentCli: require("../src/omnigent_cli"),
-      probeServerAuth: async (_session, serverUrl) => {
-        probes.push(serverUrl);
-        return { kind: "other" };
-      },
-      session: { defaultSession: {} },
-      setWindowAuthenticationNavigation() {},
-    });
+  it("routes loopback OIDC servers through the browser handoff", async () => {
+    const makeSession = (kind, calls) =>
+      runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie: async () => {},
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        oidcServerUrlError,
+        omnigentCli: { serverAuthEntry: () => null },
+        probeServerAuth: async (_session, serverUrl) => {
+          calls.probes.push(serverUrl);
+          return { kind };
+        },
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ serverUrl }) => {
+          calls.dialogs.push(serverUrl);
+          return true;
+        },
+        session: { defaultSession: {} },
+        setWindowAuthenticationNavigation() {},
+        shell: {},
+        URL,
+      });
 
-    const results = await Promise.all(
-      [
-        "http://localhost:6767",
-        "http://127.0.0.1:6767",
-        "http://[::1]:6767",
-        "https://server.example",
-      ].map((serverUrl) => ensureWindowOidcSession({}, serverUrl)),
-    );
+    // Every loopback spelling is probed; an OIDC-mode server (a tunneled or
+    // port-forwarded deployment) signs in via the system browser rather than
+    // rendering the IdP in-window.
+    const oidc = { probes: [], dialogs: [] };
+    const viaHandoff = makeSession("oidc", oidc);
+    const loopbacks = ["http://localhost:6767", "http://127.0.0.1:6767", "http://[::1]:6767"];
+    const results = await Promise.all(loopbacks.map((serverUrl) => viaHandoff({}, serverUrl)));
+    assert.deepEqual(results, [true, true, true]);
+    assert.deepEqual(oidc.probes, loopbacks);
+    assert.deepEqual(oidc.dialogs, loopbacks);
 
-    assert.deepEqual(results, [true, true, true, true]);
-    assert.deepEqual(probes, ["https://server.example"]);
+    // A local no-auth dev server (probe: authenticated) still connects directly.
+    const local = { probes: [], dialogs: [] };
+    const direct = makeSession("authenticated", local);
+    assert.equal(await direct({}, "http://localhost:6767"), true);
+    assert.deepEqual(local.probes, ["http://localhost:6767"]);
+    assert.deepEqual(local.dialogs, []);
   });
 
   it("completes the WebAuthn escape through ticket, cookie verification, and one reload", async () => {

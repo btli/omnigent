@@ -1465,11 +1465,11 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
 
 async function ensureWindowOidcSession(win, serverUrl, { forceInteractive = false } = {}) {
   if (oidcServerUrlError(serverUrl)) return false;
-  if (omnigentCli.isLoopbackServer(serverUrl)) {
-    setWindowAuthenticationNavigation(win, false);
-    return true;
-  }
 
+  // Loopback servers are probed like any other: an OIDC deployment reached
+  // through a tunnel/port-forward still signs in via the system browser (the
+  // ticket flow already permits loopback HTTP). A local no-auth server probes
+  // "authenticated" and connects directly, as before.
   let probe;
   try {
     probe = await probeServerAuth(session.defaultSession, serverUrl);
@@ -1851,10 +1851,9 @@ function createWindow(targetUrl, opts = {}) {
   registerOidcSessionExpiryHandoff(
     win.webContents,
     () => {
-      const pinnedServerUrl = windows.get(win)?.serverUrl ?? null;
-      return pinnedServerUrl && !omnigentCli.isLoopbackServer(pinnedServerUrl)
-        ? pinnedServerUrl
-        : null;
+      // Loopback included: an expired session on a tunneled/port-forwarded
+      // OIDC server recovers through the same browser handoff.
+      return windows.get(win)?.serverUrl ?? null;
     },
     async ({ serverUrl: expiredServerUrl, returnUrl }) => {
       const state = windows.get(win);
