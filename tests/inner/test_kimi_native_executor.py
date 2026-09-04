@@ -784,6 +784,8 @@ class TestUserMessageInjection:
             "Enter",
             "C-s",
         ]
+        enter_index = max(index for index, args in enumerate(sent) if args[-1] == "Enter")
+        assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
 
     def test_raises_when_draft_never_submits(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

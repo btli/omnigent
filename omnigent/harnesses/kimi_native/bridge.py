@@ -1119,7 +1119,7 @@ def inject_user_message(
                     "resolve it in the terminal before sending another message"
                 )
             if state.editor_content is not None and draft_seen and not state.editor_content:
-                # The accepted queued draft is now safe to steer into the running turn.
+                # Kimi >= 0.41 accepts C-s steering after the queued draft is accepted.
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
                 return
             if state.exit_armed and state.editor_content:
@@ -1147,7 +1147,7 @@ def inject_user_message(
             if _approval_pending(state) or not state.editor_present:
                 continue
             if state.editor_content is not None and draft_seen and not state.editor_content:
-                # The accepted queued draft is now safe to steer into the running turn.
+                # Kimi >= 0.41 accepts C-s steering after the queued draft is accepted.
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
                 return
             if state.exit_armed:
