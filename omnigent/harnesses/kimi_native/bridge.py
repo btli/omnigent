@@ -854,6 +854,8 @@ def inject_user_message(
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails before submission is accepted; a failed C-s steer is
         logged instead.
+    :raises OSError: If an OS-level tmux failure occurs before submission is
+        accepted.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
