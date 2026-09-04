@@ -3159,6 +3159,58 @@ def test_create_session_with_agent_records_workspace(
     assert fetched.host_id is None
 
 
+def test_create_session_with_agent_records_host_id_with_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify create_session_with_agent persists host_id alongside workspace.
+
+    The multipart ``POST /v1/sessions`` form accepts ``metadata.host_id``
+    for launching the bundled session's runner on an external host; the
+    binding must land on the row at creation so the launch flow (and the
+    session snapshot) sees it. Before this parameter existed, the
+    bundled-create path silently dropped the caller's host binding.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="5b6cf1f0662a1eab8722ca44e9d0b111",
+        agent_name="host-bound-bundle-agent",
+        agent_bundle_location="5b6cf1f0662a1eab8722ca44e9d0b111/bundle1",
+        agent_description=None,
+        workspace="/Users/corey/projects/bundled",
+        host_id="3f866cafac81246fb60ae6ceb1a738da",
+    )
+
+    fetched = conversation_store.get_conversation(created.conversation.id)
+    assert fetched is not None
+    assert fetched.host_id == "3f866cafac81246fb60ae6ceb1a738da"
+    assert fetched.workspace == "/Users/corey/projects/bundled"
+
+
+def test_create_session_with_agent_host_id_requires_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify host_id without a workspace is rejected at insert.
+
+    The ``workspace_required_for_host`` check constraint guards the
+    pairing; a caller that validated ``host_id`` but forgot the
+    workspace must fail loudly instead of writing a row the launch
+    flow can't use.
+    """
+    # MySQL reports check-constraint violations (error 3819) as
+    # OperationalError rather than IntegrityError.
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    with pytest.raises((IntegrityError, OperationalError)):
+        conversation_store.create_session_with_agent(
+            agent_id="9d1de2b7dd35c74faf05ff54c99ab222",
+            agent_name="host-no-ws-agent",
+            agent_bundle_location="9d1de2b7dd35c74faf05ff54c99ab222/bundle1",
+            agent_description=None,
+            host_id="3f866cafac81246fb60ae6ceb1a738da",
+        )
+
+
 def test_create_session_with_agent_workspace_defaults_to_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -5719,6 +5771,79 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
         ).data
     }
     assert ids == {mine.id}
+
+
+def test_list_conversations_shared_only_returns_accessible_but_not_owned(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``shared_only=True`` returns sessions Alice can access but does NOT own —
+    i.e. sessions shared with her by another user. Her own sessions are excluded."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared_by_bob = conversation_store.create_conversation()
+    shared_by_carol = conversation_store.create_conversation()
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com", "carol@example.com"):
+        perms.ensure_user(user)
+    # Alice owns "mine"
+    perms.grant("alice@example.com", mine.id, 4)
+    # Bob owns shared_by_bob and shares it with Alice (read)
+    perms.grant("bob@example.com", shared_by_bob.id, 4)
+    perms.grant("alice@example.com", shared_by_bob.id, 1)
+    # Carol owns shared_by_carol and shares it with Alice (edit)
+    perms.grant("carol@example.com", shared_by_carol.id, 4)
+    perms.grant("alice@example.com", shared_by_carol.id, 2)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            shared_only=True,
+        ).data
+    }
+    assert ids == {shared_by_bob.id, shared_by_carol.id}
+    assert mine.id not in ids
+
+
+def test_list_conversations_shared_only_empty_when_no_shared_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``shared_only=True`` returns an empty list when the user owns everything
+    accessible to them (single-user / no sharing scenario)."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("alice@example.com")
+    perms.grant("alice@example.com", mine.id, 4)
+
+    result = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        shared_only=True,
+    )
+    assert result.data == []
+
+
+def test_list_conversations_archived_only_returns_only_archived(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``archived_only=True`` returns only archived sessions; active ones are excluded."""
+    active = conversation_store.create_conversation()
+    archived = conversation_store.create_conversation()
+    conversation_store.update_conversation(archived.id, archived=True)
+
+    result = conversation_store.list_conversations(archived_only=True, include_archived=True)
+    ids = {c.id for c in result.data}
+    assert archived.id in ids
+    assert active.id not in ids
 
 
 def test_live_state_columns_round_trip_without_bumping_updated_at(
