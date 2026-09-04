@@ -707,9 +707,13 @@ def harness_setup_hint(harness: str | None) -> str:
             login = f", then run `{spec.binary} {' '.join(spec.login_args)}`"
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
-        if install_key is not None and not harness_cli_installed(install_key):
+        if install_key is not None:
             detected, required = harness_cli_version(install_key)
-            if detected is not None and required is not None:
+            if (
+                detected is not None
+                and required is not None
+                and not _harness_cli_version_value_satisfies(spec, detected)
+            ):
                 return (
                     f"upgrade the {spec.binary} CLI on that machine "
                     f"(installed {detected}; required {required}) with "
@@ -824,6 +828,11 @@ def _harness_cli_version_satisfies(
     version = _harness_cli_version_string(spec, binary, timeout)
     if version is None:
         return False
+    return _harness_cli_version_value_satisfies(spec, version)
+
+
+def _harness_cli_version_value_satisfies(spec: HarnessInstallSpec, version: str) -> bool:
+    """Check a parsed CLI version string against *spec*'s declared range."""
     try:
         parsed = Version(version)
     except InvalidVersion:
@@ -852,6 +861,22 @@ def _harness_cli_version_satisfies(
     return True
 
 
+def _resolve_harness_cli_binary(key: str, spec: HarnessInstallSpec) -> str | None:
+    """Resolve the executable whose version gate applies for *key*."""
+    path_binary = resolve_cli_binary(spec.binary)
+    if key != KIMI_NATIVE_KEY or path_binary is None:
+        return path_binary
+
+    from click import ClickException
+
+    from omnigent.kimi_native import resolve_kimi_executable
+
+    try:
+        return resolve_kimi_executable()
+    except ClickException:
+        return None
+
+
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     """Return the install spec for a family/harness key, or ``None``.
 
@@ -878,7 +903,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -906,7 +931,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout)
@@ -929,7 +954,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = resolve_cli_binary(spec.binary)
+    binary = _resolve_harness_cli_binary(key, spec)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)
