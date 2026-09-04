@@ -218,9 +218,12 @@ def _main_permission_request(argv: list[str]) -> int:
        qwen/kiro/hermes/goose); the payload labels the card "Kimi", and the
        server publishes the ``response.elicitation_request`` approval card and
        long-polls for the web verdict.
-    2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
-       digit + Enter into the TUI pane via :func:`inject_approval_keystroke`
-       (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
+    2. Answer kimi's permission menu from the web verdict via
+       :func:`inject_approval_keystroke` (option digit + Enter): ``accept``
+       types :data:`APPROVE_KEY` "Approve once"; ``cancel`` types
+       :data:`DENY_KEY` "Reject". ``decline`` types NOTHING — the server
+       forwards an Escape that rejects the menu, so a second keystroke would
+       race it.
 
     Fail-safe: on no verdict (timeout / server unreachable / the prompt was
     already answered in the terminal) it injects nothing and kimi's own TUI
@@ -265,11 +268,13 @@ def _main_permission_request(argv: list[str]) -> int:
     )
     verdict = _request_web_approval(url, headers, body)
     if verdict is None or verdict == "decline":
-        # Inject nothing: no verdict leaves kimi's own TUI prompt for manual
-        # answer; an explicit decline is already Rejected by the server's
-        # forwarded Escape (kimi 0.41.0: Escape on an open menu IS Reject) — the
-        # ONLY actor that closes the menu on decline, so a second keystroke would
-        # race it. cancel gets no server forward, so it still types the digit.
+        # Inject nothing. No verdict leaves kimi's own TUI prompt for manual
+        # answer. On an explicit decline the server best-effort forwards an
+        # Escape (kimi 0.41.0: Escape on an open menu IS Reject): when it lands
+        # it rejects and closes the menu, so a second keystroke here would race
+        # it. If that forward fails or reaches no runner the menu stays open for
+        # manual terminal input — the same fail-safe as no verdict, never a
+        # silent approve. cancel gets no forward, so it still types the digit.
         return 0
     key = APPROVE_KEY if verdict == "accept" else DENY_KEY
     try:
