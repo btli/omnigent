@@ -121,6 +121,7 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes() -> None:
 
     samples = (
         (f"Authorization: Bearer {labeled}", labeled),
+        ("Authorization: Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
         (f'headers={{"token": "{labeled}"}}', labeled),
         ("bearer abc:def", "abc:def"),
         ("password=;supersecret", ";supersecret"),
