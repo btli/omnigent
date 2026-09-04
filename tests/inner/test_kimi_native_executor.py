@@ -787,6 +787,28 @@ class TestUserMessageInjection:
         enter_index = max(index for index, args in enumerate(sent) if args[-1] == "Enter")
         assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
 
+    def test_ctrl_s_failure_keeps_submitted_message_delivered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=1)
+        run_tmux = kimi_native_bridge._run_tmux
+
+        def _run_tmux(socket_path: str, *args: str) -> None:
+            run_tmux(socket_path, *args)
+            if args == ("send-keys", "-t", "main", "C-s"):
+                raise RuntimeError("tmux socket disappeared")
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
+        inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+        assert sent[-2:] == [
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        assert "the draft remains queued: tmux socket disappeared" in caplog.text
+
     def test_raises_when_draft_never_submits(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

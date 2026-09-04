@@ -843,7 +843,8 @@ def inject_user_message(
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with Enter.
+    submits), settles, then submits with Enter. Once accepted, C-s steers the
+    draft into a running turn.
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
@@ -1091,6 +1092,17 @@ def inject_user_message(
                 "Kimi TUI input box disappeared before the message could be submitted; "
                 "the message was not delivered"
             )
+
+        def _steer_accepted_draft() -> None:
+            try:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+            except RuntimeError as exc:
+                _logger.warning(
+                    "Kimi Ctrl-S steer failed after Enter submitted the message; "
+                    "the draft remains queued: %s",
+                    exc,
+                )
+
         post_submit_deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
         last_enter = time.monotonic()
         while time.monotonic() < post_submit_deadline:
@@ -1120,7 +1132,7 @@ def inject_user_message(
                 )
             if state.editor_content is not None and draft_seen and not state.editor_content:
                 # Kimi >= 0.41 accepts C-s steering after the queued draft is accepted.
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+                _steer_accepted_draft()
                 return
             if state.exit_armed and state.editor_content:
                 raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
@@ -1148,7 +1160,7 @@ def inject_user_message(
                 continue
             if state.editor_content is not None and draft_seen and not state.editor_content:
                 # Kimi >= 0.41 accepts C-s steering after the queued draft is accepted.
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+                _steer_accepted_draft()
                 return
             if state.exit_armed:
                 raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
