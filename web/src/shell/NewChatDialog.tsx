@@ -1,12 +1,4 @@
-import {
-  type DragEvent,
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -201,6 +193,7 @@ import {
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -212,6 +205,7 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
+import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
   useProjectConfig,
@@ -226,6 +220,7 @@ import {
 } from "@/lib/sessionListCache";
 import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -248,7 +243,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -1545,6 +1540,18 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
+  // The host catalog re-polls while the modal is open (a provider switch under
+  // it). A draft the new catalog no longer lists would render a blank trigger,
+  // so it falls back to Default.
+  const draftModelOptions = hasPermission
+    ? claudeModelSelectOptions
+    : hasApproval
+      ? codexModelSelectOptions
+      : piModelOptions;
+  useEffect(() => {
+    if (!open || !draftModel || draftModelOptions.length === 0) return;
+    if (!draftModelOptions.some((m) => m.id === draftModel)) setDraftModel("");
+  }, [open, draftModel, draftModelOptions]);
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRouting("on");
@@ -2015,10 +2022,6 @@ export function resetLandingDraft(): void {
   landingDraft = null;
 }
 
-// Sessions the empty-landing one-click import pulls (most recent, across all
-// harnesses). Named in the button so the count is explicit before clicking.
-const LANDING_QUICK_IMPORT_LIMIT = 25;
-
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -2099,20 +2102,6 @@ export function NewChatLandingScreen() {
   const hasNoSessions =
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
-  // One-click quick import for the empty landing: pull the recent sessions
-  // across every harness on the caller's online machine.
-  const [quickImporting, setQuickImporting] = useState(false);
-  const [quickImportError, setQuickImportError] = useState<string | null>(null);
-  const [quickImportedCount, setQuickImportedCount] = useState<number | null>(null);
-  // The server persists each session as its frame arrives, so refresh the
-  // sidebar list every 5s while importing — sessions show up as they land.
-  useEffect(() => {
-    if (!quickImporting) return;
-    const id = setInterval(() => {
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-    }, 5000);
-    return () => clearInterval(id);
-  }, [quickImporting, queryClient]);
 
   const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
 
@@ -2208,38 +2197,9 @@ export function NewChatLandingScreen() {
     setAttachmentError(null);
   };
 
-  // Drag-and-drop onto the composer — same behavior as the in-session
-  // composer (drop files anywhere on the box; an inset ring + overlay
-  // signal the drop target).
-  const [isDragActive, setIsDragActive] = useState(false);
-
-  const handleDrop = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(false);
-    const dropped = Array.from(e.dataTransfer.files);
-    if (dropped.length > 0) addFiles(dropped);
-  };
-
-  const handleDragOver = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragEnter = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragLeave = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    // Only clear the active state when the pointer leaves the container
-    // itself, not when it moves between child elements inside it.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setIsDragActive(false);
-  };
+  // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
+  // the landing surface attaches here. Declared after ``landingSurface``.
+  const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -2346,6 +2306,7 @@ export function NewChatLandingScreen() {
             // Keep the catalog's default marker: the Default row names the
             // model a bare launch truly runs, for claude exactly as codex.
             isDefault: option.isDefault,
+            source: option.source,
           })),
     [hostClaudeModelOptions, sandboxSelected],
   );
@@ -2360,6 +2321,7 @@ export function NewChatLandingScreen() {
         : (hostPiModelOptions ?? []).map((option) => ({
             id: option.id,
             displayName: option.displayName ?? option.id,
+            source: option.source,
           })),
     [hostPiModelOptions, sandboxSelected],
   );
@@ -2939,29 +2901,6 @@ export function NewChatLandingScreen() {
   // which have no knobs to remember.
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
 
-  // Empty-landing one-click: import the last LANDING_QUICK_IMPORT_LIMIT sessions
-  // across all harnesses from the caller's online machine (prefer the selected
-  // one). With no online
-  // host there's nothing to read from, so send them to the Settings import
-  // section for the granular picker + its "start a host" guidance.
-  const handleQuickImport = async (): Promise<void> => {
-    const host = selectedHost?.status === "online" ? selectedHost : onlineHosts[0];
-    if (host === undefined) {
-      navigate("/settings/import");
-      return;
-    }
-    setQuickImporting(true);
-    setQuickImportError(null);
-    try {
-      const result = await importLocalSessions(host.host_id, "all", LANDING_QUICK_IMPORT_LIMIT);
-      setQuickImportedCount(result.imported);
-      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
-    } catch (e) {
-      setQuickImportError(e instanceof Error ? e.message : "Import failed. Try again.");
-    } finally {
-      setQuickImporting(false);
-    }
-  };
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create
@@ -3019,6 +2958,13 @@ export function NewChatLandingScreen() {
       selectedAgent?.harness != null &&
       selectedAgent.harness in brainHarnessLabelsAll);
   const configSummary = useMemo((): { label: string; value: string }[] => {
+    const sourceRows = (options: readonly NativeModelOption[]) => {
+      if (routingOn) return [];
+      const source =
+        options.find((option) => option.id === pickedModel)?.source ??
+        options.find((option) => option.source)?.source;
+      return modelConfigurationSourceRows(source);
+    };
     if (smartRoutingHarnessSelected) {
       // Top-level Smart Routing's modal is the locked Permissions row alone, so
       // mirror it. Report the constant — never a mode left over in state from a
@@ -3028,7 +2974,7 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      return [{ label: "Model", value: modelValue }];
+      return [{ label: "Model", value: modelValue }, ...sourceRows(piModelOptions)];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -3049,6 +2995,7 @@ export function NewChatLandingScreen() {
         { label: "Model", value: modelValue },
         { label: "Effort", value: effortValue },
         { label: "Permissions", value: permissionValue },
+        ...sourceRows(claudeModelOptions),
       ];
     }
     // Codex folds routing into its Model row, so report it the same way Claude
@@ -3079,7 +3026,11 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
-      return [...modelRows, { label: "Approval", value: approvalValue }];
+      return [
+        ...modelRows,
+        { label: "Approval", value: approvalValue },
+        ...(isCodex ? sourceRows(codexModelOptions) : []),
+      ];
     }
     if (supportsCursorMode) {
       const modeValue =
@@ -4579,16 +4530,14 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
+        {/* Drop cue, spanning the landing surface. */}
+        {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <div className="relative flex w-full flex-col gap-1">
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void handleCreate();
             }}
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
             // A home-specific focus shadow adds depth without a resting shadow
             // or focus border.
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
@@ -4599,11 +4548,6 @@ export function NewChatLandingScreen() {
             )}
             data-testid="new-chat-landing-composer"
           >
-            {isDragActive && (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-ui font-medium text-ring">Drop files here</span>
-              </div>
-            )}
             {/* Skill suggestions — floats above the composer box. */}
             {slashMenuOpen && (
               <SlashCommandMenu
@@ -4957,11 +4901,14 @@ export function NewChatLandingScreen() {
                           </TooltipTrigger>
                           <TooltipContent
                             side="top"
-                            className="flex-col items-start gap-0.5 px-3 py-2"
+                            className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
                             data-testid="new-chat-landing-config-gear-tooltip"
                           >
                             {configSummary.map((row) => (
-                              <span key={row.label} className="text-muted-foreground">
+                              <span
+                                key={row.label}
+                                className="max-w-72 truncate text-muted-foreground"
+                              >
                                 {row.label}:{" "}
                                 <span className="text-background dark:text-popover-foreground">
                                   {row.value}
@@ -5676,33 +5623,11 @@ export function NewChatLandingScreen() {
           <div className="flex flex-col items-center gap-2">
             <Button
               variant="outline"
-              loading={quickImporting}
-              onClick={() => void handleQuickImport()}
-              data-testid="landing-quick-import"
+              onClick={() => navigate("/settings/import")}
+              data-testid="landing-import-sessions"
             >
-              Import your {LANDING_QUICK_IMPORT_LIMIT} most recent sessions
+              Import your recent sessions
             </Button>
-            {quickImportedCount !== null ? (
-              <p
-                className="text-sm text-muted-foreground"
-                data-testid="landing-quick-import-result"
-              >
-                Imported {quickImportedCount} session{quickImportedCount === 1 ? "" : "s"}.
-              </p>
-            ) : quickImportError !== null ? (
-              <p className="text-sm text-destructive" data-testid="landing-quick-import-error">
-                {quickImportError}
-              </p>
-            ) : (
-              <button
-                type="button"
-                onClick={() => navigate("/settings/import")}
-                className="text-xs text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground hover:no-underline"
-                data-testid="landing-import-sessions"
-              >
-                Choose what to import
-              </button>
-            )}
           </div>
         ) : null}
       </div>
