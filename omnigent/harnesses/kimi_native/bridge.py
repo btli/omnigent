@@ -1096,10 +1096,10 @@ def inject_user_message(
         def _steer_accepted_draft() -> None:
             try:
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
                 _logger.warning(
-                    "Kimi Ctrl-S steer failed after Enter submitted the message; "
-                    "the draft remains queued: %s",
+                    "Kimi Ctrl-S steer failed after Enter was accepted; "
+                    "the message may remain queued until the turn ends: %s",
                     exc,
                 )
 
