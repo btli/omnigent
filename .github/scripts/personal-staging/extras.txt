@@ -18,4 +18,3 @@
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 5825  # supersedes #5198; omni-resolve-agent[bot]; reviewed head ee335038a6b4b8e4d854f5d07fa53b798518b679
-5955  # supersedes #5181; omni-resolve-agent[bot]; reviewed head 5eb6872d373839432e5618132e174184c88db7e1
