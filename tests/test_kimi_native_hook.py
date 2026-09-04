@@ -189,9 +189,13 @@ def test_permission_request_injects_keystroke_for_verdict(
     exit_code = kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
 
     assert exit_code == 0
-    # Routed to the shared elicitation endpoint with the gated tool.
-    assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/permission-request")
-    assert posted[0]["body"]["tool_name"] == "Bash"
+    # Routed to the vendor-agnostic native-permission endpoint, labelled Kimi.
+    assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/native-permission-request")
+    body = posted[0]["body"]
+    assert body["agent"] == "Kimi"
+    assert body["policy_name"] == "kimi_native_permission"
+    assert body["message"] == "Kimi wants to call **Bash**"
+    assert body["operation_type"] == "Bash"
     assert keys == [expected_key]
 
 
@@ -242,7 +246,7 @@ def test_permission_request_reparks_after_injection_miss(
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
     assert keys == [APPROVE_KEY, DENY_KEY]
     assert len(posted) == 2
-    assert posted[0]["_omnigent_elicitation_id"] == posted[1]["_omnigent_elicitation_id"]
+    assert posted[0]["elicitation_id"] == posted[1]["elicitation_id"]
     assert deadlines == [
         100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
         100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
@@ -301,15 +305,14 @@ def test_permission_request_ungoverned_no_request(
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, "allow"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "deny"}}}, "deny"),
-        ({"hookSpecificOutput": {"permissionDecision": "allow"}}, "allow"),
-        ({"hookSpecificOutput": {"permissionDecision": "deny"}}, "deny"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "allow_always"}}}, "allow"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "reject"}}}, "deny"),
+        ({"action": "accept"}, "allow"),
+        ({"action": "decline"}, "deny"),
+        ({"action": "cancel"}, "deny"),
         ({}, None),
-        ({"hookSpecificOutput": {}}, None),
-        ({"hookSpecificOutput": {"decision": {"behavior": "huh"}}}, None),
+        ({"action": "huh"}, None),
+        ({"action": None}, None),
+        # The old Claude PermissionRequest shape must NOT resolve to a verdict.
+        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, None),
         ("not a dict", None),
     ],
 )
@@ -328,7 +331,7 @@ def test_request_web_approval_reparks_after_read_timeout(
         httpx.ReadTimeout("poll expired", request=httpx.Request("POST", "http://server")),
         httpx.Response(
             200,
-            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            json={"action": "accept"},
             request=httpx.Request("POST", "http://server"),
         ),
     ]
@@ -353,7 +356,7 @@ def test_request_web_approval_reparks_after_read_timeout(
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
     assert len(requests) == 2
     assert requests[0]["json"] == requests[1]["json"] == body
@@ -366,7 +369,7 @@ def test_request_web_approval_reparks_empty_response(
         httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server")),
         httpx.Response(
             200,
-            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            json={"action": "accept"},
             request=httpx.Request("POST", "http://server"),
         ),
     ]
@@ -388,7 +391,7 @@ def test_request_web_approval_reparks_empty_response(
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
     assert len(requests) == 2
     assert requests[0]["json"] == requests[1]["json"] == body
@@ -422,7 +425,7 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
         lambda bridge_dir: probes.append(bridge_dir) or False,
     )
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert (
         kimi_native_hook._request_web_approval("http://server", {}, body, bridge_dir=tmp_path)
         is None
@@ -449,14 +452,14 @@ def test_permission_read_timeout_leaves_global_deadline_margin(
         def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
             return httpx.Response(
                 200,
-                json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+                json={"action": "accept"},
                 request=httpx.Request("POST", url),
             )
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
     monkeypatch.setattr(kimi_native_hook.time, "monotonic", lambda: 0.0)
 
-    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    body = {"elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
     request_budget = (
         kimi_native_hook._PERMISSION_RETRY_WINDOW_S
