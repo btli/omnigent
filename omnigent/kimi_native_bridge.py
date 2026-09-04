@@ -3,7 +3,7 @@
 The runner launches the ``kimi`` TUI in a private tmux pane and records
 that pane's socket + target here via :func:`write_tmux_target`. The harness
 executor then delivers Omnigent web-UI messages into the *same* pane via
-:func:`inject_user_message` (tmux bracketed paste + Enter) — the kimi analog
+:func:`inject_user_message` (tmux bracketed paste + Enter + C-s steer) — the kimi analog
 of claude-native's tmux send-keys bridge. This is what wires the web-UI chat box
 to the running Kimi TUI (and, since the web UI embeds that pane, the message
 shows in both surfaces).
@@ -317,7 +317,7 @@ def inject_user_message(
     :param content: User text (non-empty).
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
-        command fails.
+        command fails before submit Enter; a failed C-s steer is logged instead.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
