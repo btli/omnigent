@@ -264,10 +264,15 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{_url_component(session_id)}/hooks/native-permission-request"
     )
     verdict = _request_web_approval(url, headers, body)
-    if verdict is None:
-        # No web verdict: leave kimi's own TUI prompt for manual approval.
+    if verdict is None or verdict == "decline":
+        # No web verdict: leave kimi's own TUI prompt for manual approval. An
+        # explicit web decline is already answered — the server forwards an
+        # Escape that lands on the pane before this verdict returns, and in
+        # kimi 0.41.0 Escape on an open permission menu IS Reject. A second
+        # keystroke here would race that Escape and, once the menu has closed,
+        # submit the digit into the editor as a user turn.
         return 0
-    key = APPROVE_KEY if verdict == "allow" else DENY_KEY
+    key = APPROVE_KEY if verdict == "accept" else DENY_KEY
     try:
         inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
     except RuntimeError as exc:
@@ -283,9 +288,10 @@ def _request_web_approval(
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
-    :returns: ``"allow"`` / ``"deny"``, or ``None`` on timeout (server returns
-        an empty 200), transport failure, or an unparseable verdict — all of
-        which fall back to kimi's own TUI prompt.
+    :returns: the verdict action (``"accept"`` / ``"decline"`` / ``"cancel"``),
+        or ``None`` on timeout (server returns an empty 200), transport failure,
+        or an unparseable verdict — all of which fall back to kimi's own TUI
+        prompt.
     """
     timeout = httpx.Timeout(_PERMISSION_REQUEST_TIMEOUT_S, connect=_SURFACE_TIMEOUT_S)
     try:
@@ -308,19 +314,19 @@ def _request_web_approval(
 
 
 def _verdict_from_response(data: object) -> str | None:
-    """Extract ``"allow"`` / ``"deny"`` from the native-permission response.
+    """Extract the web verdict action from the native-permission response.
 
     The vendor-agnostic endpoint returns an ``ElicitationResult``
-    (``{"action": "accept"|"decline"|"cancel"}``): ``accept`` maps to allow,
-    ``decline`` / ``cancel`` to deny. Anything else is no verdict.
+    (``{"action": "accept"|"decline"|"cancel"}``); the action is returned
+    verbatim so the caller can act on ``decline`` (which the server answers
+    with a forwarded Escape) differently from ``cancel``. Anything else is no
+    verdict.
     """
     if not isinstance(data, dict):
         return None
     action = data.get("action")
-    if action == "accept":
-        return "allow"
-    if action in ("decline", "cancel"):
-        return "deny"
+    if action in ("accept", "decline", "cancel"):
+        return action
     return None
 
 
