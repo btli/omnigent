@@ -78,6 +78,9 @@ const serverLoadCode = liveCode.match(
 const expiryHandoffCallbackCode = createWindowCode?.match(
   /async \(\{ serverUrl: expiredServerUrl, returnUrl \}\) => \{[\s\S]*?\n    \}/,
 )?.[0];
+const expiryHandoffServerUrlGetterCode = createWindowCode?.match(
+  /registerOidcSessionExpiryHandoff\(\s*win\.webContents,\s*(\(\) => \{[\s\S]*?\n    \}),/,
+)?.[1];
 const oauthPopupCode = liveCode.match(
   /function hardenOauthPopup\(child\)[\s\S]*?(?=async function showWebAuthnTimeout)/,
 )?.[0];
@@ -977,6 +980,11 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(await direct({}, "http://localhost:6767"), true);
     assert.deepEqual(local.probes, ["http://localhost:6767"]);
     assert.deepEqual(local.dialogs, []);
+  });
+
+  it("wiring-only: includes loopback servers in expiry handoff", () => {
+    assert.ok(expiryHandoffServerUrlGetterCode);
+    assert.doesNotMatch(expiryHandoffServerUrlGetterCode, /isLoopbackServer/);
   });
 
   it("completes the WebAuthn escape through ticket, cookie verification, and one reload", async () => {
