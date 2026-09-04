@@ -366,6 +366,9 @@ def inject_user_message(
             time.sleep(_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Enter queues the draft mid-turn; C-s steers it into the running turn
+    # and is a no-op while idle.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:

@@ -159,6 +159,18 @@ class TestApprovalKeystroke:
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
         assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
 
+    def test_message_submit_sends_enter_then_ctrl_s(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane="context: 1%\nsteer now")
+        kimi_native_bridge.inject_user_message(tmp_path, content="steer now")
+        assert [args for args in sent if args[0] == "send-keys"] == [
+            ("send-keys", "-t", "main", "C-a"),
+            ("send-keys", "-t", "main", "C-k"),
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+
     def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.
         sent = self._stub_tmux(monkeypatch, pane="● Hello! How can I help?")
