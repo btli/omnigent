@@ -7,11 +7,8 @@
 //      IdP sign-in flow includes a passkey (WebAuthn) validation stage
 //   2. open the desktop app -> bundled setup page
 //   3. type the server URL -> Connect
-//   4. facet 1: the Electron window ITSELF navigates to the third-party
+//   4. regression: the Electron window ITSELF navigates to the third-party
 //      IdP's sign-in page (embedded user-agent; RFC 8252 §8.12 forbids this)
-//   5. facet 2: the IdP page's modal navigator.credentials.get({publicKey})
-//      never settles — no passkey prompt, no error, the RP-supplied timeout
-//      (1500 ms, same as the report's measurement) is not honored
 //
 // The fake IdP below is a real HTTP server (like tests/e2e_ui/auth/_fake_idp.py,
 // in Node so this lane stays self-contained). Its /authorize page mimics
@@ -20,11 +17,10 @@
 // discoverable-credential request), reporting ceremony state into the DOM so
 // both the assertions and the recorded clip can see it.
 //
-// Both tests assert the CORRECT behavior — on a build without the
-// system-browser handoff they fail (the IdP renders in-window and its modal
-// ceremony never settles); with it they pass and stand as the regression
-// guard. This covers loopback server URLs too: a tunneled/port-forwarded
-// OIDC deployment must get the same handoff as a remote one.
+// The test asserts the correct behavior: the IdP must not render in-window.
+// If it does, the test also captures whether its modal ceremony settles. This
+// covers loopback server URLs too: a tunneled/port-forwarded OIDC deployment
+// must get the same handoff as a remote one.
 //
 // Run from web/electron, after building the SPA:
 //   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_oidc_in_window_idp.e2e.js
@@ -38,7 +34,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const {
   REPO_ROOT,
@@ -48,8 +44,6 @@ const {
   launchDesktop,
   saveRecording,
 } = require("./desktopHarness");
-
-const deps = desktopDepsAvailable();
 
 /** Repo-root recordings dir (workspace artifact, uncommitted). */
 const RECORDINGS_ROOT = path.join(REPO_ROOT, "recordings", "desktop-oidc-idp");
@@ -73,6 +67,19 @@ const SERVER_PYTHONPATH = [
   path.join(REPO_ROOT, "sdks", "python-client"),
   path.join(REPO_ROOT, "sdks", "ui"),
 ].join(path.delimiter);
+
+function testDepsAvailable() {
+  const missing = [...desktopDepsAvailable().missing];
+  if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) missing.push("built SPA");
+  const python = spawnSync(PYTHON, ["-c", "from omnigent.cli import main"], {
+    env: { ...process.env, PYTHONPATH: SERVER_PYTHONPATH },
+    stdio: "ignore",
+  });
+  if (python.error || python.status !== 0) missing.push(`${PYTHON} with server deps`);
+  return { ok: missing.length === 0, missing };
+}
+
+const deps = testDepsAvailable();
 
 /** Same minimal agent spec as desktopHarness / the Python suite's fixture. */
 const TEST_AGENT_YAML = `name: hello_world
@@ -455,7 +462,8 @@ describe(
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    // Facet 1 — RFC 8252 §8.12: "native apps MUST NOT use embedded
+    // This guard covers in-window authorization; unit tests cover the positive handoff.
+    // RFC 8252 §8.12: "native apps MUST NOT use embedded
     // user-agents to perform authorization requests". Connecting to a
     // self-hosted OIDC server must hand the IdP sign-in off to the system
     // browser (as the Databricks/Okta path already does); the third-party
@@ -476,15 +484,29 @@ describe(
           .then(() => window.url())
           .catch(() => null);
         if (inWindowIdpUrl) {
-          // Hold the frame so the in-window IdP page is legible in the clip,
-          // and record what the page shows (evidence for the handoff).
-          await window.waitForTimeout(1_500);
+          const statusEl = window.locator("#webauthn-status");
+          await statusEl.waitFor({ state: "visible", timeout: 10_000 });
+          const settled = await window
+            .waitForFunction(
+              () => document.getElementById("webauthn-status")?.dataset.outcome !== "pending",
+              { timeout: SETTLE_DEADLINE_MS },
+            )
+            .then(() => true)
+            .catch(() => false);
+          const outcome = await statusEl.getAttribute("data-outcome");
           const uvpa = await window
             .locator("#uvpa")
             .textContent()
             .catch(() => "<no probe>");
+          const elapsed = await window
+            .locator("#elapsed")
+            .textContent()
+            .catch(() => "?");
           logStep(`main window navigated to IdP: ${inWindowIdpUrl}`);
           logStep(`isUserVerifyingPlatformAuthenticatorAvailable: ${uvpa}`);
+          logStep(
+            `ceremony ${settled ? "settled" : "remained pending"} after ${elapsed}: ${outcome}`,
+          );
         }
         assert.equal(
           inWindowIdpUrl,
@@ -495,75 +517,6 @@ describe(
       } finally {
         await closeDesktop(electronApp, window);
         const saved = saveRecording(recordDir, "in-window-idp");
-        logStep(`recording(s) saved: ${saved.join(", ") || "<none>"}`);
-        fs.rmSync(userDataDir, { recursive: true, force: true });
-      }
-    });
-
-    // Facet 2 — the passkey step hangs forever: a modal WebAuthn get() on the
-    // in-window IdP page never settles. Electron ships no authenticator UI or
-    // WebAuthn dispatch (app.configureWebAuthn was removed in #2036), so the
-    // ceremony neither resolves nor rejects — the RP-supplied timeout is not
-    // honored and the user gets an unbounded silent spinner. A functioning
-    // user agent settles the ceremony (resolve, or reject with
-    // NotAllowedError at the timeout).
-    it("settles the IdP page's passkey ceremony instead of hanging forever", async () => {
-      const recordDir = path.join(RECORDINGS_ROOT, "raw-passkey-hang");
-      const { electronApp, window, userDataDir } = await launchDesktop({ recordDir });
-      try {
-        logStep("desktop launched; driving setup page");
-        await connectToServer(window, server.serverUrl);
-        const reachedIdp = await window
-          .waitForURL((u) => u.origin === idp.origin, { timeout: 15_000 })
-          .then(() => true)
-          .catch(() => false);
-        if (!reachedIdp) {
-          // Fixed build: the IdP never renders in-window, so an embedded
-          // ceremony cannot hang — this facet passes vacuously.
-          logStep("IdP page never rendered in-window; embedded ceremony n/a");
-          return;
-        }
-        logStep("IdP page rendered in-window; observing the passkey ceremony");
-        const statusEl = window.locator("#webauthn-status");
-        await statusEl.waitFor({ state: "visible", timeout: 10_000 });
-        // The ceremony sets data-outcome="pending" the moment it starts.
-        await window
-          .waitForFunction(
-            // oxlint-disable-next-line no-undef — evaluated in the page.
-            () => !!document.getElementById("webauthn-status")?.dataset.outcome,
-            { timeout: 10_000 },
-          )
-          .catch(() => {});
-        const uvpa = await window
-          .locator("#uvpa")
-          .textContent()
-          .catch(() => "<no probe>");
-        logStep(`isUserVerifyingPlatformAuthenticatorAvailable: ${uvpa}`);
-        // Give the ceremony SETTLE_DEADLINE_MS (~7x the 1500 ms RP timeout;
-        // the report measured "pending beyond 10s") to settle either way.
-        const settled = await window
-          .waitForFunction(
-            // oxlint-disable-next-line no-undef — evaluated in the page.
-            () => document.getElementById("webauthn-status")?.dataset.outcome !== "pending",
-            { timeout: SETTLE_DEADLINE_MS },
-          )
-          .then(() => true)
-          .catch(() => false);
-        const outcome = await statusEl.getAttribute("data-outcome");
-        const elapsed = await window
-          .locator("#elapsed")
-          .textContent()
-          .catch(() => "?");
-        logStep(`ceremony outcome after ${elapsed}: ${outcome}`);
-        assert.ok(
-          settled,
-          `WebAuthn passkey ceremony never settled: still "${outcome}" after ` +
-            `${SETTLE_DEADLINE_MS} ms despite an RP timeout of ${RP_TIMEOUT_MS} ms — ` +
-            `no prompt, no error, no way to continue (isUVPAA=${uvpa})`,
-        );
-      } finally {
-        await closeDesktop(electronApp, window);
-        const saved = saveRecording(recordDir, "passkey-hang");
         logStep(`recording(s) saved: ${saved.join(", ") || "<none>"}`);
         fs.rmSync(userDataDir, { recursive: true, force: true });
       }
