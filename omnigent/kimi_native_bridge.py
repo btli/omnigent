@@ -24,6 +24,8 @@ from pathlib import Path
 from omnigent._platform import stable_user_id
 from omnigent.json_types import JsonObject as _JsonObject
 
+_logger = logging.getLogger(__name__)
+
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
 
@@ -202,7 +204,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
-    """Invoke ``tmux -S <socket> <args...>`` and raise on failure."""
+    """Invoke tmux, normalizing nonzero exits and timeouts to ``RuntimeError``."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, *args],
@@ -371,10 +373,10 @@ def inject_user_message(
     # and no-ops while idle. Relies on Kimi >= 0.41.0 Ctrl-S steer semantics.
     try:
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
-    except RuntimeError as exc:
-        logging.getLogger(__name__).warning(
-            "Kimi Ctrl-S steer failed after Enter submitted the message; "
-            "the draft remains queued: %s",
+    except (RuntimeError, OSError) as exc:
+        _logger.warning(
+            "Kimi Ctrl-S steer failed after Enter was sent; "
+            "the message may remain queued until the turn ends: %s",
             exc,
         )
 

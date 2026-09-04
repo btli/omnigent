@@ -176,18 +176,27 @@ class TestApprovalKeystroke:
         enter_index = sent.index(enter_call)
         assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
 
+    @pytest.mark.parametrize(
+        "injected_error",
+        [
+            pytest.param(RuntimeError("tmux socket disappeared"), id="runtime-error"),
+            pytest.param(OSError("tmux socket disappeared"), id="os-error"),
+        ],
+    )
     def test_ctrl_s_failure_keeps_submitted_message_delivered(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
+        injected_error: RuntimeError | OSError,
     ) -> None:
         sent = self._stub_tmux(monkeypatch, pane="context: 1%\nsteer now")
+        stub_run_tmux = kimi_native_bridge._run_tmux
 
         def _run_tmux(_socket_path: str, *args: str) -> None:
-            sent.append(args)
+            stub_run_tmux(_socket_path, *args)
             if args == ("send-keys", "-t", "main", "C-s"):
-                raise RuntimeError("tmux socket disappeared")
+                raise injected_error
 
         monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
         kimi_native_bridge.inject_user_message(tmp_path, content="steer now")
@@ -195,7 +204,7 @@ class TestApprovalKeystroke:
             ("send-keys", "-t", "main", "Enter"),
             ("send-keys", "-t", "main", "C-s"),
         ]
-        assert "the draft remains queued: tmux socket disappeared" in caplog.text
+        assert "the message may remain queued until the turn ends" in caplog.text
 
     def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.
