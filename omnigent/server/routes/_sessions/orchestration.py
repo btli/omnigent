@@ -13,7 +13,7 @@ import json
 import math
 import secrets
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -165,6 +165,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _deferred_elicitation_clear_tasks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
+    _llm_response_denied_turns,
     _logger,
     _managed_launch_tasks,
     _MirroredToolCall,
@@ -846,7 +847,10 @@ def _build_session_list_item(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
-        status=_session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+        status=_list_status_with_starting(
+            _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+            conv.id,
+        ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
@@ -5517,11 +5521,69 @@ async def _record_create_route_prompt(
     return conv
 
 
+# Sessions with a message dispatch still awaiting its runner (cold boot). The
+# session list reports them as running so a booting session spins instead of
+# reading idle until the runner accepts the message. Process-local and
+# best-effort: with several replicas only the one handling the POST knows.
+_dispatch_in_flight: dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def _mark_dispatch_in_flight(conversation_id: str) -> Iterator[None]:
+    """
+    Count a message as in flight for *conversation_id* until the block exits.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    _dispatch_in_flight[conversation_id] = _dispatch_in_flight.get(conversation_id, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = _dispatch_in_flight.get(conversation_id, 1) - 1
+        if remaining > 0:
+            _dispatch_in_flight[conversation_id] = remaining
+        else:
+            _dispatch_in_flight.pop(conversation_id, None)
+
+
+def _session_is_starting(conversation_id: str) -> bool:
+    """
+    Whether a session has a message waiting on a runner that has not taken it.
+
+    :param conversation_id: Session/conversation identifier.
+    :returns: ``True`` while a dispatch is in flight or a native message is
+        parked in :mod:`omnigent.runtime.pending_inputs`.
+    """
+    return _dispatch_in_flight.get(conversation_id, 0) > 0 or pending_inputs.has_pending(
+        conversation_id
+    )
+
+
+def _list_status_with_starting(
+    status: Literal["idle", "running", "failed"],
+    conversation_id: str,
+) -> Literal["idle", "running", "failed"]:
+    """
+    Promote an idle session with a message still waiting on its runner to running.
+
+    :param status: Rolled-up list status for the session.
+    :param conversation_id: Session/conversation identifier.
+    :returns: ``"running"`` for a booting session, else *status* unchanged.
+    """
+    if status == "idle" and _session_is_starting(conversation_id):
+        return "running"
+    return status
+
+
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
 
-    return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
+    session_id = kwargs.get("session_id", args[0] if args else None)
+    if not isinstance(session_id, str):
+        return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
+    with _mark_dispatch_in_flight(session_id):
+        return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
 
 
 async def _dispatch_session_event_to_runner_impl(
@@ -6216,6 +6278,10 @@ async def _relay_runner_stream_once(
                             )
                         if status == "running":
                             text_acc.clear()
+                            # A new turn invalidates any deny marker a prior
+                            # turn left un-consumed (e.g. its terminal event
+                            # never reached the relay across a reconnect).
+                            _llm_response_denied_turns.pop(session_id, None)
                         continue
 
                     # Terminal spin-up status from the runner's auto-create
@@ -6298,13 +6364,29 @@ async def _relay_runner_stream_once(
                         and _item.get("status") == "completed"
                         and text_acc
                     ):
+                        # A deny recorded by a mid-turn LLM_RESPONSE evaluation
+                        # (harnesses that gate per LLM call) marks this segment
+                        # as denied content; consume it the same way the
+                        # terminal flush does.
+                        _boundary_deny = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
                             text_acc,
                             current_response_id,
                             current_model,
+                            deny_reason=_boundary_deny,
+                            # Gate each segment as it becomes durable: without
+                            # this a RESPONSE-phase policy is bypassed whenever
+                            # the model emits the offending text before a tool
+                            # call (the segment persists here, ahead of the
+                            # terminal-flush evaluation).
+                            evaluate_response_phase=_boundary_deny is None,
                         )
+                        # A failed append leaves text_acc for retry — re-arm
+                        # the marker so the retry persists the sentinel.
+                        if _boundary_deny is not None and text_acc:
+                            _llm_response_denied_turns[session_id] = _boundary_deny
 
                     conv_item = _extract_persistent_item_from_sse(
                         event,
@@ -6335,13 +6417,37 @@ async def _relay_runner_stream_once(
                             if isinstance(_resp_model, str) and _resp_model
                             else current_model
                         )
+                        # An LLM_RESPONSE DENY recorded by the policy-evaluate
+                        # route means this buffered text is the denied content;
+                        # the flush persists the deny sentinel instead. Popped
+                        # here (not merely read) so the marker can never bleed
+                        # into a later turn.
+                        #
+                        # Scope: the LLM_RESPONSE verdict exists only after the
+                        # full stream, so it can sanitize only this final
+                        # buffered segment; text persisted at earlier tool-call
+                        # boundaries is already durable (the turn still fails
+                        # with a persisted deny error item). Segment-complete
+                        # durable gating is the RESPONSE phase's job — the
+                        # boundary flush above evaluates it for every segment.
+                        _deny_reason = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
                             text_acc,
                             current_response_id,
                             _final_model,
+                            deny_reason=_deny_reason,
+                            # Terminal flush is the only place the runner
+                            # topology can evaluate the spec's RESPONSE-phase
+                            # output policies over the final assistant text.
+                            evaluate_response_phase=_deny_reason is None,
                         )
+                        # A failed append leaves text_acc intact for a retry
+                        # at a later flush — re-arm the marker so the retry
+                        # still persists the sentinel, not the denied text.
+                        if _deny_reason is not None and text_acc:
+                            _llm_response_denied_turns[session_id] = _deny_reason
 
                     error_item = _error_item_from_sse(
                         event,
@@ -6684,6 +6790,11 @@ def _ensure_runner_relay(
         current = _runner_relay_tasks.get(session_id)
         if current is not None and current.task is t:
             _runner_relay_tasks.pop(session_id, None)
+            # A deny marker is only consumable by this relay's flushes;
+            # drop any leftover so the (unbounded) marker dict cannot
+            # leak entries for relays that died before their terminal
+            # flush. A replacement relay re-records on the next verdict.
+            _llm_response_denied_turns.pop(session_id, None)
 
     task.add_done_callback(_on_done)
     return handle
