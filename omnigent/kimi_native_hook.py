@@ -265,12 +265,11 @@ def _main_permission_request(argv: list[str]) -> int:
     )
     verdict = _request_web_approval(url, headers, body)
     if verdict is None or verdict == "decline":
-        # No web verdict: leave kimi's own TUI prompt for manual approval. An
-        # explicit web decline is already answered — the server forwards an
-        # Escape that lands on the pane before this verdict returns, and in
-        # kimi 0.41.0 Escape on an open permission menu IS Reject. A second
-        # keystroke here would race that Escape and, once the menu has closed,
-        # submit the digit into the editor as a user turn.
+        # Inject nothing: no verdict leaves kimi's own TUI prompt for manual
+        # answer; an explicit decline is already Rejected by the server's
+        # forwarded Escape (kimi 0.41.0: Escape on an open menu IS Reject) — the
+        # ONLY actor that closes the menu on decline, so a second keystroke would
+        # race it. cancel gets no server forward, so it still types the digit.
         return 0
     key = APPROVE_KEY if verdict == "accept" else DENY_KEY
     try:
