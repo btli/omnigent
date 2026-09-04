@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -308,7 +309,7 @@ def inject_user_message(
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with Enter.
+    submits), settles, then submits with Enter and steers the draft into a running turn with C-s.
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
@@ -368,7 +369,14 @@ def inject_user_message(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     # Enter queues the draft mid-turn; C-s steers it into the running turn
     # and no-ops while idle. Relies on Kimi >= 0.41.0 Ctrl-S steer semantics.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+    except RuntimeError as exc:
+        logging.getLogger(__name__).warning(
+            "Kimi Ctrl-S steer failed after Enter submitted the message; "
+            "the draft remains queued: %s",
+            exc,
+        )
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:

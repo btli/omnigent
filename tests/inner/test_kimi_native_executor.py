@@ -122,7 +122,8 @@ class TestBridge:
 
 class TestApprovalKeystroke:
     """`inject_approval_keystroke` types the option digit + Enter, guarded by
-    the permission-menu marker so a stray verdict can't leak a keystroke."""
+    the permission-menu marker so a stray verdict can't leak a keystroke.
+    The shared tmux stub also covers user-message key sequencing."""
 
     def _stub_tmux(
         self, monkeypatch: pytest.MonkeyPatch, *, pane: str, alive: bool = True
@@ -174,6 +175,27 @@ class TestApprovalKeystroke:
         assert enter_call in sent, f"message-submit Enter missing from tmux calls: {sent!r}"
         enter_index = sent.index(enter_call)
         assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
+
+    def test_ctrl_s_failure_keeps_submitted_message_delivered(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane="context: 1%\nsteer now")
+
+        def _run_tmux(_socket_path: str, *args: str) -> None:
+            sent.append(args)
+            if args == ("send-keys", "-t", "main", "C-s"):
+                raise RuntimeError("tmux socket disappeared")
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
+        kimi_native_bridge.inject_user_message(tmp_path, content="steer now")
+        assert sent[-2:] == [
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        assert "the draft remains queued: tmux socket disappeared" in caplog.text
 
     def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.
