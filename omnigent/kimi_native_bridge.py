@@ -318,6 +318,7 @@ def inject_user_message(
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails before submit Enter; a failed C-s steer is logged instead.
+    :raises OSError: If an OS-level tmux failure occurs before submit Enter.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
