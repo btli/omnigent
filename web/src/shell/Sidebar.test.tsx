@@ -1002,6 +1002,7 @@ describe("Sidebar session list", () => {
   });
 
   it("closes the mobile sidebar when an extension nav row is selected", () => {
+    stubViewportWidth(375);
     mockConversations(THREE_TYPE_CONVERSATIONS);
     const onClose = vi.fn();
     renderSidebar(true, "/", undefined, undefined, [TEST_EXTENSION], onClose);
