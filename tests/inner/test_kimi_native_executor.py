@@ -170,6 +170,10 @@ class TestApprovalKeystroke:
             ("send-keys", "-t", "main", "Enter"),
             ("send-keys", "-t", "main", "C-s"),
         ]
+        enter_call = ("send-keys", "-t", "main", "Enter")
+        assert enter_call in sent, f"message-submit Enter missing from tmux calls: {sent!r}"
+        enter_index = sent.index(enter_call)
+        assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
 
     def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Prompt already answered in the terminal → marker gone → no keystroke.

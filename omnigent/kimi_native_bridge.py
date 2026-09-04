@@ -367,7 +367,7 @@ def inject_user_message(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     # Enter queues the draft mid-turn; C-s steers it into the running turn
-    # and is a no-op while idle.
+    # and no-ops while idle. Relies on Kimi >= 0.41.0 Ctrl-S steer semantics.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
 
 
