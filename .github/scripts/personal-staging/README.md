@@ -85,6 +85,15 @@ race with the nightly, the next hour retries.
 
 ## Personal production nightly (`personal-production.yml`)
 
+Production pins also dispatch `personal-staging-images.yml`, which accepts
+both ring tag families. Server and host artifacts contain native amd64 and
+arm64 images. Native GitHub runners check the host binaries as uid 1000 and
+1000660000 before promoting `production-nightly` (or `staging-nightly`).
+Clusters using a multi-architecture host image can select Pi workers with
+`sandbox.providers[].kubernetes.node_selector: {kubernetes.io/arch: arm64}`.
+Set `pod_ready_timeout_s: 600` in that provider block to allow a cold image
+download; the default is 90 seconds.
+
 `Personal Production Nightly` (cron `30 10 * * *`, plus `workflow_dispatch`)
 runs the same composer with `--ring production`: fork branch `production` =
 upstream main + every open **non-draft** btli PR plus numeric pins from

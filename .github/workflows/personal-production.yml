@@ -8,7 +8,7 @@
 # builds a debug APK and an unsigned macOS desktop app from the pinned
 # commit and publishes both on the dated prerelease plus a floating
 # `production-latest` release (stable download URLs for device testing).
-# No image dispatch (that stays on the staging nightly).
+# Publishes native-verified amd64/arm64 server and host images for the same pin.
 #
 # Migration gate (schema safety, spec decision 11): stage.py itself refuses
 # the atomic push when the candidate touches omnigent/db/migrations/versions/
@@ -174,6 +174,21 @@ jobs:
       - name: Report failure
         if: failure()
         run: echo "## Personal production nightly — compose job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-images:
+    needs: compose
+    if: needs.compose.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch image publication for the immutable production pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ needs.compose.outputs.tag }}
+        run: |
+          gh workflow run personal-staging-images.yml -R btli/omnigent \
+            --ref main -f ref="$SOURCE_TAG"
 
   # Secretless: this job executes third-party gradle/build code from the
   # merged PRs, so it gets no secrets, no persisted git credentials, and
