@@ -3871,6 +3871,36 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "ResetSessionModelOverrideRequest": {
+        "additionalProperties": false,
+        "description": "Reset a launch-time model selection only while that selection is current.",
+        "properties": {
+          "expected_model_override": {
+            "minLength": 1,
+            "title": "Expected Model Override",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_model_override"
+        ],
+        "title": "ResetSessionModelOverrideRequest",
+        "type": "object"
+      },
+      "ResetSessionModelOverrideResponse": {
+        "description": "Whether the launch-time selection was still current and was cleared.",
+        "properties": {
+          "reset": {
+            "title": "Reset",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reset"
+        ],
+        "title": "ResetSessionModelOverrideResponse",
+        "type": "object"
+      },
       "ResourceEventData": {
         "description": "Data payload for a persisted resource lifecycle event.\n\nThese items are written to the conversation store when a\nsession resource is created or deleted, so reconnecting\nclients can discover resource history without replaying the\nlive SSE stream.  The agent loop filters them out of the\nLLM's message context (they are metadata, not conversation\ncontent).",
         "properties": {
@@ -12038,6 +12068,59 @@
           }
         },
         "summary": "Get Session Labels",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/model-override/reset": {
+      "post": {
+        "description": "Retire a rejected pick after fallback without replacing a newer selection.",
+        "operationId": "reset_session_model_override_v1_sessions__session_id__model_override_reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetSessionModelOverrideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetSessionModelOverrideResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Session Model Override",
         "tags": [
           "sessions"
         ]

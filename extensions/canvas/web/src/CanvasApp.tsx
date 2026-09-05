@@ -143,6 +143,7 @@ function CanvasSurface({
   }
   const [activeCanvas, setActiveCanvas] = useState(MAIN_CANVAS_ID);
   const [loading, setLoading] = useState(true);
+  const [loadingSessions, setLoadingSessions] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const flowContainerRef = useRef<HTMLDivElement>(null);
@@ -160,6 +161,7 @@ function CanvasSurface({
   const activeCanvasRef = useRef(MAIN_CANVAS_ID);
   const openingRef = useRef(false);
   const initializedRef = useRef(false);
+  const hasLoadedAllSessionsRef = useRef(false);
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
   const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
@@ -209,8 +211,7 @@ function CanvasSurface({
     };
   }, []);
 
-  // Preserve a user's saved view across ordinary window resizes. React Flow
-  // safely applies the same transform to the new container dimensions.
+  // Restore the same canvas point at the center even if the container resized.
   const applyViewport = useCallback(
     (saved: CanvasViewport | null, sessionCount: number) => {
       requestAnimationFrame(() => {
@@ -219,8 +220,21 @@ function CanvasSurface({
           saved !== null && saved.zoom >= MIN_ZOOM && saved.zoom <= MAX_ZOOM;
         if (usable) {
           viewportDirtyRef.current = true;
+          const size = containerSize();
           void setViewport(
-            { x: saved.x, y: saved.y, zoom: saved.zoom },
+            {
+              x:
+                saved.x +
+                (size.width > 0 && saved.width
+                  ? (size.width - saved.width) / 2
+                  : 0),
+              y:
+                saved.y +
+                (size.height > 0 && saved.height
+                  ? (size.height - saved.height) / 2
+                  : 0),
+              zoom: saved.zoom,
+            },
             { duration: 0 },
           );
         } else {
@@ -228,7 +242,7 @@ function CanvasSurface({
         }
       });
     },
-    [applyDefaultViewport, setViewport],
+    [applyDefaultViewport, containerSize, setViewport],
   );
 
   const openSession = useCallback(
@@ -381,10 +395,17 @@ function CanvasSurface({
         projectList: ExtensionProjectSummary[],
       ) => void | Promise<void>,
     ) => {
-      const projectListPromise = loadProjects(context);
-      await loadSessions(context, async (progress) => {
-        await onProgress(progress, await projectListPromise);
-      });
+      setLoadingSessions(!hasLoadedAllSessionsRef.current);
+      try {
+        const projectListPromise = loadProjects(context);
+        await loadSessions(context, async (progress) => {
+          await onProgress(progress, await projectListPromise);
+        });
+        // Once the full list is known, routine refreshes stay quiet.
+        hasLoadedAllSessionsRef.current = true;
+      } finally {
+        if (aliveRef.current) setLoadingSessions(false);
+      }
     },
     [context],
   );
@@ -847,7 +868,19 @@ function CanvasSurface({
       <header className="canvas-toolbar">
         <div>
           <h1>Canvas</h1>
-          <span>{sessionCountLabel(visibleSessions.length)}</span>
+          <div className="canvas-session-count">
+            <span>{sessionCountLabel(visibleSessions.length)}</span>
+            {loadingSessions && (
+              <svg
+                className="canvas-spinner"
+                role="status"
+                aria-label="Loading sessions"
+                viewBox="0 0 24 24"
+              >
+                <path d="M21 12a9 9 0 1 1-6.22-8.56" />
+              </svg>
+            )}
+          </div>
         </div>
       </header>
       {canvasTabs}
