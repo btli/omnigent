@@ -43,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -292,46 +293,107 @@ def _steer_reached_llm(client: httpx.Client, mock_url: str, mark: str) -> bool:
     return any(mark in json.dumps(req) for req in requests)
 
 
-def _server_alive(socket_path: str) -> bool:
-    """Whether a tmux server with the kimi session still exists on *socket_path*."""
+def _server_pid(socket_path: str) -> int | None:
+    """The tmux server PID for *socket_path*, captured while reachable, else ``None``.
+
+    Enables an independent, socket-free liveness check and kill at teardown, so a
+    tmux/socket probe that hangs can't make a live server look dead.
+    """
     try:
-        return (
-            subprocess.run(
-                ["tmux", "-S", socket_path, "has-session", "-t", "kimi:0.0"],
-                capture_output=True,
-                timeout=_TMUX_TIMEOUT_S,
-            ).returncode
-            == 0
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "display-message", "-p", "#{pid}"],
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return False
-
-
-def _teardown_tmux_server(socket_path: str) -> str | None:
-    """kill-server, verify termination, escalate once; return a note if it may be orphaned.
-
-    A nonzero kill-server rc usually just means "no server running" (already gone), so
-    only a server still live afterward is a real failure. On a live server, retry the
-    kill once as a fallback. The caller removes the socket dir regardless; a returned
-    note is surfaced (never masked). Returns ``None`` when nothing remains.
-    """
-
-    def _kill() -> None:
-        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-            subprocess.run(
-                ["tmux", "-S", socket_path, "kill-server"],
-                capture_output=True,
-                text=True,
-                timeout=_TMUX_TIMEOUT_S,
-            )
-
-    _kill()
-    if not _server_alive(socket_path):
         return None
-    _kill()  # fallback termination
-    if _server_alive(socket_path):
-        return f"tmux server survived kill-server + retry on {socket_path!r} (possible orphan)"
-    return None
+    out = proc.stdout.strip()
+    return int(out) if proc.returncode == 0 and out.isdigit() else None
+
+
+def _pid_is_our_server(pid: int | None, socket_path: str) -> str:
+    """Three-state check that *pid* is still OUR tmux server: ``alive``/``dead``/``unknown``.
+
+    Matches the process command to ``tmux`` + *socket_path*, so a recycled PID reads as
+    ``dead`` (our server is gone) and is never mistaken for a live server we'd wrongly
+    kill. A failed/timed-out ``ps`` is ``unknown`` (a possible survivor), never ``dead``.
+    """
+    if pid is None:
+        return "unknown"
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    if proc.returncode != 0:
+        return "dead"
+    command = proc.stdout
+    return "alive" if ("tmux" in command and socket_path in command) else "dead"
+
+
+def _has_session_state(socket_path: str) -> str:
+    """Three-state ``has-session`` probe: ``alive``/``dead``/``unknown`` (failure = unknown)."""
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "has-session", "-t", "kimi:0.0"],
+            capture_output=True,
+            timeout=_TMUX_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    return "alive" if proc.returncode == 0 else "dead"
+
+
+def _server_liveness(socket_path: str, server_pid: int | None) -> str:
+    """Combined three-state liveness: the reuse-safe PID probe wins, else has-session."""
+    pid_state = _pid_is_our_server(server_pid, socket_path)
+    if pid_state != "unknown":
+        return pid_state
+    return _has_session_state(socket_path)
+
+
+def _teardown_tmux_server(socket_path: str, server_pid: int | None) -> str | None:
+    """Terminate the tmux server; return a note if it may survive (never a false "clean").
+
+    A failed/timed-out probe is a POSSIBLE SURVIVOR (unknown), not "dead", so a hung
+    kill-server + hung verification can no longer report success over a live orphan.
+    kill-server is the normal path; if the server isn't confirmed dead, escalate to an
+    INDEPENDENT PID-based SIGTERM/SIGKILL — guarded by a command match so a recycled PID
+    is never signalled. The caller removes the socket dir regardless; a returned note
+    carries the PID + socket as a usable manual-cleanup path and is surfaced, never masked.
+    """
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        subprocess.run(
+            ["tmux", "-S", socket_path, "kill-server"],
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_TIMEOUT_S,
+        )
+    if _server_liveness(socket_path, server_pid) == "dead":
+        return None
+    # Not confirmed dead (alive OR unknown) → independent PID-based termination, but only
+    # when the PID is still confirmably OUR tmux server (never signal a recycled PID).
+    if server_pid is not None and _pid_is_our_server(server_pid, socket_path) == "alive":
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(server_pid, sig)
+        if _server_liveness(socket_path, server_pid) == "dead":
+            return None
+    state = _server_liveness(socket_path, server_pid)
+    if server_pid is None:
+        return (
+            f"tmux server on {socket_path!r} may still be running (state={state}); kill-server "
+            "did not confirm termination and no server PID was captured for an independent kill"
+        )
+    return (
+        f"tmux server pid {server_pid} on {socket_path!r} may still be running (state={state}) "
+        "after kill-server and an independent PID kill; kill it manually if it lingers"
+    )
 
 
 async def _drain_run_turn(executor: KimiNativeExecutor, text: str) -> list[object]:
@@ -420,6 +482,9 @@ def kimi_tui(
 
     write_tmux_target(bridge_dir, socket_path=Path(socket_path), tmux_target=target)
 
+    # Captured once the server is reachable; teardown uses it for an independent,
+    # socket-free kill. ``None`` (boot failed before capture) falls back to probes.
+    server_pid: int | None = None
     # Enter the cleanup scope BEFORE launching so a failed/partial ``new-session``
     # (timeout, OSError, nonzero exit) still tears down any half-created server and
     # removes the socket dir instead of leaking them.
@@ -468,12 +533,14 @@ def kimi_tui(
             socket_path, target, lambda p: "context:" in p, _INPUT_READY_TIMEOUT_S
         )
         assert ready, f"Kimi TUI never mounted its input box.\nPane:\n{pane}"
+        # Server is up now — capture its PID for the independent teardown kill.
+        server_pid = _server_pid(socket_path)
         yield socket_path, target, bridge_dir, mock_llm_server_url, version
     finally:
-        # Inspect the kill outcome (G3): remove the socket dir unconditionally, but
-        # if a server survives the kill + fallback, surface it (annotate the in-flight
-        # error, else warn) rather than reporting a clean teardown over an orphan.
-        teardown_note = _teardown_tmux_server(socket_path)
+        # Terminate the server (independent PID kill if a probe can't confirm death) and
+        # remove the socket dir unconditionally; if the server may survive, surface it
+        # (annotate the in-flight error, else warn) rather than reporting a clean teardown.
+        teardown_note = _teardown_tmux_server(socket_path, server_pid)
         shutil.rmtree(socket_dir, ignore_errors=True)
         if teardown_note is not None:
             in_flight = sys.exc_info()[1]
