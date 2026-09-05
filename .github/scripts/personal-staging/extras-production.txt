@@ -9,3 +9,8 @@
 # upstream. Bot-authored pins are never covered by the open-PR stream;
 # remove them once merged upstream, or replace them when superseded.
 5825  # supersedes #5198; omni-resolve-agent[bot]; reviewed head ee335038a6b4b8e4d854f5d07fa53b798518b679
+6370  # draft fix/kimi-provider-resolution (btli) force-promoted into production; remove once marked ready or merged upstream
+6436  # draft fix/kimi-permission-label-main (btli) force-promoted into production; remove once marked ready or merged upstream
+6439  # draft fix/kimi-steer-ctrl-s-main (btli) force-promoted into production; remove once marked ready or merged upstream
+6449  # draft fix/kimi-trust-preseed (btli) force-promoted into production; remove once marked ready or merged upstream
+6481  # draft fix/archive-list-tombstone (btli) force-promoted into production; remove once marked ready or merged upstream
