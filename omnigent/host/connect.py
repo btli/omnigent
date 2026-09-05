@@ -4031,9 +4031,22 @@ def run_host_process(
     # broker and attribute commits to the owner. Best-effort; the host runs in
     # every executor and holds the launch token, so no launcher needs to inject
     # anything GitHub-specific.
-    from omnigent.git_credential_github import configure_host_git
+    from omnigent.git_credential_github import (
+        configure_host_gh,
+        configure_host_git,
+        start_host_gh_refresh,
+    )
 
     configure_host_git(server_url, identity.host_id)
+    # gh CLI ignores git's credential.helper for its own API calls, so also
+    # materialize the owner's brokered token into gh's hosts.yml, then keep it
+    # fresh: git re-fetches per op via the broker, but gh reads a static
+    # hosts.yml, so a background thread re-writes it before the GitHub token
+    # expires (~8h). All three are no-ops outside a managed sandbox; the refresher
+    # runs regardless of the startup write (its ticks re-fetch, so a transient
+    # broker blip at startup can't strand a connected owner for the whole session).
+    configure_host_gh(server_url, identity.host_id)
+    start_host_gh_refresh(server_url, identity.host_id)
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
