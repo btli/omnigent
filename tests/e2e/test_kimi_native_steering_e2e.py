@@ -16,12 +16,16 @@ the paste, so the executor-adapter tears down ``_watch_injections`` immediately
 
 Oracle: Kimi merges a steer locally and fires NO new model request until the
 blocked turn releases — identically on fixed and unfixed builds — so the mock
-cannot tell steered from queued. The queue affordance is therefore the sole
-discriminator (see the discriminator assertion, which must not be simplified
-away). The test first calibrates that the affordance both appears (a mid-turn
-Enter-only submit queues) and disappears (Ctrl-S flushes) on this binary, then
-requires it absent after the production steer, then confirms the steer reached
-the model conversation.
+cannot tell steered from queued. The queue affordance is the sole discriminator
+(the sustained-absence assertion below; do not replace it with a mock check). To
+make "affordance absent" a structural guarantee rather than a race, the test
+first calibrates that a mid-turn Enter-only submit makes the affordance appear
+and MEASURES that repaint latency, clears that draft with a direct ``Ctrl-S``
+(so the discriminator only ever depends on flushing a SINGLE draft), then
+requires the affordance to stay CONTINUOUSLY ABSENT for a window derived from the
+measured latency: an unfixed build re-queues and repaints inside the window
+(RED), a fixed build never queues (GREEN). It revalidates the turn is still in
+flight right before steering, and confirms the steer reached the model after.
 
 Opt in with ``OMNIGENT_E2E_KIMI=1``; needs the ``kimi`` CLI (>= 0.41.0, where
 ``Ctrl-S`` steers) and ``tmux``. Excluded from default ``pytest`` runs
@@ -34,13 +38,16 @@ Opt in with ``OMNIGENT_E2E_KIMI=1``; needs the ``kimi`` CLI (>= 0.41.0, where
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from functools import cache
 from pathlib import Path
@@ -142,11 +149,26 @@ _CONTROL_TEXT = f"{_CONTROL_MARK} calibration only"
 # queue-vs-steer, not the mere presence of a Ctrl-S hint.
 _QUEUE_AFFORDANCE = "to steer immediately"
 
+# Moon-phase spinner glyphs Kimi animates WHILE a turn is streaming; absent when
+# idle (the transcript shows the assistant reply instead). A running-turn marker.
+_SPINNER_GLYPHS = ("🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘")
+
 _BOOT_TIMEOUT_S = 45.0
 _INPUT_READY_TIMEOUT_S = 45.0
 _MIDTURN_TIMEOUT_S = 60.0
 _AFFORDANCE_TIMEOUT_S = 20.0
+_RUNNING_SPINNER_TIMEOUT_S = 10.0
 _STEER_LLM_TIMEOUT_S = 30.0
+# The sustained-absence window is measured_repaint_latency × this multiplier,
+# floored — generous enough that an unfixed build's re-queued affordance always
+# repaints inside it, so RED is deterministic rather than a race.
+_ABSENCE_SAFETY_MULT = 4.0
+_MIN_ABSENCE_WINDOW_S = 4.0
+# Minimum non-empty captures across the absence window before "absent" is
+# trustworthy — an all-empty window (tmux failing) must not read as GREEN.
+_MIN_ABSENCE_OBSERVATIONS = 5
+_MEASURE_POLL_S = 0.1
+_ABSENCE_POLL_S = 0.25
 _SETTLE_S = 0.5
 _POLL_S = 0.5
 # Per-command tmux budget; a tmux server starved by a parallel boot can stall
@@ -191,31 +213,49 @@ def _send_keys(socket_path: str, target: str, *keys: str) -> None:
     _run_tmux(socket_path, "send-keys", "-t", target, *keys)
 
 
-def _await_pane(
-    socket_path: str, target: str, predicate: Callable[[str], bool], timeout_s: float
-) -> tuple[bool, str]:
-    """Poll captures until *predicate* holds on a NON-EMPTY pane.
+def _poll_window(
+    socket_path: str,
+    target: str,
+    predicate: Callable[[str], bool],
+    window_s: float,
+    poll_s: float,
+) -> tuple[float | None, str, int]:
+    """Poll captures for up to *window_s*, testing *predicate* on NON-EMPTY panes.
 
-    ``_capture`` returns ``""`` on any tmux failure (timeout, OSError, nonzero
-    exit), so an empty capture is never fed to *predicate*. A "the affordance is
-    gone" check therefore can't be flipped true by a transient tmux hiccup — it
-    keeps polling and times out loudly instead. Returns
-    ``(matched, last_non_empty_pane)`` so the caller reports what it actually saw.
+    Returns ``(first_hit_time, last_non_empty_pane, non_empty_count)``. ``first_hit_time``
+    is the monotonic time *predicate* first held (``None`` if it never did within the
+    window). ``_capture`` returns ``""`` on any tmux failure, and an empty pane is never
+    fed to *predicate* — so neither an appearance measurement nor a sustained-absence
+    check can be satisfied or falsified by a transient/persistent capture failure.
     """
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + window_s
     last = ""
+    non_empty = 0
     while time.monotonic() < deadline:
         pane = _capture(socket_path, target)
         if pane:
+            non_empty += 1
             last = pane
             if predicate(pane):
-                return True, pane
-        time.sleep(_POLL_S)
-    return False, last
+                return time.monotonic(), last, non_empty
+        time.sleep(poll_s)
+    return None, last, non_empty
 
 
-def _queue_via_enter_only(socket_path: str, target: str, bridge_dir: Path, text: str) -> None:
-    """Submit *text* mid-turn exactly as an UNFIXED build would: clear, paste, Enter (no C-s)."""
+def _await_pane(
+    socket_path: str, target: str, predicate: Callable[[str], bool], timeout_s: float
+) -> tuple[bool, str]:
+    """Wait for *predicate* to hold on a NON-EMPTY pane; return ``(matched, last_pane)``."""
+    hit, pane, _ = _poll_window(socket_path, target, predicate, timeout_s, _POLL_S)
+    return hit is not None, pane
+
+
+def _submit_enter_only(socket_path: str, target: str, bridge_dir: Path, text: str) -> float:
+    """Submit *text* mid-turn as an UNFIXED build would (clear, paste, Enter; no C-s).
+
+    Returns the monotonic time of the Enter send-key, so the caller can measure how
+    long Kimi takes to repaint the queue affordance.
+    """
     _send_keys(socket_path, target, "C-a")
     _send_keys(socket_path, target, "C-k")
     paste_path = bridge_dir / "calibration_paste.bin"
@@ -224,6 +264,7 @@ def _queue_via_enter_only(socket_path: str, target: str, bridge_dir: Path, text:
     _run_tmux(socket_path, "paste-buffer", "-p", "-d", "-b", "omni-calibration", "-t", target)
     time.sleep(_SETTLE_S)
     _send_keys(socket_path, target, "Enter")
+    return time.monotonic()
 
 
 def _wait_for(predicate: Callable[[], bool], timeout_s: float, *, poll_s: float = _POLL_S) -> bool:
@@ -249,6 +290,48 @@ def _steer_reached_llm(client: httpx.Client, mock_url: str, mark: str) -> bool:
     except httpx.HTTPError:
         return False
     return any(mark in json.dumps(req) for req in requests)
+
+
+def _server_alive(socket_path: str) -> bool:
+    """Whether a tmux server with the kimi session still exists on *socket_path*."""
+    try:
+        return (
+            subprocess.run(
+                ["tmux", "-S", socket_path, "has-session", "-t", "kimi:0.0"],
+                capture_output=True,
+                timeout=_TMUX_TIMEOUT_S,
+            ).returncode
+            == 0
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _teardown_tmux_server(socket_path: str) -> str | None:
+    """kill-server, verify termination, escalate once; return a note if it may be orphaned.
+
+    A nonzero kill-server rc usually just means "no server running" (already gone), so
+    only a server still live afterward is a real failure. On a live server, retry the
+    kill once as a fallback. The caller removes the socket dir regardless; a returned
+    note is surfaced (never masked). Returns ``None`` when nothing remains.
+    """
+
+    def _kill() -> None:
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            subprocess.run(
+                ["tmux", "-S", socket_path, "kill-server"],
+                capture_output=True,
+                text=True,
+                timeout=_TMUX_TIMEOUT_S,
+            )
+
+    _kill()
+    if not _server_alive(socket_path):
+        return None
+    _kill()  # fallback termination
+    if _server_alive(socket_path):
+        return f"tmux server survived kill-server + retry on {socket_path!r} (possible orphan)"
+    return None
 
 
 async def _drain_run_turn(executor: KimiNativeExecutor, text: str) -> list[object]:
@@ -387,18 +470,17 @@ def kimi_tui(
         assert ready, f"Kimi TUI never mounted its input box.\nPane:\n{pane}"
         yield socket_path, target, bridge_dir, mock_llm_server_url, version
     finally:
-        # kill-server in its own guard so a teardown timeout/OSError can't skip the
-        # socket-dir removal or mask the real test result.
-        try:
-            subprocess.run(
-                ["tmux", "-S", socket_path, "kill-server"],
-                capture_output=True,
-                timeout=_TMUX_TIMEOUT_S,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-        finally:
-            shutil.rmtree(socket_dir, ignore_errors=True)
+        # Inspect the kill outcome (G3): remove the socket dir unconditionally, but
+        # if a server survives the kill + fallback, surface it (annotate the in-flight
+        # error, else warn) rather than reporting a clean teardown over an orphan.
+        teardown_note = _teardown_tmux_server(socket_path)
+        shutil.rmtree(socket_dir, ignore_errors=True)
+        if teardown_note is not None:
+            in_flight = sys.exc_info()[1]
+            if in_flight is not None:
+                in_flight.add_note(f"kimi_tui teardown: {teardown_note}")
+            else:
+                warnings.warn(f"kimi_tui teardown: {teardown_note}", stacklevel=2)
 
 
 @pytest.mark.parametrize("steer_via", ["fresh_run_turn", "enqueue_session_message"])
@@ -446,26 +528,30 @@ def test_midturn_steer_is_applied_not_queued(
             f"steer.\nPane:\n{_capture(socket_path, target)}"
         )
 
-        # Calibrate the oracle against THIS live build: a mid-turn Enter-only submit
-        # (what an unfixed build sends) must show the queue affordance...
-        _queue_via_enter_only(socket_path, target, bridge_dir, _CONTROL_TEXT)
-        calibrated, cal_pane = _await_pane(
+        # Calibrate the oracle against THIS live build AND measure repaint latency:
+        # a mid-turn Enter-only submit (what an unfixed build sends) must show the
+        # queue affordance, and we time how long the repaint takes.
+        enter_at = _submit_enter_only(socket_path, target, bridge_dir, _CONTROL_TEXT)
+        appeared_at, cal_pane, _ = _poll_window(
             socket_path,
             target,
             lambda p: _QUEUE_AFFORDANCE in p and _CONTROL_MARK in p,
             _AFFORDANCE_TIMEOUT_S,
+            _MEASURE_POLL_S,
         )
-        assert calibrated, (
+        assert appeared_at is not None, (
             "Kimi did not show its queue affordance for a mid-turn Enter-only message, so "
             f"the queued-vs-steered oracle can't be trusted for kimi {version_str} (the "
             f"affordance {_QUEUE_AFFORDANCE!r} may have drifted).\nPane:\n{cal_pane}"
         )
+        repaint_latency = appeared_at - enter_at
+        absence_window = max(_MIN_ABSENCE_WINDOW_S, repaint_latency * _ABSENCE_SAFETY_MULT)
 
-        # ...and a direct Ctrl-S must clear that single queued draft. This proves the
-        # affordance both appears and disappears here, AND leaves the queue empty, so
-        # the discriminator below only ever depends on Ctrl-S flushing a SINGLE draft
-        # — never on a whole-queue flush the fix does not promise. This send is direct
-        # tmux, so removing the production Ctrl-S does not affect it.
+        # Clear the calibration draft with a direct Ctrl-S. This proves the affordance
+        # also disappears here AND leaves the queue empty, so the discriminator only
+        # ever depends on Ctrl-S flushing a SINGLE draft — never a whole-queue flush
+        # the fix doesn't promise. Direct tmux, so removing production Ctrl-S can't
+        # affect it.
         _send_keys(socket_path, target, "C-s")
         cleared, cal_pane = _await_pane(
             socket_path, target, lambda p: _QUEUE_AFFORDANCE not in p, _AFFORDANCE_TIMEOUT_S
@@ -473,6 +559,25 @@ def test_midturn_steer_is_applied_not_queued(
         assert cleared, (
             f"Direct Ctrl-S did not clear a single queued draft for kimi {version_str}; the "
             f"queue-flush the fix relies on has drifted.\nPane:\n{cal_pane}"
+        )
+
+        # Revalidate the turn is STILL in flight after that cleanup, so the production
+        # steer lands mid-stream and the test isn't vacuously green.
+        assert _gate_pending(proxy_blind_client, mock_url), (
+            "Turn is no longer in flight after the calibration Ctrl-S (the mock no longer holds "
+            f"the model request); a steer now would land on an idle session and prove nothing "
+            f"about mid-turn steering for kimi {version_str}."
+        )
+        running, running_pane = _await_pane(
+            socket_path,
+            target,
+            lambda p: any(glyph in p for glyph in _SPINNER_GLYPHS),
+            _RUNNING_SPINNER_TIMEOUT_S,
+        )
+        assert running, (
+            "Turn stopped rendering its running-turn spinner after the calibration cleanup, so "
+            f"it is no longer mid-stream for kimi {version_str}; a steer now proves nothing.\n"
+            f"Pane:\n{running_pane}"
         )
 
         # Steer mid-turn through the production path (queue now holds one draft).
@@ -483,20 +588,29 @@ def test_midturn_steer_is_applied_not_queued(
             steered = asyncio.run(executor.enqueue_session_message("main", _STEER_TEXT))
         assert steered, f"steer injection via {steer_via} reported failure"
 
-        # DISCRIMINATOR (load-bearing): the queue affordance must be gone. This is the
-        # ONLY assertion that separates steered from queued: Kimi merges the steer
-        # locally and fires no new model request until the blocked turn releases, so
-        # the mock sees identical requests on fixed and unfixed builds and cannot
-        # discriminate. Do NOT replace this with a mock-request check. ``_await_pane``
-        # requires a NON-EMPTY capture, so a tmux failure can't read as "gone".
-        applied, pane = _await_pane(
-            socket_path, target, lambda p: _QUEUE_AFFORDANCE not in p, _AFFORDANCE_TIMEOUT_S
+        # DISCRIMINATOR (load-bearing): the queue affordance must stay CONTINUOUSLY
+        # ABSENT for the calibration-derived window. This is the ONLY assertion that
+        # separates steered from queued: Kimi merges the steer locally and fires no new
+        # model request until release, so the mock sees identical requests on fixed and
+        # unfixed builds and cannot discriminate. Do NOT replace it with a mock check.
+        # An unfixed build re-queues on Enter and repaints the affordance within roughly
+        # the measured latency (well inside the window) → RED; a fixed build's Ctrl-S
+        # flushes before any repaint, so absence holds across the whole window → GREEN.
+        hit_at, last_pane, observations = _poll_window(
+            socket_path, target, lambda p: _QUEUE_AFFORDANCE in p, absence_window, _ABSENCE_POLL_S
         )
-        assert applied, (
+        assert hit_at is None, (
             "Mid-turn steer was QUEUED, not applied to the running turn: Kimi's queue-pane "
-            f"affordance {_QUEUE_AFFORDANCE!r} is still present for kimi {version_str}. Omnigent "
-            "committed the steer with Enter and never sent the CLI's Ctrl-S steer key.\n"
-            f"Pane:\n{pane}"
+            f"affordance {_QUEUE_AFFORDANCE!r} reappeared for kimi {version_str} within the "
+            f"{absence_window:.1f}s absence window (measured calibration repaint latency "
+            f"{repaint_latency:.2f}s). Omnigent committed the steer with Enter and never sent "
+            f"the CLI's Ctrl-S steer key.\nPane:\n{last_pane}"
+        )
+        # Absence is only trustworthy if we actually saw the pane throughout the window.
+        assert observations >= _MIN_ABSENCE_OBSERVATIONS, (
+            f"Only {observations} non-empty captures across the {absence_window:.1f}s absence "
+            "window; tmux may be failing, so 'affordance absent' is untrustworthy.\n"
+            f"Pane:\n{last_pane}"
         )
 
         # Corroborate the inject physically happened (guards an absent affordance from
