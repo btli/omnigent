@@ -8,8 +8,13 @@ import { useNavigate } from "@/lib/routing";
 import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
 import { ExtensionHostServiceError } from "./errors";
 import { grantedHostMethods } from "./registry";
-import { createProjectSummary, listProjectSummaries, parseCreateProjectParams } from "./projects";
-import { listSessionPage, SessionReadLimiter } from "./sessions";
+import {
+  cachedProjectSummaries,
+  createProjectSummary,
+  listProjectSummaries,
+  parseCreateProjectParams,
+} from "./projects";
+import { cachedInitialSessionPage, listSessionPage, SessionReadLimiter } from "./sessions";
 import {
   ExtensionStorageError,
   ExtensionStorageWriteLimiter,
@@ -73,7 +78,9 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const queryClient = useQueryClient();
   const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
-  const sessionReadLimiter = useMemo(() => new SessionReadLimiter(), []);
+  const sessionListLimiter = useMemo(() => new SessionReadLimiter(), []);
+  const pullRequestLimiter = useMemo(() => new SessionReadLimiter(), []);
+  const servedCachedInitialSessionsRef = useRef(false);
   // External URLs the host has handed to this extension; the only ones it may open.
   const externalUrlsRef = useRef(new Set<string>());
 
@@ -160,10 +167,19 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           await mapStorageErrors(() => storage.delete(objectParams(params).key, signal));
           return null;
         }),
-      "sessions.listPage": (params: unknown, signal: AbortSignal) =>
-        sessionReadLimiter.run(signal, () => listSessionPage(params, signal)),
+      "sessions.listPage": (params: unknown, signal: AbortSignal) => {
+        throwIfAborted(signal);
+        if (!servedCachedInitialSessionsRef.current) {
+          const cached = cachedInitialSessionPage(queryClient, params);
+          if (cached) {
+            servedCachedInitialSessionsRef.current = true;
+            return cached;
+          }
+        }
+        return sessionListLimiter.run(signal, () => listSessionPage(params, signal));
+      },
       "sessions.pullRequest": (params: unknown, signal: AbortSignal) =>
-        sessionReadLimiter.run(signal, async (): Promise<ExtensionPullRequest | null> => {
+        pullRequestLimiter.run(signal, async (): Promise<ExtensionPullRequest | null> => {
           const sessionId = objectParams(params).sessionId;
           if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) {
             throw new ExtensionHostServiceError("InvalidParams", "sessionId is invalid");
@@ -181,7 +197,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
         }),
       "projects.list": (_params: unknown, signal: AbortSignal) => {
         throwIfAborted(signal);
-        return listProjectSummaries();
+        return cachedProjectSummaries(queryClient) ?? listProjectSummaries();
       },
       "projects.create": async (params: unknown, signal: AbortSignal) => {
         const name = parseCreateProjectParams(params);
@@ -193,7 +209,15 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
       },
     };
     return grantedHostMethods(extension, implementations);
-  }, [extension, navigate, queryClient, sessionReadLimiter, theme, writeLimiter]);
+  }, [
+    extension,
+    navigate,
+    pullRequestLimiter,
+    queryClient,
+    sessionListLimiter,
+    theme,
+    writeLimiter,
+  ]);
   const events = useMemo(() => ({ "theme.changed": { theme } }), [theme]);
   return { methods, events };
 }
