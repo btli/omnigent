@@ -821,8 +821,13 @@ def _settle_pane(
         if not trust_accepted and state.trust_visible:
             _raise_if_injection_cancelled(cancel_event)
             trust_accepted = True
-            with contextlib.suppress(RuntimeError):
+            try:
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            except (RuntimeError, OSError):
+                _logger.warning(
+                    "could not accept Kimi trust modal with tmux Enter; waiting for TUI recovery",
+                    exc_info=True,
+                )
         if time.monotonic() >= deadline:
             break
         time.sleep(_POLL_INTERVAL_S)
