@@ -175,6 +175,9 @@ _POLL_S = 0.5
 # Per-command tmux budget; a tmux server starved by a parallel boot can stall
 # past 5s while healthy.
 _TMUX_TIMEOUT_S = 10.0
+# Grace between a teardown SIGTERM and SIGKILL, during which the PID's ownership
+# is re-validated so SIGKILL never lands on a recycled PID.
+_SIGKILL_GRACE_S = 0.5
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
@@ -315,9 +318,13 @@ def _server_pid(socket_path: str) -> int | None:
 def _pid_is_our_server(pid: int | None, socket_path: str) -> str:
     """Three-state check that *pid* is still OUR tmux server: ``alive``/``dead``/``unknown``.
 
-    Matches the process command to ``tmux`` + *socket_path*, so a recycled PID reads as
-    ``dead`` (our server is gone) and is never mistaken for a live server we'd wrongly
-    kill. A failed/timed-out ``ps`` is ``unknown`` (a possible survivor), never ``dead``.
+    ``alive`` requires the strict ``tmux`` + *socket_path* command match — the sole gate on
+    signalling, so a recycled or unrelated PID is never killed. ``dead`` is reserved for a
+    truly-gone PID (``ps`` returncode != 0). Everything else is ``unknown`` (a possible
+    survivor): a failed/timed-out ``ps``, OR a live PID whose proctitle doesn't confirm the
+    socket — notably Linux, which retitles the server to ``tmux: server`` without the socket.
+    Returning ``unknown`` (not a false ``dead``) makes :func:`_server_liveness` defer to
+    ``has-session`` for the authoritative answer instead of short-circuiting to "clean".
     """
     if pid is None:
         return "unknown"
@@ -331,9 +338,11 @@ def _pid_is_our_server(pid: int | None, socket_path: str) -> str:
     except (subprocess.TimeoutExpired, OSError):
         return "unknown"
     if proc.returncode != 0:
-        return "dead"
+        return "dead"  # PID truly gone
     command = proc.stdout
-    return "alive" if ("tmux" in command and socket_path in command) else "dead"
+    if "tmux" in command and socket_path in command:
+        return "alive"  # confirmed ours — safe to signal
+    return "unknown"  # PID exists but not confirmably ours; defer, never a false "dead"
 
 
 def _has_session_state(socket_path: str) -> str:
@@ -377,11 +386,16 @@ def _teardown_tmux_server(socket_path: str, server_pid: int | None) -> str | Non
     if _server_liveness(socket_path, server_pid) == "dead":
         return None
     # Not confirmed dead (alive OR unknown) → independent PID-based termination, but only
-    # when the PID is still confirmably OUR tmux server (never signal a recycled PID).
+    # while the PID is still confirmably OUR tmux server. Re-validate ownership before EACH
+    # signal: if SIGTERM ends tmux and the OS recycles the PID, the strict match no longer
+    # holds, so SIGKILL is skipped rather than landing on an unrelated recycled process.
     if server_pid is not None and _pid_is_our_server(server_pid, socket_path) == "alive":
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(server_pid, signal.SIGTERM)
+        time.sleep(_SIGKILL_GRACE_S)
+        if _pid_is_our_server(server_pid, socket_path) == "alive":
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                os.kill(server_pid, sig)
+                os.kill(server_pid, signal.SIGKILL)
         if _server_liveness(socket_path, server_pid) == "dead":
             return None
     state = _server_liveness(socket_path, server_pid)
