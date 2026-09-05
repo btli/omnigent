@@ -204,6 +204,21 @@ export function useResizableInlinePanel(
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  const pendingClientX = useRef<number | null>(null);
+  const pendingFrame = useRef<number | null>(null);
+  const cancelPendingMove = useCallback(() => {
+    if (pendingFrame.current !== null) cancelAnimationFrame(pendingFrame.current);
+    pendingFrame.current = null;
+    pendingClientX.current = null;
+  }, []);
+  const flushPendingMove = useCallback(() => {
+    const clientX = pendingClientX.current;
+    cancelPendingMove();
+    if (clientX !== null) {
+      widthStore.set(clamp(window.innerWidth - clientX, minWidthRef.current, reservedRef.current));
+    }
+  }, [cancelPendingMove]);
+
   const resizeEnabled = enabled && persistEnabled && resolvedWidth !== 0;
   // Exposed so the rail can suppress its open/close motion mid-drag.
   const [isDragging, setIsDragging] = useState(false);
@@ -214,19 +229,25 @@ export function useResizableInlinePanel(
       widthStore.beginDrag();
       setIsDragging(true);
     }, []),
-    onCancel: useCallback(() => {
+    onCancel: () => {
+      cancelPendingMove();
       widthStore.rollbackDrag();
       setIsDragging(false);
-    }, []),
-    onCommit: useCallback(() => {
+    },
+    onCommit: () => {
+      flushPendingMove();
       widthStore.persist();
       setIsDragging(false);
-    }, []),
-    onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
-      widthStore.set(
-        clamp(window.innerWidth - e.clientX, minWidthRef.current, reservedRef.current),
-      );
-    }, []),
+    },
+    onMove: useCallback(
+      (event: React.PointerEvent<HTMLElement>) => {
+        pendingClientX.current = event.clientX;
+        if (pendingFrame.current === null) {
+          pendingFrame.current = requestAnimationFrame(flushPendingMove);
+        }
+      },
+      [flushPendingMove],
+    ),
   });
   const cancelResizeDrag = resizeDrag.cancelDrag;
 
