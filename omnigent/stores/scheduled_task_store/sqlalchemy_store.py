@@ -412,6 +412,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         project_id: str | None,
     ) -> bool:
         """Replace a Project id only while the expected assignment is current."""
+
         def write(session: Session) -> bool:
             result = cast(
                 CursorResult[tuple[object]],
