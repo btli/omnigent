@@ -238,7 +238,7 @@ const ROW_TITLE_RESERVE = {
   awaiting: "pr-29 no-fine-hover:md:pr-48",
 } as const;
 const ROW_CONTROL_CLASS =
-  "hidden text-muted-foreground transition-opacity md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
+  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
 const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
