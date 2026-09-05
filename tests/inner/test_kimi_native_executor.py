@@ -214,7 +214,9 @@ class TestSettlePaneReadiness:
         caplog: pytest.LogCaptureFixture,
         error_type: type[Exception],
     ) -> None:
-        panes = iter(["Trust this folder?", "context: 0% (0/1M)"])
+        trust_pane = "Trust this folder?\nEnable project MCP servers"
+        ready_pane = "╭──╮\n│ > │\n╰──╯\ncontext: 0% (0/1M)"
+        panes = iter([trust_pane, ready_pane])
         monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: next(panes))
         monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda _seconds: None)
         sent: list[tuple[str, ...]] = []
