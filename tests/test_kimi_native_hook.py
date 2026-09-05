@@ -221,7 +221,7 @@ def test_permission_request_omits_preview_without_tool_input(
     monkeypatch.setattr(
         kimi_native_hook,
         "_request_web_approval",
-        lambda url, headers, body: posted.append({"body": body}) or "accept",
+        lambda url, headers, body, **kwargs: posted.append({"body": body}) or "accept",
     )
     _capture_injection(monkeypatch)
 
