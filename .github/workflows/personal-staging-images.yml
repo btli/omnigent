@@ -178,6 +178,7 @@ jobs:
                 kiro-cli --version
                 gh --version
               '
+          done
 
   promote-channel:
     needs: [build-and-push, native-host-check]

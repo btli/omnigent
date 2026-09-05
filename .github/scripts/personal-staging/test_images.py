@@ -52,3 +52,15 @@ def test_promotion_requires_native_host_checks() -> None:
     assert "native-host-check" in jobs["promote-channel"]["needs"]
     machines = jobs["native-host-check"]["strategy"]["matrix"]["include"]
     assert {entry["machine"] for entry in machines} == {"x86_64", "aarch64"}
+
+
+def test_all_publisher_shell_steps_parse() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    for job in jobs.values():
+        for step in job.get("steps", []):
+            if "run" not in step:
+                continue
+            result = subprocess.run(
+                ["bash", "-n"], input=step["run"], text=True, capture_output=True
+            )
+            assert result.returncode == 0, f"{step['name']}: {result.stderr}"
