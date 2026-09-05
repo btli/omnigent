@@ -283,9 +283,41 @@ def test_project_assignment_migration_downgrade_round_trip(tmp_path: Path) -> No
     clear_engine_cache()
 
 
-def test_single_alembic_head_at_project_id_revision(tmp_path: Path) -> None:
+def test_deployed_project_revision_runs_new_parallel_migration(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'deployed-project-revision.db'}"
+    engine = sa.create_engine(uri)
+    config = _build_alembic_config(uri)
+
+    # This is the production state that exposed the regression: the project
+    # migration was already stamped before the sandbox migration existed.
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, "a5363b7c9d2e")
+    assert "project_id" in {
+        column["name"] for column in sa.inspect(engine).get_columns("scheduled_tasks")
+    }
+    assert "terminating_sandbox_id" not in {
+        column["name"] for column in sa.inspect(engine).get_columns("hosts")
+    }
+
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, "head")
+    assert "terminating_sandbox_id" in {
+        column["name"] for column in sa.inspect(engine).get_columns("hosts")
+    }
+    with engine.connect() as conn:
+        assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "c18e2f7a4b90"
+        )
+
+    engine.dispose()
+    clear_engine_cache()
+
+
+def test_single_alembic_head_after_project_merge(tmp_path: Path) -> None:
     config = _build_alembic_config(f"sqlite:///{tmp_path / 'heads.db'}")
-    assert ScriptDirectory.from_config(config).get_heads() == ["a5363b7c9d2e"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["c18e2f7a4b90"]
 
 
 @pytest.mark.parametrize("dialect", ["postgresql", "sqlite", "mysql"])
