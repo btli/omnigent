@@ -3667,11 +3667,8 @@ function ConversationRowImpl({
   const swipeActions = useSwipeActions();
   const hasSwipeLeft = swipeActions.left !== "none";
   const hasSwipeRight = swipeActions.right !== "none";
-  // No capability gate here: the recognizer branches per-event on the active
-  // sequence's `pointerType` (it only ever claims touch pointers), so it stays
-  // attached even when `hasTouch` reads false — `maxTouchPoints` is a
-  // point-in-time affordance signal that never re-notifies when a digitizer
-  // attaches, and gating event handling on it left first touches dead.
+  // The sequence's pointerType owns recognition, so hardware capability
+  // queries cannot disable the first touch from a newly attached digitizer.
   const swipeEnabled = gestureEnabled && isOwner && (hasSwipeLeft || hasSwipeRight);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const rowLinkRef = useRef<HTMLAnchorElement>(null);
@@ -3885,7 +3882,7 @@ function ConversationRowImpl({
       onKeyDown={gesture.clearClickSuppression}
       className={cn(
         SIDEBAR_ROW,
-        "relative flex flex-col justify-center text-left text-foreground transition-colors",
+        "relative flex flex-col justify-center text-left text-foreground motion-safe:transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -4022,10 +4019,9 @@ function ConversationRowImpl({
         if (ownsPointer || isDragging) e.preventDefault();
       }}
       className={cn(
-        "group relative",
-        isSwiping && "mx-1",
+        "group relative overflow-hidden",
         isDragging && "opacity-40",
-        gesture.phase === "armed" && "z-10 scale-[1.01] shadow-sm",
+        gesture.phase === "armed" && "z-10 motion-safe:scale-[1.01] shadow-sm",
         ownsPointer && "touch-none",
       )}
       // Keep vertical scrolling native while claiming the horizontal axis for
@@ -4043,7 +4039,7 @@ function ConversationRowImpl({
           data-testid="conversation-swipe-reveal"
           className={cn(
             "pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[var(--radius-otto-sm)]",
-            "transition-colors",
+            "motion-safe:transition-colors",
             swipingAction === "delete"
               ? swipeCommitted
                 ? "bg-destructive/20 text-destructive"
@@ -4056,8 +4052,8 @@ function ConversationRowImpl({
         >
           <span
             className={cn(
-              "flex items-center transition-transform",
-              swipeCommitted ? "scale-110" : "scale-100",
+              "flex items-center motion-safe:transition-transform",
+              swipeCommitted ? "motion-safe:scale-110" : "motion-safe:scale-100",
             )}
           >
             {swipingAction === "delete" ? (
@@ -4072,24 +4068,16 @@ function ConversationRowImpl({
           </span>
         </div>
       )}
-      {/* Inset instead of translating so the title re-truncates and every row
-          control stays inside the panel. */}
       <div
         data-testid="conversation-swipe-surface"
         className={cn(
-          "relative",
+          "relative w-full",
           isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
           // Transition only at rest, so the row eases back when the gesture
           // ends but tracks the finger 1:1 while swiping.
-          gesture.dx === 0 && "transition-[margin] duration-200",
+          gesture.dx === 0 && "motion-safe:transition-transform motion-safe:duration-200",
         )}
-        style={
-          gesture.dx !== 0
-            ? gesture.dx < 0
-              ? { marginRight: -gesture.dx }
-              : { marginLeft: gesture.dx }
-            : undefined
-        }
+        style={{ transform: `translateX(${gesture.dx}px)` }}
       >
         {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
