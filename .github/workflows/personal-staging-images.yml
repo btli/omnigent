@@ -167,6 +167,7 @@ jobs:
               -e HOME=/tmp/verify --entrypoint sh \
               "ghcr.io/btli/omnigent-host@${HOST_DIGEST}" -ec '
                 mkdir -p "$HOME"
+                cd "$HOME"
                 test "$(uname -m)" = "$EXPECTED_MACHINE"
                 python -c "from omnigent.host.service import HostService"
                 node --version
