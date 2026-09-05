@@ -1055,7 +1055,7 @@ async def test_update_agent_and_project_in_the_same_patch(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     """Agent switching and project filing are applied atomically."""
-    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
     project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "Automation", "alice@example.com")
