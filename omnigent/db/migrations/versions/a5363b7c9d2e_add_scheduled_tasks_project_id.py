@@ -1,7 +1,7 @@
 """Add first-class Project membership to scheduled tasks.
 
 Revision ID: a5363b7c9d2e
-Revises: gb1b2c3d4e5f
+Revises: ga1b2c3d4e5f
 """
 
 import sqlalchemy as sa
@@ -10,7 +10,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision = "a5363b7c9d2e"
-down_revision = "gb1b2c3d4e5f"
+down_revision = "ga1b2c3d4e5f"
 branch_labels = None
 depends_on = None
 
