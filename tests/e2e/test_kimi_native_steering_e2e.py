@@ -1,46 +1,31 @@
-"""E2E: a mid-turn steer must be applied to the running Kimi turn, not queued.
+"""E2E: a mid-turn steer must steer the running Kimi turn, not queue behind it.
 
-Guards against the mid-turn steer regression: steering a running ``kimi`` (Kimi
-Code, ``kimi-native``) session does not take effect immediately. Omnigent
-injects the steer text into the Kimi TUI via
-:func:`omnigent.kimi_native_bridge.inject_user_message`, which commits the
-message with ``Enter``. On an UNFIXED build that is *all* it does — it never
-sends the CLI's steer key (``Ctrl-S``). Mid-turn, Kimi treats a bare ``Enter``
-as "queue this for after the turn": the steer lands in Kimi's queue (``↑ to
-edit · ctrl-s to steer immediately``) and is ignored until the turn ends,
-instead of steering the in-flight turn. The fix additionally sends ``Ctrl-S``,
-which flushes the queued text into the running turn (and no-ops while idle).
+Regression guard for kimi-native steering. Omnigent injects a steer into the
+Kimi TUI via :func:`omnigent.kimi_native_bridge.inject_user_message`. An UNFIXED
+build commits it with ``Enter`` only; mid-turn, Kimi QUEUES a bare ``Enter``
+(shown as ``↑ to edit · ctrl-s to steer immediately``) and ignores it until the
+turn ends. The fix also sends ``Ctrl-S``, which flushes the draft into the
+running turn (and no-ops while idle).
 
-The seam this drives, and why it is the REAL one:
+Real seam: ``KimiNativeExecutor.run_turn`` yields ``TurnComplete`` right after
+the paste, so the executor-adapter tears down ``_watch_injections`` immediately
+— a steer arriving while Kimi streams lands as a FRESH ``run_turn``, not through
+``enqueue_session_message``. The test drives the steer through a fresh
+``run_turn`` (the real path) and, parametrized, through
+``enqueue_session_message`` (the brief initial-paste window).
 
-``KimiNativeExecutor.run_turn`` injects the message and then yields
-``TurnComplete`` immediately (``omnigent/inner/kimi_native_executor.py``), so
-the executor-adapter tears down its ``_watch_injections`` task in the ``finally``
-as soon as that generator completes
-(``omnigent/runtime/harnesses/_executor_adapter.py``). The
-``enqueue_session_message`` / ``_watch_injections`` window is therefore open only
-for the few seconds of the INITIAL paste; a steer that arrives while Kimi is
-actually streaming lands as a FRESH ``run_turn``, not through
-``enqueue_session_message``. So the primary check drives the steer through a
-fresh ``run_turn`` (the real mid-turn path); the enqueue path is covered too,
-via parametrization, to pin the brief initial-paste window.
+Oracle: Kimi merges a steer locally and fires NO new model request until the
+blocked turn releases — identically on fixed and unfixed builds — so the mock
+cannot tell steered from queued. The queue affordance is therefore the sole
+discriminator (see the discriminator assertion, which must not be simplified
+away). The test first calibrates that the affordance both appears (a mid-turn
+Enter-only submit queues) and disappears (Ctrl-S flushes) on this binary, then
+requires it absent after the production steer, then confirms the steer reached
+the model conversation.
 
-Oracle (Kimi's steer merges locally — no new model request fires until the
-blocked turn releases, identically on both fixed and unfixed builds, so the mock
-cannot discriminate queued-vs-steered on its own; the queue affordance is the
-discriminator):
-
-1. calibrate — a mid-turn ``Enter``-only submission (exactly what an unfixed
-   build sends) MUST show Kimi's queue affordance, proving the affordance string
-   is live for this binary so its later absence is meaningful, not a rename;
-2. discriminate — after the production steer (paste + ``Enter`` + ``Ctrl-S``) the
-   queue affordance MUST be gone (steer flushed into the running turn);
-3. corroborate — after the blocked turn releases, the steer marker MUST reach the
-   model conversation, so an absent affordance can't be a silently-dropped inject.
-
-Real-binary e2e. Opt in with ``OMNIGENT_E2E_KIMI=1``; needs the ``kimi`` CLI
-(>= 0.41.0, where ``Ctrl-S`` steers) and ``tmux``. Excluded from default
-``pytest`` runs (``--ignore=tests/e2e``). Invoke with::
+Opt in with ``OMNIGENT_E2E_KIMI=1``; needs the ``kimi`` CLI (>= 0.41.0, where
+``Ctrl-S`` steers) and ``tmux``. Excluded from default ``pytest`` runs
+(``--ignore=tests/e2e``)::
 
     OMNIGENT_E2E_KIMI=1 uv run --no-sync pytest \
         tests/e2e/test_kimi_native_steering_e2e.py -v --timeout=600
@@ -56,7 +41,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from functools import cache
 from pathlib import Path
 
@@ -102,21 +87,28 @@ _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 
 @cache
-def _kimi_version() -> tuple[int, int, int] | None:
-    """Parse ``kimi --version`` into a release tuple, or ``None`` if undeterminable."""
+def _kimi_version() -> tuple[tuple[int, int, int] | None, str]:
+    """Return ``(release_tuple, "")`` from ``kimi --version``, or ``(None, why)``.
+
+    Rejects a nonzero exit (and OS/timeout failure) BEFORE parsing, so a version
+    string can't be scraped out of an error response; *why* carries the diagnostic.
+    """
     binary = _kimi_binary()
     if binary is None:
-        return None
+        return None, "kimi binary could not be resolved"
     try:
         proc = subprocess.run(
             [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"`{binary} --version` did not run: {exc}"
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+        return None, f"`{binary} --version` exited {proc.returncode}: {detail}"
     match = _VERSION_RE.search(proc.stdout) or _VERSION_RE.search(proc.stderr)
     if match is None:
-        return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        return None, f"no version in `{binary} --version` output: {proc.stdout.strip()!r}"
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3))), ""
 
 
 pytestmark = [
@@ -199,12 +191,31 @@ def _send_keys(socket_path: str, target: str, *keys: str) -> None:
     _run_tmux(socket_path, "send-keys", "-t", target, *keys)
 
 
-def _queue_via_enter_only(socket_path: str, target: str, bridge_dir: Path, text: str) -> None:
-    """Submit *text* mid-turn exactly as an UNFIXED build would: clear, paste, Enter (no C-s).
+def _await_pane(
+    socket_path: str, target: str, predicate: Callable[[str], bool], timeout_s: float
+) -> tuple[bool, str]:
+    """Poll captures until *predicate* holds on a NON-EMPTY pane.
 
-    Used to calibrate the oracle — a bare Enter mid-turn must queue, so the queue
-    affordance appears and its later absence (after the real steer) is meaningful.
+    ``_capture`` returns ``""`` on any tmux failure (timeout, OSError, nonzero
+    exit), so an empty capture is never fed to *predicate*. A "the affordance is
+    gone" check therefore can't be flipped true by a transient tmux hiccup — it
+    keeps polling and times out loudly instead. Returns
+    ``(matched, last_non_empty_pane)`` so the caller reports what it actually saw.
     """
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        pane = _capture(socket_path, target)
+        if pane:
+            last = pane
+            if predicate(pane):
+                return True, pane
+        time.sleep(_POLL_S)
+    return False, last
+
+
+def _queue_via_enter_only(socket_path: str, target: str, bridge_dir: Path, text: str) -> None:
+    """Submit *text* mid-turn exactly as an UNFIXED build would: clear, paste, Enter (no C-s)."""
     _send_keys(socket_path, target, "C-a")
     _send_keys(socket_path, target, "C-k")
     paste_path = bridge_dir / "calibration_paste.bin"
@@ -215,7 +226,7 @@ def _queue_via_enter_only(socket_path: str, target: str, bridge_dir: Path, text:
     _send_keys(socket_path, target, "Enter")
 
 
-def _wait_for(predicate, timeout_s: float, *, poll_s: float = _POLL_S) -> bool:
+def _wait_for(predicate: Callable[[], bool], timeout_s: float, *, poll_s: float = _POLL_S) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if predicate():
@@ -277,9 +288,9 @@ def kimi_tui(
     if mock_llm_server_url is None:
         pytest.skip("mock LLM server required (run without --llm-api-key)")
 
-    version = _kimi_version()
+    version, version_detail = _kimi_version()
     if version is None:
-        pytest.skip(f"could not determine kimi version from {kimi_bin!r} --version")
+        pytest.skip(f"kimi version undeterminable: {version_detail}")
     if version < _MIN_KIMI_VERSION:
         observed = ".".join(str(part) for part in version)
         minimum = ".".join(str(part) for part in _MIN_KIMI_VERSION)
@@ -326,62 +337,68 @@ def kimi_tui(
 
     write_tmux_target(bridge_dir, socket_path=Path(socket_path), tmux_target=target)
 
-    launch = subprocess.run(
-        [
-            "tmux",
-            "-S",
-            socket_path,
-            "new-session",
-            "-d",
-            "-s",
-            "kimi",
-            "-x",
-            "200",
-            "-y",
-            "50",
-            kimi_bin,
-        ],
-        cwd=str(workspace),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=_TMUX_TIMEOUT_S,
-    )
-    if launch.returncode != 0:
-        detail = launch.stderr.strip() or launch.stdout.strip() or "<no output>"
-        raise RuntimeError(f"tmux new-session for kimi failed (rc={launch.returncode}): {detail}")
+    # Enter the cleanup scope BEFORE launching so a failed/partial ``new-session``
+    # (timeout, OSError, nonzero exit) still tears down any half-created server and
+    # removes the socket dir instead of leaking them.
     try:
+        launch = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "new-session",
+                "-d",
+                "-s",
+                "kimi",
+                "-x",
+                "200",
+                "-y",
+                "50",
+                kimi_bin,
+            ],
+            cwd=str(workspace),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_TIMEOUT_S,
+        )
+        if launch.returncode != 0:
+            detail = launch.stderr.strip() or launch.stdout.strip() or "<no output>"
+            raise RuntimeError(
+                f"tmux new-session for kimi failed (rc={launch.returncode}): {detail}"
+            )
+
         # First-run "Trust this folder?" gate: the trust option is pre-selected,
         # so Enter accepts it and mounts the input box. Only send Enter once we
         # positively see the prompt, so a changed startup UI can't eat a stray
-        # Enter (already-mounted input, seen via "context:", needs no Enter).
-        saw_gate = _wait_for(
-            lambda: (
-                "Trust this" in _capture(socket_path, target)
-                or "context:" in _capture(socket_path, target)
-            ),
+        # Enter (an already-mounted input, seen via "context:", needs no Enter).
+        saw_gate, pane = _await_pane(
+            socket_path,
+            target,
+            lambda p: "Trust this" in p or "context:" in p,
             _BOOT_TIMEOUT_S,
         )
-        assert saw_gate, (
-            "Kimi TUI never showed its trust prompt or input box.\n"
-            f"Pane:\n{_capture(socket_path, target)}"
-        )
-        if "Trust this" in _capture(socket_path, target):
+        assert saw_gate, f"Kimi TUI never showed its trust prompt or input box.\nPane:\n{pane}"
+        if "Trust this" in pane:
             _send_keys(socket_path, target, "Enter")
-        ready = _wait_for(
-            lambda: "context:" in _capture(socket_path, target), _INPUT_READY_TIMEOUT_S
+        ready, pane = _await_pane(
+            socket_path, target, lambda p: "context:" in p, _INPUT_READY_TIMEOUT_S
         )
-        assert ready, (
-            f"Kimi TUI never mounted its input box.\nPane:\n{_capture(socket_path, target)}"
-        )
+        assert ready, f"Kimi TUI never mounted its input box.\nPane:\n{pane}"
         yield socket_path, target, bridge_dir, mock_llm_server_url, version
     finally:
-        subprocess.run(
-            ["tmux", "-S", socket_path, "kill-server"],
-            capture_output=True,
-            timeout=_TMUX_TIMEOUT_S,
-        )
-        shutil.rmtree(socket_dir, ignore_errors=True)
+        # kill-server in its own guard so a teardown timeout/OSError can't skip the
+        # socket-dir removal or mask the real test result.
+        try:
+            subprocess.run(
+                ["tmux", "-S", socket_path, "kill-server"],
+                capture_output=True,
+                timeout=_TMUX_TIMEOUT_S,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        finally:
+            shutil.rmtree(socket_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("steer_via", ["fresh_run_turn", "enqueue_session_message"])
@@ -392,11 +409,10 @@ def test_midturn_steer_is_applied_not_queued(
 ) -> None:
     """A steer sent mid-turn must steer the running Kimi turn, not queue behind it.
 
-    ``fresh_run_turn`` is the real mid-turn path (a second ``run_turn`` while the
-    first turn streams); ``enqueue_session_message`` covers the brief initial-paste
-    window. Both go through ``inject_user_message`` (paste + Enter + Ctrl-S), so
-    both must flush the steer into the running turn. If Ctrl-S were narrowed to the
-    enqueue path only, the ``fresh_run_turn`` row would regress and fail here.
+    ``fresh_run_turn`` is the real mid-turn path; ``enqueue_session_message`` covers
+    the initial-paste window. Both go through ``inject_user_message`` (paste + Enter
+    + Ctrl-S), so narrowing Ctrl-S to the enqueue path alone would fail the
+    ``fresh_run_turn`` row here.
     """
     socket_path, target, bridge_dir, mock_url, version = kimi_tui
     version_str = ".".join(str(part) for part in version)
@@ -430,26 +446,36 @@ def test_midturn_steer_is_applied_not_queued(
             f"steer.\nPane:\n{_capture(socket_path, target)}"
         )
 
-        # Calibrate: a bare Enter mid-turn (what an unfixed build sends) must queue
-        # and show the affordance. Proves the affordance string is live for this
-        # kimi build, so its absence after the real steer is meaningful.
+        # Calibrate the oracle against THIS live build: a mid-turn Enter-only submit
+        # (what an unfixed build sends) must show the queue affordance...
         _queue_via_enter_only(socket_path, target, bridge_dir, _CONTROL_TEXT)
-        calibrated = _wait_for(
-            lambda: (
-                _QUEUE_AFFORDANCE in _capture(socket_path, target)
-                and _CONTROL_MARK in _capture(socket_path, target)
-            ),
+        calibrated, cal_pane = _await_pane(
+            socket_path,
+            target,
+            lambda p: _QUEUE_AFFORDANCE in p and _CONTROL_MARK in p,
             _AFFORDANCE_TIMEOUT_S,
         )
-        calibration_pane = _capture(socket_path, target)
         assert calibrated, (
             "Kimi did not show its queue affordance for a mid-turn Enter-only message, so "
             f"the queued-vs-steered oracle can't be trusted for kimi {version_str} (the "
-            f"affordance {_QUEUE_AFFORDANCE!r} may have drifted).\nPane:\n{calibration_pane}"
+            f"affordance {_QUEUE_AFFORDANCE!r} may have drifted).\nPane:\n{cal_pane}"
         )
 
-        # Steer mid-turn through the production path. Ctrl-S flushes the queued
-        # draft(s) into the running turn, so the affordance must disappear.
+        # ...and a direct Ctrl-S must clear that single queued draft. This proves the
+        # affordance both appears and disappears here, AND leaves the queue empty, so
+        # the discriminator below only ever depends on Ctrl-S flushing a SINGLE draft
+        # — never on a whole-queue flush the fix does not promise. This send is direct
+        # tmux, so removing the production Ctrl-S does not affect it.
+        _send_keys(socket_path, target, "C-s")
+        cleared, cal_pane = _await_pane(
+            socket_path, target, lambda p: _QUEUE_AFFORDANCE not in p, _AFFORDANCE_TIMEOUT_S
+        )
+        assert cleared, (
+            f"Direct Ctrl-S did not clear a single queued draft for kimi {version_str}; the "
+            f"queue-flush the fix relies on has drifted.\nPane:\n{cal_pane}"
+        )
+
+        # Steer mid-turn through the production path (queue now holds one draft).
         if steer_via == "fresh_run_turn":
             events = asyncio.run(_drain_run_turn(executor, _STEER_TEXT))
             steered = not any(isinstance(event, ExecutorError) for event in events)
@@ -457,11 +483,15 @@ def test_midturn_steer_is_applied_not_queued(
             steered = asyncio.run(executor.enqueue_session_message("main", _STEER_TEXT))
         assert steered, f"steer injection via {steer_via} reported failure"
 
-        applied = _wait_for(
-            lambda: _QUEUE_AFFORDANCE not in _capture(socket_path, target),
-            _AFFORDANCE_TIMEOUT_S,
+        # DISCRIMINATOR (load-bearing): the queue affordance must be gone. This is the
+        # ONLY assertion that separates steered from queued: Kimi merges the steer
+        # locally and fires no new model request until the blocked turn releases, so
+        # the mock sees identical requests on fixed and unfixed builds and cannot
+        # discriminate. Do NOT replace this with a mock-request check. ``_await_pane``
+        # requires a NON-EMPTY capture, so a tmux failure can't read as "gone".
+        applied, pane = _await_pane(
+            socket_path, target, lambda p: _QUEUE_AFFORDANCE not in p, _AFFORDANCE_TIMEOUT_S
         )
-        pane = _capture(socket_path, target)
         assert applied, (
             "Mid-turn steer was QUEUED, not applied to the running turn: Kimi's queue-pane "
             f"affordance {_QUEUE_AFFORDANCE!r} is still present for kimi {version_str}. Omnigent "
@@ -469,9 +499,10 @@ def test_midturn_steer_is_applied_not_queued(
             f"Pane:\n{pane}"
         )
 
-        # Corroborate: release the blocked turn, then the steer marker must reach
-        # the model conversation. Guards an absent affordance from meaning the
-        # inject was silently dropped rather than genuinely steered.
+        # Corroborate the inject physically happened (guards an absent affordance from
+        # meaning a silently-dropped inject rather than a real steer): after releasing
+        # the turn, the steer marker must reach the model. This does NOT discriminate
+        # steered-vs-queued — the discriminator above is the only leg that does.
         release_mock_gate(mock_url)
         gate_released = True
         reached = _wait_for(
