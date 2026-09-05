@@ -1,11 +1,11 @@
-name: Publish personal staging images
-run-name: Publish personal staging images (${{ inputs.ref }}) by @${{ github.actor }}
+name: Publish personal ring images
+run-name: Publish personal ring images (${{ inputs.ref }}) by @${{ github.actor }}
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Existing nightly-* tag name (bare, e.g. nightly-20260809)'
+        description: 'Immutable nightly-YYYYMMDD or production-YYYYMMDD[-rerunN] tag'
         required: true
         type: string
 
@@ -24,6 +24,10 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    outputs:
+      server_digest: ${{ steps.build-server.outputs.digest }}
+      host_digest: ${{ steps.build-host.outputs.digest }}
+      channel: ${{ steps.source.outputs.channel }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -39,14 +43,14 @@ jobs:
           set -euo pipefail
 
           case "${INPUT_REF}" in
-            nightly-*) tag_name="${INPUT_REF}" ;;
+            nightly-*|production-*) tag_name="${INPUT_REF}" ;;
             *)
-              echo "Dispatch ref must be a nightly-* tag name, got '${INPUT_REF}'." >&2
+              echo "Dispatch ref must be a nightly-* or production-* tag name, got '${INPUT_REF}'." >&2
               exit 1
               ;;
           esac
 
-          if [[ ! "${tag_name}" =~ ^nightly-[A-Za-z0-9_.-]{1,120}$ ]]; then
+          if [[ ! "${tag_name}" =~ ^(nightly|production)-[0-9]{8}(-rerun[0-9]+)?$ ]]; then
             echo "Tag '${tag_name}' is not a valid Docker tag name." >&2
             exit 1
           fi
@@ -60,6 +64,11 @@ jobs:
           host_image='ghcr.io/btli/omnigent-host'
           echo "server_tags=${server_image}:sha-${short_sha},${server_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
           echo "host_tags=${host_image}:sha-${short_sha},${host_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
+          if [[ "$tag_name" == production-* ]]; then
+            echo "channel=production-nightly" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=staging-nightly" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
@@ -125,13 +134,72 @@ jobs:
           provenance: false
           sbom: true
 
-      - name: Publish staging-nightly tags
+  native-host-check:
+    needs: build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            machine: x86_64
+          - runner: ubuntu-24.04-arm
+            machine: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the native host as both runtime users
         env:
-          SERVER_DIGEST: ${{ steps.build-server.outputs.digest }}
-          HOST_DIGEST: ${{ steps.build-host.outputs.digest }}
+          HOST_DIGEST: ${{ needs.build-and-push.outputs.host_digest }}
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: |
+          set -euo pipefail
+          for uid in 1000 1000660000; do
+            docker run --rm --user "$uid:$uid" -e EXPECTED_MACHINE \
+              -e HOME=/tmp/verify --entrypoint sh \
+              "ghcr.io/btli/omnigent-host@${HOST_DIGEST}" -ec '
+                mkdir -p "$HOME"
+                test "$(uname -m)" = "$EXPECTED_MACHINE"
+                python -c "from omnigent.host.service import HostService"
+                node --version
+                claude --version
+                codex --version
+                pi --version
+                agy --version
+                kiro-cli --version
+                gh --version
+              '
+
+  promote-channel:
+    needs: [build-and-push, native-host-check]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified channel tags
+        env:
+          SERVER_DIGEST: ${{ needs.build-and-push.outputs.server_digest }}
+          HOST_DIGEST: ${{ needs.build-and-push.outputs.host_digest }}
+          CHANNEL: ${{ needs.build-and-push.outputs.channel }}
         run: |
           set -euo pipefail
           test -n "${SERVER_DIGEST}"
           test -n "${HOST_DIGEST}"
-          crane tag "ghcr.io/btli/omnigent-server@${SERVER_DIGEST}" staging-nightly
-          crane tag "ghcr.io/btli/omnigent-host@${HOST_DIGEST}" staging-nightly
+          docker buildx imagetools create -t "ghcr.io/btli/omnigent-server:${CHANNEL}" "ghcr.io/btli/omnigent-server@${SERVER_DIGEST}"
+          docker buildx imagetools create -t "ghcr.io/btli/omnigent-host:${CHANNEL}" "ghcr.io/btli/omnigent-host@${HOST_DIGEST}"
