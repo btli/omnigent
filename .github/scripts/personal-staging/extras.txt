@@ -18,4 +18,3 @@
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 5825  # supersedes #5198; omni-resolve-agent[bot]; reviewed head ee335038a6b4b8e4d854f5d07fa53b798518b679
-6368  # supersedes #5955 (bot carry of #5181); draft fix/forwarder-retry-dedup-rebased (btli) pinned explicitly — open-PR cap exceeded; remove once merged upstream
