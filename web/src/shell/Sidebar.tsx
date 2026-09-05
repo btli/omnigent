@@ -3882,11 +3882,11 @@ function ConversationRowImpl({
       onKeyDown={gesture.clearClickSuppression}
       className={cn(
         SIDEBAR_ROW,
-        "relative flex flex-col justify-center text-left text-foreground motion-safe:transition-colors",
+        "relative flex flex-col justify-center text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
-        "w-full",
+        "w-full focus-visible:outline-offset-[-2px]",
         // Rest reserve: mobile drops the controls, so the row reserves only
         // what the badge needs — the same width a fine-hover desktop uses
         // before hover reveals the controls. Without fine hover at md+ (touch
@@ -4039,7 +4039,7 @@ function ConversationRowImpl({
           data-testid="conversation-swipe-reveal"
           className={cn(
             "pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[var(--radius-otto-sm)]",
-            "motion-safe:transition-colors",
+            "transition-colors",
             swipingAction === "delete"
               ? swipeCommitted
                 ? "bg-destructive/20 text-destructive"
@@ -4052,7 +4052,7 @@ function ConversationRowImpl({
         >
           <span
             className={cn(
-              "flex items-center motion-safe:transition-transform",
+              "flex items-center transition-transform",
               swipeCommitted ? "motion-safe:scale-110" : "motion-safe:scale-100",
             )}
           >
@@ -4075,7 +4075,7 @@ function ConversationRowImpl({
           isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
           // Transition only at rest, so the row eases back when the gesture
           // ends but tracks the finger 1:1 while swiping.
-          gesture.dx === 0 && "motion-safe:transition-transform motion-safe:duration-200",
+          gesture.dx === 0 && "transition-transform duration-200",
         )}
         style={{ transform: `translateX(${gesture.dx}px)` }}
       >
