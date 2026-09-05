@@ -679,6 +679,7 @@ class TestUserMessageInjection:
         capture_log: list[tuple[int, str]] | None = None,
         cancel_after_clear: threading.Event | None = None,
         sticky_post_paste: bool = False,
+        ctrl_s_error: RuntimeError | OSError | None = None,
     ) -> list[tuple[str, ...]]:
         def _editor_pane(text: str) -> str:
             rows = text.splitlines() or [""]
@@ -758,6 +759,8 @@ class TestUserMessageInjection:
                 if submit_after_enters is not None and enters["count"] >= submit_after_enters:
                     tui["pane"] = _editor_pane("")
                     empty_captures["count"] = empty_captures_after_submit
+            elif args[-1] == "C-s" and ctrl_s_error is not None:
+                raise ctrl_s_error
 
         monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
         return sent
@@ -768,6 +771,51 @@ class TestUserMessageInjection:
         sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=2)
         inject_user_message(tmp_path / "bridge", content="fix the flaky test")
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter", "Enter"]
+
+    def test_message_submit_sends_enter_then_ctrl_s(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="steer now",
+        )
+        inject_user_message(tmp_path / "bridge", content="steer now")
+        enter = ("send-keys", "-t", "main", "Enter")
+        enter_index = sent.index(enter)
+        assert sent[enter_index : enter_index + 2] == [
+            enter,
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+
+    @pytest.mark.parametrize(
+        "ctrl_s_error",
+        [
+            pytest.param(RuntimeError("tmux socket disappeared"), id="runtime-error"),
+            pytest.param(OSError("tmux socket disappeared"), id="os-error"),
+        ],
+    )
+    def test_ctrl_s_failure_keeps_submitted_message_delivered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        ctrl_s_error: RuntimeError | OSError,
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="steer now",
+            ctrl_s_error=ctrl_s_error,
+        )
+        inject_user_message(tmp_path / "bridge", content="steer now")
+        assert sent[-2:] == [
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        assert "the message may remain queued until the turn ends" in caplog.text
 
     def test_raises_when_draft_never_submits(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
