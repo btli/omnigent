@@ -340,6 +340,36 @@ describe("fetchWorkspaceFileBytes", () => {
 
     await expect(fetchWorkspaceFileBytes("sess_x", "missing.glb")).rejects.toThrow("404 Not Found");
   });
+
+  it("rejects a Content-Length above the 256 MiB preview limit before reading", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(new Uint8Array([1]), {
+        headers: { "Content-Length": String(256 * 1024 * 1024 + 1) },
+      }),
+    );
+
+    await expect(fetchWorkspaceFileBytes("sess_123", "huge.glb")).rejects.toThrow("256 MiB");
+
+    const signal = fetchMock.mock.calls.at(-1)?.[1]?.signal as AbortSignal | undefined;
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("cancels a chunked response as soon as the bounded read crosses the limit", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.enqueue(new Uint8Array([4, 5, 6]));
+      },
+      cancel,
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body));
+
+    await expect(
+      fetchWorkspaceFileBytes("sess_123", "chunked.glb", { maxBytes: 4 }),
+    ).rejects.toThrow("4 bytes");
+    expect(cancel).toHaveBeenCalledOnce();
+  });
 });
 
 // ---------------------------------------------------------------------------
