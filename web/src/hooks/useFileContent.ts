@@ -113,6 +113,18 @@ function clickDownloadLink(href: string, filename: string): void {
   link.remove();
 }
 
+/** Fetch a workspace file's complete bytes through the uncapped download route. */
+export async function fetchWorkspaceFileBytes(
+  conversationId: string,
+  path: string,
+): Promise<ArrayBuffer> {
+  const res = await authenticatedFetch(
+    workspaceFileUrl(conversationId, path, { download: "true" }),
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.arrayBuffer();
+}
+
 /**
  * Download a workspace file's complete bytes.
  *

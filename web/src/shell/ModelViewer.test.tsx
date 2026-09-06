@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 
@@ -19,12 +19,15 @@ interface LoaderBehavior {
   // If set, the parsed object carries a mesh whose material references textures
   // (as a textured 3MF does), so teardown's texture disposal can be asserted.
   texturedMaterial: boolean;
+  // Hold the GLTFLoader callback so unmount-before-parse completion is testable.
+  deferGltf: boolean;
 }
 
 const behavior: LoaderBehavior = {
   mode: "valid",
   orbitThrows: false,
   texturedMaterial: false,
+  deferGltf: false,
 };
 
 // Textures the textured-material mesh references; disposed flags are asserted
@@ -48,6 +51,7 @@ const materialTextures: { map: TextureRecord; normalMap: TextureRecord } = {
 
 // Records so tests can assert which loader ran and that teardown happened.
 const parseCalls: string[] = [];
+let pendingGltfLoad: (() => void) | null = null;
 interface RendererRecord {
   disposed: boolean;
   contextLost: boolean;
@@ -99,6 +103,35 @@ function loaderStub(name: string) {
 vi.mock("three/examples/jsm/loaders/STLLoader.js", () => ({ STLLoader: loaderStub("stl") }));
 vi.mock("three/examples/jsm/loaders/3MFLoader.js", () => ({ ThreeMFLoader: loaderStub("3mf") }));
 vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStub("obj") }));
+// GLTFLoader's parse is callback-based rather than sync like the loaders
+// above, so its stub invokes onLoad/onError to mirror that contract.
+vi.mock("three/examples/jsm/loaders/GLTFLoader.js", () => ({
+  GLTFLoader: class {
+    parse(
+      _data: unknown,
+      _path: string,
+      onLoad: (gltf: { scene: unknown }) => void,
+      onError: (error: unknown) => void,
+    ) {
+      parseCalls.push("gltf");
+      if (behavior.mode === "throw") {
+        onError(new Error("malformed model"));
+        return;
+      }
+      const load = () => onLoad({ scene: makeParsedObject() });
+      if (behavior.deferGltf) pendingGltfLoad = load;
+      else load();
+    }
+  },
+}));
+
+// The real module stays for `fileContentToBlob`; only the uncapped-byte fetch
+// is stubbed so large-model tests control it without a network.
+const fetchWorkspaceFileBytesMock = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  fetchWorkspaceFileBytes: fetchWorkspaceFileBytesMock,
+}));
 
 vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
   OrbitControls: class {
@@ -251,12 +284,16 @@ beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
   behavior.texturedMaterial = false;
+  behavior.deferGltf = false;
   materialTextures.map = makeTextureRecord();
   materialTextures.normalMap = makeTextureRecord();
   parseCalls.length = 0;
+  pendingGltfLoad = null;
   lastRenderer = null;
   lastMaterial = null;
   themeState.resolvedTheme = "light";
+  fetchWorkspaceFileBytesMock.mockReset();
+  fetchWorkspaceFileBytesMock.mockResolvedValue(new ArrayBuffer(8));
   vi.stubGlobal(
     "requestAnimationFrame",
     vi.fn(() => 1),
@@ -284,7 +321,11 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
     // A file with no recognizable extension but an OBJ content type must parse
     // through the OBJ loader — proving detection and parsing use one resolver.
     render(
-      <ModelViewer data={makeData({ path: "blob", content_type: "model/obj" })} path="blob" />,
+      <ModelViewer
+        data={makeData({ path: "blob", content_type: "model/obj" })}
+        path="blob"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(parseCalls).toContain("obj"));
     expect(parseCalls).not.toContain("stl");
@@ -298,6 +339,7 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
       <ModelViewer
         data={makeData({ path: "download", content_type: "model/3mf" })}
         path="download"
+        conversationId="conv_1"
       />,
     );
     await waitFor(() => expect(parseCalls).toContain("3mf"));
@@ -310,16 +352,59 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
       <ModelViewer
         data={makeData({ path: "widget.stl", content_type: "application/octet-stream" })}
         path="widget.stl"
+        conversationId="conv_1"
       />,
     );
     await waitFor(() => expect(parseCalls).toContain("stl"));
+  });
+
+  it("selects the GLTF loader for a .glb (extension fallback)", async () => {
+    render(
+      <ModelViewer
+        data={makeData({ path: "scene.glb", content_type: "application/octet-stream" })}
+        path="scene.glb"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(parseCalls).toContain("gltf"));
+    expect(parseCalls).not.toContain("stl");
+  });
+
+  it("selects the GLTF loader for a utf-8 .gltf (extension fallback)", async () => {
+    // JSON glTF arrives as utf-8 text (like ASCII OBJ); it must still reach the
+    // GLTF loader rather than a binary-only path.
+    render(
+      <ModelViewer
+        data={makeData({
+          path: "scene.gltf",
+          content_type: "text/plain",
+          encoding: "utf-8",
+          content: "{}",
+        })}
+        path="scene.gltf"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(parseCalls).toContain("gltf"));
+  });
+
+  it("selects the GLTF loader by MIME when the extension is unknown", async () => {
+    render(
+      <ModelViewer
+        data={makeData({ path: "blob", content_type: "model/gltf-binary" })}
+        path="blob"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(parseCalls).toContain("gltf"));
+    expect(parseCalls).not.toContain("stl");
   });
 });
 
 describe("ModelViewer error states", () => {
   it("shows the error overlay for a malformed model (parse throws)", async () => {
     behavior.mode = "throw";
-    render(<ModelViewer data={makeData()} path="part.stl" />);
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
   });
 
@@ -327,20 +412,73 @@ describe("ModelViewer error states", () => {
     // OBJLoader can return an empty group for comment-only input; the
     // bounding-box guard must route that to the error UI, not a blank canvas.
     behavior.mode = "empty";
-    render(<ModelViewer data={makeData({ path: "empty.obj" })} path="empty.obj" />);
+    render(
+      <ModelViewer
+        data={makeData({ path: "empty.obj" })}
+        path="empty.obj"
+        conversationId="conv_1"
+      />,
+    );
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
   });
 
   it("shows the error overlay for a model with non-finite bounds", async () => {
     behavior.mode = "nan";
-    render(<ModelViewer data={makeData({ path: "nan.obj" })} path="nan.obj" />);
+    render(
+      <ModelViewer data={makeData({ path: "nan.obj" })} path="nan.obj" conversationId="conv_1" />,
+    );
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
   });
 
-  it("shows the truncated message without attempting to parse", async () => {
-    render(<ModelViewer data={makeData({ truncated: true })} path="part.stl" />);
-    expect(await screen.findByText(/too large to preview/)).toBeDefined();
-    expect(parseCalls).toHaveLength(0);
+  it("shows the error overlay when the uncapped fetch for a truncated envelope fails", async () => {
+    fetchWorkspaceFileBytesMock.mockRejectedValue(new Error("404 Not Found"));
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="part.stl" conversationId="conv_1" />,
+    );
+    expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
+  });
+});
+
+describe("ModelViewer large models (past the read cap)", () => {
+  it("fetches the uncapped stream and renders when the envelope is truncated", async () => {
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="part.stl" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(parseCalls).toContain("stl"));
+    expect(fetchWorkspaceFileBytesMock).toHaveBeenCalledWith("conv_1", "part.stl");
+    // The full bytes render, so neither the old truncated-model error nor the
+    // generic truncation banner appears.
+    expect(screen.queryByText(/too large to preview/)).toBeNull();
+    expect(screen.queryByText(/too large to load fully/)).toBeNull();
+    expect(screen.queryByText(/Unable to render/)).toBeNull();
+  });
+
+  it("reads the JSON envelope (not the download stream) when the file fits", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    await waitFor(() => expect(parseCalls).toContain("stl"));
+    expect(fetchWorkspaceFileBytesMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("ModelViewer async cleanup", () => {
+  it("does not build a scene when glTF parsing finishes after unmount", async () => {
+    behavior.deferGltf = true;
+    const { unmount } = render(
+      <ModelViewer
+        data={makeData({ path: "scene.glb" })}
+        path="scene.glb"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(pendingGltfLoad).not.toBeNull());
+
+    unmount();
+    await act(async () => {
+      pendingGltfLoad?.();
+      await Promise.resolve();
+    });
+
+    expect(lastRenderer).toBeNull();
   });
 });
 
@@ -348,13 +486,17 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
   it("recovers when props change from invalid to valid", async () => {
     // Start malformed → error overlay shown.
     behavior.mode = "throw";
-    const { rerender } = render(<ModelViewer data={makeData()} path="bad.stl" />);
+    const { rerender } = render(
+      <ModelViewer data={makeData()} path="bad.stl" conversationId="conv_1" />,
+    );
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
 
     // A later valid model must render — only possible if the canvas container
     // (and its ref) stayed mounted under the overlay through the error state.
     behavior.mode = "valid";
-    rerender(<ModelViewer data={makeData({ path: "good.stl" })} path="good.stl" />);
+    rerender(
+      <ModelViewer data={makeData({ path: "good.stl" })} path="good.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(parseCalls).toContain("stl"));
     await waitFor(() => expect(screen.queryByText(/Unable to render 3D model/)).toBeNull());
     expect(lastRenderer).not.toBeNull();
@@ -367,7 +509,7 @@ describe("ModelViewer teardown", () => {
     // tear down the already-created renderer (dispose + forceContextLoss)
     // rather than leaking the context until unmount.
     behavior.orbitThrows = true;
-    render(<ModelViewer data={makeData()} path="part.stl" />);
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     await waitFor(() => expect(lastRenderer?.contextLost).toBe(true));
     expect(lastRenderer?.disposed).toBe(true);
@@ -376,7 +518,9 @@ describe("ModelViewer teardown", () => {
   });
 
   it("releases the renderer/WebGL context on unmount", async () => {
-    const { unmount } = render(<ModelViewer data={makeData()} path="part.stl" />);
+    const { unmount } = render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(lastRenderer?.contextLost).toBe(false);
     unmount();
@@ -390,7 +534,7 @@ describe("ModelViewer teardown", () => {
     // each texture the material holds.
     behavior.texturedMaterial = true;
     const { unmount } = render(
-      <ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" />,
+      <ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" conversationId="conv_1" />,
     );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(materialTextures.map.disposed).toBe(false);
@@ -406,7 +550,7 @@ describe("ModelViewer theme awareness", () => {
 
   it("builds the scene from the active light theme", async () => {
     themeState.resolvedTheme = "light";
-    render(<ModelViewer data={makeData()} path="part.stl" />);
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     // Canvas clear color and STL material track the light theme.
     expect(lastRenderer?.clearColor).toBe(light.background);
@@ -415,7 +559,7 @@ describe("ModelViewer theme awareness", () => {
 
   it("builds the scene from the active dark theme", async () => {
     themeState.resolvedTheme = "dark";
-    render(<ModelViewer data={makeData()} path="part.stl" />);
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(lastRenderer?.clearColor).toBe(dark.background);
     expect(lastMaterial?.color).toBe(dark.stlMaterial);
@@ -430,7 +574,9 @@ describe("ModelViewer theme awareness", () => {
     // Reuse ONE data object across renders: the build effect keys on
     // [data, path], so a fresh object would rebuild and mask the in-place path.
     const stableData = makeData();
-    const { rerender } = render(<ModelViewer data={stableData} path="part.stl" />);
+    const { rerender } = render(
+      <ModelViewer data={stableData} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(lastRenderer?.clearColor).toBe(light.background);
     const rendererBefore = lastRenderer;
@@ -439,7 +585,7 @@ describe("ModelViewer theme awareness", () => {
     // Toggle to dark and re-render with the SAME data/path — the scene must
     // recolor in place rather than rebuild (same renderer, no extra parse).
     themeState.resolvedTheme = "dark";
-    rerender(<ModelViewer data={stableData} path="part.stl" />);
+    rerender(<ModelViewer data={stableData} path="part.stl" conversationId="conv_1" />);
     await waitFor(() => expect(lastRenderer?.clearColor).toBe(dark.background));
     expect(lastMaterial?.color).toBe(dark.stlMaterial);
     expect(lastRenderer).toBe(rendererBefore);
