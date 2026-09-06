@@ -1002,7 +1002,7 @@ export function CodeViewer({
           </div>
         }
       >
-        <ModelViewer data={fileQuery.data} path={path} />
+        <ModelViewer data={fileQuery.data} path={path} conversationId={conversationId} />
       </Suspense>
     );
   }
