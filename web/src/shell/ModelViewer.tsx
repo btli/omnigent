@@ -41,6 +41,57 @@ interface ParsedModel {
   stlMaterial: THREE.MeshStandardMaterial | null;
 }
 
+const GENERIC_MODEL_ERROR = "Unable to render 3D model.";
+const MODEL_SIZE_ERROR = "Model exceeds the 256 MiB preview limit — download it to view.";
+const EXTERNAL_GLTF_ERROR =
+  "This glTF references external files, which preview does not support yet — download it to view.";
+
+class ExternalGltfResourceError extends Error {
+  constructor() {
+    super(EXTERNAL_GLTF_ERROR);
+    this.name = "ExternalGltfResourceError";
+  }
+}
+
+interface GltfDocument {
+  buffers?: { uri?: unknown }[];
+  images?: { uri?: unknown }[];
+}
+
+function gltfDocument(buffer: ArrayBuffer): GltfDocument {
+  const view = new DataView(buffer);
+  let jsonBytes: Uint8Array;
+  if (buffer.byteLength >= 20 && view.getUint32(0, true) === 0x46546c67) {
+    const jsonLength = view.getUint32(12, true);
+    const jsonType = view.getUint32(16, true);
+    if (jsonType !== 0x4e4f534a || 20 + jsonLength > buffer.byteLength) {
+      throw new Error("Invalid GLB JSON chunk");
+    }
+    jsonBytes = new Uint8Array(buffer, 20, jsonLength);
+  } else {
+    jsonBytes = new Uint8Array(buffer);
+  }
+  return JSON.parse(new TextDecoder().decode(jsonBytes).replace(/^\uFEFF/, "")) as GltfDocument;
+}
+
+function assertSelfContainedGltf(buffer: ArrayBuffer): void {
+  const document = gltfDocument(buffer);
+  const references = [...(document.buffers ?? []), ...(document.images ?? [])];
+  if (references.some(({ uri }) => typeof uri === "string" && !/^data:/i.test(uri))) {
+    throw new ExternalGltfResourceError();
+  }
+}
+
+function modelErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.name === "WorkspaceFilePreviewTooLargeError") {
+    return MODEL_SIZE_ERROR;
+  }
+  if (error instanceof Error && error.name === "ExternalGltfResourceError") {
+    return EXTERNAL_GLTF_ERROR;
+  }
+  return GENERIC_MODEL_ERROR;
+}
+
 /**
  * Parse raw model bytes into a three.js Object3D for the given format.
  *
@@ -57,7 +108,7 @@ interface ParsedModel {
  * the returned `stlMaterial` handle lets the caller recolor it on a theme
  * toggle without reparsing.
  */
-async function parseModel(
+export async function parseModel(
   format: ModelFormat,
   buffer: ArrayBuffer,
   theme: ModelViewerTheme,
@@ -75,9 +126,12 @@ async function parseModel(
     return { object: new ThreeMFLoader().parse(buffer), stlMaterial: null };
   }
   if (format === "gltf") {
+    assertSelfContainedGltf(buffer);
+    const isGlb = buffer.byteLength >= 4 && new DataView(buffer).getUint32(0, true) === 0x46546c67;
+    const data = isGlb ? buffer : new TextDecoder().decode(buffer);
     return new Promise((resolve, reject) => {
       new GLTFLoader().parse(
-        buffer,
+        data,
         "",
         (gltf) => resolve({ object: gltf.scene, stlMaterial: null }),
         reject,
@@ -150,10 +204,14 @@ function hasRenderableBounds(box: THREE.Box3): boolean {
  * three.js `isTexture` flag rather than `instanceof` (the loaders and the app
  * can hold different three copies).
  */
-function disposeMaterial(material: THREE.Material): void {
+function disposeMaterial(material: THREE.Material, disposedTextures: Set<THREE.Texture>): void {
   for (const value of Object.values(material)) {
     const texture = value as THREE.Texture | null;
-    if (texture?.isTexture) texture.dispose();
+    if (!texture?.isTexture || disposedTextures.has(texture)) continue;
+    disposedTextures.add(texture);
+    const sourceData = texture.source?.data as { close?: () => void } | undefined;
+    sourceData?.close?.();
+    texture.dispose();
   }
   material.dispose();
 }
@@ -163,14 +221,15 @@ function disposeMaterial(material: THREE.Material): void {
  * buffers backing them are released. three.js does not do this automatically.
  */
 function disposeObject(object: THREE.Object3D): void {
+  const disposedTextures = new Set<THREE.Texture>();
   object.traverse((child) => {
     const mesh = child as THREE.Mesh;
     mesh.geometry?.dispose();
     const material = mesh.material;
     if (Array.isArray(material)) {
-      material.forEach(disposeMaterial);
+      material.forEach((item) => disposeMaterial(item, disposedTextures));
     } else if (material) {
-      disposeMaterial(material);
+      disposeMaterial(material, disposedTextures);
     }
   });
 }
@@ -248,7 +307,7 @@ export function ModelViewer({
   conversationId: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [errored, setErrored] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
@@ -280,13 +339,14 @@ export function ModelViewer({
     // extension still selects the right loader here.
     const format = getModelFormat(path, data.content_type);
     if (!format) {
-      setErrored(true);
+      setErrorMessage(GENERIC_MODEL_ERROR);
       return;
     }
 
-    setErrored(false);
+    setErrorMessage(null);
 
     let disposed = false;
+    const abortController = new AbortController();
     const res: SceneResources = {
       scene: new THREE.Scene(),
       renderer: null,
@@ -305,12 +365,12 @@ export function ModelViewer({
     const theme = themeRef.current;
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
 
-    const fail = () => {
+    const fail = (message = GENERIC_MODEL_ERROR) => {
       // Free anything created before the failure, then show the error UI. The
       // cleanup return also calls teardownScene, which is idempotent.
       teardownScene(res);
       if (resRef.current === res) resRef.current = null;
-      if (!disposed) setErrored(true);
+      if (!disposed) setErrorMessage(message);
     };
 
     const load = async () => {
@@ -319,7 +379,7 @@ export function ModelViewer({
         // envelope means the model crossed the server read cap, so use the
         // existing uncapped download stream instead.
         const buffer = data.truncated
-          ? await fetchWorkspaceFileBytes(conversationId, path)
+          ? await fetchWorkspaceFileBytes(conversationId, path, { signal: abortController.signal })
           : await fileContentToBlob(data).arrayBuffer();
         if (disposed) return;
 
@@ -384,14 +444,15 @@ export function ModelViewer({
         };
         res.resizeObserver = new ResizeObserver(onResize);
         res.resizeObserver.observe(container);
-      } catch {
-        fail();
+      } catch (error) {
+        fail(modelErrorMessage(error));
       }
     };
     void load();
 
     return () => {
       disposed = true;
+      abortController.abort();
       teardownScene(res);
       if (resRef.current === res) resRef.current = null;
     };
@@ -410,9 +471,9 @@ export function ModelViewer({
         aria-label={`3D preview of ${filename}`}
         className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
-      {errored && (
+      {errorMessage && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
-          Unable to render 3D model.
+          {errorMessage}
         </div>
       )}
     </div>
