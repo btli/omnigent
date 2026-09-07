@@ -14,7 +14,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-from omnigent.model_fallbacks import KIMI_PRICED_MODEL_FAMILIES
 from omnigent.onboarding.providers import ModelInfo, find_catalog_models
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
@@ -205,39 +204,6 @@ class ModelPricing:
     cache_write_per_token: float | None = None
 
 
-# Kimi's posted API rates, the pricing fallback when the shared catalog has no
-# entry for the effective kimi model id (e.g. ``system.ai.kimi-k3`` or the
-# ``kimi-k3-databricks`` alias the kimi-native forwarder reports). Matched by
-# substring against the lowercased model id; the catalog, when it does carry
-# the model, stays authoritative. The family keys live in the owned
-# ``KIMI_PRICED_MODEL_FAMILIES`` fallback record (kimi-k3, kimi-k2.7,
-# kimi-k2.6 — in that order, which this rate tuple mirrors).
-# Source: https://platform.kimi.ai/ (retrieved 2026-08-28), USD per million
-# tokens:
-#   K3:        input $3.00, output $15.00, cache hit $0.30
-#   K2.7 Code: input $0.95, output  $4.00, cache hit $0.19
-#   K2.6:      input $0.95, output  $4.00, cache hit $0.16
-# Kimi publishes no cache-write rate, so ``cache_write_per_token`` stays
-# ``None`` and :func:`compute_llm_cost` derives it from the input rate.
-_KIMI_POSTED_PRICING: dict[str, ModelPricing] = dict(
-    zip(
-        KIMI_PRICED_MODEL_FAMILIES.model_ids,
-        (
-            ModelPricing(
-                input_per_token=3.00e-6, output_per_token=15.00e-6, cache_read_per_token=0.30e-6
-            ),
-            ModelPricing(
-                input_per_token=0.95e-6, output_per_token=4.00e-6, cache_read_per_token=0.19e-6
-            ),
-            ModelPricing(
-                input_per_token=0.95e-6, output_per_token=4.00e-6, cache_read_per_token=0.16e-6
-            ),
-        ),
-        strict=True,
-    )
-)
-
-
 def fetch_model_pricing(model: str) -> ModelPricing | None:
     """
     Look up per-token pricing for *model* from the MLflow catalog.
@@ -251,9 +217,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         or ``"databricks-gpt-5-5"``.
     :returns: A :class:`ModelPricing`, or ``None`` when pricing is
         unavailable (network error, model not in catalog, or catalog
-        entry lacks input/output pricing data). Kimi models absent from
-        the catalog fall back to the posted rates in
-        ``_KIMI_POSTED_PRICING``.
+        entry lacks input/output pricing data).
     """
 
     def _extract(info: ModelInfo) -> ModelPricing | None:
@@ -279,14 +243,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     prices = {price for info in matches if (price := _extract(info)) is not None}
     if len(prices) == 1:
         return next(iter(prices))
-    if matches:
-        # Contradictory or unpriced catalog metadata is authoritative uncertainty,
-        # not a miss that may be replaced with a static provider rate.
-        return None
-    lowered = model.lower()
-    for key, posted in _KIMI_POSTED_PRICING.items():
-        if key in lowered:
-            return posted
+    # Contradictory or unpriced catalog metadata is authoritative uncertainty.
     return None
 
 
