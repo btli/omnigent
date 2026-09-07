@@ -4128,14 +4128,14 @@ function ConversationRowImpl({
       style={!ownsPointer && swipeTouchAction ? { touchAction: swipeTouchAction } : undefined}
     >
       {/* Clip the hint to the vacated strip so it cannot overlap the moving
-          surface. The threshold also scales the glyph, avoiding a color-only cue. */}
+          surface. The threshold also scales the glyph, avoiding a color-only cue.
+          Action colors switch immediately so reversals cannot inherit the old color. */}
       {isSwiping && (
         <div
           aria-hidden
           data-testid="conversation-swipe-reveal"
           className={cn(
             "pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[var(--radius-otto-sm)]",
-            "transition-colors",
             swipingAction === "delete"
               ? swipeCommitted
                 ? "bg-destructive/20 text-destructive"
