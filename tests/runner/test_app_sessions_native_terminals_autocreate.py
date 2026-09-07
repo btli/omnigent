@@ -2163,11 +2163,17 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         )
 
     # Client-safe payload pointing at the runner log — no raw exception text.
+    error_id = error["error_id"]
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
     assert error == {
         "code": "native_terminal_start_failed",
+        "error_id": error_id,
         "message": (
             "Native Codex terminal failed to start; "
-            f"see the runner log for details: {pinned_runner_log}"
+            f"see the runner log for details: {pinned_runner_log} "
+            f"Error ID: {error_id}."
         ),
     }
     # The raw cause must NOT leak into the surfaced message, but MUST be
@@ -2175,6 +2181,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     # text back in the payload) or the server-side log was dropped.
     assert "requires the 'codex' CLI" not in error["message"]
     assert "requires the 'codex' CLI on PATH." in caplog.text
+    assert error_id in caplog.text
     assert [p.event for p in published] == [
         {
             "type": "session.status",
@@ -2183,6 +2190,45 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         },
     ]
     assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
+
+
+def test_publish_native_terminal_start_error_redacts_mismatch_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The actionable WSL mismatch response omits the rejected executable path."""
+    published: list[_PublishedEvent] = []
+    sensitive_path = "/mnt/c/Users/private/AppData/Roaming/npm/claude.cmd"
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(_PublishedEvent(session_id=session_id, event=event))
+
+    with caplog.at_level(logging.WARNING):
+        error = _publish_native_terminal_start_error(
+            _capture,
+            "415c9954e2fe4b9276083a4d2c66f690",
+            "Claude",
+            ClaudeNativeHookInterpreterMismatchError(
+                f"Claude Code executable {sensitive_path!r} is Windows-native"
+            ),
+        )
+
+    error_id = error["error_id"]
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
+    assert error == {
+        "code": "native_terminal_start_failed",
+        "error_id": error_id,
+        "message": (
+            "Claude Code is Windows-native, but Omnigent is running under WSL. "
+            "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
+            f"binary wins PATH resolution, then retry. Error ID: {error_id}."
+        ),
+    }
+    assert sensitive_path not in error["message"]
+    assert sensitive_path in caplog.text
+    assert error_id in caplog.text
+    assert published[0].event["error"] == error
 
 
 def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(
