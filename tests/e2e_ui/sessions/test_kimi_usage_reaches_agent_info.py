@@ -263,9 +263,7 @@ def test_kimi_session_reports_token_usage_in_agent_info(
             # executor emits ``TurnComplete(usage=None)`` so the section never
             # renders (the whole usage/cost block is gated on non-empty
             # ``usage_by_model``).
-            expect(page.get_by_test_id("agent-info-usage-by-model")).to_be_visible(
-                timeout=15_000
-            )
+            expect(page.get_by_test_id("agent-info-usage-by-model")).to_be_visible(timeout=15_000)
         finally:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
     finally:
