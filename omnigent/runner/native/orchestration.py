@@ -42,7 +42,7 @@ import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -6059,18 +6059,27 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. The message is a client-safe string naming
-        the runner's log file; the raw cause is logged there for operators,
-        not surfaced to the caller.
+        JSON error responses. Known actionable configuration errors surface
+        their safe message directly; other causes point to the runner log.
     """
+    error_id = f"err_{uuid.uuid4().hex}"
     _logger.warning(
-        "Native %s terminal start failed: %s",
+        "Native %s terminal start failed; error_id=%s: %s",
         runtime_name,
+        error_id,
         exc,
         exc_info=exc,
-        extra={"session_id": runner_primary_session_id()},
+        extra={"session_id": runner_primary_session_id(), "error_id": error_id},
     )
-    if IS_WINDOWS:
+    from omnigent.claude_native_bridge import ClaudeNativeHookInterpreterMismatchError
+
+    if isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
+        message = (
+            "Claude Code is Windows-native, but Omnigent is running under WSL. "
+            "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
+            "binary wins PATH resolution, then retry."
+        )
+    elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
         message = (
@@ -6084,7 +6093,11 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
             f"Native {runtime_name} terminal failed to start; "
             f"see the runner log for details: {log_reference}"
         )
-    return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
+    return {
+        "code": _NATIVE_TERMINAL_START_FAILED_CODE,
+        "error_id": error_id,
+        "message": f"{message} Error ID: {error_id}.",
+    }
 
 
 def _publish_native_terminal_start_error(
@@ -6532,6 +6545,7 @@ async def _auto_create_claude_terminal(
         augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -6616,9 +6630,8 @@ async def _auto_create_claude_terminal(
     await _cancel_auto_forwarder_task(session_id)
     reset_transcript_forward_state(bridge_dir)
     _logger.info(
-        "Claude terminal bridge prepared: session=%s bridge_dir=%s",
+        "Claude terminal bridge prepared: session=%s",
         session_id,
-        bridge_dir,
         extra={"session_id": session_id},
     )
     # Pre-accept Claude's first-run trust + onboarding TUI prompts for this
@@ -7176,6 +7189,14 @@ async def _auto_create_claude_terminal(
     _harness_cfg = load_effective_config()
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
+    # Validate the binary this terminal will actually spawn: ``launch_command``
+    # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
+    # name resolves against this process's inherited PATH (same lookup tmux's
+    # pane shell and omnigent.inner.terminal perform). Mirrors
+    # ``_preflight_local_tools`` on the local-CLI path.
+    resolved_claude = resolve_cli_binary(launch_command)
+    if resolved_claude is not None:
+        validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
 

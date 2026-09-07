@@ -69,6 +69,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -2932,11 +2933,11 @@ export function NewChatLandingScreen() {
   );
 
   // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
+  // spin up a throwaway worktree without inventing one. Uses the secure-context-
+  // safe UUID helper (a plain-http self-hosted origin has no `crypto.randomUUID`);
+  // the short prefix keeps the dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
     const name = `worktree-${suffix}`;
     setBranchName(name);
     return name;
@@ -4245,6 +4246,11 @@ export function NewChatLandingScreen() {
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
     trackClick("new_chat.start_session", "button");
+    // BrowserRouter may defer its React update even though history already
+    // changed. Remember the submit location so a late create cannot redirect
+    // after the user has navigated elsewhere while this component is still
+    // mounted in the outgoing transition tree.
+    const createLocation = window.location.href;
     // Remember the repo/branch for next time (seeds the picker on the next
     // visit). Only when a repo is actually set — a no-repo session leaves the
     // remembered repo untouched rather than clearing it.
@@ -4671,7 +4677,9 @@ export function NewChatLandingScreen() {
       // session; jumping them into this one now would hijack that. The
       // session is created either way and its first message stays held
       // for whenever they open it.
-      if (onScreenRef.current) navigate(`/c/${data.id}`);
+      if (onScreenRef.current && window.location.href === createLocation) {
+        navigate(`/c/${data.id}`);
+      }
     } catch {
       returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");

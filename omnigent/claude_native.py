@@ -90,12 +90,14 @@ from omnigent.claude_model_vocabulary import (
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
+    ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
     read_active_session_id,
     read_user_effort_level,
     url_component,
+    validate_claude_hook_interpreter_compatibility,
 )
 from omnigent.claude_native_forwarder import (
     reset_transcript_forward_state,
@@ -435,6 +437,23 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
+def _ambient_env_is_non_anthropic_gateway() -> bool:
+    """Whether the ambient process env routes through a non-Anthropic gateway.
+
+    Used as the ``claude_config is None`` counterpart to
+    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
+    set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
+    fingerprint must treat the env as a non-canonical endpoint.
+    """
+    from urllib.parse import urlparse
+
+    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if not base_url:
+        return False
+    host = (urlparse(base_url).hostname or "").lower()
+    return host != "anthropic.com" and not host.endswith(".anthropic.com")
 
 
 def _claude_family(token: str) -> str | None:
@@ -1206,12 +1225,14 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.model_catalog_store import binary_identity, fingerprint_of
 
     command, _ = resolve_claude_launch("claude", [])
+    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
+        ambient_gateway,
     )
 
 
@@ -1238,7 +1259,10 @@ async def claude_model_catalog(
     if probe is None:
         return None
     rows = list(probe.alias_rows)
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    _non_canonical = (
+        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
+    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    if _non_canonical:
         rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
 
     configured_pin = claude_config.model if claude_config is not None else None
@@ -1260,11 +1284,10 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        servable = (
-            claude_config is None
-            or _serves_canonical_anthropic_ids(claude_config)
-            or not default_model.startswith("claude-")
-        )
+        _canonical_ids_ok = (
+            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
+        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
+        servable = _canonical_ids_ok or not default_model.startswith("claude-")
         if servable:
             # The probe's printed label describes the ENUMERATION run's
             # model; it only names a config-pinned default when the two are
@@ -5156,7 +5179,18 @@ def _claude_transcript_records_from_session_items(
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
+    previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
+        # A forwarder retry that slipped past idempotency persists as an
+        # adjacent row identical in everything but the store envelope
+        # (id/created_at). Drop it so store duplicates don't become
+        # duplicated model context on every resume; genuine adjacent
+        # repeats differ in payload or response_id and survive.
+        if previous_item is not None and _transcript_items_equal_ignoring_envelope(
+            item, previous_item
+        ):
+            continue
+        previous_item = item
         # Compaction items carry the post-compaction context. Replace
         # all prior records with the compacted messages so the
         # reconstructed transcript reflects the compacted state.
@@ -5378,6 +5412,33 @@ def _claude_transcript_record_from_session_item(
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "message": message,
         **extra,
+    }
+
+
+def _transcript_items_equal_ignoring_envelope(
+    item: _JsonObject,
+    other: _JsonObject,
+) -> bool:
+    """
+    Compare two session items ignoring store-envelope fields.
+
+    A duplicate row created by a forwarder retry re-post is byte-identical
+    in payload but differs in the store-assigned ``id`` and ``created_at``.
+    Everything else — including ``response_id``, which differs across
+    genuine turns — participates in the comparison, so a user legitimately
+    repeating the same message in a later turn is not collapsed. The filter
+    assumes a turn never legitimately emits byte-identical adjacent payloads
+    within the same ``response_id``; such a repeat would be collapsed too.
+
+    :param item: Flat API item dict, e.g.
+        ``{"type": "message", "role": "user", "content": [...]}``.
+    :param other: The item to compare against.
+    :returns: ``True`` when the items are equal apart from ``id`` and
+        ``created_at``.
+    """
+    envelope = ("id", "created_at")
+    return {k: v for k, v in item.items() if k not in envelope} == {
+        k: v for k, v in other.items() if k not in envelope
     }
 
 
@@ -5672,11 +5733,16 @@ def _preflight_local_tools(command: str) -> None:
     :raises click.ClickException: If ``command`` or ``tmux`` is not
         available on the local ``PATH``.
     """
-    if shutil.which(command) is None:
+    resolved_command = shutil.which(command)
+    if resolved_command is None:
         raise click.ClickException(
             f"Claude Code CLI command {command!r} was not found on local PATH. "
             "--server selects the Omnigent server only; Claude still runs locally."
         )
+    try:
+        validate_claude_hook_interpreter_compatibility(resolved_command)
+    except ClaudeNativeHookInterpreterMismatchError as exc:
+        raise click.ClickException(str(exc)) from exc
     if shutil.which("tmux") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Claude wrapper "
