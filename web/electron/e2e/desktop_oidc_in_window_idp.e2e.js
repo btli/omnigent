@@ -470,7 +470,9 @@ describe(
     // IdP page must never render inside the Electron window.
     it("does not render the third-party IdP sign-in page inside the Electron window", async () => {
       const recordDir = path.join(RECORDINGS_ROOT, "raw-in-window-idp");
-      const { electronApp, window, userDataDir } = await launchDesktop({ recordDir });
+      const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
+        recordDir,
+      });
       let inWindowIdpUrl;
       try {
         logStep("desktop launched; driving setup page");
@@ -516,6 +518,7 @@ describe(
         );
       } finally {
         await closeDesktop(electronApp, window);
+        await stopDisplayCapture();
         const saved = saveRecording(recordDir, "in-window-idp");
         logStep(`recording(s) saved: ${saved.join(", ") || "<none>"}`);
         fs.rmSync(userDataDir, { recursive: true, force: true });
