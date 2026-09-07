@@ -315,16 +315,43 @@ async function launchDesktop(opts) {
     // endpoint; a version override keeps the app off the update path.
     env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
   });
-  // If firstWindow() throws after launch() succeeded, close the app here so the
-  // Electron process isn't orphaned (the caller never got a handle to close).
+  // If the window wait throws after launch() succeeded, close the app here so
+  // the Electron process isn't orphaned (the caller never got a handle to close).
   let window;
   try {
-    window = await electronApp.firstWindow();
+    window = await appWindow(electronApp);
   } catch (err) {
     await electronApp.close().catch(() => {});
     throw err;
   }
   return { electronApp, window, userDataDir };
+}
+
+/**
+ * Resolve the app window (setup page, or the loaded server when `serverUrl`
+ * was pre-seeded). The shell opens auxiliary windows of its own — the update
+ * status overlay attaches as soon as the boot-time update check starts — and
+ * that page can beat the app window's, so a bare `firstWindow()` sometimes
+ * hands back the overlay and every setup-page locator times out. Wait for a
+ * window that is positively the app one; fall back to `firstWindow()` so a
+ * launch that never produces one still fails on the caller's own assertions.
+ *
+ * @param {import("playwright").ElectronApplication} electronApp
+ * @param {number} [timeoutMs]
+ * @returns {Promise<import("playwright").Page>}
+ */
+async function appWindow(electronApp, timeoutMs = 15_000) {
+  const isAppUrl = (url) => url.includes("/setup/index.html") || /^https?:/.test(url);
+  const fallback = await electronApp.firstWindow();
+  const deadline = Date.now() + timeoutMs;
+  /* oxlint-disable no-await-in-loop */
+  for (;;) {
+    const match = electronApp.windows().find((win) => isAppUrl(win.url()));
+    if (match) return match;
+    if (Date.now() >= deadline) return fallback;
+    await sleep(100);
+  }
+  /* oxlint-enable no-await-in-loop */
 }
 
 /**
