@@ -1,6 +1,6 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorIcon,
   MonitorCloudIcon,
@@ -8,7 +8,9 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  ChevronsUpDownIcon,
   GitBranchIcon,
+  LockIcon,
   ArrowUpIcon,
   Loader2Icon,
   FileTextIcon,
@@ -40,13 +42,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
 import {
-  Command,
-  CommandEmpty,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import {
   CLAUDE_NATIVE_EFFORTS,
   PI_NATIVE_EFFORTS,
   ConfigRow,
@@ -72,11 +67,21 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { randomUUID } from "@/lib/randomUUID";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
@@ -124,6 +129,7 @@ import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { readLastSandboxRepo, writeLastSandboxRepo } from "@/lib/repoPreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
 import {
   AUTO_HARNESS_DESCRIPTION,
@@ -205,6 +211,7 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
+import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
@@ -784,6 +791,181 @@ export function deriveRepoName(url: string): string | null {
   const last = t.split(/[/:]/).pop() ?? "";
   const name = last.endsWith(".git") ? last.slice(0, -4) : last;
   return name === "" ? null : name;
+}
+
+/** Shared trigger styling for the repo/branch comboboxes. */
+const COMBOBOX_TRIGGER_CLASS =
+  "flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors hover:border-ring/60 focus-visible:border-ring";
+
+/**
+ * Searchable combobox for picking one of the caller's GitHub repos.
+ *
+ * A trigger button opens a `cmdk` search list (repos are filtered as you
+ * type on ``owner/name``), which scales to accounts with many repos far
+ * better than a native ``<select>``. Selecting a repo fills the same
+ * URL/branch state the free-text inputs drive; the empty value shows the
+ * "Choose a repository…" placeholder.
+ *
+ * @param repos The caller's accessible repos (newest-first from the API).
+ * @param value The selected repo's ``owner/name`` ("" = none).
+ * @param onSelect Called with the chosen repo (or ``null`` to clear).
+ */
+function SandboxRepoCombobox({
+  repos,
+  value,
+  onSelect,
+}: {
+  repos: GithubRepo[];
+  value: string;
+  onSelect: (repo: GithubRepo | null) => void;
+}): ReactNode {
+  const [open, setOpen] = useState(false);
+  const selected = repos.find((r) => r.full_name === value) ?? null;
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          role="combobox"
+          aria-expanded={open}
+          aria-label="GitHub repository"
+          className={COMBOBOX_TRIGGER_CLASS}
+          data-testid="new-chat-landing-repo-select"
+        >
+          <span className="truncate">{selected ? selected.full_name : "Choose a repository…"}</span>
+          <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
+        <Command>
+          <CommandInput
+            placeholder="Search repositories…"
+            data-testid="new-chat-landing-repo-search"
+          />
+          <CommandList>
+            <CommandEmpty>No repositories found.</CommandEmpty>
+            <CommandGroup>
+              {repos.map((r) => (
+                <CommandItem
+                  key={r.full_name}
+                  value={r.full_name}
+                  data-checked={r.full_name === value}
+                  onSelect={() => {
+                    onSelect(r);
+                    setOpen(false);
+                  }}
+                >
+                  <span className="truncate">{r.full_name}</span>
+                  {r.private && (
+                    <LockIcon
+                      className="size-3 shrink-0 opacity-60"
+                      aria-label="Private repository"
+                    />
+                  )}
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
+ * Searchable branch combobox for the connected-GitHub repo picker.
+ *
+ * Lazily fetches the chosen repo's branches and filters them as you type.
+ * The empty value is the "default branch" sentinel: leaving it selected
+ * appends no ``#branch`` fragment, so the server clones the repo's default
+ * branch.
+ *
+ * @param fullName The chosen repo's ``owner/name``.
+ * @param value The currently selected branch ("" = default).
+ * @param defaultBranch The repo's default branch, for the sentinel label.
+ * @param onChange Called with the newly selected branch.
+ */
+function SandboxRepoBranchSelect({
+  fullName,
+  value,
+  defaultBranch,
+  onChange,
+}: {
+  fullName: string;
+  value: string;
+  defaultBranch: string | null;
+  onChange: (branch: string) => void;
+}): ReactNode {
+  const [open, setOpen] = useState(false);
+  const { data, isPending } = useQuery({
+    queryKey: ["github-branches", fullName],
+    queryFn: () => fetchGithubBranches(fullName),
+    staleTime: 5 * 60_000,
+  });
+  const branches = data?.connected ? data.branches : [];
+  const defaultLabel = defaultBranch ? `Default (${defaultBranch})` : "Default branch";
+  // Options: the fetched branches minus the default (represented by the
+  // empty-value sentinel). Include the current value even before the list
+  // loads (e.g. a draft-restored branch) so the trigger label always
+  // resolves to a real option.
+  const options = branches.filter((b) => b !== defaultBranch);
+  if (value !== "" && !options.includes(value)) {
+    options.unshift(value);
+  }
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          role="combobox"
+          aria-expanded={open}
+          aria-label={`Branch for ${fullName}`}
+          className={COMBOBOX_TRIGGER_CLASS}
+          data-testid="new-chat-landing-repo-branch-select"
+        >
+          <GitBranchIcon className="size-3.5 shrink-0 opacity-60" />
+          <span className="truncate">{value === "" ? defaultLabel : value}</span>
+          <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
+        <Command>
+          <CommandInput
+            placeholder="Search branches…"
+            data-testid="new-chat-landing-repo-branch-search"
+          />
+          <CommandList>
+            <CommandEmpty>{isPending ? "Loading branches…" : "No branches found."}</CommandEmpty>
+            <CommandGroup>
+              <CommandItem
+                value={defaultLabel}
+                data-checked={value === ""}
+                onSelect={() => {
+                  onChange("");
+                  setOpen(false);
+                }}
+              >
+                {defaultLabel}
+              </CommandItem>
+              {options.map((b) => (
+                <CommandItem
+                  key={b}
+                  value={b}
+                  data-checked={b === value}
+                  onSelect={() => {
+                    onChange(b);
+                    setOpen(false);
+                  }}
+                >
+                  {b}
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 /**
@@ -1456,7 +1638,9 @@ function HarnessConfigModal({
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
   claudeModelsError: string | null;
-  codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  // Full catalog rows (not a narrowed Pick): the Effort row reads each
+  // model's supportedReasoningEfforts ladder off the same response.
+  codexModelOptions: readonly NativeModelOption[];
   codexModelsLoading: boolean;
   codexModelsError: string | null;
   piModelOptions: readonly { id: string; displayName: string }[];
@@ -1540,6 +1724,35 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
+  // Codex advertises a per-model effort ladder, so the Effort row follows the
+  // DRAFTED model — else picking another model still lists the old rungs.
+  // "Default" ("") resolves to the catalog-default row: for a new session
+  // that is the model a bare launch truly runs.
+  const codexEffortLevels = useMemo(
+    () =>
+      isCodex
+        ? codexEffortLevelsForModel(
+            codexModelOptions,
+            draftModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+          )
+        : [],
+    [isCodex, codexModelOptions, draftModel],
+  );
+  // Drop a drafted level the newly-picked model doesn't offer, so no stale
+  // rung shows and Save never commits a level the model rejects. Codex only:
+  // other harnesses use a model-independent ladder.
+  const clampCodexDraftEffort = (modelId: string) => {
+    if (!isCodex) return;
+    setDraftEffort((prev) =>
+      prev &&
+      codexEffortLevelsForModel(
+        codexModelOptions,
+        modelId || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+      ).includes(prev)
+        ? prev
+        : "",
+    );
+  };
   // The host catalog re-polls while the modal is open (a provider switch under
   // it). A draft the new catalog no longer lists would render a blank trigger,
   // so it falls back to Default.
@@ -1564,10 +1777,12 @@ function HarnessConfigModal({
       // "Default" = no override; defer routing to the spec default (null,
       // omitted from create) — never emit an explicit "on"/"off".
       setDraftRouting(null);
+      clampCodexDraftEffort("");
     } else {
       setDraftModel(value);
       // Picking an explicit model turns routing off (mutually exclusive).
       setDraftRouting(null);
+      clampCodexDraftEffort(value);
     }
   };
 
@@ -1600,13 +1815,16 @@ function HarnessConfigModal({
       if (entryHarness)
         writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
-      if (isCodex) setPickedModel(draftModel);
+      if (isCodex) {
+        setPickedModel(draftModel);
+        setPickedEffort(draftEffort);
+      }
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
       if (entryHarness) {
         writeHarnessOption(entryHarness, {
           mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
-          ...(isCodex ? { model: draftModel } : {}),
+          ...(isCodex ? { model: draftModel, effort: draftEffort } : {}),
         });
       }
     } else if (hasCursor) {
@@ -1802,6 +2020,46 @@ function HarnessConfigModal({
                   )}
                 </RoutingModelSelect>
               </ConfigRow>
+              {/* Codex's effort ladder is per-model metadata off the same
+              catalog response; hidden when the drafted model advertises no
+              levels (mirroring the in-session gear's composer-config-effort
+              row). */}
+              {isCodex && codexEffortLevels.length > 0 && (
+                <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+                  <Select
+                    // Smart Routing picks the model (and its effort) per
+                    // turn, so an explicit effort is meaningless: the row is
+                    // frozen and reads as an em-dash placeholder. Radix shows
+                    // the placeholder for the empty value, which no item can
+                    // carry.
+                    value={smartRoutingOn ? "" : draftEffort || EFFORT_SELECT_NONE}
+                    onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                    disabled={smartRoutingOn}
+                  >
+                    <SelectTrigger
+                      className="w-full cursor-pointer"
+                      data-testid="new-chat-landing-config-effort"
+                      aria-label="Reasoning effort"
+                    >
+                      <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                    </SelectTrigger>
+                    <SelectContent
+                      position="popper"
+                      align="start"
+                      className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                    >
+                      <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                      {/* Codex efforts render raw — its ids aren't title-cased
+                      (matching the in-session gear's labeling). */}
+                      {codexEffortLevels.map((level) => (
+                        <SelectItem key={level} value={level}>
+                          {level}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </ConfigRow>
+              )}
               <ConfigRow label="Approval" description="What the agent can do without asking">
                 <DescribedSelect
                   // Codex adds the DANGEROUS full-bypass as a 4th option; when
@@ -2348,12 +2606,32 @@ export function NewChatLandingScreen() {
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
+  // Seed from the in-session draft, else the last repo the user launched with
+  // (remembered across visits) so returning users don't re-pick it. The repo
+  // combobox derives its selection from the URL, so a remembered repo the
+  // account can no longer access just shows unselected.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
-    () => restoredDraft?.sandboxRepoUrl ?? "",
+    () => restoredDraft?.sandboxRepoUrl ?? readLastSandboxRepo()?.url ?? "",
   );
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
-    () => restoredDraft?.sandboxRepoBranch ?? "",
+    () => restoredDraft?.sandboxRepoBranch ?? readLastSandboxRepo()?.branch ?? "",
   );
+  // When the server advertises the GitHub App and the caller has connected
+  // their account, offer a picker over their repos instead of only the
+  // free-text URL. The /repos endpoint returns `connected: false` when the
+  // account isn't linked, so gating the query on `enabled_connections` and
+  // reading `connected` off the payload doubles as the connection check.
+  const githubReposEnabled =
+    info !== "loading" && (info.enabled_connections ?? []).includes("github");
+  const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
+    queryKey: ["github-repos"],
+    queryFn: fetchGithubRepos,
+    enabled: githubReposEnabled,
+    staleTime: 5 * 60_000,
+  });
+  const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
+  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
+  const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
@@ -2732,11 +3010,11 @@ export function NewChatLandingScreen() {
   );
 
   // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
+  // spin up a throwaway worktree without inventing one. Uses the secure-context-
+  // safe UUID helper (a plain-http self-hosted origin has no `crypto.randomUUID`);
+  // the short prefix keeps the dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
     const name = `worktree-${suffix}`;
     setBranchName(name);
     return name;
@@ -3026,8 +3304,19 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
+      // Mirror the modal's Effort row: em-dash while routing picks per turn,
+      // else the picked level (Codex ids render raw, not title-cased).
+      const effortRows = !isCodex
+        ? []
+        : [
+            {
+              label: "Effort",
+              value: routingOn ? EFFORT_UNAVAILABLE_PLACEHOLDER : pickedEffort || "Default",
+            },
+          ];
       return [
         ...modelRows,
+        ...effortRows,
         { label: "Approval", value: approvalValue },
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
@@ -3204,16 +3493,30 @@ export function NewChatLandingScreen() {
       // A remembered routing "on" outranks a remembered concrete model, and
       // also drops any model/effort left in the shared state (e.g. seeded for
       // Claude Code before the harness switch).
-      setPickedModel(
+      const seededCodexModel =
         (selectedNativeHarness === "codex-native" ? projectSeed(codexModelOptions) : null) ??
-          (!storedRoutingOn &&
+        (!storedRoutingOn &&
+        selectedNativeHarness === "codex-native" &&
+        stored.model != null &&
+        codexModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "");
+      setPickedModel(seededCodexModel);
+      // Restore the remembered Codex effort only while the seeded model's
+      // ladder (the catalog default's when no model is pinned) still offers
+      // it — anything else resolves to "" so a level another harness left in
+      // the shared state never rides a Codex create.
+      setPickedEffort(
+        !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
-          stored.model != null &&
-          codexModelOptions.some((m) => m.id === stored.model)
-            ? stored.model
-            : ""),
+          stored.effort != null &&
+          codexEffortLevelsForModel(
+            codexModelOptions,
+            seededCodexModel || (codexModelOptions.find((m) => m.isDefault)?.id ?? null),
+          ).includes(stored.effort)
+          ? stored.effort
+          : "",
       );
-      if (storedRoutingOn) setPickedEffort("");
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgySkipPermissions) {
@@ -3795,6 +4098,13 @@ export function NewChatLandingScreen() {
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
+  // The connected-GitHub repo (if any) whose clone URL matches the current
+  // free-text value, so the picker <select> stays in sync with the URL field
+  // and we can offer the matching branch list.
+  const selectedSandboxRepo = sandboxRepos.find(
+    (r) => (r.clone_url ?? `https://github.com/${r.full_name}.git`) === sandboxRepoUrl.trim(),
+  );
+  const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
   const sandboxRepoLabel = sandboxRepoName
     ? sandboxRepoBranch.trim()
       ? `${sandboxRepoName}#${sandboxRepoBranch.trim()}`
@@ -4038,6 +4348,17 @@ export function NewChatLandingScreen() {
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
     trackClick("new_chat.start_session", "button");
+    // BrowserRouter may defer its React update even though history already
+    // changed. Remember the submit location so a late create cannot redirect
+    // after the user has navigated elsewhere while this component is still
+    // mounted in the outgoing transition tree.
+    const createLocation = window.location.href;
+    // Remember the repo/branch for next time (seeds the picker on the next
+    // visit). Only when a repo is actually set — a no-repo session leaves the
+    // remembered repo untouched rather than clearing it.
+    if (sandboxRepoUrl.trim()) {
+      writeLastSandboxRepo(sandboxRepoUrl, sandboxRepoBranch);
+    }
     setCreating(true);
     setCreateError(null);
     // The draft is spent from the moment it is submitted: it belongs to the
@@ -4295,7 +4616,9 @@ export function NewChatLandingScreen() {
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              (agentSupportsPermissionMode || selectedNativeHarness === "pi-native") &&
+              (agentSupportsPermissionMode ||
+                selectedNativeHarness === "pi-native" ||
+                nativeAgent?.harness === "codex-native") &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -4373,7 +4696,8 @@ export function NewChatLandingScreen() {
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
-          supportsEffortPicker: selectedNativeHarness === "pi-native",
+          supportsEffortPicker:
+            selectedNativeHarness === "pi-native" || selectedNativeHarness === "codex-native",
           permissionMode,
           approvalMode,
           bypassSandbox,
@@ -4458,7 +4782,9 @@ export function NewChatLandingScreen() {
       // session; jumping them into this one now would hijack that. The
       // session is created either way and its first message stays held
       // for whenever they open it.
-      if (onScreenRef.current) navigate(`/c/${data.id}`);
+      if (onScreenRef.current && window.location.href === createLocation) {
+        navigate(`/c/${data.id}`);
+      }
     } catch {
       returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");
@@ -5285,11 +5611,70 @@ export function NewChatLandingScreen() {
                           </Tooltip>
                         )}
                       </div>
+                      {/* Connected-GitHub picker: choose one of the caller's
+                        repos + a branch, which fills the same URL/branch state
+                        the free-text inputs below drive. Only shown when the
+                        server advertises the GitHub App and the account is
+                        linked; otherwise the free-text URL is the only path. */}
+                      {showGithubRepoPicker && (
+                        <>
+                          <SandboxRepoCombobox
+                            repos={sandboxRepos}
+                            value={selectedSandboxRepo?.full_name ?? ""}
+                            onSelect={(repo) => {
+                              setSandboxRepoUrl(
+                                repo
+                                  ? (repo.clone_url ?? `https://github.com/${repo.full_name}.git`)
+                                  : "",
+                              );
+                              // A new repo has its own branches — reset so a
+                              // stale branch never rides along.
+                              setSandboxRepoBranch("");
+                            }}
+                          />
+                          {sandboxReposTruncated && (
+                            <p
+                              className="text-xs text-muted-foreground"
+                              data-testid="new-chat-landing-repo-truncated"
+                            >
+                              Showing your most recently pushed repositories. Don't see one? Paste
+                              its URL below.
+                            </p>
+                          )}
+                          {selectedSandboxRepo && (
+                            <SandboxRepoBranchSelect
+                              fullName={selectedSandboxRepo.full_name}
+                              value={sandboxRepoBranch}
+                              defaultBranch={selectedSandboxRepo.default_branch}
+                              onChange={setSandboxRepoBranch}
+                            />
+                          )}
+                          <p className="text-xs text-muted-foreground">
+                            or paste a repository URL:
+                          </p>
+                        </>
+                      )}
+                      {/* Connected but the repo list failed to load: say so
+                        explicitly, so a transient error isn't mistaken for
+                        "GitHub not connected" (the picker just wouldn't render). */}
+                      {githubReposEnabled && sandboxReposErrored && !showGithubRepoPicker && (
+                        <p
+                          className="text-xs text-destructive"
+                          data-testid="new-chat-landing-repo-error"
+                        >
+                          Couldn't load your GitHub repositories. Paste a repository URL below.
+                        </p>
+                      )}
                       <input
                         id="landing-repo-url"
                         type="text"
                         value={sandboxRepoUrl}
-                        onChange={(e) => setSandboxRepoUrl(e.target.value)}
+                        onChange={(e) => {
+                          // Editing the repo invalidates a branch picked for the
+                          // previous repo, so clear it (mirrors the repo select).
+                          setSandboxRepoUrl(e.target.value);
+                          setSandboxRepoBranch("");
+                        }}
                         placeholder="https://github.com/org/repo"
                         className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-input"

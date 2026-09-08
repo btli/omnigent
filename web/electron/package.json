@@ -139,7 +139,7 @@
       ]
     },
     "linux": {
-      "icon": "icons/icon.png",
+      "icon": "icons/icon.svg",
       "category": "Development",
       "maintainer": "Databricks, Inc. <support@omnigent.ai>",
       "target": [
@@ -170,6 +170,6 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.3.9",
-    "js-yaml": "^4.3.0"
+    "js-yaml": "^4.3.1"
   }
 }

@@ -1,6 +1,7 @@
 import {
   type FormEvent,
   type KeyboardEvent,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -832,14 +833,6 @@ export function ChatPage() {
       ? hostProbeOptions
       : sessionModelOptions;
 
-  // Loading + error gates for `/c/:id` hydration.
-  if (urlConvId) {
-    if (loadingConversation) return <HydratingPlaceholder />;
-    if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
-    }
-  }
-
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
   // `runner_asleep` is deliberately NOT here — there the host relaunches
@@ -852,75 +845,97 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  function onSend(text: string, files?: File[]) {
-    if (!agentId) return;
-    // An unbound coding clone (fork-source label) needs a directory before
-    // it can run: open the picker and stash this message to replay after
-    // the bind. Pin the prompt to THIS session so it replays here, never
-    // into a session the user may switch to first; carry any attachments
-    // so the replay sends the same payload.
-    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    // Unreachable → no executor to dispatch this turn to, and no host to
-    // wake. Surface the reconnect dialog instead of POSTing into
-    // a void.
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls. With the
-    // always-steer preference on, a mid-turn follow-up skips the queue and is
-    // POSTed now instead.
-    const chat = useChatStore.getState();
-    if (
-      shouldQueueSend(
-        chat.conversationId,
-        chat.status,
-        chat.sessionStatus,
-        chat.queuedMessages,
-        readAlwaysSteer(),
-      )
-    ) {
-      chat.enqueueMessage(text, files);
-      return;
-    }
-    void useChatStore.getState().send(text, agentId, files, {
-      onConversationCreated: (newId) => {
-        // Eager URL update: the moment the server tells us this
-        // conversation's id, promote `/` → `/c/:newId`. Replace (not
-        // push) so the back button takes the user wherever they came
-        // from rather than to a stale `/`.
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSend = useCallback(
+    (text: string, files?: File[]) => {
+      if (!agentId) return;
+      // An unbound coding clone (fork-source label) needs a directory before
+      // it can run: open the picker and stash this message to replay after
+      // the bind. Pin the prompt to THIS session so it replays here, never
+      // into a session the user may switch to first; carry any attachments
+      // so the replay sends the same payload.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      // Unreachable → no executor to dispatch this turn to, and no host to
+      // wake. Surface the reconnect dialog instead of POSTing into
+      // a void.
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+      // FIFO immediately when genuinely idle, so nothing stalls. With the
+      // always-steer preference on, a mid-turn follow-up skips the queue and is
+      // POSTed now instead.
+      const chat = useChatStore.getState();
+      if (
+        shouldQueueSend(
+          chat.conversationId,
+          chat.status,
+          chat.sessionStatus,
+          chat.queuedMessages,
+          readAlwaysSteer(),
+        )
+      ) {
+        chat.enqueueMessage(text, files);
+        return;
+      }
+      void useChatStore.getState().send(text, agentId, files, {
+        onConversationCreated: (newId) => {
+          // Eager URL update: the moment the server tells us this
+          // conversation's id, promote `/` → `/c/:newId`. Replace (not
+          // push) so the back button takes the user wherever they came
+          // from rather than to a stale `/`.
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onSendSlashCommand(name: string, args: string) {
-    if (!agentId) return;
-    // Slash commands aren't replayed (an edge), but still route an unbound
-    // coding clone to the directory picker so it isn't a dead end.
-    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setResumeDirDialogOpen(true);
-      return;
-    }
-    if (urlConvId && isUnreachable) {
-      setReconnectDialogOpen(true);
-      return;
-    }
-    void useChatStore.getState().sendSlashCommand(name, args, agentId, {
-      onConversationCreated: (newId) => {
-        navigate(`/c/${newId}`, { replace: true });
-      },
-    });
-  }
+  const onSendSlashCommand = useCallback(
+    (name: string, args: string) => {
+      if (!agentId) return;
+      // Slash commands aren't replayed (an edge), but still route an unbound
+      // coding clone to the directory picker so it isn't a dead end.
+      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+        setResumeDirDialogOpen(true);
+        return;
+      }
+      if (urlConvId && isUnreachable) {
+        setReconnectDialogOpen(true);
+        return;
+      }
+      void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        onConversationCreated: (newId) => {
+          navigate(`/c/${newId}`, { replace: true });
+        },
+      });
+    },
+    [
+      agentId,
+      urlConvId,
+      runnerOnline,
+      isUnboundFork,
+      canResumeOnLocalHost,
+      isUnreachable,
+      navigate,
+    ],
+  );
 
-  function onStop() {
+  const onStop = useCallback(() => {
     useChatStore.getState().stop();
-  }
+  }, []);
 
   // Sub-agent (child) sessions aren't returned by the sidebar list, so
   // ``activeConv`` is null for them — the snapshot (fetched above as
@@ -934,19 +949,26 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
-  // Once present, the live session snapshot is authoritative.
-  const capabilitySource = {
-    labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
-    harness: activeSession?.harness ?? null,
-  };
+  // Once present, the live session snapshot is authoritative. Memoized so the
+  // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
+  // stable identity across the switch's re-render burst.
+  const capabilitySource = useMemo(
+    () => ({
+      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+      harness: activeSession?.harness ?? null,
+    }),
+    [activeSession, activeConv],
+  );
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands.
-  const effortLevels = effortLevelsForConv(
-    capabilitySource,
-    codexModelOptions,
-    llmModel ?? selectedModel,
+  // before the first report lands. Memoized because codex-native resolves
+  // via codexEffortLevelsForModel, which returns a fresh array each call;
+  // a new identity here would defeat the memo() on MainAgentSurface/Composer
+  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  const effortLevels = useMemo(
+    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
+    [capabilitySource, codexModelOptions, llmModel, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -957,13 +979,35 @@ export function ChatPage() {
   // Prefer the full agent object (with mcp_servers) from the session
   // endpoint when viewing a conversation. Fall back to the sessions-
   // derived list for the `/` (no session) picker view.
-  const visibleAgents = boundAgentId
-    ? boundAgentBySession
-      ? [boundAgentBySession]
-      : boundAgentName
-        ? [{ id: boundAgentId, name: boundAgentName } as Agent]
-        : agents?.filter((a) => a.id === boundAgentId)
-    : agents;
+  const visibleAgents = useMemo(
+    () =>
+      boundAgentId
+        ? boundAgentBySession
+          ? [boundAgentBySession]
+          : boundAgentName
+            ? [{ id: boundAgentId, name: boundAgentName } as Agent]
+            : agents?.filter((a) => a.id === boundAgentId)
+        : agents,
+    [boundAgentId, boundAgentBySession, boundAgentName, agents],
+  );
+
+  const onShowReconnectHelp = useCallback(() => {
+    // Route the banner to the SAME dialog typing a message would: an
+    // unbound coding clone or a host-less session the caller can resume
+    // in-app opens the directory picker (bind + launch), everything else
+    // gets the reconnect dialog.
+    if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
+    else setReconnectDialogOpen(true);
+  }, [isUnboundFork, canResumeOnLocalHost]);
+
+  // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
+  // early return can't change the hook order between renders.
+  if (urlConvId) {
+    if (loadingConversation) return <HydratingPlaceholder />;
+    if (conversationLoadError) {
+      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+    }
+  }
 
   const mainAgent = (
     <MainAgentSurface
@@ -978,14 +1022,7 @@ export function ChatPage() {
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
-      onShowReconnectHelp={() => {
-        // Route the banner to the SAME dialog typing a message would: an
-        // unbound coding clone or a host-less session the caller can resume
-        // in-app opens the directory picker (bind + launch), everything else
-        // gets the reconnect dialog.
-        if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
-        else setReconnectDialogOpen(true);
-      }}
+      onShowReconnectHelp={onShowReconnectHelp}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1365,7 +1402,7 @@ export function updateWarmTerminalSurfaces(
  * `MainTerminalView`. The switcher itself stays visible (in the header,
  * see ViewModeToggle) so the user can flip back to Chat.
  */
-function MainAgentSurface({
+const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
   status,
   isWorking,
@@ -1522,6 +1559,12 @@ function MainAgentSurface({
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
   const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
+  // Stable so they don't defeat Composer's memo on the switch re-render burst.
+  const removeReplyQuote = useCallback(
+    (i: number) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i)),
+    [],
+  );
+  const clearReplyQuotes = useCallback(() => setReplyQuotes([]), []);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
@@ -1532,6 +1575,50 @@ function MainAgentSurface({
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
   );
+
+  // Synchronous bottom re-pin for the composer's growth, called in the same
+  // task as the height change (before any paint — the only ordering Gecko
+  // doesn't paint past; every async pin leaves one intermediate frame).
+  // Guarded by the live lock state, not the public isAtBottom alias, so a
+  // reader who scrolled up mid-stream is never yanked down. The spacer
+  // re-measures first: its reserved height tracks the viewport, so it must
+  // shrink in this same task — otherwise the pin reads a stale scrollHeight
+  // and the browser paints the spacer's later RO settle as a visible shift.
+  const spacerMeasureRef = useRef<(() => void) | null>(null);
+  // Whether the transcript was physically at the bottom as of its last scroll
+  // event. Evaluated lazily-per-event (not at pin time) so the write never
+  // reads the just-shrunk viewport, where any distance readouts are already
+  // off the bottom by the growth amount — an escaped reader must be detected
+  // from their escape scroll, not from the shrink it preceded.
+  const pinnedToBottomRef = useRef(false);
+  useEffect(() => {
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const update = () => {
+      pinnedToBottomRef.current =
+        scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 1;
+    };
+    update();
+    scrollEl.addEventListener("scroll", update, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", update);
+  }, [scroller]);
+
+  const pinScrollOnComposerGrowth = useCallback(() => {
+    spacerMeasureRef.current?.();
+    // Read through a local so the linter doesn't flag the DOM write as
+    // a mutation of the outer `scroller` state ref.
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const lockState = scroller?.state;
+    if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
+    // A reader who escaped the bottom (or never arrived) keeps their
+    // position: growth must not yank it down.
+    if (!pinnedToBottomRef.current) return;
+    // Park at the same position stick-to-bottom settles on (one pixel short
+    // of the maximum); writing the exact bottom would leave the settle one
+    // pixel lower than the library's park and trail a 1px snap-back.
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
+  }, [scroller]);
 
   // Persistent terminal surfaces for terminal-first sessions. Each is
   // mounted from the moment its terminal is reachable — not just when the
@@ -1625,6 +1712,7 @@ function MainAgentSurface({
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
             terminalFirst={terminalFirst}
+            spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
@@ -1649,8 +1737,8 @@ function MainAgentSurface({
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
             replyQuotes={replyQuotes}
-            onRemoveQuote={(i) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i))}
-            onClearAllQuotes={() => setReplyQuotes([])}
+            onRemoveQuote={removeReplyQuote}
+            onClearAllQuotes={clearReplyQuotes}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
@@ -1673,6 +1761,7 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
+            onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
           />
 
           {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
@@ -1683,7 +1772,7 @@ function MainAgentSurface({
       )}
     </>
   );
-}
+});
 
 function HydratingPlaceholder() {
   return (
@@ -1835,6 +1924,15 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
+  /**
+   * Synchronous pin: called in the same task as the composer's height
+   * change so the transcript stays bottom-locked before the browser
+   * paints the now-smaller viewport with the scroll offset stale — Gecko
+   * visibly paints that intermediate frame, bouncing the last visible
+   * message. A same-task write is the only ordering no engine paints past.
+   * The callback itself decides whether the reader is bottom-locked.
+   */
+  onViewportShrinkPinScroll?: () => void;
 }
 
 /**
@@ -2387,7 +2485,7 @@ export function BackgroundTaskPill() {
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
  */
-export function Composer({
+function ComposerImpl({
   status,
   isWorking,
   disabled,
@@ -2420,6 +2518,7 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
+  onViewportShrinkPinScroll,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -2801,10 +2900,16 @@ export function Composer({
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
-    useChatStore.setState({ failedSendDraft: null });
+    useChatStore.setState({
+      failedSendDraft: null,
+      pendingRetryStableId: failedSendDraft.stableId ?? null,
+    });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
+      useChatStore.setState({ pendingRetryStableId: null });
+      return;
+    }
     setValue(failedSendDraft.text);
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0) {
@@ -2955,7 +3060,22 @@ export function Composer({
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // Growth stays in the flex column so the transcript viewport ends where the
   // composer begins instead of letting the card cover visible output.
-  useAutoGrowTextarea(textareaRef, value, 10);
+  // The onGrowth pin re-locks the transcript bottom in the same task as the
+  // height change, before any paint — see the prop doc on ComposerProps.
+  const onGrowthRef = useRef(onViewportShrinkPinScroll);
+  useLayoutEffect(() => {
+    onGrowthRef.current = onViewportShrinkPinScroll;
+  });
+  // The hook measures on every keystroke, but growth only changes at line
+  // wraps: skip the spacer re-measure and transcript pin while the box rests
+  // at an unchanged height.
+  const lastGrowthPxRef = useRef<number | null>(null);
+  const onGrowth = useCallback((px: number) => {
+    if (lastGrowthPxRef.current === px) return;
+    lastGrowthPxRef.current = px;
+    onGrowthRef.current?.();
+  }, []);
+  useAutoGrowTextarea(textareaRef, value, 10, onGrowth);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -3662,6 +3782,22 @@ export function Composer({
                   codexModelOptions={codexModelOptions}
                   costRoutingEligible={costRoutingEligible}
                   harnessLabel={harnessLabel}
+                  // The pill-wide hover highlight advertises one clickable
+                  // control, so the label half opens the same config modal as
+                  // the gear whenever the gear renders beside it.
+                  onOpenConfig={
+                    hasSessionConfig({
+                      showModels,
+                      showEffort,
+                      costRoutingEligible,
+                      subagentRoutingEligible,
+                      showClaudePermissionMode,
+                      showCodexApprovalMode,
+                    })
+                      ? () => setPickerOpenNonce((n) => n + 1)
+                      : null
+                  }
+                  configDisabled={isReadOnly || unreachable}
                 />
               </ComposerModelSource>
               <ComposerConfigGear
@@ -3736,6 +3872,8 @@ export function Composer({
     </form>
   );
 }
+
+export const Composer = memo(ComposerImpl);
 
 /**
  * Whether the main chat's display-only "Working…" indicator should light up.
@@ -4622,14 +4760,44 @@ function SessionConfigModal({
 }
 
 /**
+ * Whether the session surfaces any run-config the gear modal can edit. Shared
+ * render guard for the config gear and click-to-open gate for the model/effort
+ * label half of the composer's split pill, so both halves stay in lockstep.
+ */
+function hasSessionConfig({
+  showModels,
+  showEffort,
+  costRoutingEligible,
+  subagentRoutingEligible,
+  showClaudePermissionMode,
+  showCodexApprovalMode,
+}: {
+  showModels: boolean;
+  showEffort: boolean;
+  costRoutingEligible: boolean;
+  subagentRoutingEligible: boolean;
+  showClaudePermissionMode: boolean;
+  showCodexApprovalMode: boolean;
+}): boolean {
+  return (
+    showModels ||
+    showEffort ||
+    costRoutingEligible ||
+    subagentRoutingEligible ||
+    showClaudePermissionMode ||
+    showCodexApprovalMode
+  );
+}
+
+/**
  * Composer gear affordance: a ghost `SettingsIcon` that shows the session's
  * live run-config on hover and opens `SessionConfigModal` on click. Rendered
  * only when the session has at least one switchable knob (model, effort, or
  * smart routing) — otherwise there's nothing to configure.
  *
  * @param openNonce External "open the modal" signal, nonce-keyed so repeat
- *   requests re-open (bare ``/model`` submits route here now that the composer
- *   trigger is a read-only label). ``0`` / omitted means never requested.
+ *   requests re-open (bare ``/model`` submits and clicks on the pill's
+ *   model/effort label half route here). ``0`` / omitted means never requested.
  */
 function ComposerConfigGear({
   harnessLabel,
@@ -4679,12 +4847,14 @@ function ComposerConfigGear({
   });
 
   if (
-    !showModels &&
-    !showEffort &&
-    !costRoutingEligible &&
-    !subagentRoutingEligible &&
-    !showClaudePermissionMode &&
-    !showCodexApprovalMode
+    !hasSessionConfig({
+      showModels,
+      showEffort,
+      costRoutingEligible,
+      subagentRoutingEligible,
+      showClaudePermissionMode,
+      showCodexApprovalMode,
+    })
   )
     return null;
 
@@ -4965,11 +5135,13 @@ function ComposerModelSource({
 }
 
 /**
- * Read-only ``<Model> <Effort>`` label in the composer, left of the config
- * gear. Model switching / effort control now live in the gear modal, so this
- * is a glanceable status label rather than a dropdown trigger — model in the
- * foreground, effort muted. Renders nothing when neither is known/switchable
- * (the harness identity and full config live in the gear tooltip/modal).
+ * ``<Model> <Effort>`` label in the composer, left of the config gear — model
+ * in the foreground, effort muted. Renders nothing when neither is
+ * known/switchable (the harness identity and full config live in the gear
+ * tooltip/modal). The pill's hover highlight spans both halves, so when the
+ * gear renders the label is a button opening the same session-config modal —
+ * the click target matches the hover affordance; without a gear it stays a
+ * plain read-only span.
  *
  * @param showModels Whether the session exposes a model to surface.
  * @param showEffort Whether the session exposes a reasoning-effort level.
@@ -4978,6 +5150,10 @@ function ComposerModelSource({
  * @param costRoutingEligible Whether Smart Routing is offered for this session.
  * @param harnessLabel Harness identity (e.g. "Polly (Pi)"), used as the label
  *   fallback for SDK/bundle agents that surface no model/effort.
+ * @param onOpenConfig Opens the session-config modal; ``null`` when the gear
+ *   isn't rendered, which keeps the label non-interactive.
+ * @param configDisabled Mirrors the gear's inert state (read-only viewer /
+ *   unreachable session): soft-disables the click without dimming the label.
  */
 function ComposerModelEffortLabel({
   showModels,
@@ -4986,6 +5162,8 @@ function ComposerModelEffortLabel({
   codexModelOptions,
   costRoutingEligible,
   harnessLabel,
+  onOpenConfig = null,
+  configDisabled = false,
 }: {
   showModels: boolean;
   showEffort: boolean;
@@ -4993,6 +5171,8 @@ function ComposerModelEffortLabel({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   harnessLabel: string | null;
+  onOpenConfig?: (() => void) | null;
+  configDisabled?: boolean;
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
@@ -5010,18 +5190,6 @@ function ComposerModelEffortLabel({
         className="ml-1 inline size-3 shrink-0 animate-spin text-muted-foreground"
       />
     ) : null;
-  // Routing picks the model + effort per turn, so the label reads
-  // "Smart Routing" with no pinned model/effort — matching the tooltip.
-  if (routingOn) {
-    return (
-      <span
-        data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
-      >
-        <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
-      </span>
-    );
-  }
   const effortLabel =
     showEffort && selectedEffort
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
@@ -5030,32 +5198,61 @@ function ComposerModelEffortLabel({
   // in the label even though the gear modal has no Model dropdown for them —
   // showModels gates only the modal control, not this read-out.
   const model = showModels || modelPickerKind === null ? modelLabel : null;
-  // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
-  // the harness identity ("Polly (Pi)") so the slot isn't empty. Scoped to
-  // SDK/bundle (modelPickerKind === null): native wrappers keep an empty label
-  // when their model is unresolved rather than surfacing the bare vendor name,
-  // which the gear tooltip already shows.
-  if (!model && !effortLabel) {
+
+  let content: ReactNode;
+  if (routingOn) {
+    // Routing picks the model + effort per turn, so the label reads
+    // "Smart Routing" with no pinned model/effort — matching the tooltip.
+    content = <span className="text-foreground">{SMART_ROUTING_LABEL}</span>;
+  } else if (!model && !effortLabel) {
+    // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
+    // the harness identity ("Polly (Pi)") so the slot isn't empty. Scoped to
+    // SDK/bundle (modelPickerKind === null): native wrappers keep an empty label
+    // when their model is unresolved rather than surfacing the bare vendor name,
+    // which the gear tooltip already shows.
     if (modelPickerKind !== null || !harnessLabel) return null;
-    return (
-      <span
-        data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
-      >
-        <span className="text-foreground">{harnessLabel}</span>
-      </span>
+    content = <span className="text-foreground">{harnessLabel}</span>;
+  } else {
+    content = (
+      <>
+        {model && <span className="text-foreground">{model}</span>}
+        {model && effortLabel && " "}
+        {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
+        {modelPending}
+      </>
     );
   }
 
+  const labelClass =
+    "min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground";
+  if (!onOpenConfig) {
+    return (
+      <span data-testid="composer-model-effort-label" className={labelClass}>
+        {content}
+      </span>
+    );
+  }
+  // The pill highlights as one control when hovered anywhere, so the label
+  // half must act like the gear beside it: clicking opens the same config
+  // modal. Soft-disable (aria-disabled) mirrors the gear so the pill's hover
+  // highlight drops with it, while the label text stays fully readable.
   return (
-    <span
+    <button
+      type="button"
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+      aria-haspopup="dialog"
+      aria-disabled={configDisabled}
+      onClick={() => {
+        if (configDisabled) return;
+        onOpenConfig();
+      }}
+      className={cn(
+        labelClass,
+        "h-9 rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring md:h-8",
+        configDisabled ? "cursor-default" : "cursor-pointer",
+      )}
     >
-      {model && <span className="text-foreground">{model}</span>}
-      {model && effortLabel && " "}
-      {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
-      {modelPending}
-    </span>
+      {content}
+    </button>
   );
 }

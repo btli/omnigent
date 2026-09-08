@@ -36,7 +36,7 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -125,6 +125,11 @@ interface ChatHeaderProps {
    */
   projectName: string | null;
   /**
+   * The filed project's chosen emoji icon (a unicode grapheme), or ``null``
+   * for the default folder glyph. Shown as the breadcrumb's leading segment.
+   */
+  projectIcon?: string | null;
+  /**
    * Route the title links to (the parent session, when inside a sub-agent),
    * making the title a way back out. ``undefined`` renders it as plain text.
    */
@@ -200,6 +205,7 @@ export function ChatHeader({
   actionConversation = null,
   conversationTitle,
   projectName,
+  projectIcon,
   titleLinkTo,
   boundAgent,
   wrapperLabel,
@@ -224,12 +230,20 @@ export function ChatHeader({
   const { trackClick } = useOmnigentAnalytics();
   const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peekRequest = useRef(0);
+  // Once the dwell fires the peek, the card fades in click-through, so the
+  // pointer keeps resting on the toggle — long enough to trip the hover
+  // tooltip's own (longer) delay. The peek is the intended hover reveal, so
+  // suppress the tooltip when the peek fires. Pointer-armed only: keyboard
+  // focus never arms a peek, so the focus tooltip still works.
+  const suppressTooltip = useRef(false);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
   const cancelPeek = useCallback(() => {
     peekRequest.current += 1;
     if (peekTimer.current) {
       clearTimeout(peekTimer.current);
       peekTimer.current = null;
     }
+    suppressTooltip.current = false;
   }, []);
   const onPeekSidebar = useCallback(() => {
     if (isMobile) return;
@@ -238,6 +252,8 @@ export function ChatHeader({
     peekTimer.current = setTimeout(() => {
       peekTimer.current = null;
       if (peekRequest.current !== request) return;
+      suppressTooltip.current = true;
+      setTooltipOpen(false);
       onOpenSidebar(true);
     }, 400);
   }, [isMobile, onOpenSidebar, cancelPeek]);
@@ -360,7 +376,11 @@ export function ChatHeader({
   // folder icon in the breadcrumb.
   const projectTag =
     !isMobile && actionConversation && !isChildSession ? (
-      <HeaderProjectTag conversationId={actionConversation.id} projectName={projectName} />
+      <HeaderProjectTag
+        conversationId={actionConversation.id}
+        projectName={projectName}
+        projectIcon={projectIcon}
+      />
     ) : null;
   // Click-to-rename on the breadcrumb title, same gating as the folder tag:
   // desktop, owner-managed top-level row. A sub-agent's title stays a
@@ -402,7 +422,13 @@ export function ChatHeader({
         )}
       >
         {!sidebarOpen && (
-          <Tooltip>
+          <Tooltip
+            open={tooltipOpen}
+            onOpenChange={(next) => {
+              if (next && suppressTooltip.current) return;
+              setTooltipOpen(next);
+            }}
+          >
             <TooltipTrigger asChild>
               <Button
                 type="button"
@@ -449,6 +475,7 @@ export function ChatHeader({
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
+            projectIcon={projectIcon}
             projectTag={projectTag ?? undefined}
             titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}

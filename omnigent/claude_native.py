@@ -27,6 +27,7 @@ from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
+    sanitize_replayed_image_blocks,
     strip_unparseable_image_output,
     tool_result_content_blocks,
 )
@@ -89,12 +90,14 @@ from omnigent.claude_model_vocabulary import (
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
+    ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
     read_active_session_id,
     read_user_effort_level,
     url_component,
+    validate_claude_hook_interpreter_compatibility,
 )
 from omnigent.claude_native_forwarder import (
     reset_transcript_forward_state,
@@ -436,6 +439,23 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
+def _ambient_env_is_non_anthropic_gateway() -> bool:
+    """Whether the ambient process env routes through a non-Anthropic gateway.
+
+    Used as the ``claude_config is None`` counterpart to
+    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
+    set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
+    fingerprint must treat the env as a non-canonical endpoint.
+    """
+    from urllib.parse import urlparse
+
+    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if not base_url:
+        return False
+    host = (urlparse(base_url).hostname or "").lower()
+    return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -485,6 +505,49 @@ def claude_catalog_serves_model(
     return family is not None and any(
         _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
     )
+
+
+def claude_catalog_launch_spelling(
+    rows: list[dict[str, object]],
+    model: str,
+) -> str | None:
+    """The catalog's own launch spelling for *model*, when a row denotes it.
+
+    A deployed spec pin or a routing pick can spell a served model in the
+    gateway/catalog namespace (``system.ai.claude-opus-4-8[1m]``,
+    ``databricks-claude-sonnet-5``) while the launch catalog lists the same
+    model bare — the mechanical ``databricks-`` / ``system.ai.`` prefixes and
+    case never distinguish models. Fold those away and return the matching
+    row's wire model (its id when the row carries no wire model): the
+    spelling this catalog vouches for as ``--model``. The ``[1m]`` marker
+    denotes a distinct request on the same model, so it never folds away.
+
+    An exact row keeps the caller's spelling. An id no row folds onto — or
+    one that folds onto several *different* launch spellings — returns
+    ``None``; the caller decides whether that refuses the launch.
+
+    :param rows: Catalog rows, e.g. ``[{"id": "opus", "model": "claude-opus-5"}]``.
+    :param model: A picker id or model id, e.g. ``"system.ai.claude-opus-5"``.
+    :returns: The catalog's launch spelling for the model, or ``None``.
+    """
+    from omnigent.claude_model_vocabulary import prefix_folded_model_id
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return model
+    folded = prefix_folded_model_id(model)
+    if not folded:
+        return None
+    spellings: set[str] = set()
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        wire_model = str(row.get("model") or "").strip()
+        if any(
+            spelling and prefix_folded_model_id(spelling) == folded
+            for spelling in (row_id, wire_model)
+        ):
+            spellings.add(wire_model or row_id)
+    return next(iter(spellings)) if len(spellings) == 1 else None
 
 
 def _endpoint_origin(url: str) -> str:
@@ -1162,12 +1225,14 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.model_catalog_store import binary_identity, fingerprint_of
 
     command, _ = resolve_claude_launch("claude", [])
+    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
+        ambient_gateway,
     )
 
 
@@ -1194,7 +1259,10 @@ async def claude_model_catalog(
     if probe is None:
         return None
     rows = list(probe.alias_rows)
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    _non_canonical = (
+        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
+    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    if _non_canonical:
         rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
 
     configured_pin = claude_config.model if claude_config is not None else None
@@ -1216,11 +1284,10 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        servable = (
-            claude_config is None
-            or _serves_canonical_anthropic_ids(claude_config)
-            or not default_model.startswith("claude-")
-        )
+        _canonical_ids_ok = (
+            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
+        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
+        servable = _canonical_ids_ok or not default_model.startswith("claude-")
         if servable:
             # The probe's printed label describes the ENUMERATION run's
             # model; it only names a config-pinned default when the two are
@@ -3587,6 +3654,7 @@ async def _attach_with_transcript_forwarder(
                 attach_url=attach_url,
                 headers=headers,
                 recover=recover,
+                session_name="Claude",
                 base_url=base_url,
                 session_id=prepared.session_id,
                 terminal_id=prepared.terminal_id,
@@ -3630,6 +3698,7 @@ async def _attach_with_reconnect(
     attach_url: str,
     headers: dict[str, str],
     recover: Callable[[], Awaitable[None]] | None,
+    session_name: str = "Claude",
     base_url: str | None = None,
     session_id: str | None = None,
     terminal_id: str | None = None,
@@ -3660,6 +3729,8 @@ async def _attach_with_reconnect(
         (not before the first). ``None`` disables reconnect; the
         loop returns after one ``attach`` call. Callback exceptions
         are logged and the loop still retries.
+    :param session_name: User-facing native session name used in reconnect
+        messages, e.g. ``"Claude"`` or ``"Codex"``.
     :param base_url: Omnigent server URL for the post-close terminal probe;
         ``None`` disables the probe.
     :param session_id: Session/conversation id for the probe path.
@@ -3697,7 +3768,8 @@ async def _attach_with_reconnect(
                 await recover()
             except Exception:  # noqa: BLE001
                 _logger.warning(
-                    "claude-native reconnect recovery callback raised; retrying attach anyway",
+                    "%s-native reconnect recovery callback raised; retrying attach anyway",
+                    session_name.lower(),
                     exc_info=True,
                 )
         first_attempt = False
@@ -3756,14 +3828,15 @@ async def _attach_with_reconnect(
             if recover is None:
                 raise
             click.echo(
-                f"\nClaude session connection lost ({exc}); reconnecting...",
+                f"\n{session_name} session connection lost ({exc}); reconnecting...",
                 err=True,
             )
         except (WebSocketException, OSError, ConnectionError) as exc:
             if recover is None:
                 raise
             click.echo(
-                f"\nClaude session connection lost ({type(exc).__name__}: {exc}); reconnecting...",
+                f"\n{session_name} session connection lost "
+                f"({type(exc).__name__}: {exc}); reconnecting...",
                 err=True,
             )
         else:
@@ -3782,7 +3855,7 @@ async def _attach_with_reconnect(
                     )
                     return _AttachOutcome.EXITED
             click.echo(
-                "\nClaude session connection closed by server; reconnecting...",
+                f"\n{session_name} session connection closed by server; reconnecting...",
                 err=True,
             )
         await _sleep(delay)
@@ -5106,7 +5179,18 @@ def _claude_transcript_records_from_session_items(
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
+    previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
+        # A forwarder retry that slipped past idempotency persists as an
+        # adjacent row identical in everything but the store envelope
+        # (id/created_at). Drop it so store duplicates don't become
+        # duplicated model context on every resume; genuine adjacent
+        # repeats differ in payload or response_id and survive.
+        if previous_item is not None and _transcript_items_equal_ignoring_envelope(
+            item, previous_item
+        ):
+            continue
+        previous_item = item
         # Compaction items carry the post-compaction context. Replace
         # all prior records with the compacted messages so the
         # reconstructed transcript reflects the compacted state.
@@ -5163,6 +5247,7 @@ def _claude_transcript_records_from_session_items(
                         parent_uuid=parent_uuid,
                         cwd=cwd,
                         bridge_dir=bridge_dir,
+                        allow_native_message_content=True,
                     )
                     if cm_record is not None:
                         records.append(cm_record)
@@ -5201,6 +5286,7 @@ def _claude_transcript_record_from_session_item(
     parent_uuid: str | None,
     cwd: Path,
     bridge_dir: Path,
+    allow_native_message_content: bool = False,
 ) -> _JsonObject | None:
     """
     Convert one Omnigent item into one Claude transcript record.
@@ -5224,6 +5310,8 @@ def _claude_transcript_record_from_session_item(
         ``Path("/home/me/repo")``.
     :param bridge_dir: Session bridge directory for re-materializing
         attachment blocks.
+    :param allow_native_message_content: Accept Claude-native string and
+        content-block shapes when API-block conversion finds no content.
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
@@ -5235,12 +5323,18 @@ def _claude_transcript_record_from_session_item(
         role = item.get("role")
         if role == "user":
             user_content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
+            if user_content is None and allow_native_message_content:
+                user_content = _claude_native_message_content(item.get("content"), role="user")
             if user_content is None:
                 return None
             record_type = "user"
             message = {"role": "user", "content": user_content}
         elif role == "assistant":
             assistant_content = _claude_assistant_content_from_api_blocks(item.get("content"))
+            if assistant_content is None and allow_native_message_content:
+                assistant_content = _claude_native_message_content(
+                    item.get("content"), role="assistant"
+                )
             if assistant_content is None:
                 return None
             record_type = "assistant"
@@ -5319,6 +5413,60 @@ def _claude_transcript_record_from_session_item(
         "message": message,
         **extra,
     }
+
+
+def _transcript_items_equal_ignoring_envelope(
+    item: _JsonObject,
+    other: _JsonObject,
+) -> bool:
+    """
+    Compare two session items ignoring store-envelope fields.
+
+    A duplicate row created by a forwarder retry re-post is byte-identical
+    in payload but differs in the store-assigned ``id`` and ``created_at``.
+    Everything else — including ``response_id``, which differs across
+    genuine turns — participates in the comparison, so a user legitimately
+    repeating the same message in a later turn is not collapsed. The filter
+    assumes a turn never legitimately emits byte-identical adjacent payloads
+    within the same ``response_id``; such a repeat would be collapsed too.
+
+    :param item: Flat API item dict, e.g.
+        ``{"type": "message", "role": "user", "content": [...]}``.
+    :param other: The item to compare against.
+    :returns: ``True`` when the items are equal apart from ``id`` and
+        ``created_at``.
+    """
+    envelope = ("id", "created_at")
+    return {k: v for k, v in item.items() if k not in envelope} == {
+        k: v for k, v in other.items() if k not in envelope
+    }
+
+
+def _claude_native_message_content(
+    content: object,
+    *,
+    role: str,
+) -> str | list[_JsonObject] | None:
+    """Validate Claude-native message content for transcript reconstruction."""
+    if isinstance(content, str):
+        if not content:
+            return None
+        if role == "assistant":
+            return [{"type": "text", "text": content}]
+        return content
+    if not isinstance(content, list) or not content:
+        return None
+    blocks: list[_JsonObject] = []
+    for value in content:
+        block = _json_object(value)
+        if block is None or not isinstance(block.get("type"), str):
+            return None
+        blocks.append(block)
+    # A compaction snapshot strips image base64 to a marker; replayed verbatim
+    # that marker reaches the provider as source.data and fails the resume, so
+    # downgrade any unusable image block to its omitted-image placeholder.
+    sanitized = sanitize_replayed_image_blocks(blocks)
+    return cast(list[_JsonObject], sanitized)
 
 
 def _synthetic_claude_transcript_uuid(
@@ -5585,11 +5733,16 @@ def _preflight_local_tools(command: str) -> None:
     :raises click.ClickException: If ``command`` or ``tmux`` is not
         available on the local ``PATH``.
     """
-    if shutil.which(command) is None:
+    resolved_command = shutil.which(command)
+    if resolved_command is None:
         raise click.ClickException(
             f"Claude Code CLI command {command!r} was not found on local PATH. "
             "--server selects the Omnigent server only; Claude still runs locally."
         )
+    try:
+        validate_claude_hook_interpreter_compatibility(resolved_command)
+    except ClaudeNativeHookInterpreterMismatchError as exc:
+        raise click.ClickException(str(exc)) from exc
     if shutil.which("tmux") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Claude wrapper "
