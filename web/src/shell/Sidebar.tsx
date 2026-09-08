@@ -4177,6 +4177,7 @@ function ConversationRowImpl({
               <PinnedProjectFlyoutContent
                 title={conversation.title ?? conversation.id}
                 projectName={projectFlyoutName}
+                projectIcon={projectFlyoutIcon}
                 gitBranch={gitBranch}
               />
             </HoverCard>
