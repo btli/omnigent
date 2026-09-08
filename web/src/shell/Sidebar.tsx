@@ -52,6 +52,7 @@ import {
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  UsersIcon,
   WalletIcon,
   XIcon,
 } from "lucide-react";
@@ -206,15 +207,11 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 
-// Positioning for a row's trailing session-state badge. Anchored at the row's
-// right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
-// archive + kebab take its place; on mobile those controls are gone, so the
-// badge simply holds the right edge. Without fine hover at md+ (touch tablets)
-// the controls are persistently visible instead, so the badge shifts left of
-// them (right-20 clears the control column) and never fades — a tap's sticky
-// :hover or a keyboard focus must not drop the state there.
+// Positioning shared by a row's trailing state badges. On fine-hover desktop
+// they fade when the action controls appear; touch tablets keep both controls
+// and badges visible, with each badge positioned left of the controls below.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0 no-fine-hover:md:right-20";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -236,7 +233,9 @@ const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 const ROW_TITLE_RESERVE = {
   none: "pr-2 no-fine-hover:md:pr-20",
   dot: "pr-8 no-fine-hover:md:pr-27",
+  dotShared: "pr-14 no-fine-hover:md:pr-33",
   awaiting: "pr-29 no-fine-hover:md:pr-48",
+  awaitingShared: "pr-36 no-fine-hover:md:pr-55",
 } as const;
 const ROW_CONTROL_CLASS =
   "hidden text-muted-foreground transition-opacity focus-visible:ring-inset md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
@@ -3741,7 +3740,9 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
-  const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
+  const showSharedIndicator = !isOwner;
+  const hasSessionIndicator = sessionState !== null || showDraftIndicator;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
 
   const gestureEnabled = !selectionMode && !isEditing;
   const dragEnabled = gestureEnabled && isOwner && !isArchived;
@@ -3976,7 +3977,15 @@ function ConversationRowImpl({
         // plus the badge's own width when one is present.
         !selectionMode &&
           ROW_TITLE_RESERVE[
-            sessionState?.kind === "awaiting" ? "awaiting" : hasTrailingIndicator ? "dot" : "none"
+            sessionState?.kind === "awaiting"
+              ? showSharedIndicator
+                ? "awaitingShared"
+                : "awaiting"
+              : hasSessionIndicator && showSharedIndicator
+                ? "dotShared"
+                : hasTrailingIndicator
+                  ? "dot"
+                  : "none"
           ],
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
@@ -4028,7 +4037,7 @@ function ConversationRowImpl({
     >
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
-      <div className="flex w-full items-center gap-1.5">
+      <div className="flex w-full items-center">
         <span
           className={cn(
             "relative min-w-0 truncate",
@@ -4219,10 +4228,11 @@ function ConversationRowImpl({
               <SquareIcon className="size-4 text-muted-foreground" />
             )}
           </span>
-        ) : hasTrailingIndicator ? (
+        ) : hasSessionIndicator ? (
           <span
             className={cn(
               SESSION_STATE_SLOT_CLASS,
+              "right-1 no-fine-hover:md:right-20",
               // The wide "awaiting" pill keeps its natural width; every other
               // marker (running/starting/unseen dot, or the draft pencil) sits in
               // the fixed centered box so it lines up under the kebab.
@@ -4243,6 +4253,22 @@ function ConversationRowImpl({
             )}
           </span>
         ) : null}
+        {!selectionMode && showSharedIndicator && (
+          <span
+            role="img"
+            aria-label="Shared session"
+            title="Shared with you"
+            className={cn(
+              SESSION_STATE_SLOT_CLASS,
+              SESSION_STATE_DOT_SLOT_CLASS,
+              hasSessionIndicator
+                ? "right-8 no-fine-hover:md:right-27"
+                : "right-1 no-fine-hover:md:right-20",
+            )}
+          >
+            <UsersIcon className="size-3.5" aria-hidden="true" />
+          </span>
+        )}
         {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
             row, so their spacing is defined once (gap-0.5) and stays aligned
             with the project-folder header actions, which use the same pattern.
