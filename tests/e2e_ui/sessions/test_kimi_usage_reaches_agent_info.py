@@ -31,6 +31,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 import uuid
@@ -41,7 +42,22 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
+from omnigent.inner.kimi_executor import _resolve_kimi_binary
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
+
+# Binary-presence gate, mirroring tests/e2e/test_kimi_executor_e2e.py and the
+# other native-CLI e2e_ui modules (codex / goose / hermes render parity): the
+# e2e-ui CI job installs only the claude-code and codex CLIs, and without a
+# ``kimi`` binary the turn can never write a ``wire.jsonl``, so the wire-log
+# precondition below would fail instead of pinning the usage-drop regression.
+pytestmark = pytest.mark.skipif(
+    shutil.which(_resolve_kimi_binary()) is None,
+    reason=(
+        "the kimi (or OMNIGENT_KIMI_PATH) binary is required for the "
+        "headless-kimi usage e2e; install via "
+        "`curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`"
+    ),
+)
 
 # The kimi CLI reaches the loopback mock only when loopback is exempt from the
 # ambient credential proxy; mirror the codex-native e2e module-import guard so
