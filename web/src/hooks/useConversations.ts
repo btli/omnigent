@@ -360,11 +360,17 @@ export function isSessionArchiving(id: string): boolean {
 function applySessionTombstones(page: ConversationsPage, dropArchiving = false): ConversationsPage {
   if (deletingSessionTombstones.size === 0 && archivingSessionTombstones.size === 0) return page;
   let changed = false;
+  let lastArchivingId: string | null = null;
   const data: Conversation[] = [];
   for (const conv of page.data) {
     const archiving = isSessionArchiving(conv.id);
-    if (isSessionDeleting(conv.id) || (dropArchiving && archiving)) {
+    if (isSessionDeleting(conv.id)) {
       changed = true;
+      continue;
+    }
+    if (dropArchiving && archiving) {
+      changed = true;
+      lastArchivingId = conv.id;
       continue;
     }
     if (archiving && conv.archived !== true) {
@@ -379,7 +385,8 @@ function applySessionTombstones(page: ConversationsPage, dropArchiving = false):
     ...page,
     data,
     first_id: data[0]?.id ?? null,
-    last_id: data[data.length - 1]?.id ?? null,
+    // Archived rows remain valid server cursors; deleted rows do not.
+    last_id: data[data.length - 1]?.id ?? lastArchivingId,
   };
 }
 
@@ -866,6 +873,8 @@ async function paintConversationsArchived(
     archived ? ids : [],
     (entryGen) => ({ gen: entryGen }),
   );
+  // Unarchive must not retain a true pin; overlapping rollbacks reconcile
+  // through the server refresh path rather than pinning archived:false.
   if (!archived) clearArchivingSessionTombstones(ids);
   const snapshot = snapshotArchiveLists(queryClient);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);

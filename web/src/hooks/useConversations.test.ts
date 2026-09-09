@@ -2550,6 +2550,61 @@ describe("useArchiveConversation", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
   });
 
+  it("keeps pagination alive when archive tombstones empty a fetched page", async () => {
+    let settlePatch = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settlePatch = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const seeded = infinitePage([conversation({ id: "conv_a" })]);
+    seeded.pages[0].has_more = true;
+    queryClient.setQueryData(["conversations", "", false], seeded);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const list = renderHook(() => useConversations("", false), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(list.result.current.data!.pages[0].data).toEqual([]));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...staleListPage, has_more: true }));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", false] }));
+
+    const page = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0];
+    expect(page.data).toEqual([]);
+    expect(page.last_id).toBe("conv_a");
+    expect(list.result.current.hasNextPage).toBe(true);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [
+          {
+            id: "conv_other",
+            object: "conversation",
+            title: "Older",
+            created_at: 0,
+            updated_at: 4,
+          },
+        ],
+        first_id: "conv_other",
+        last_id: "conv_other",
+        has_more: false,
+      }),
+    );
+    await act(() => list.result.current.fetchNextPage());
+    expect(fetchMock.mock.calls[2][0]).toContain("after=conv_a");
+
+    settlePatch(
+      mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
+    );
+    await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
+  });
+
   it("cancels in-flight conversations AND project-sessions fetches on archive", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ id: "conv_a", object: "conversation", archived: true, updated_at: 10 }),
@@ -2774,8 +2829,8 @@ describe("useArchiveConversation", () => {
       );
       await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
 
-      // Delete while the archive pin is still in its grace window: the delete
-      // tombstone replaces the archive entry, including its pending expiry.
+      // Delete while the archive pin is still in its grace window: the
+      // independent delete tombstone takes visibility precedence.
       fetchMock.mockResolvedValueOnce(mockResponse({}));
       fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", deleted: true }));
       await del.result.current.mutateAsync({ id: "conv_a" });
@@ -2855,9 +2910,8 @@ describe("useArchiveConversation", () => {
     );
     await archive.result.current.mutateAsync({ id: "conv_a", archived: true });
 
-    // The delete fails (stop ok, DELETE 500): onError releases the delete
-    // tombstone and re-arms the archive pin it replaced, so the rollback
-    // refetch's stale page stays pinned archived:true (off the default page).
+    // The delete fails (stop ok, DELETE 500): onError releases only the delete
+    // tombstone, so the independent archive pin survives the rollback.
     fetchMock.mockResolvedValueOnce(mockResponse({}));
     fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
     fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
