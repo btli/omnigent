@@ -2794,6 +2794,45 @@ describe("useArchiveConversation", () => {
     }
   });
 
+  it("a failed archive cannot release an active delete tombstone", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_a" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", false), { wrapper });
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+    const del = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+    const defaultIds = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.map((c) => c.id);
+
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    let settleDelete = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleDelete = resolve;
+        }),
+    );
+    del.result.current.mutate({ id: "conv_a" });
+    await waitFor(() => expect(defaultIds()).toEqual([]));
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    archive.result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(archive.result.current.isError).toBe(true));
+
+    fetchMock.mockResolvedValueOnce(mockResponse(staleListPage));
+    await act(() => queryClient.refetchQueries({ queryKey: ["conversations", "", false] }));
+    expect(defaultIds()).toEqual([]);
+
+    settleDelete(mockResponse({ id: "conv_a", deleted: true }));
+    await waitFor(() => expect(del.result.current.isSuccess).toBe(true));
+  });
+
   it("a failed delete inside the archive grace window re-arms the archive pin", async () => {
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     queryClient.setQueryData(

@@ -255,84 +255,101 @@ export interface ConversationsPage {
 }
 
 // ── Hidden-session tombstones (delete / archive in flight) ──────────
-//
-// Deleting ids are dropped from fetches/frames; archiving ids are pinned
-// `archived: true`. Each entry records its owning mutation generation, so
-// a superseded settle can neither release nor expire it.
-const sessionTombstones = new Map<
-  string,
-  { kind: "delete" | "archive"; gen: number; timer?: ReturnType<typeof setTimeout> }
->();
+interface SessionTombstone {
+  gen: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+// Delete and archive lifecycles are independent, so archive cannot release
+// the stronger delete tombstone.
+const deletingSessionTombstones = new Map<string, SessionTombstone>();
+const archivingSessionTombstones = new Map<string, SessionTombstone>();
 let tombstoneGen = 0;
 
 /** Grace window for the server's async list-index catch-up. */
 const DELETED_TOMBSTONE_MS = 60_000;
 
-/** Tombstone the sessions for an in-flight delete/archive; returns the owning generation. */
-function markSessionTombstones(ids: Iterable<string>, kind: "delete" | "archive"): number {
+/** Replace entries in one tombstone lifecycle; returns the owning generation. */
+function markSessionTombstones<T extends SessionTombstone>(
+  tombstones: Map<string, T>,
+  ids: Iterable<string>,
+  makeEntry: (gen: number) => T,
+): number {
   const gen = ++tombstoneGen;
   for (const id of ids) {
-    const prev = sessionTombstones.get(id);
+    const prev = tombstones.get(id);
     if (prev?.timer !== undefined) clearTimeout(prev.timer);
-    sessionTombstones.set(id, { kind, gen });
+    tombstones.set(id, makeEntry(gen));
   }
   return gen;
 }
 
 /** Release tombstones the caller still owns (`gen` matches) — the mutation failed or was undone. */
-function releaseSessionTombstones(ids: Iterable<string>, gen: number): void {
+function releaseSessionTombstones<T extends SessionTombstone>(
+  tombstones: Map<string, T>,
+  ids: Iterable<string>,
+  gen: number,
+): void {
   for (const id of ids) {
-    const entry = sessionTombstones.get(id);
+    const entry = tombstones.get(id);
     if (entry === undefined || entry.gen !== gen) continue;
     if (entry.timer !== undefined) clearTimeout(entry.timer);
-    sessionTombstones.delete(id);
-  }
-}
-
-/** Clear archive tombstones outright — an explicit unarchive brings the row back. */
-function releaseArchiveTombstones(ids: Iterable<string>): void {
-  for (const id of ids) {
-    const entry = sessionTombstones.get(id);
-    if (entry?.kind !== "archive") continue;
-    if (entry.timer !== undefined) clearTimeout(entry.timer);
-    sessionTombstones.delete(id);
+    tombstones.delete(id);
   }
 }
 
 /** Hold settled tombstones through the reindex grace window, then release them. */
-function expireSessionTombstones(ids: Iterable<string>, gen: number): void {
+function expireSessionTombstones<T extends SessionTombstone>(
+  tombstones: Map<string, T>,
+  ids: Iterable<string>,
+  gen: number,
+): void {
   for (const id of ids) {
-    const entry = sessionTombstones.get(id);
+    const entry = tombstones.get(id);
     if (entry === undefined || entry.gen !== gen) continue;
     if (entry.timer !== undefined) clearTimeout(entry.timer);
     entry.timer = setTimeout(() => {
-      if (sessionTombstones.get(id) === entry) sessionTombstones.delete(id);
+      if (tombstones.get(id) === entry) tombstones.delete(id);
     }, DELETED_TOMBSTONE_MS);
   }
 }
 
 /** Re-arm archive tombstones a failed unarchive/delete cleared, with a fresh grace window. */
 function rearmArchiveTombstones(ids: readonly string[]): void {
-  const rearm = ids.filter((id) => sessionTombstones.get(id) === undefined);
-  if (rearm.length > 0) expireSessionTombstones(rearm, markSessionTombstones(rearm, "archive"));
+  const rearm = ids.filter((id) => archivingSessionTombstones.get(id) === undefined);
+  if (rearm.length === 0) return;
+  const gen = markSessionTombstones(archivingSessionTombstones, rearm, (entryGen) => ({
+    gen: entryGen,
+  }));
+  expireSessionTombstones(archivingSessionTombstones, rearm, gen);
+}
+
+function clearArchivingSessionTombstones(ids: Iterable<string>): void {
+  for (const id of ids) {
+    const entry = archivingSessionTombstones.get(id);
+    if (entry?.timer !== undefined) clearTimeout(entry.timer);
+    archivingSessionTombstones.delete(id);
+  }
 }
 
 /** Wipe every tombstone — exported for test cleanup. */
 export function clearSessionTombstones(): void {
-  for (const entry of sessionTombstones.values()) {
-    if (entry.timer !== undefined) clearTimeout(entry.timer);
+  for (const tombstones of [deletingSessionTombstones, archivingSessionTombstones]) {
+    for (const entry of tombstones.values()) {
+      if (entry.timer !== undefined) clearTimeout(entry.timer);
+    }
+    tombstones.clear();
   }
-  sessionTombstones.clear();
 }
 
 /** Whether a session has an optimistic delete in flight (tombstoned). */
 export function isSessionDeleting(id: string): boolean {
-  return sessionTombstones.get(id)?.kind === "delete";
+  return deletingSessionTombstones.has(id);
 }
 
 /** Whether a session has an optimistic archive in flight (tombstoned). */
 export function isSessionArchiving(id: string): boolean {
-  return sessionTombstones.get(id)?.kind === "archive";
+  return archivingSessionTombstones.has(id);
 }
 
 /**
@@ -341,16 +358,16 @@ export function isSessionArchiving(id: string): boolean {
  * — lists that never show archived rows). Cursors follow the survivors.
  */
 function applySessionTombstones(page: ConversationsPage, dropArchiving = false): ConversationsPage {
-  if (sessionTombstones.size === 0) return page;
+  if (deletingSessionTombstones.size === 0 && archivingSessionTombstones.size === 0) return page;
   let changed = false;
   const data: Conversation[] = [];
   for (const conv of page.data) {
-    const tombstone = sessionTombstones.get(conv.id);
-    if (tombstone?.kind === "delete" || (dropArchiving && tombstone !== undefined)) {
+    const archiving = isSessionArchiving(conv.id);
+    if (isSessionDeleting(conv.id) || (dropArchiving && archiving)) {
       changed = true;
       continue;
     }
-    if (tombstone?.kind === "archive" && conv.archived !== true) {
+    if (archiving && conv.archived !== true) {
       changed = true;
       data.push({ ...conv, archived: true });
       continue;
@@ -844,9 +861,12 @@ async function paintConversationsArchived(
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
   ]);
-  // Unarchive marks nothing but still gets a gen, so gen-guarded release/expire are no-ops.
-  const gen = markSessionTombstones(archived ? ids : [], "archive");
-  if (!archived) releaseArchiveTombstones(ids);
+  const gen = markSessionTombstones(
+    archivingSessionTombstones,
+    archived ? ids : [],
+    (entryGen) => ({ gen: entryGen }),
+  );
+  if (!archived) clearArchivingSessionTombstones(ids);
   const snapshot = snapshotArchiveLists(queryClient);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
   if (archived) dropFromPinnedCache(queryClient, ids);
@@ -861,9 +881,11 @@ export function useArchiveConversation() {
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
       // A newer mutation owns the id — leave its tombstone and overlay alone.
-      const live = sessionTombstones.get(id);
+      const live = archivingSessionTombstones.get(id);
       if (context && live !== undefined && live.gen !== context.gen) return;
-      if (archived && context) releaseSessionTombstones([id], context.gen);
+      if (archived && context) {
+        releaseSessionTombstones(archivingSessionTombstones, [id], context.gen);
+      }
       if (context) rearmArchiveTombstones(context.restoreArchiving);
       // Roll back to exactly the pre-archive caches, synchronously — so the
       // row (and any dropped pin) returns at once, rather than waiting on a
@@ -878,7 +900,9 @@ export function useArchiveConversation() {
     },
     onSuccess: (updated, { archived }, context) => {
       markConversationSeen(updated.id, updated.updated_at);
-      if (archived && context) expireSessionTombstones([updated.id], context.gen);
+      if (archived && context) {
+        expireSessionTombstones(archivingSessionTombstones, [updated.id], context.gen);
+      }
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
       // or drops it from that project folder's own paginated list. These read
@@ -925,14 +949,12 @@ function removeConversationsFromLists(queryClient: QueryClient, ids: Set<string>
 
 /** Re-apply every live tombstone's optimistic state after a wholesale snapshot restore. */
 function reapplyLiveTombstones(queryClient: QueryClient): void {
-  const deleted = new Set<string>();
-  const archived = new Set<string>();
-  for (const [id, entry] of sessionTombstones)
-    if (entry.kind === "delete") deleted.add(id);
-    else archived.add(id);
+  const archived = new Set(archivingSessionTombstones.keys());
   for (const id of archived) overlayArchivedIntoCaches(queryClient, id, true);
   if (archived.size > 0) dropFromPinnedCache(queryClient, archived);
-  if (deleted.size > 0) removeConversationsFromLists(queryClient, deleted);
+  if (deletingSessionTombstones.size > 0) {
+    removeConversationsFromLists(queryClient, new Set(deletingSessionTombstones.keys()));
+  }
 }
 
 /** Every cached list touched by an optimistic delete, as it was before. */
@@ -955,13 +977,14 @@ interface DeletedListsSnapshot {
 async function paintConversationsDeleted(
   queryClient: QueryClient,
   ids: readonly string[],
-): Promise<{ snapshot: DeletedListsSnapshot; gen: number; restoreArchiving: string[] }> {
-  const restoreArchiving = ids.filter((id) => isSessionArchiving(id));
+): Promise<{ snapshot: DeletedListsSnapshot; gen: number }> {
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
   ]);
-  const gen = markSessionTombstones(ids, "delete");
+  const gen = markSessionTombstones(deletingSessionTombstones, ids, (entryGen) => ({
+    gen: entryGen,
+  }));
   const snapshot: DeletedListsSnapshot = {
     lists: [
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
@@ -970,7 +993,7 @@ async function paintConversationsDeleted(
     pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
   };
   removeConversationsFromLists(queryClient, new Set(ids));
-  return { snapshot, gen, restoreArchiving };
+  return { snapshot, gen };
 }
 
 /**
@@ -988,12 +1011,11 @@ async function paintConversationsDeleted(
  */
 function restoreDeletedConversations(
   queryClient: QueryClient,
-  paint: { snapshot: DeletedListsSnapshot; gen: number; restoreArchiving: string[] } | undefined,
+  paint: { snapshot: DeletedListsSnapshot; gen: number } | undefined,
   failedIds: readonly string[],
 ): void {
   if (paint !== undefined) {
-    releaseSessionTombstones(failedIds, paint.gen);
-    rearmArchiveTombstones(paint.restoreArchiving.filter((id) => failedIds.includes(id)));
+    releaseSessionTombstones(deletingSessionTombstones, failedIds, paint.gen);
     for (const [key, data] of paint.snapshot.lists) queryClient.setQueryData(key, data);
     queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, paint.snapshot.pinned);
     reapplyLiveTombstones(queryClient);
@@ -1021,7 +1043,8 @@ function finalizeDeletedConversations(
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });
   }
-  expireSessionTombstones(ids, gen);
+  clearArchivingSessionTombstones(ids);
+  expireSessionTombstones(deletingSessionTombstones, ids, gen);
   // Deleting the last member of a project empties it, so refresh the
   // project list to drop the now-empty folder. Unlike the conversations
   // list, /v1/sessions/projects reads the DB directly (no search-index
@@ -1210,20 +1233,22 @@ export function useBulkArchiveConversations() {
       const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
       const succeeded = ids.filter((id) => !failed.has(id));
       if (archived) {
-        releaseSessionTombstones(failed, context.gen);
-        expireSessionTombstones(succeeded, context.gen);
+        releaseSessionTombstones(archivingSessionTombstones, failed, context.gen);
+        expireSessionTombstones(archivingSessionTombstones, succeeded, context.gen);
       }
       rearmArchiveTombstones(context.restoreArchiving.filter((id) => failed.has(id)));
       restoreArchiveLists(queryClient, context.snapshot);
       reapplyLiveTombstones(queryClient);
       // Succeeded unarchives own no tombstone — re-apply their flag by hand.
       if (!archived) {
-        for (const id of succeeded.filter((sid) => !sessionTombstones.has(sid)))
+        for (const id of succeeded.filter((sid) => !archivingSessionTombstones.has(sid)))
           overlayArchivedIntoCaches(queryClient, id, false);
       }
     },
     onSuccess: (_data, { ids, archived }, context) => {
-      if (archived && context !== undefined) expireSessionTombstones(ids, context.gen);
+      if (archived && context !== undefined) {
+        expireSessionTombstones(archivingSessionTombstones, ids, context.gen);
+      }
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike
