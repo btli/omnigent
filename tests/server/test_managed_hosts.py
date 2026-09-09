@@ -2909,7 +2909,10 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
     provider: ClassVar[str] = "islo"
 
 
-@pytest.mark.parametrize("workspace_state", ["ephemeral", "persistent", "no_repo"])
+@pytest.mark.parametrize(
+    "workspace_state",
+    ["ephemeral", "persistent", "no_repo", "empty", "stale_tmp", "non_repo", "clone_failure"],
+)
 async def test_resume_agent_sandbox_prepares_recorded_workspace(
     db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workspace_state: str
 ) -> None:
@@ -2921,6 +2924,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
 
     workspace = tmp_path / "home with spaces" / "workspace"
     clone_dir = workspace / "repo"
+    temporary = workspace / "repo.tmp"
     call_log = tmp_path / "calls.log"
     repo = (
         parse_repo_workspace("https://github.com/org/repo.git#release/test")
@@ -2963,6 +2967,17 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             " M unstaged.txt",
             "?? untracked.txt",
         }
+    elif workspace_state in {"empty", "stale_tmp"}:
+        clone_dir.mkdir(parents=True)
+        if workspace_state == "stale_tmp":
+            temporary.mkdir()
+            (temporary / "partial-clone.txt").write_text("interrupted clone\n")
+    elif workspace_state == "non_repo":
+        (clone_dir / ".git").mkdir(parents=True)
+        (clone_dir / ".git" / "config").write_text("incomplete repository\n")
+        (clone_dir / "untracked.txt").write_text("keep me\n")
+        temporary.mkdir()
+        (temporary / "partial-clone.txt").write_text("keep this too\n")
 
     host_store = HostStore(db_uri)
     fake = _AgentSandboxFakeLauncher(host_store)
@@ -2990,8 +3005,14 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             kwargs["host_id"],
         )
         git_command = (
-            'command git "$@"' if workspace_state == "persistent" else 'mkdir -p "${@: -1}"'
+            'test ! -e "${@: -1}"; mkdir -p "${@: -1}/.git"; '
+            'printf "ref: refs/heads/release/test\\n" > "${@: -1}/.git/HEAD"; '
+            'printf "cloned\\n" > "${@: -1}/tracked.txt"'
         )
+        if workspace_state == "persistent":
+            git_command = 'command git "$@"'
+        elif workspace_state == "clone_failure":
+            git_command += '; printf "clone failed\\n" >&2; return 1'
         script = (
             'python3() { printf "credentials\\n" >> "$CALL_LOG"; }\n'
             'git() { printf "git %s\\n" "$*" >> "$CALL_LOG"; ' + git_command + "; }\n" + command[2]
@@ -3000,22 +3021,43 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         return _EntrypointFakeLauncher.start_host(fake, sandbox_id, **kwargs)
 
     monkeypatch.setattr(fake, "start_host", _start)
-    await resume_managed_host(host.host_id, host_store, _injected_config(fake), repo=repo)
+    failed = workspace_state in {"non_repo", "clone_failure"}
+    if failed:
+        with pytest.raises(HTTPException) as exc:
+            await resume_managed_host(host.host_id, host_store, _injected_config(fake), repo=repo)
+        assert exc.value.status_code == 502
+        cause = exc.value.__cause__
+        assert isinstance(cause, subprocess.CalledProcessError)
+        assert cause.returncode != 0
+        assert (
+            "has no .git/HEAD and is not an empty directory; refusing to overwrite it"
+            if workspace_state == "non_repo"
+            else "clone failed"
+        ) in cause.stderr
+    else:
+        await resume_managed_host(host.host_id, host_store, _injected_config(fake), repo=repo)
 
     assert fake.resumed == ["sb-workspace-wake"]
-    assert host_store.is_online(host.host_id)
+    assert host_store.is_online(host.host_id) is not failed
     assert (captured["repo_url"], captured["repo_branch"], captured["repo_name"]) == (
         (repo.url, repo.branch, repo.repo_name) if repo is not None else (None, None, None)
     )
     assert workspace.is_dir()
     calls = call_log.read_text().splitlines() if call_log.exists() else []
-    if workspace_state == "ephemeral":
+    if workspace_state in {"ephemeral", "empty", "stale_tmp", "clone_failure"}:
         assert repo is not None
         assert calls == [
             "credentials",
-            f"git clone --branch release/test --single-branch -- {repo.url} {clone_dir}",
+            f"git clone --branch release/test --single-branch -- {repo.url} {temporary}",
         ]
-        assert clone_dir.is_dir()
+        if workspace_state == "clone_failure":
+            assert not clone_dir.exists()
+            assert (temporary / ".git" / "HEAD").is_file()
+        else:
+            assert (clone_dir / ".git" / "HEAD").read_text() == "ref: refs/heads/release/test\n"
+            assert (clone_dir / "tracked.txt").read_text() == "cloned\n"
+            assert not (clone_dir / "partial-clone.txt").exists()
+            assert not temporary.exists()
     elif workspace_state == "persistent":
         assert calls == []
         assert _git("branch", "--show-current") == before_branch == "local-work\n"
@@ -3026,6 +3068,13 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert (clone_dir / "staged.txt").read_text() == "staged change\n"
         assert (clone_dir / "unstaged.txt").read_text() == "unstaged change\n"
         assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
+    elif workspace_state == "non_repo":
+        assert calls == []
+        assert (clone_dir / ".git" / "config").read_text() == "incomplete repository\n"
+        assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
+        assert (temporary / "partial-clone.txt").read_text() == "keep this too\n"
+        assert set(clone_dir.iterdir()) == {clone_dir / ".git", clone_dir / "untracked.txt"}
+        assert list((clone_dir / ".git").iterdir()) == [clone_dir / ".git" / "config"]
     else:
         assert calls == []
         assert list(workspace.iterdir()) == []

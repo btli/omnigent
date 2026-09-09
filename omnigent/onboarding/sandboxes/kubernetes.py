@@ -464,9 +464,9 @@ def _render_workspace_prep_command(
     """
     Render the init container command that prepares the workspace.
 
-    Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
-    requested and the directory is absent, and merges *host_config* into
-    ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default
+    Creates ``<workspace>``, atomically clones into an absent or empty
+    ``<clone_dir>`` when requested, preserves existing repositories, and merges
+    *host_config* into ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default
     ``~/.omnigent`` when set — all BEFORE the host starts. Running in an init
     container means a failure
     terminates the init container non-zero — surfaced fast by the start wait
@@ -485,7 +485,22 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repo_url is not None and clone_dir is not None:
-        script += f"if [ ! -d {shlex.quote(clone_dir)} ]; then\n"
+        target = shlex.quote(clone_dir)
+        temporary = shlex.quote(f"{clone_dir}.tmp")
+        error = shlex.quote(
+            f"Workspace {clone_dir} has no .git/HEAD and is not an empty directory; "
+            "refusing to overwrite it"
+        )
+        script += (
+            f"if [ ! -e {shlex.quote(f'{clone_dir}/.git/HEAD')} ]; then\n"
+            f"  if [ -e {target} ] || [ -L {target} ]; then\n"
+            f"    if ! rmdir -- {target}; then\n"
+            f"      printf '%s\\n' {error} >&2\n"
+            "      exit 1\n"
+            "    fi\n"
+            "  fi\n"
+            f"  rm -rf -- {temporary}\n"
+        )
         # Prefer the owner's per-user credential for the clone: when they've
         # connected GitHub, wire the broker as the sole github.com helper so a
         # private clone authenticates as *them*. When they haven't connected this
@@ -505,7 +520,11 @@ def _render_workspace_prep_command(
             if repo_branch is not None
             else ""
         )
-        script += f"  git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\nfi\n"
+        script += (
+            f"  git clone {branch}-- {shlex.quote(repo_url)} {temporary}\n"
+            f"  mv -f -- {temporary} {target}\n"
+            "fi\n"
+        )
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]
