@@ -58,6 +58,7 @@ import {
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
@@ -889,7 +890,9 @@ function selectAgent(agentId: string): void {
 function selectUnconfiguredAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
@@ -1418,7 +1421,9 @@ describe("NewChatLandingScreen", () => {
     for (const id of ["a_cursor", "a_pi", "a_kiro"]) {
       expect(screen.queryByTestId(`new-chat-landing-agent-${id}`)).toBeNull();
     }
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
     const morePi = screen.getByTestId("new-chat-landing-agent-a_pi");
     const moreCursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
     const moreKiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
@@ -1498,7 +1503,9 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
     expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
   });
 
@@ -1629,7 +1636,9 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
     expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
   });
 
@@ -3918,7 +3927,8 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    fireEvent.click(hostItem);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
@@ -3939,7 +3949,8 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    fireEvent.click(hostItem);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
@@ -3980,22 +3991,12 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 // Touch devices can't hover, so the desktop submenu flyouts ("More" for
 // needs-setup harnesses, "Custom agents") are unreachable there. Below the
 // `md` breakpoint the picker swaps its contents in place: tapping the row
-// drills into that group's page with a Back row. jsdom's matchMedia mock
-// reports non-mobile, so these tests force the `max-width` query to match.
+// drills into that group's page with a Back row. These tests pin a phone width.
 // ---------------------------------------------------------------------------
 
 function forceMobileViewport(): () => void {
   const real = window.matchMedia;
-  window.matchMedia = ((query: string) => ({
-    matches: /max-width/.test(query),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
+  stubMatchMedia({ width: 375 });
   return () => {
     window.matchMedia = real;
   };
