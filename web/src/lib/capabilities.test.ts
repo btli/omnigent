@@ -101,6 +101,8 @@ describe("sandboxOptionLabel", () => {
   it.each([
     ["_foo", "Foo Sandbox"],
     ["foo__bar", "Foo Bar Sandbox"],
+    ["foo_", "Foo Sandbox"],
+    ["foo__", "Foo Sandbox"],
   ])("avoids stray spaces when humanizing %s", (provider, expected) => {
     expect(sandboxOptionLabel(provider)).toBe(expected);
   });
