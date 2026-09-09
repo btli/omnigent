@@ -4049,6 +4049,7 @@ async def _run_managed_wake(
                 host_id,
                 host_store,
                 sandbox_config,
+                repos=_managed_relaunch_repos(conv, session_id),
                 force=True,
                 on_stage=_on_stage,
                 agent_name=agent_name,

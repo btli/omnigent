@@ -530,10 +530,13 @@ def _render_workspace_prep_command(
                 if repo.branch is not None
                 else ""
             )
+            target = shlex.quote(clone_dir)
+            script += f"if [ ! -d {target} ]; then\n"
             script += (
-                f"git clone {branch}-- {shlex.quote(repo.url)} "
-                f'{shlex.quote(clone_dir)} & pids="$pids $!"\n'
+                f"  git clone {branch}-- {shlex.quote(repo.url)} "
+                f'{target} & pids="$pids $!"\n'
             )
+            script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
         script += '[ "$rc" -eq 0 ]\n'
     if host_config is not None:
