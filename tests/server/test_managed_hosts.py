@@ -2915,6 +2915,8 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
         "ephemeral",
         "persistent",
         "gitfile",
+        "dangling_gitfile",
+        "malformed_gitfile",
         "no_repo",
         "empty",
         "stale_tmp",
@@ -2938,12 +2940,17 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     staged_clone = temporary / "clone"
     ownership_marker = temporary / ".omnigent-workspace-prep"
     call_log = tmp_path / "calls.log"
+    broken_gitfile = workspace_state in {"dangling_gitfile", "malformed_gitfile"}
     repo = (
         parse_repo_workspace("https://github.com/org/repo.git#release/test")
         if workspace_state != "no_repo"
         else None
     )
     monkeypatch.setenv("CALL_LOG", str(call_log))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "0")
 
     def _git(*args: str, directory: Path = clone_dir) -> str:
         return subprocess.run(
@@ -2951,10 +2958,6 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         ).stdout
 
     if workspace_state in {"persistent", "gitfile"}:
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
-        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-        monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "0")
         initial_dir = tmp_path / "main checkout" if workspace_state == "gitfile" else clone_dir
         initial_dir.mkdir(parents=True)
         _git("init", "--initial-branch=main", directory=initial_dir)
@@ -2987,6 +2990,19 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             " M unstaged.txt",
             "?? untracked.txt",
         }
+    elif broken_gitfile:
+        clone_dir.mkdir(parents=True)
+        backing_dir = tmp_path / "backing git dir"
+        gitfile_contents = f"gitdir: {backing_dir}\n"
+        if workspace_state == "malformed_gitfile":
+            _git("init", "--bare", str(backing_dir), directory=tmp_path)
+            gitfile_contents += "unexpected second line\n"
+        (clone_dir / ".git").write_text(gitfile_contents)
+        (clone_dir / "untracked.txt").write_text("keep me\n")
+        temporary.mkdir()
+        ownership_marker.touch()
+        (temporary / "partial-clone.txt").write_text("keep staging too\n")
+        before_files = {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
     elif workspace_state in {"empty", "stale_tmp"}:
         clone_dir.mkdir(parents=True)
         if workspace_state == "stale_tmp":
@@ -3034,7 +3050,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             'printf "ref: refs/heads/release/test\\n" > "${@: -1}/.git/HEAD"; '
             'printf "cloned\\n" > "${@: -1}/tracked.txt"'
         )
-        if workspace_state in {"persistent", "gitfile"}:
+        if workspace_state in {"persistent", "gitfile"} or broken_gitfile:
             git_command = 'command git "$@"'
         elif workspace_state in {"clone_failure", "unowned_tmp"}:
             git_command += '; printf "clone failed\\n" >&2; return 1'
@@ -3051,7 +3067,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         "clone_failure": "clone failed",
         "unowned_tmp": "is not owned by workspace prep; refusing to remove it",
     }
-    failed = workspace_state in failure_messages
+    failed = workspace_state in failure_messages or broken_gitfile
     if failed:
         with pytest.raises(HTTPException) as exc:
             await resume_managed_host(host.host_id, host_store, _injected_config(fake), repo=repo)
@@ -3059,7 +3075,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         cause = exc.value.__cause__
         assert isinstance(cause, subprocess.CalledProcessError)
         assert cause.returncode != 0
-        assert failure_messages[workspace_state] in cause.stderr
+        assert failure_messages["non_repo" if broken_gitfile else workspace_state] in cause.stderr
     else:
         await resume_managed_host(host.host_id, host_store, _injected_config(fake), repo=repo)
 
@@ -3070,6 +3086,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     )
     assert workspace.is_dir()
     calls = call_log.read_text().splitlines() if call_log.exists() else []
+    gitfile_probe = f"git -C {clone_dir} rev-parse --resolve-git-dir {clone_dir}/.git"
     if workspace_state in {"ephemeral", "empty", "stale_tmp", "clone_failure"}:
         assert repo is not None
         assert calls == [
@@ -3086,7 +3103,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             assert not (clone_dir / "partial-clone.txt").exists()
             assert not temporary.exists()
     elif workspace_state in {"persistent", "gitfile"}:
-        assert calls == []
+        assert calls == ([gitfile_probe] if workspace_state == "gitfile" else [])
         assert _git("branch", "--show-current") == before_branch == "local-work\n"
         assert _git("rev-parse", "HEAD") == before_head
         assert _git("status", "--porcelain") == before_status
@@ -3097,6 +3114,11 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert (clone_dir / "staged.txt").read_text() == "staged change\n"
         assert (clone_dir / "unstaged.txt").read_text() == "unstaged change\n"
         assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
+    elif broken_gitfile:
+        assert calls == [gitfile_probe]
+        assert {
+            path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()
+        } == before_files
     elif workspace_state == "unowned_tmp":
         assert calls == []
         assert not clone_dir.exists()

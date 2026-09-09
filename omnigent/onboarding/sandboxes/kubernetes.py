@@ -500,7 +500,8 @@ def _render_workspace_prep_command(
         # Keep ownership outside the clone so an interrupted clone remains safe to clean up.
         script += (
             f"if [ ! -e {shlex.quote(f'{clone_dir}/.git/HEAD')} ] && "
-            f"! {{ [ -f {gitfile} ] && grep -q '^gitdir: ' {gitfile}; }}; then\n"
+            f"! {{ [ -f {gitfile} ] && git -C {target} rev-parse "
+            f"--resolve-git-dir {gitfile} >/dev/null 2>&1; }}; then\n"
             f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             f"    if ! rmdir -- {target}; then\n"
             f"      printf '%s\\n' {error} >&2\n"
