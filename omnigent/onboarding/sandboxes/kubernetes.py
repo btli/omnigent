@@ -486,20 +486,37 @@ def _render_workspace_prep_command(
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repo_url is not None and clone_dir is not None:
         target = shlex.quote(clone_dir)
+        gitfile = shlex.quote(f"{clone_dir}/.git")
         temporary = shlex.quote(f"{clone_dir}.tmp")
+        marker = shlex.quote(f"{clone_dir}.tmp/.omnigent-workspace-prep")
+        staged_clone = shlex.quote(f"{clone_dir}.tmp/clone")
         error = shlex.quote(
-            f"Workspace {clone_dir} has no .git/HEAD and is not an empty directory; "
+            f"Workspace {clone_dir} has no Git checkout and is not an empty directory; "
             "refusing to overwrite it"
         )
+        staging_error = shlex.quote(
+            f"Staging path {clone_dir}.tmp is not owned by workspace prep; refusing to remove it"
+        )
+        # Keep ownership outside the clone so an interrupted clone remains safe to clean up.
         script += (
-            f"if [ ! -e {shlex.quote(f'{clone_dir}/.git/HEAD')} ]; then\n"
+            f"if [ ! -e {shlex.quote(f'{clone_dir}/.git/HEAD')} ] && "
+            f"! {{ [ -f {gitfile} ] && grep -q '^gitdir: ' {gitfile}; }}; then\n"
             f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             f"    if ! rmdir -- {target}; then\n"
             f"      printf '%s\\n' {error} >&2\n"
             "      exit 1\n"
             "    fi\n"
             "  fi\n"
-            f"  rm -rf -- {temporary}\n"
+            f"  if [ -e {temporary} ] || [ -L {temporary} ]; then\n"
+            f"    if [ -d {temporary} ] && [ ! -L {temporary} ] && [ -f {marker} ]; then\n"
+            f"      rm -rf -- {temporary}\n"
+            "    else\n"
+            f"      printf '%s\\n' {staging_error} >&2\n"
+            "      exit 1\n"
+            "    fi\n"
+            "  fi\n"
+            f"  mkdir -- {temporary}\n"
+            f"  touch -- {marker}\n"
         )
         # Prefer the owner's per-user credential for the clone: when they've
         # connected GitHub, wire the broker as the sole github.com helper so a
@@ -521,8 +538,10 @@ def _render_workspace_prep_command(
             else ""
         )
         script += (
-            f"  git clone {branch}-- {shlex.quote(repo_url)} {temporary}\n"
-            f"  mv -f -- {temporary} {target}\n"
+            f"  git clone {branch}-- {shlex.quote(repo_url)} {staged_clone}\n"
+            f"  mv -f -- {staged_clone} {target}\n"
+            f"  rm -f -- {marker}\n"
+            f"  rmdir -- {temporary}\n"
             "fi\n"
         )
     if host_config is not None:
