@@ -230,10 +230,10 @@ def test_home_emptydir_carries_size_limit(tmp_path: Path) -> None:
 def test_ephemeral_storage_resources_accepted_and_forwarded(tmp_path: Path) -> None:
     """Configured ephemeral-storage must survive config parse into the pod.
 
-    Today the server-side allowlist rejects the key at startup, and even if
-    it passed, the launcher forwards only cpu/memory — so sandboxes carry
-    request 0 for ephemeral-storage and the scheduler cannot spread them by
-    disk.
+    Regression guard: the server-side allowlist used to reject the key at
+    startup, and even when it passed, the launcher forwarded only cpu/memory
+    — so sandboxes carried request 0 for ephemeral-storage and the scheduler
+    could not spread them by disk.
     """
     port = _find_free_port()
     config_path = _write_server_config(
@@ -248,7 +248,7 @@ def test_ephemeral_storage_resources_accepted_and_forwarded(tmp_path: Path) -> N
     proc, log_path = _spawn_server(tmp_path, config_path, port, capture_path)
     try:
         base_url = f"http://127.0.0.1:{port}"
-        # Fails here today: startup rejects the 'ephemeral-storage' key.
+        # Would fail here if startup regressed to rejecting 'ephemeral-storage'.
         _wait_for_health(proc, base_url, log_path)
         _create_managed_session(base_url)
         manifest = _await_submitted_job_manifest(capture_path, log_path)
