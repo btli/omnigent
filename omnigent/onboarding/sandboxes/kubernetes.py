@@ -544,7 +544,8 @@ def _render_workspace_prep_command(
             )
             script += (
                 f"if [ ! -e {target}/.git/HEAD ] && "
-                f"! {{ [ -f {gitfile} ] && grep -q '^gitdir: ' {gitfile}; }}; then\n"
+                f"! {{ [ -f {gitfile} ] && git -C {target} rev-parse "
+                f"--resolve-git-dir {gitfile} >/dev/null 2>&1; }}; then\n"
             )
             script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             script += f"    if ! rmdir -- {target}; then\n"
