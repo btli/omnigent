@@ -510,7 +510,6 @@ def _render_workspace_prep_command(
             "from omnigent.git_credential_github import configure_clone_credentials; "
             f"configure_clone_credentials({server_url!r}, {host_id!r})"
         )
-        script += f"python3 -c {shlex.quote(wire)} || true\n"
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
         # the launch loudly, not boot the host on it. ``set -e`` stays on, but a
@@ -520,7 +519,7 @@ def _render_workspace_prep_command(
         # branch-pinned clones fast.
         # ponytail: unbounded fan-out; add `xargs -P <n>` if huge repo sets on a
         # 2-vCPU pod ever thrash.
-        script += "pids=''\n"
+        script += "pids=''\nwired=''\n"
         # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
         # shared clone dir would fail the concurrent clones, so disambiguate.
         for repo, dirname in zip(repos, clone_dir_names(repos), strict=True):
@@ -531,10 +530,21 @@ def _render_workspace_prep_command(
                 else ""
             )
             target = shlex.quote(clone_dir)
-            script += f"if [ ! -d {target} ]; then\n"
+            temporary = shlex.quote(f"{clone_dir}.tmp")
+            error = shlex.quote(
+                f"Workspace {clone_dir} has no .git/HEAD and is not an empty directory; "
+                "refusing to overwrite it"
+            )
+            script += f"if [ ! -e {target}/.git/HEAD ]; then\n"
+            script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
+            script += f"    if ! rmdir -- {target}; then\n"
+            script += f"      printf '%s\\n' {error} >&2\n"
+            script += "      exit 1\n    fi\n  fi\n"
+            script += f"  rm -rf -- {temporary}\n"
+            script += f"  if [ -z \"$wired\" ]; then python3 -c {shlex.quote(wire)} || true; wired=1; fi\n"
             script += (
-                f"  git clone {branch}-- {shlex.quote(repo.url)} "
-                f'{target} & pids="$pids $!"\n'
+                f"  (git clone {branch}-- {shlex.quote(repo.url)} {temporary} "
+                f"&& mv -f -- {temporary} {target}) & pids=\"$pids $!\"\n"
             )
             script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
