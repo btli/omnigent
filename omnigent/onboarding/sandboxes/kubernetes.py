@@ -481,10 +481,11 @@ def _render_workspace_prep_command(
     """
     Render the init container command that prepares the workspace.
 
-    Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
-    requested, and merges *host_config* into ``config.yaml`` under
-    ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent`` when set — all
-    BEFORE the host starts. Running in an init container means a failure
+    Creates ``<workspace>``, atomically clones into an absent or empty
+    ``<clone_dir>`` when requested, preserves existing repositories, and merges
+    *host_config* into ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default
+    ``~/.omnigent`` when set — all BEFORE the host starts. Running in an init
+    container means a failure
     terminates the init container non-zero — surfaced fast by the start wait
     with the error as the container log tail — rather than silently leaving the
     host without its workspace or provider config.
@@ -501,6 +502,40 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repo_url is not None and clone_dir is not None:
+        target = shlex.quote(clone_dir)
+        gitfile = shlex.quote(f"{clone_dir}/.git")
+        temporary = shlex.quote(f"{clone_dir}.tmp")
+        marker = shlex.quote(f"{clone_dir}.tmp/.omnigent-workspace-prep")
+        staged_clone = shlex.quote(f"{clone_dir}.tmp/clone")
+        error = shlex.quote(
+            f"Workspace {clone_dir} has no Git checkout and is not an empty directory; "
+            "refusing to overwrite it"
+        )
+        staging_error = shlex.quote(
+            f"Staging path {clone_dir}.tmp is not owned by workspace prep; refusing to remove it"
+        )
+        # Keep ownership outside the clone so an interrupted clone remains safe to clean up.
+        script += (
+            f"if [ ! -e {shlex.quote(f'{clone_dir}/.git/HEAD')} ] && "
+            f"! {{ [ -f {gitfile} ] && git -C {target} rev-parse "
+            f"--resolve-git-dir {gitfile} >/dev/null 2>&1; }}; then\n"
+            f"  if [ -e {target} ] || [ -L {target} ]; then\n"
+            f"    if ! rmdir -- {target}; then\n"
+            f"      printf '%s\\n' {error} >&2\n"
+            "      exit 1\n"
+            "    fi\n"
+            "  fi\n"
+            f"  if [ -e {temporary} ] || [ -L {temporary} ]; then\n"
+            f"    if [ -d {temporary} ] && [ ! -L {temporary} ] && [ -f {marker} ]; then\n"
+            f"      rm -rf -- {temporary}\n"
+            "    else\n"
+            f"      printf '%s\\n' {staging_error} >&2\n"
+            "      exit 1\n"
+            "    fi\n"
+            "  fi\n"
+            f"  mkdir -- {temporary}\n"
+            f"  touch -- {marker}\n"
+        )
         # Prefer the owner's per-user credential for the clone: when they've
         # connected GitHub, wire the broker as the sole github.com helper so a
         # private clone authenticates as *them*. When they haven't connected this
@@ -511,7 +546,7 @@ def _render_workspace_prep_command(
             "from omnigent.git_credential_github import configure_clone_credentials; "
             f"configure_clone_credentials({server_url!r}, {host_id!r})"
         )
-        script += f"python3 -c {shlex.quote(wire)} || true\n"
+        script += f"  python3 -c {shlex.quote(wire)} || true\n"
         # ``--`` separates options from the (already-validated) URL so it can
         # never be parsed as a flag; --single-branch keeps branch-pinned clones
         # fast. Auth: the broker (above, if connected) else the image's GIT_TOKEN.
@@ -520,7 +555,13 @@ def _render_workspace_prep_command(
             if repo_branch is not None
             else ""
         )
-        script += f"git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\n"
+        script += (
+            f"  git clone {branch}-- {shlex.quote(repo_url)} {staged_clone}\n"
+            f"  mv -f -- {staged_clone} {target}\n"
+            f"  rm -f -- {marker}\n"
+            f"  rmdir -- {temporary}\n"
+            "fi\n"
+        )
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]

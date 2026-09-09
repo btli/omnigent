@@ -130,12 +130,14 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
+    MANAGED_REPO_LABEL_KEY,
     ManagedHostLaunch,
     ManagedLaunchTracker,
     ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+    parse_repo_workspace,
 )
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -3595,6 +3597,26 @@ async def ensure_runner_connected(
     return runner_client, conv
 
 
+def _recorded_repo_workspace(
+    session_id: str, labels: dict[str, str], *, invalid_label_fallback: str
+) -> RepoWorkspace | None:
+    raw_repo = labels.get(MANAGED_REPO_LABEL_KEY)
+    if raw_repo is None:
+        return None
+    try:
+        return parse_repo_workspace(raw_repo)
+    except ValueError:
+        _logger.warning(
+            "Session %s has an unparseable %s label (%r); %s",
+            session_id,
+            MANAGED_REPO_LABEL_KEY,
+            raw_repo,
+            invalid_label_fallback,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
 def _kick_managed_relaunch(
     *,
     session_id: str,
@@ -3630,30 +3652,11 @@ def _kick_managed_relaunch(
     :param app_state: ``request.app.state`` — supplies the registries and the
         agent store the classifier is re-derived from.
     """
-    from omnigent.server.managed_hosts import (
-        MANAGED_REPO_LABEL_KEY,
-        parse_repo_workspace,
+    repo = _recorded_repo_workspace(
+        session_id,
+        conv.labels,
+        invalid_label_fallback="relaunching with an empty workspace",
     )
-
-    # Re-clone the repository the session was created with so the
-    # fresh generation's workspace matches the create-time state.
-    # The label holds the raw create-time value, already validated
-    # by the create's parse — a parse failure here means the label
-    # was tampered with, and the relaunch proceeds with an empty
-    # workspace rather than dying.
-    repo = None
-    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
-    if raw_repo is not None:
-        try:
-            repo = parse_repo_workspace(raw_repo)
-        except ValueError:
-            _logger.warning(
-                "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
-                session_id,
-                MANAGED_REPO_LABEL_KEY,
-                raw_repo,
-                extra={"session_id": session_id},
-            )
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
@@ -3873,6 +3876,11 @@ async def _run_managed_wake(
             host_id,
             host_store,
             sandbox_config,
+            repo=_recorded_repo_workspace(
+                session_id,
+                conv.labels,
+                invalid_label_fallback="waking without a repository",
+            ),
             force=True,
             on_stage=_on_stage,
             agent_name=agent_name,
