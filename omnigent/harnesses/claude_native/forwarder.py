@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -43,6 +43,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
+from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native._native_post_delivery import (
     append_dead_letter,
@@ -83,6 +84,17 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # One per Claude Task-tool subagent; appears alongside the matching
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+# Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
+# stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
+# both the current ``Agent`` name and the still-supported ``Task`` alias match.
+_SUBAGENT_SPAWN_TOOL_NAMES = frozenset(AGENT_TOOL_NAMES)
+
+
+def _subagent_id_from_meta_path(meta_path: Path) -> str:
+    """``agent-<id>.meta.json`` / ``agent-<id>.jsonl`` → ``<id>``."""
+    return meta_path.stem.removeprefix("agent-").removesuffix(".meta")
+
+
 _DEFAULT_POLL_INTERVAL_S = 0.25
 # Minimum spacing between permission-mode pane reads. Unlike the model mirror
 # (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
@@ -381,6 +393,9 @@ class SubagentEntry:
     :param child_conversation_id: Omnigent child Conversation id minted
         by the server's ``external_subagent_start`` handler,
         e.g. ``"conv_child456"``.
+    :param parent_subagent_id: Claude-side id of the immediate parent
+        sub-agent, or ``None`` when the top-level session spawned this
+        agent.
     :param byte_offset: Bytes already forwarded from the sub-agent's
         ``.jsonl``. ``0`` means we haven't read anything yet (the
         common case when the sub-agent has just been created).
@@ -403,6 +418,7 @@ class SubagentEntry:
 
     subagent_id: str
     child_conversation_id: str
+    parent_subagent_id: str | None = None
     byte_offset: int = 0
     seen_source_ids: tuple[str, ...] = ()
     last_activity_ts: float | None = None
@@ -1142,6 +1158,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
             continue
         child_id = row.get("child_conversation_id")
+        parent_subagent_id = row.get("parent_subagent_id")
         byte_offset = row.get("byte_offset", 0)
         seen_source_ids = row.get("seen_source_ids", [])
         last_activity_ts = row.get("last_activity_ts")
@@ -1152,6 +1169,8 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         # what keeps the parked sub-agent from being retried.
         if not isinstance(child_id, str):
             continue
+        if parent_subagent_id is not None and not isinstance(parent_subagent_id, str):
+            parent_subagent_id = None
         if not isinstance(byte_offset, int) or byte_offset < 0:
             byte_offset = 0
         if not isinstance(seen_source_ids, list) or not all(
@@ -1165,6 +1184,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
+            parent_subagent_id=parent_subagent_id,
             byte_offset=byte_offset,
             seen_source_ids=tuple(seen_source_ids),
             last_activity_ts=last_activity_ts,
@@ -1186,6 +1206,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
         "subagents": {
             entry.subagent_id: {
                 "child_conversation_id": entry.child_conversation_id,
+                "parent_subagent_id": entry.parent_subagent_id,
                 "byte_offset": entry.byte_offset,
                 "seen_source_ids": list(entry.seen_source_ids),
                 "last_activity_ts": entry.last_activity_ts,
@@ -1337,6 +1358,91 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
+def _tool_use_ids_in_transcript(
+    transcript_path: Path,
+    *,
+    include_sidechains: bool,
+) -> set[str]:
+    """Return assistant tool-use ids from a Claude transcript.
+
+    A partial trailing record is ignored because Claude may still be writing it;
+    the next watcher poll reads the completed record.
+
+    :param transcript_path: Claude JSONL transcript to inspect.
+    :param include_sidechains: Whether records mirrored from child agents
+        belong to this transcript owner.
+    :returns: Tool-use ids owned by this transcript.
+    """
+    try:
+        # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
+        # while Claude is writing; the mangled tail line fails JSON parse below
+        # and is skipped, and the completed record is read on the next poll.
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return set()
+    tool_use_ids: set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("isSidechain") is True and not include_sidechains:
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
+            # Restricting to it keeps an unrelated tool-use id collision from
+            # making a legitimate spawn look ambiguous.
+            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
+                continue
+            tool_use_id = block.get("id")
+            if isinstance(tool_use_id, str) and tool_use_id:
+                tool_use_ids.add(tool_use_id)
+    return tool_use_ids
+
+
+def _subagent_parents_by_tool_use(
+    transcript_path: Path,
+    subagents_dir: Path,
+) -> dict[str, str | None]:
+    """Correlate Claude spawn tool ids to their immediate transcript owner.
+
+    Reads the root transcript and every ``agent-*.jsonl`` in full. The caller
+    only invokes this when unregistered meta files exist, so idle sessions pay
+    nothing. The common case is a transient spawn burst; the exception is an
+    orphan meta whose spawn record never lands, which keeps the transcripts
+    re-read on every poll until it appears (or the process restarts).
+    """
+    owners: dict[str, str | None] = {}
+    ambiguous: set[str] = set()
+    transcript_owners: list[tuple[Path, str | None]] = [(transcript_path, None)]
+    transcript_owners.extend(
+        (path, _subagent_id_from_meta_path(path))
+        for path in sorted(subagents_dir.glob("agent-*.jsonl"))
+    )
+    for path, owner_id in transcript_owners:
+        for tool_use_id in _tool_use_ids_in_transcript(
+            path,
+            include_sidechains=owner_id is not None,
+        ):
+            if tool_use_id in owners and owners[tool_use_id] != owner_id:
+                ambiguous.add(tool_use_id)
+            else:
+                owners[tool_use_id] = owner_id
+    for tool_use_id in ambiguous:
+        owners.pop(tool_use_id, None)
+    return owners
+
+
 async def _forward_available_subagents(
     *,
     client: httpx.AsyncClient,
@@ -1388,96 +1494,174 @@ async def _forward_available_subagents(
     # filesystem on the event loop.
     meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.glob(_SUBAGENT_META_GLOB)))
     updated = state
-    for meta_path in meta_paths:
-        # ``agent-<id>.meta.json`` → ``<id>``
-        subagent_id = meta_path.stem.removeprefix("agent-").removesuffix(".meta")
-        if subagent_id in updated.subagents:
-            continue
-        retry_key = f"subagent_start:{subagent_id}"
-        if start_retry_tracker.retry_delay_s(retry_key) is not None:
-            continue
+    candidate_meta_paths = [
+        path
+        for path in meta_paths
+        if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
+        and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
+    ]
+    parents_by_tool_use = (
+        await asyncio.to_thread(
+            _subagent_parents_by_tool_use,
+            transcript_path,
+            subagents_dir,
+        )
+        if candidate_meta_paths
+        else {}
+    )
+    pending: list[tuple[Path, dict[str, str], str | None]] = []
+    for meta_path in candidate_meta_paths:
         meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
         if meta is None:
-            # File may be mid-write; try again on the next tick.
             continue
-        try:
-            child_id = await _post_external_subagent_start(
-                client,
-                parent_session_id=parent_session_id,
-                subagent_id=subagent_id,
-                agent_type=meta["agentType"],
-                description=meta["description"],
-                tool_use_id=meta["toolUseId"],
+        tool_use_id = meta["toolUseId"]
+        if tool_use_id not in parents_by_tool_use:
+            # No transcript owns this spawn yet: the record is still mid-write, or
+            # it resolved to two owners and was dropped as ambiguous. Either way we
+            # retry next tick; log so a persistent miss (e.g. a transcript-format
+            # drift) is diagnosable rather than silent.
+            _logger.debug(
+                "Deferring claude-native sub-agent with no resolved parent; "
+                "parent_session=%s subagent_id=%s tool_use_id=%s",
+                parent_session_id,
+                _subagent_id_from_meta_path(meta_path),
+                tool_use_id,
             )
-        except httpx.HTTPError as exc:
-            decision = start_retry_tracker.record_failure(retry_key, exc)
-            if decision.exhausted:
-                _logger.error(
-                    "Dropping claude-native sub-agent after permanent HTTP failures; "
-                    "parent_session=%s subagent_id=%s attempts=%s http_status=%s",
-                    parent_session_id,
+            continue
+        pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
+
+    while pending:
+        deferred: list[tuple[Path, dict[str, str], str | None]] = []
+        made_progress = False
+        for meta_path, meta, parent_subagent_id in pending:
+            subagent_id = _subagent_id_from_meta_path(meta_path)
+            retry_key = f"subagent_start:{subagent_id}"
+            if parent_subagent_id is None:
+                immediate_parent_session_id = parent_session_id
+            else:
+                parent_entry = updated.subagents.get(parent_subagent_id)
+                if parent_entry is None:
+                    deferred.append((meta_path, meta, parent_subagent_id))
+                    continue
+                if not parent_entry.child_conversation_id:
+                    # The parent was parked (registration exhausted its retries),
+                    # so its conversation will never exist and this child can never
+                    # attach. Park the child too rather than re-resolving it every
+                    # tick; the empty child id filters it out of the tail loops.
+                    if subagent_id not in updated.subagents:
+                        # No dead letter: the child can't be replayed anywhere
+                        # correct — its parent conversation never existed, and a
+                        # replay would re-post it under the root session and
+                        # flatten the hierarchy. The WARNING is the recovery signal.
+                        _logger.warning(
+                            "Parking claude-native sub-agent whose parent was "
+                            "dropped; parent_session=%s subagent_id=%s "
+                            "parent_subagent_id=%s",
+                            parent_session_id,
+                            subagent_id,
+                            parent_subagent_id,
+                        )
+                        updated = SubagentForwardState(
+                            subagents={
+                                **updated.subagents,
+                                subagent_id: SubagentEntry(
+                                    subagent_id=subagent_id,
+                                    child_conversation_id="",
+                                    parent_subagent_id=parent_subagent_id,
+                                ),
+                            }
+                        )
+                        await _write_subagent_forward_state_async(bridge_dir, updated)
+                        made_progress = True
+                    continue
+                immediate_parent_session_id = parent_entry.child_conversation_id
+            try:
+                child_id = await _post_external_subagent_start(
+                    client,
+                    parent_session_id=immediate_parent_session_id,
+                    subagent_id=subagent_id,
+                    agent_type=meta["agentType"],
+                    description=meta["description"],
+                    tool_use_id=meta["toolUseId"],
+                )
+            except httpx.HTTPError as exc:
+                decision = start_retry_tracker.record_failure(retry_key, exc)
+                if decision.exhausted:
+                    _logger.error(
+                        "Dropping claude-native sub-agent after permanent HTTP failures; "
+                        "parent_session=%s subagent_id=%s attempts=%s http_status=%s",
+                        immediate_parent_session_id,
+                        subagent_id,
+                        decision.attempts,
+                        _http_status_for_log(exc),
+                    )
+                    append_dead_letter(
+                        bridge_dir,
+                        session_id=immediate_parent_session_id,
+                        event_type="external_subagent_start",
+                        payload={
+                            "subagent_id": subagent_id,
+                            "agent_type": meta["agentType"],
+                            "description": meta["description"],
+                            "tool_use_id": meta["toolUseId"],
+                            "parent_subagent_id": parent_subagent_id,
+                        },
+                        reason="permanent HTTP failure after retries",
+                        delivered_ambiguous=False,
+                        http_status=_http_status_for_log(exc),
+                    )
+                    updated = SubagentForwardState(
+                        subagents={
+                            **updated.subagents,
+                            subagent_id: SubagentEntry(
+                                subagent_id=subagent_id,
+                                child_conversation_id="",
+                                parent_subagent_id=parent_subagent_id,
+                            ),
+                        }
+                    )
+                    await _write_subagent_forward_state_async(bridge_dir, updated)
+                    continue
+                _logger.warning(
+                    "Failed to register claude-native sub-agent; parent_session=%s "
+                    "subagent_id=%s attempt=%s permanent=%s next_retry_s=%.3f "
+                    "http_status=%s",
+                    immediate_parent_session_id,
                     subagent_id,
                     decision.attempts,
+                    decision.permanent,
+                    decision.delay_s,
                     _http_status_for_log(exc),
-                    extra={"session_id": parent_session_id},
+                    exc_info=True,
+                    extra={"session_id": immediate_parent_session_id},
                 )
-                # Dead-letter the dropped payload for recovery (#1120; replay #1579).
-                append_dead_letter(
-                    bridge_dir,
-                    session_id=parent_session_id,
-                    event_type="external_subagent_start",
-                    payload={
-                        "subagent_id": subagent_id,
-                        "agent_type": meta["agentType"],
-                        "description": meta["description"],
-                        "tool_use_id": meta["toolUseId"],
-                    },
-                    reason="permanent HTTP failure after retries",
-                    # Claude only dead-letters permanent 4xx (it retries
-                    # transient failures forever), so the server proved it
-                    # rejected the item: never ambiguous, never replayable (#1579).
-                    delivered_ambiguous=False,
-                    http_status=_http_status_for_log(exc),
-                )
-                # Park this sub-agent: insert a sentinel entry so we
-                # don't keep retrying. ``child_conversation_id=""``
-                # is filtered out by the tail / status loops below.
-                updated = SubagentForwardState(
-                    subagents={
-                        **updated.subagents,
-                        subagent_id: SubagentEntry(
-                            subagent_id=subagent_id,
-                            child_conversation_id="",
-                        ),
-                    }
-                )
-                await _write_subagent_forward_state_async(bridge_dir, updated)
                 continue
-            _logger.warning(
-                "Failed to register claude-native sub-agent; parent_session=%s "
-                "subagent_id=%s attempt=%s permanent=%s next_retry_s=%.3f "
-                "http_status=%s",
-                parent_session_id,
-                subagent_id,
-                decision.attempts,
-                decision.permanent,
-                decision.delay_s,
-                _http_status_for_log(exc),
-                exc_info=True,
-                extra={"session_id": parent_session_id},
+            start_retry_tracker.clear(retry_key)
+            updated = SubagentForwardState(
+                subagents={
+                    **updated.subagents,
+                    subagent_id: SubagentEntry(
+                        subagent_id=subagent_id,
+                        child_conversation_id=child_id,
+                        parent_subagent_id=parent_subagent_id,
+                    ),
+                }
             )
-            continue
-        start_retry_tracker.clear(retry_key)
-        updated = SubagentForwardState(
-            subagents={
-                **updated.subagents,
-                subagent_id: SubagentEntry(
-                    subagent_id=subagent_id,
-                    child_conversation_id=child_id,
-                ),
-            }
-        )
-        await _write_subagent_forward_state_async(bridge_dir, updated)
+            await _write_subagent_forward_state_async(bridge_dir, updated)
+            made_progress = True
+        if not made_progress:
+            # A full pass registered nothing: every deferred child is waiting on a
+            # parent we haven't seen on disk yet. Retry next tick; log the stuck
+            # set so a parent that never arrives doesn't strand children silently.
+            if deferred:
+                _logger.debug(
+                    "Deferring claude-native sub-agents whose parent is not yet "
+                    "registered; parent_session=%s pending=%s",
+                    parent_session_id,
+                    [_subagent_id_from_meta_path(path) for path, _, _ in deferred],
+                )
+            break
+        pending = deferred
 
     # ── Tail each tracked sub-agent's transcript ────────
     now = time.time()
@@ -1559,13 +1743,10 @@ async def _forward_available_subagents(
                     # someone needs to recover it.
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1588,13 +1769,10 @@ async def _forward_available_subagents(
                     item_retry_tracker.clear(retry_key)
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1624,13 +1802,11 @@ async def _forward_available_subagents(
             had_item = True
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=new_entry.last_status,
             )
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
@@ -1638,26 +1814,21 @@ async def _forward_available_subagents(
         # posted successfully (or there were no items at all).
         # Advancing past a failed item permanently skips it.
         if not items_failed and (result.byte_offset != entry.byte_offset or had_item):
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                entry,
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
-                last_status=entry.last_status,
             )
         elif had_item:
             # Items DID flow but a later post failed — still record
             # the activity timestamp so the status badge advances,
             # but leave byte_offset at the previous tick's value so
             # the failed items get retried.
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
-                byte_offset=entry.byte_offset,
+            new_entry = replace(
+                entry,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=entry.last_status,
             )
 
         # Quiescence-based status. Sub-agent transcripts don't carry
@@ -1698,14 +1869,7 @@ async def _forward_available_subagents(
                     )
                 else:
                     status_retry_tracker.clear(retry_key)
-                    new_entry = SubagentEntry(
-                        subagent_id=new_entry.subagent_id,
-                        child_conversation_id=new_entry.child_conversation_id,
-                        byte_offset=new_entry.byte_offset,
-                        seen_source_ids=new_entry.seen_source_ids,
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=desired_status,
-                    )
+                    new_entry = replace(new_entry, last_status=desired_status)
 
         if new_entry is not entry:
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})

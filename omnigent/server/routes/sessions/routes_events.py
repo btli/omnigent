@@ -208,6 +208,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
+from omnigent.server.user_settings import background_session_titles_enabled_for_user
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
@@ -1171,6 +1172,8 @@ def register_events_routes(
                 conversation_store,
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
+                permission_store=permission_store,
+                user_id=user_id,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -1926,6 +1929,7 @@ def register_events_routes(
             coordinator=background_title_coordinator,
             conversation=conv,
             event=body,
+            enabled=await background_session_titles_enabled_for_user(permission_store, user_id),
         )
         # Schedule display-name generation for child sessions (the
         # title coordinator skips children because their title is
