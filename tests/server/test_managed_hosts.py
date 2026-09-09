@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import re
+import shlex
+import subprocess
 import sys
 import types
 import uuid
@@ -40,6 +42,7 @@ from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
+    MANAGED_REPO_LABEL_KEY,
     MICROSANDBOX_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
@@ -2907,6 +2910,157 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
     provider: ClassVar[str] = "islo"
 
 
+@pytest.mark.parametrize("workspace_state", ["ephemeral", "persistent", "no_repo"])
+async def test_resume_agent_sandbox_prepares_recorded_workspace(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workspace_state: str
+) -> None:
+    """Wake restores a lost clone and preserves every local change on persistent HOME."""
+    from omnigent.onboarding.sandboxes.kubernetes import _render_workspace_prep_command
+
+    class _AgentSandboxFakeLauncher(_EntrypointFakeLauncher):
+        provider: ClassVar[str] = "agent_sandbox"
+
+    workspace = tmp_path / "home with spaces" / "workspace"
+    clone_dir = workspace / "repo"
+    source = tmp_path / "source"
+    clone_log = tmp_path / "clone.log"
+    repo = (
+        parse_repo_workspace("https://github.com/org/repo.git#release/test")
+        if workspace_state != "no_repo"
+        else None
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/org/repo.git")
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    if repo is not None:
+        _git("init", "--initial-branch=main", str(source))
+        (source / "tracked.txt").write_text("from main\n")
+        _git("-C", str(source), "add", ".")
+        _git("-C", str(source), "commit", "-m", "Initial commit")
+        _git("-C", str(source), "checkout", "-b", "release/test")
+        (source / "branch.txt").write_text("from recorded branch\n")
+        _git("-C", str(source), "add", ".")
+        _git("-C", str(source), "commit", "-m", "Branch commit")
+
+    before = None
+    if workspace_state == "persistent":
+        _git("clone", "--branch=release/test", str(source), str(clone_dir))
+        _git("-C", str(clone_dir), "checkout", "-b", "local-work")
+        (clone_dir / "tracked.txt").write_text("staged change\n")
+        _git("-C", str(clone_dir), "add", "tracked.txt")
+        (clone_dir / "tracked.txt").write_text("unstaged change\n")
+        (clone_dir / "untracked.txt").write_text("keep me\n")
+        before = {
+            path.relative_to(clone_dir): path.read_bytes()
+            for path in clone_dir.rglob("*")
+            if path.is_file()
+        }
+
+    host_store = HostStore(db_uri)
+    fake = _AgentSandboxFakeLauncher(host_store)
+    fake.can_resume = True
+    host = host_store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="managed-workspace-wake",
+        user_id=_OWNER,
+        token="old-token",
+        provider="agent_sandbox",
+        sandbox_id="sb-workspace-wake",
+        token_expires_at=now_epoch() + 60,
+    )
+    captured: dict[str, Any] = {}
+
+    def _start(sandbox_id: str, **kwargs: Any) -> str:
+        captured.update(kwargs)
+        repo_name = kwargs["repo_name"]
+        command = _render_workspace_prep_command(
+            str(workspace),
+            str(workspace / repo_name) if repo_name else None,
+            kwargs["repo_url"],
+            kwargs["repo_branch"],
+            kwargs["server_url"],
+            kwargs["host_id"],
+        )
+        # Only credential discovery is stubbed; the rendered shell runs real git.
+        script = (
+            "python3() { :; }\n"
+            f"git() {{ printf '%s\\n' \"$*\" >> {shlex.quote(str(clone_log))}; "
+            'command git "$@"; }\n' + command[2]
+        )
+        subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
+        return _EntrypointFakeLauncher.start_host(fake, sandbox_id, **kwargs)
+
+    monkeypatch.setattr(fake, "start_host", _start)
+    await resume_managed_host(host.host_id, host_store, _injected_config(fake), repo=repo)
+
+    assert fake.resumed == ["sb-workspace-wake"]
+    assert host_store.is_online(host.host_id)
+    assert (captured["repo_url"], captured["repo_branch"], captured["repo_name"]) == (
+        (repo.url, repo.branch, repo.repo_name) if repo is not None else (None, None, None)
+    )
+    assert workspace.is_dir()
+    if workspace_state == "ephemeral":
+        assert (clone_dir / "branch.txt").read_text() == "from recorded branch\n"
+        assert _git("-C", str(clone_dir), "branch", "--show-current") == "release/test"
+        assert len(clone_log.read_text().splitlines()) == 1
+    elif workspace_state == "persistent":
+        assert not clone_log.exists()
+        assert {
+            path.relative_to(clone_dir): path.read_bytes()
+            for path in clone_dir.rglob("*")
+            if path.is_file()
+        } == before
+    else:
+        assert not clone_log.exists()
+        assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.parametrize("raw_repo", [None, "https://github.com/org/repo.git#release/test", "bad"])
+async def test_run_managed_wake_forwards_recorded_repo(
+    monkeypatch: pytest.MonkeyPatch, raw_repo: str | None
+) -> None:
+    """The session's saved URL supplies wake prep, as it does for a fresh generation."""
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _resume(*args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
+    conv = SimpleNamespace(
+        labels={MANAGED_REPO_LABEL_KEY: raw_repo} if raw_repo is not None else {},
+        host_id="host_1",
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv_1")
+    await orchestration._run_managed_wake(
+        session_id="conv_1",
+        conv=conv,
+        sandbox_config=SimpleNamespace(),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+    )
+    assert captured["repo"] == (
+        parse_repo_workspace(raw_repo) if raw_repo is not None and raw_repo != "bad" else None
+    )
+    assert tracker.get("conv_1") is None
+
+
 async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri: str) -> None:
     """The wake gate requires matching provider, sandbox id, and ``can_resume``."""
     host_store = HostStore(db_uri)
@@ -2942,7 +3096,10 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     assert host_resume_supported(no_sandbox, _injected_config(resumable)) is False
 
 
-async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri: str) -> None:
+@pytest.mark.parametrize("raw_repo", [None, "https://github.com/org/repo.git#main"])
+async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(
+    db_uri: str, raw_repo: str | None
+) -> None:
     """A resumable managed host wakes in place under the same sandbox id."""
     host_store = HostStore(db_uri)
 
@@ -2966,9 +3123,15 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     host_store.set_offline(first.host_id)
     assert host_resume_supported(host_store.get_host(first.host_id), config) is True
 
-    await resume_managed_host(first.host_id, host_store, config)
+    await resume_managed_host(
+        first.host_id,
+        host_store,
+        config,
+        repo=parse_repo_workspace(raw_repo) if raw_repo is not None else None,
+    )
 
     assert fake.resumed == ["sb-fake-1"]
+    assert not any("git clone" in command for command in fake.commands)
     assert len(fake.provisioned_names) == 1
     woke = host_store.get_host(first.host_id)
     assert woke is not None

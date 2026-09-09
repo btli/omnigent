@@ -3729,6 +3729,8 @@ async def _run_managed_wake(
         classifier, or ``None`` to leave it unstamped.
     """
     from omnigent.server.managed_hosts import (
+        MANAGED_REPO_LABEL_KEY,
+        parse_repo_workspace,
         resolve_managed_agent_label,
         resume_managed_host,
     )
@@ -3767,10 +3769,24 @@ async def _run_managed_wake(
                 agent_id,
                 session_id=session_id,
             )
+        repo = None
+        raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
+        if raw_repo is not None:
+            try:
+                repo = parse_repo_workspace(raw_repo)
+            except ValueError:
+                _logger.warning(
+                    "Session %s has an unparseable %s label (%r); waking without a repository",
+                    session_id,
+                    MANAGED_REPO_LABEL_KEY,
+                    raw_repo,
+                    extra={"session_id": session_id},
+                )
         await resume_managed_host(
             host_id,
             host_store,
             sandbox_config,
+            repo=repo,
             force=True,
             on_stage=_on_stage,
             agent_name=agent_name,

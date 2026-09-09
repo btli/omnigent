@@ -465,9 +465,9 @@ def _render_workspace_prep_command(
     Render the init container command that prepares the workspace.
 
     Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
-    requested, and merges *host_config* into ``config.yaml`` under
-    ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent`` when set — all
-    BEFORE the host starts. Running in an init container means a failure
+    requested and the directory is absent, and merges *host_config* into
+    ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent``
+    when set — all BEFORE the host starts. Running in an init container means a failure
     terminates the init container non-zero — surfaced fast by the start wait
     with the error as the container log tail — rather than silently leaving the
     host without its workspace or provider config.
@@ -484,6 +484,8 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repo_url is not None and clone_dir is not None:
+        # A resumed Pod may retain HOME on a PVC; preserve its clone and local work.
+        script += f"if [ ! -d {shlex.quote(clone_dir)} ]; then\n"
         # Prefer the owner's per-user credential for the clone: when they've
         # connected GitHub, wire the broker as the sole github.com helper so a
         # private clone authenticates as *them*. When they haven't connected this
@@ -494,7 +496,7 @@ def _render_workspace_prep_command(
             "from omnigent.git_credential_github import configure_clone_credentials; "
             f"configure_clone_credentials({server_url!r}, {host_id!r})"
         )
-        script += f"python3 -c {shlex.quote(wire)} || true\n"
+        script += f"  python3 -c {shlex.quote(wire)} || true\n"
         # ``--`` separates options from the (already-validated) URL so it can
         # never be parsed as a flag; --single-branch keeps branch-pinned clones
         # fast. Auth: the broker (above, if connected) else the image's GIT_TOKEN.
@@ -503,7 +505,7 @@ def _render_workspace_prep_command(
             if repo_branch is not None
             else ""
         )
-        script += f"git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\n"
+        script += f"  git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\nfi\n"
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]
