@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
 
 import click
+import psutil
 import yaml
 from pydantic import BaseModel, ConfigDict
 from rich import box
@@ -77,7 +78,9 @@ from omnigent.host.daemon_lifecycle import (
 from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
+    LocalServerStartupError,
     _pid_alive,
+    consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     local_server_status,
     local_server_url_if_healthy,
@@ -2163,6 +2166,40 @@ def _enforce_wrapper_guard() -> None:
         raise SystemExit(2)
 
 
+def _ensure_stdio_survives_unencodable_output() -> None:
+    """Keep stdio writes from aborting when the stream encoding is legacy.
+
+    A shell on a legacy non-UTF-8 encoding (Windows ANSI codepage like
+    cp1252, a C/latin-1 locale, or an explicit ``PYTHONIOENCODING``) hands
+    Python stdio streams that can't encode the CLI's decorative glyphs
+    (emoji, ``✓``, ``←``, …), so a plain ``print`` raises
+    ``UnicodeEncodeError`` mid-command. Reconfigure such streams so the
+    unencodable character degrades to a stand-in instead of killing the
+    command: on Windows switch to UTF-8 outright (modern terminals render
+    it, and it preserves the glyphs); elsewhere keep the stream's own
+    encoding and only relax the error handler, so output stays in the
+    encoding the consumer asked for. ``PYTHONUTF8`` can't help here since
+    PEP 540 reads it only at interpreter startup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        # Trade-off: errors="replace" is process-wide, so any genuinely
+        # unencodable output (not just decorative glyphs) degrades to "?"
+        # instead of raising — acceptable for a CLI's human-facing stdio.
+        # Detached/replaced streams (or a test's capture object) can't be
+        # reconfigured; the glyph fallback still guards the actual writes.
+        with contextlib.suppress(ValueError, OSError):
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2202,6 +2239,11 @@ def main() -> None:
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+
+    # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
+    # can't encode the CLI's glyphs; harden the streams before any command
+    # renders so the write degrades instead of aborting.
+    _ensure_stdio_survives_unencodable_output()
 
     # Relocate pre-rename ~/.omniagents state before anything reads ~/.omnigent
     # (update-check cache, diagnostics logs, config). No-op once migrated.
@@ -2278,6 +2320,7 @@ def main() -> None:
         log_cli_exception,
         print_stale_host_hint,
         setup_cli_logging,
+        suppresses_recovery_hint,
     )
 
     setup_cli_logging(argv)
@@ -2314,7 +2357,10 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_stale_host_recovery:
+        # Withhold the stale-host hint for failures `omnigent stop` cannot
+        # fix — a crashed background server (LocalServerStartupError) or a
+        # missing dependency — whose real cause is already surfaced above.
+        if suggest_stale_host_recovery and not suppresses_recovery_hint(exc):
             print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
@@ -2929,9 +2975,11 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     A held record flock is a definitive live owner (the kernel drops it on
     death), so it is the fast positive signal. When the lock is free or can't
     be probed (no ``fcntl``, unreadable), fall back to whether the PID is
-    alive — so a daemon still mid-startup (hasn't grabbed the lock yet) is not
-    reaped. Reaping therefore requires both signals dead: a free lock and a
-    dead PID.
+    alive and still names the recorded daemon (see
+    :func:`_pid_is_recorded_daemon`) — so a daemon still mid-startup (hasn't
+    grabbed the lock yet) is not reaped, while a pid recycled to an unrelated
+    process is. Reaping therefore requires a free lock and a dead-or-foreign
+    PID.
 
     :param record: Existing daemon record for *target*.
     :param target: Normalized daemon target, e.g. ``"local"``.
@@ -2939,7 +2987,7 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     """
     if _record_flock_is_held(_daemon_record_path(target)) is True:
         return True
-    return _pid_alive(record.pid)
+    return _pid_is_recorded_daemon(record)
 
 
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
@@ -3119,6 +3167,50 @@ def _foreground_daemon_record(
     )
 
 
+_DAEMON_PID_START_TOLERANCE_S = 5.0
+
+
+def _describe_pid(pid: int) -> str:
+    """Name what actually holds *pid* — user and command — for error copy.
+
+    Best-effort: any psutil failure degrades to the bare pid.
+    """
+    try:
+        proc = psutil.Process(pid)
+        user = proc.username()
+        name = proc.name()
+        return f"pid={pid} ({name}, user {user})"
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        return f"pid={pid}"
+
+
+def _pid_is_recorded_daemon(record: _HostDaemonRecord) -> bool:
+    """Whether *record*'s pid still names the recorded daemon, not a recycled pid.
+
+    A bare existence check keeps trusting the pid after a reboot: the kernel
+    recycles low pids, and a fresh system daemon can then hold the recorded
+    pid forever — the host refuses to start and ``host stop`` tries to signal
+    an unrelated process. The record's own ``started_at`` is the identity: a
+    process created *after* the record's start time (beyond a small clock
+    tolerance) cannot be the daemon that wrote it. The check is one-sided on
+    purpose — a daemon always exists before it writes its record, so a
+    creation time *earlier* than ``started_at`` (even by minutes of slow
+    startup or sign-in) is still ours. Legacy records without a start time,
+    and pids whose creation time can't be read, fall back to alive-only.
+    """
+    if not _pid_alive(record.pid):
+        return False
+    if record.started_at <= 0:
+        return True
+    try:
+        created = psutil.Process(record.pid).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:  # noqa: BLE001 — unreadable creation time: alive-only
+        return True
+    return created <= record.started_at + _DAEMON_PID_START_TOLERANCE_S
+
+
 def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None:
     """
     Find a live daemon that already serves a foreground record target.
@@ -3130,12 +3222,18 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     :returns: Conflicting live record, or ``None``.
     """
     existing = _find_daemon_record(record.target)
-    if (
-        existing is not None
-        and existing.pid != record.pid
-        and _daemon_owner_is_live(existing, record.target)
-    ):
-        return existing
+    if existing is not None and existing.pid != record.pid:
+        if _daemon_owner_is_live(existing, record.target):
+            return existing
+        # Dead, or alive but not our daemon (pid recycled after a reboot):
+        # the record is stale, not a conflict — prune it and start normally.
+        if _pid_alive(existing.pid):
+            click.echo(
+                f"Removing stale daemon record for {_host_display_url(existing.target)!r}: "
+                f"{_describe_pid(existing.pid)} is not this daemon (pid recycled).",
+                err=True,
+            )
+        _delete_daemon_record(existing)
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
         if (
@@ -3145,6 +3243,12 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
+        if (
+            local_record is not None
+            and local_record.pid != record.pid
+            and not _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+        ):
+            _delete_daemon_record(local_record)
     return None
 
 
@@ -3166,12 +3270,21 @@ def _claim_foreground_daemon_record(
         stop_command = _host_stop_command(conflict.server_url or "")
         raise click.ClickException(
             "A host daemon is already running for this server "
-            f"(pid={conflict.pid}, target={conflict.target}). "
+            f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
             f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
             "to stop it first."
         )
     previous = _find_daemon_record(record.target)
-    if previous is not None and not _pid_alive(previous.pid):
+    if (
+        previous is not None
+        and previous.pid != record.pid
+        and not _pid_is_recorded_daemon(previous)
+    ):
+        # Stale for the same recycled-pid reason as the conflict path: the
+        # recorded pid exists but is not our daemon.
+        _delete_daemon_record(previous)
+        previous = None
+    elif previous is not None and not _pid_alive(previous.pid):
         _delete_daemon_record(previous)
         previous = None
     _write_daemon_record(record)
@@ -3577,7 +3690,7 @@ def _discover_local_server_url(
 
     :param timeout: Max seconds to wait, e.g. ``60.0``.
     :returns: The loopback server URL, e.g. ``"http://127.0.0.1:8123"``.
-    :raises click.ClickException: If the daemon exits first, or the server
+    :raises LocalServerStartupError: If the daemon exits first, or the server
         does not come up within the timeout.
     """
     import time
@@ -3588,13 +3701,23 @@ def _discover_local_server_url(
         if url is not None:
             return url
         if not _host_daemon_alive():
-            raise click.ClickException(
+            # The server crashed in the daemon's subprocess; surface its
+            # sanitized log tail here (attributed by daemon PID) — terminal
+            # stderr is the only place the user actually looks.
+            record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+            daemon_pid = record.pid if record is not None else None
+            detail = ""
+            tail_info = consume_failed_server_log_tail(daemon_pid)
+            if tail_info is not None:
+                tail_path, tail = tail_info
+                detail = f"\n  Server log: {tail_path}\n\n  Last 50 lines:\n{tail}"
+            raise LocalServerStartupError(
                 "The local daemon exited before its Omnigent server became ready. "
                 f"See logs under {process_log_dir_reference('host')} and "
-                f"{process_log_dir_reference('server')}."
+                f"{process_log_dir_reference('server')}." + detail
             )
         time.sleep(0.2)
-    raise click.ClickException(
+    raise LocalServerStartupError(
         f"Timed out after {timeout:.0f}s waiting for the local Omnigent server to "
         f"start. See {process_log_dir_reference('server')} for details."
     )
@@ -6542,17 +6665,21 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     from omnigent.chat import _remote_headers
 
     cfg = _load_effective_config()
-    base_url = _resolve_attach_server(server, cfg.get("server"))
-    if base_url is None:
+    resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
+    if resolved_server is None:
         startup = ensure_local_omnigent_server()
-        base_url = startup.url
+        resolved_server = ServerUrl(startup.url)
 
-    base_url = base_url.rstrip("/")
+    base_url = resolved_server.api_base
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
     with httpx.Client(
         base_url=base_url,
-        headers=_remote_headers(server_url=base_url, host_id=None),
+        headers=_remote_headers(
+            server_url=base_url,
+            host_id=None,
+            org_id=resolved_server.org_id,
+        ),
         timeout=30.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
@@ -7813,11 +7940,25 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
         ``server`` key of the effective merged config), or ``None``.
     :returns: Normalized base URL without a trailing slash, or ``None``.
     """
+    resolved = _resolve_attach_server_url(server, configured_server)
+    return resolved.api_base if resolved is not None else None
+
+
+def _resolve_attach_server_url(
+    server: str | None, configured_server: str | None
+) -> ServerUrl | None:
+    """Resolve an attach target without discarding its workspace selector.
+
+    :param server: Explicit ``--server`` value, or ``None``.
+    :param configured_server: Configured server fallback, or ``None``.
+    :returns: The resolved server value, including a SPOG workspace selector,
+        or ``None`` when no remote or running local server is available.
+    """
     chosen = server if server is not None else configured_server
     if chosen:
-        return _resolve_server_url(chosen).api_base
+        return _resolve_server_url(chosen)
     local = local_server_url_if_healthy()
-    return local.rstrip("/") if local else None
+    return ServerUrl(local) if local else None
 
 
 def _require_live_conversation(
@@ -9129,7 +9270,7 @@ def _base_daemon_status_payload(record: _HostDaemonRecord) -> _HostPayload:
         "mode": record.mode,
         "server_url": base_url,
         "pid": record.pid,
-        "process": "online" if _pid_alive(record.pid) else "offline",
+        "process": "online" if _pid_is_recorded_daemon(record) else "offline",
         "log_path": record.log_path,
         "host_id": host_id,
         "host_status": None,
@@ -9866,7 +10007,15 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     :param force: Send SIGKILL after the SIGTERM grace period.
     :raises click.ClickException: If the process stays alive.
     """
-    if not _pid_alive(record.pid):
+    if not _pid_is_recorded_daemon(record):
+        # Dead, or alive with a recycled pid (often another user's system
+        # daemon) — never signal it; the record is stale, so drop it.
+        if _pid_alive(record.pid):
+            click.echo(
+                f"Skipping stale daemon record for {_host_display_url(record.target)!r}: "
+                f"{_describe_pid(record.pid)} is not this daemon (pid recycled).",
+                err=True,
+            )
         _delete_daemon_record(record)
         return
     if _signal_daemon_pid(record, signal.SIGTERM):

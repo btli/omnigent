@@ -16,7 +16,8 @@ survive a sandbox dying at the provider's lifetime cap.
 
 The sandbox host authenticates back with a dedicated launch token the
 server mints per launch (see
-:meth:`omnigent.stores.host_store.HostStore.register_managed_host` and
+:meth:`omnigent.stores.host_store.HostStore.register_managed_host`,
+:meth:`omnigent.stores.host_store.HostStore.replace_managed_host_sandbox`, and
 the managed-token branch in
 :mod:`omnigent.server.routes.host_tunnel`) — the user's own
 credentials never enter the sandbox.
@@ -1373,6 +1374,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "secret_mounts",
                     "pod_ready_timeout_s",
                     "runtime_class",
+                    "home_size_limit",
                 },
                 "sandbox.kubernetes",
             )
@@ -1396,6 +1398,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 raw, "kubernetes", "pod_ready_timeout_s"
             ),
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
+            home_size_limit=_parse_kubernetes_home_size_limit(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     elif provider == "microsandbox":
@@ -2462,6 +2465,17 @@ _K8S_LABEL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
 # Kubernetes resource quantity, e.g. "500m", "2", "1Gi", "1.5" — a number with
 # an optional binary/decimal suffix.
 _K8S_QUANTITY_RE = re.compile(r"^\d+(\.\d+)?([eE][-+]?\d+)?[a-zA-Z]{0,2}i?$")
+# Container resource fields ``sandbox.kubernetes.resources`` may carry per tier.
+# ``ephemeral-storage`` bounds the Pod's node-local disk (emptyDirs, container
+# writable layers, logs): its request lets the scheduler spread sandboxes by
+# disk and its limit makes the kubelet evict only the sandbox that exceeds it.
+_KUBERNETES_RESOURCE_FIELDS: frozenset[str] = frozenset({"cpu", "memory", "ephemeral-storage"})
+# Default ``sizeLimit`` of the writable-HOME emptyDir when
+# ``sandbox.kubernetes.home_size_limit`` is absent. Mirrors
+# ``_HOME_SIZE_LIMIT_DEFAULT`` in omnigent.onboarding.sandboxes.kubernetes
+# (kept in step by a test); the launcher module is imported lazily so the
+# server never pays for the kubernetes SDK at config-parse time.
+KUBERNETES_HOME_SIZE_LIMIT_DEFAULT: str = "8Gi"
 
 
 def _validate_dns1123_label(value: str | None, field: str) -> None:
@@ -2528,10 +2542,13 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     """
     Extract and validate the optional ``sandbox.kubernetes.resources`` block.
 
-    Shape: ``{requests?: {cpu?, memory?}, limits?: {cpu?, memory?}}`` — every
-    level optional, each ``cpu`` / ``memory`` a non-empty Kubernetes quantity
-    string. Validated at parse time so an operator typo fails server startup
-    instead of the first managed launch; an omitted field keeps the default.
+    Shape: ``{requests?: {cpu?, memory?, ephemeral-storage?}, limits?: {cpu?,
+    memory?, ephemeral-storage?}}`` — every level optional, each field a
+    non-empty Kubernetes quantity string. Validated at parse time so an
+    operator typo fails server startup instead of the first managed launch; an
+    omitted ``cpu`` / ``memory`` keeps the launcher default, an omitted
+    ``ephemeral-storage`` stays unset (a namespace ``LimitRange`` may default
+    it).
 
     :param raw: The raw ``sandbox`` mapping.
     :returns: The validated resources block, or ``None`` when omitted.
@@ -2558,14 +2575,15 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
         if not isinstance(tier_value, dict):
             raise ValueError(
                 f"server config 'sandbox.kubernetes.resources.{tier}' must be a "
-                "mapping of 'cpu' / 'memory' to quantity strings"
+                "mapping of 'cpu' / 'memory' / 'ephemeral-storage' to quantity strings"
             )
         norm_tier: dict[str, str] = {}
         for field, field_value in tier_value.items():
-            if field not in ("cpu", "memory"):
+            if field not in _KUBERNETES_RESOURCE_FIELDS:
                 raise ValueError(
                     f"server config 'sandbox.kubernetes.resources.{tier}' has an "
-                    f"unknown key {field!r} (expected 'cpu' or 'memory')"
+                    f"unknown key {field!r} (expected 'cpu', 'memory' or "
+                    "'ephemeral-storage')"
                 )
             if not isinstance(field_value, str) or not field_value.strip():
                 raise ValueError(
@@ -2582,6 +2600,44 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
             norm_tier[field] = quantity
         normalized[tier] = norm_tier
     return normalized
+
+
+def _parse_kubernetes_home_size_limit(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.home_size_limit``.
+
+    The ``sizeLimit`` of the writable-HOME emptyDir every runner Pod mounts.
+    Three states, distinguished at parse time so the launcher receives a
+    resolved value:
+
+    - key absent → :data:`KUBERNETES_HOME_SIZE_LIMIT_DEFAULT`, so a stock
+      deployment is bounded without any config;
+    - explicit ``null`` → ``None``, an unbounded emptyDir (the pre-limit
+      behaviour, for operators whose nodes have ample nodefs);
+    - a Kubernetes quantity string (``"8Gi"``, ``"20Gi"``) → that limit.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The size limit, or ``None`` for unbounded.
+    :raises ValueError: When the field is present but not a quantity string.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None or "home_size_limit" not in section:
+        return KUBERNETES_HOME_SIZE_LIMIT_DEFAULT
+    value = section["home_size_limit"]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "server config 'sandbox.kubernetes.home_size_limit' must be a Kubernetes "
+            "quantity string (e.g. '8Gi') or null for an unbounded HOME emptyDir"
+        )
+    quantity = value.strip()
+    if not _K8S_QUANTITY_RE.match(quantity):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.home_size_limit' is not a valid "
+            f"Kubernetes quantity: {value!r} (e.g. '8Gi', '20Gi')"
+        )
+    return quantity
 
 
 # Path prefixes a pvc_mounts mount_path may not overlap — neither sitting at
@@ -2829,6 +2885,7 @@ def _kubernetes_launcher_factory(
     secret_mounts: list[dict[str, object]] | None,
     pod_ready_timeout_s: int | None,
     runtime_class: str | None,
+    home_size_limit: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -2862,6 +2919,8 @@ def _kubernetes_launcher_factory(
     :param runtime_class: ``RuntimeClass`` name every runner Pod is scheduled
         under as ``spec.runtimeClassName`` (e.g. ``kata`` for micro-VM
         isolation), or ``None`` for the cluster's default runtime.
+    :param home_size_limit: Resolved ``sizeLimit`` for every runner Pod's
+        writable-HOME emptyDir, or ``None`` for an unbounded emptyDir.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -2892,6 +2951,7 @@ def _kubernetes_launcher_factory(
             secret_mounts=secret_mounts,
             pod_ready_timeout_s=pod_ready_timeout_s,
             runtime_class=runtime_class,
+            home_size_limit=home_size_limit,
         )
 
     return _build
@@ -3069,7 +3129,12 @@ async def relaunch_managed_host(
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
     if host.sandbox_id is not None:
-        await _terminate_sandbox_best_effort(launcher, host, host.sandbox_id)
+        await _terminate_sandbox_best_effort(
+            launcher,
+            host.sandbox_id,
+            host_id=host.host_id,
+            provider=host.sandbox_provider,
+        )
     try:
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
@@ -3095,7 +3160,7 @@ async def relaunch_managed_host(
     except ValueError as exc:
         raise HTTPException(
             status_code=409,
-            detail=f"managed sandbox relaunch conflicted with pending cleanup: {exc}",
+            detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -3246,16 +3311,35 @@ async def _register_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
-    record = await asyncio.to_thread(
-        host_store.register_managed_host,
-        host_id=host_id,
-        name=host_name,
-        user_id=owner,
-        token=token,
-        provider=launcher.provider,
-        sandbox_id=sandbox_id,
-        token_expires_at=now_epoch() + config.token_ttl_s,
-    )
+    if keep_host_on_failure:
+        record = await asyncio.to_thread(
+            host_store.replace_managed_host_sandbox,
+            host_id=host_id,
+            user_id=owner,
+            token=token,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + config.token_ttl_s,
+        )
+        if record is None:
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=host_id,
+                provider=launcher.provider,
+            )
+            raise ValueError(f"managed host {host_id!r} no longer exists")
+    else:
+        record = await asyncio.to_thread(
+            host_store.register_managed_host,
+            host_id=host_id,
+            name=host_name,
+            user_id=owner,
+            token=token,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + config.token_ttl_s,
+        )
     try:
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
@@ -3286,7 +3370,12 @@ async def _register_and_start_host(
         # cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
         if keep_host_on_failure:
-            await _terminate_sandbox_best_effort(launcher, record, sandbox_id)
+            await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=record.host_id,
+                provider=record.sandbox_provider,
+            )
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
         else:
             # The row was just armed with THIS single-provider config, so a
@@ -3494,17 +3583,6 @@ async def resume_managed_host(
             return
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
-        token = secrets.token_urlsafe(32)
-        armed = await asyncio.to_thread(
-            host_store.rearm_managed_host,
-            host.host_id,
-            sandbox_id=sandbox_id,
-            expected_updated_at=host.updated_at,
-            token=token,
-            token_expires_at=now_epoch() + entry.token_ttl_s,
-        )
-        if armed is None:
-            return
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",
             host.host_id,
@@ -3513,6 +3591,39 @@ async def resume_managed_host(
         )
         try:
             await asyncio.to_thread(launcher.resume, sandbox_id)
+            token = secrets.token_urlsafe(32)
+            armed = await asyncio.to_thread(
+                host_store.rearm_managed_host,
+                host.host_id,
+                sandbox_id=sandbox_id,
+                expected_updated_at=host.updated_at,
+                token=token,
+                token_expires_at=now_epoch() + entry.token_ttl_s,
+            )
+            if armed is None:
+                current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                if current is None:
+                    await _terminate_sandbox_best_effort(
+                        launcher,
+                        sandbox_id,
+                        host_id=host.host_id,
+                        provider=host.sandbox_provider,
+                    )
+                    raise ValueError(f"managed host {host.host_id!r} no longer exists")
+                if current.sandbox_id != sandbox_id:
+                    terminated = await _terminate_sandbox_best_effort(
+                        launcher,
+                        sandbox_id,
+                        host_id=host.host_id,
+                        provider=host.sandbox_provider,
+                    )
+                    if terminated and current.terminating_sandbox_id == sandbox_id:
+                        await asyncio.to_thread(
+                            host_store.mark_sandbox_terminated,
+                            host.host_id,
+                            sandbox_id=sandbox_id,
+                        )
+                return
             await _start_sandbox_host(
                 launcher,
                 sandbox_id,
@@ -3529,8 +3640,8 @@ async def resume_managed_host(
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
-            # A failed wake must NOT tear the sandbox down (the volume is the
-            # user's); just surface it.
+            # An ordinary failed wake must NOT tear the sandbox down (the volume
+            # is the user's); just surface it. Full teardown is handled above.
             if isinstance(exc, HTTPException):
                 raise
             message = exc.message if isinstance(exc, click.ClickException) else str(exc)
@@ -3547,13 +3658,11 @@ async def terminate_managed_host(
     """
     Terminate a managed host's sandbox and delete its host row.
 
-    Deleting the row is both teardown and revocation in one operation:
-    the host disappears from the picker AND its launch token stops
-    resolving. Best-effort on the sandbox side: termination failures
-    (or a missing/mismatched launcher after a config change) are
-    logged, not raised — the provider's lifetime cap reaps stragglers,
-    and the caller (session delete / launch-failure cleanup) must not
-    be blocked by provider hiccups.
+    The latest row is locked and logically deleted before provider termination.
+    This removes the host from user-visible reads, revokes its token, and
+    serializes teardown with generation replacement. Recorded sandbox ids remain
+    on the tombstone until termination succeeds, allowing the reaper to retry
+    transient provider failures.
 
     :param host: The managed host to tear down. Active and pending sandbox ids
         are both terminated when present.
@@ -3562,25 +3671,40 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    launcher = _launcher_for_teardown(host, config)
-    sandbox_ids = dict.fromkeys((host.sandbox_id, host.terminating_sandbox_id))
+    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if tombstone is None:
+        return
+    launcher = _launcher_for_teardown(tombstone, config)
+    sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:
-            await _terminate_sandbox_best_effort(launcher, host, sandbox_id)
-    await asyncio.to_thread(host_store.delete_host, host.host_id)
+            terminated = await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=tombstone.host_id,
+                provider=tombstone.sandbox_provider,
+            )
+            if terminated:
+                await asyncio.to_thread(
+                    host_store.mark_sandbox_terminated,
+                    tombstone.host_id,
+                    sandbox_id=sandbox_id,
+                )
 
 
 async def _terminate_sandbox_best_effort(
     launcher: SandboxHostLauncher | None,
-    host: Host,
     sandbox_id: str,
+    *,
+    host_id: str,
+    provider: str | None,
 ) -> bool:
-    """Terminate one explicit provider sandbox id without touching its row."""
+    """Terminate one provider sandbox id without touching its host row."""
     if launcher is None:
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
             "sandbox %s must be deleted with the provider's own tooling",
-            host.sandbox_provider,
+            provider,
             sandbox_id,
         )
         return False
@@ -3591,8 +3715,8 @@ async def _terminate_sandbox_best_effort(
         _logger.warning(
             "Failed to terminate managed sandbox %s (provider=%s) for host %s",
             sandbox_id,
-            host.sandbox_provider,
-            host.host_id,
+            provider,
+            host_id,
             exc_info=True,
         )
         return False
