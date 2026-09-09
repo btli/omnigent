@@ -2913,7 +2913,7 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
 async def test_resume_agent_sandbox_prepares_recorded_workspace(
     db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workspace_state: str
 ) -> None:
-    """Wake restores a lost clone and preserves existing persistent workspace files."""
+    """Wake restores a lost clone and preserves a persistent repository's local work."""
     from omnigent.onboarding.sandboxes.kubernetes import _render_workspace_prep_command
 
     class _AgentSandboxFakeLauncher(_EntrypointFakeLauncher):
@@ -2928,9 +2928,41 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         else None
     )
     monkeypatch.setenv("CALL_LOG", str(call_log))
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(clone_dir), *args], check=True, capture_output=True, text=True
+        ).stdout
+
     if workspace_state == "persistent":
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+        monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "0")
         clone_dir.mkdir(parents=True)
-        (clone_dir / "local-work.txt").write_text("keep me\n")
+        _git("init", "--initial-branch=main")
+        _git("config", "user.name", "Test")
+        _git("config", "user.email", "test@example.com")
+        _git("remote", "add", "origin", str(tmp_path / "origin.git"))
+        (clone_dir / "staged.txt").write_text("original staged\n")
+        (clone_dir / "unstaged.txt").write_text("original unstaged\n")
+        _git("add", ".")
+        _git("commit", "-m", "Initial commit")
+        _git("checkout", "-b", "local-work")
+        (clone_dir / "staged.txt").write_text("staged change\n")
+        _git("add", "staged.txt")
+        (clone_dir / "unstaged.txt").write_text("unstaged change\n")
+        (clone_dir / "untracked.txt").write_text("keep me\n")
+        before_branch = _git("branch", "--show-current")
+        before_head = _git("rev-parse", "HEAD")
+        before_status = _git("status", "--porcelain")
+        before_index = (clone_dir / ".git" / "index").read_bytes()
+        before_config = (clone_dir / ".git" / "config").read_bytes()
+        assert set(before_status.splitlines()) == {
+            "M  staged.txt",
+            " M unstaged.txt",
+            "?? untracked.txt",
+        }
 
     host_store = HostStore(db_uri)
     fake = _AgentSandboxFakeLauncher(host_store)
@@ -2957,9 +2989,12 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             kwargs["server_url"],
             kwargs["host_id"],
         )
+        git_command = (
+            'command git "$@"' if workspace_state == "persistent" else 'mkdir -p "${@: -1}"'
+        )
         script = (
             'python3() { printf "credentials\\n" >> "$CALL_LOG"; }\n'
-            'git() { printf "git %s\\n" "$*" >> "$CALL_LOG"; mkdir -p "${@: -1}"; }\n' + command[2]
+            'git() { printf "git %s\\n" "$*" >> "$CALL_LOG"; ' + git_command + "; }\n" + command[2]
         )
         subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
         return _EntrypointFakeLauncher.start_host(fake, sandbox_id, **kwargs)
@@ -2983,7 +3018,14 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert clone_dir.is_dir()
     elif workspace_state == "persistent":
         assert calls == []
-        assert (clone_dir / "local-work.txt").read_text() == "keep me\n"
+        assert _git("branch", "--show-current") == before_branch == "local-work\n"
+        assert _git("rev-parse", "HEAD") == before_head
+        assert _git("status", "--porcelain") == before_status
+        assert (clone_dir / ".git" / "index").read_bytes() == before_index
+        assert (clone_dir / ".git" / "config").read_bytes() == before_config
+        assert (clone_dir / "staged.txt").read_text() == "staged change\n"
+        assert (clone_dir / "unstaged.txt").read_text() == "unstaged change\n"
+        assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
     else:
         assert calls == []
         assert list(workspace.iterdir()) == []
