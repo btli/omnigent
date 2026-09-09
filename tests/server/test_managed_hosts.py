@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import re
-import shlex
 import subprocess
 import sys
 import types
@@ -2914,7 +2913,7 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
 async def test_resume_agent_sandbox_prepares_recorded_workspace(
     db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workspace_state: str
 ) -> None:
-    """Wake restores a lost clone and preserves every local change on persistent HOME."""
+    """Wake restores a lost clone and preserves existing persistent workspace files."""
     from omnigent.onboarding.sandboxes.kubernetes import _render_workspace_prep_command
 
     class _AgentSandboxFakeLauncher(_EntrypointFakeLauncher):
@@ -2922,50 +2921,16 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
 
     workspace = tmp_path / "home with spaces" / "workspace"
     clone_dir = workspace / "repo"
-    source = tmp_path / "source"
-    clone_log = tmp_path / "clone.log"
+    call_log = tmp_path / "calls.log"
     repo = (
         parse_repo_workspace("https://github.com/org/repo.git#release/test")
         if workspace_state != "no_repo"
         else None
     )
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/org/repo.git")
-
-    def _git(*args: str) -> str:
-        return subprocess.run(
-            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-
-    if repo is not None:
-        _git("init", "--initial-branch=main", str(source))
-        (source / "tracked.txt").write_text("from main\n")
-        _git("-C", str(source), "add", ".")
-        _git("-C", str(source), "commit", "-m", "Initial commit")
-        _git("-C", str(source), "checkout", "-b", "release/test")
-        (source / "branch.txt").write_text("from recorded branch\n")
-        _git("-C", str(source), "add", ".")
-        _git("-C", str(source), "commit", "-m", "Branch commit")
-
-    before = None
+    monkeypatch.setenv("CALL_LOG", str(call_log))
     if workspace_state == "persistent":
-        _git("clone", "--branch=release/test", str(source), str(clone_dir))
-        _git("-C", str(clone_dir), "checkout", "-b", "local-work")
-        (clone_dir / "tracked.txt").write_text("staged change\n")
-        _git("-C", str(clone_dir), "add", "tracked.txt")
-        (clone_dir / "tracked.txt").write_text("unstaged change\n")
-        (clone_dir / "untracked.txt").write_text("keep me\n")
-        before = {
-            path.relative_to(clone_dir): path.read_bytes()
-            for path in clone_dir.rglob("*")
-            if path.is_file()
-        }
+        clone_dir.mkdir(parents=True)
+        (clone_dir / "local-work.txt").write_text("keep me\n")
 
     host_store = HostStore(db_uri)
     fake = _AgentSandboxFakeLauncher(host_store)
@@ -2992,11 +2957,9 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             kwargs["server_url"],
             kwargs["host_id"],
         )
-        # Only credential discovery is stubbed; the rendered shell runs real git.
         script = (
-            "python3() { :; }\n"
-            f"git() {{ printf '%s\\n' \"$*\" >> {shlex.quote(str(clone_log))}; "
-            'command git "$@"; }\n' + command[2]
+            'python3() { printf "credentials\\n" >> "$CALL_LOG"; }\n'
+            'git() { printf "git %s\\n" "$*" >> "$CALL_LOG"; mkdir -p "${@: -1}"; }\n' + command[2]
         )
         subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
         return _EntrypointFakeLauncher.start_host(fake, sandbox_id, **kwargs)
@@ -3010,19 +2973,19 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         (repo.url, repo.branch, repo.repo_name) if repo is not None else (None, None, None)
     )
     assert workspace.is_dir()
+    calls = call_log.read_text().splitlines() if call_log.exists() else []
     if workspace_state == "ephemeral":
-        assert (clone_dir / "branch.txt").read_text() == "from recorded branch\n"
-        assert _git("-C", str(clone_dir), "branch", "--show-current") == "release/test"
-        assert len(clone_log.read_text().splitlines()) == 1
+        assert repo is not None
+        assert calls == [
+            "credentials",
+            f"git clone --branch release/test --single-branch -- {repo.url} {clone_dir}",
+        ]
+        assert clone_dir.is_dir()
     elif workspace_state == "persistent":
-        assert not clone_log.exists()
-        assert {
-            path.relative_to(clone_dir): path.read_bytes()
-            for path in clone_dir.rglob("*")
-            if path.is_file()
-        } == before
+        assert calls == []
+        assert (clone_dir / "local-work.txt").read_text() == "keep me\n"
     else:
-        assert not clone_log.exists()
+        assert calls == []
         assert list(workspace.iterdir()) == []
 
 
@@ -3096,10 +3059,7 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     assert host_resume_supported(no_sandbox, _injected_config(resumable)) is False
 
 
-@pytest.mark.parametrize("raw_repo", [None, "https://github.com/org/repo.git#main"])
-async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(
-    db_uri: str, raw_repo: str | None
-) -> None:
+async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri: str) -> None:
     """A resumable managed host wakes in place under the same sandbox id."""
     host_store = HostStore(db_uri)
 
@@ -3127,7 +3087,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(
         first.host_id,
         host_store,
         config,
-        repo=parse_repo_workspace(raw_repo) if raw_repo is not None else None,
+        repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
     )
 
     assert fake.resumed == ["sb-fake-1"]

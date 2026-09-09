@@ -3524,10 +3524,7 @@ async def resume_managed_host(
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
-        # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
-        # providers retain their filesystem and do not need workspace prep.
-        if launcher.provider != "agent_sandbox":
-            repo = None
+        workspace_repo = repo if launcher.provider == "agent_sandbox" else None
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -3578,9 +3575,9 @@ async def resume_managed_host(
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=entry.server_url,
-                repo_url=repo.url if repo is not None else None,
-                repo_branch=repo.branch if repo is not None else None,
-                repo_name=repo.repo_name if repo is not None else None,
+                repo_url=workspace_repo.url if workspace_repo is not None else None,
+                repo_branch=workspace_repo.branch if workspace_repo is not None else None,
+                repo_name=workspace_repo.repo_name if workspace_repo is not None else None,
                 host_config=entry.host_config,
                 on_stage=on_stage,
                 agent_name=agent_name,

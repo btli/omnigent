@@ -466,8 +466,9 @@ def _render_workspace_prep_command(
 
     Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
     requested and the directory is absent, and merges *host_config* into
-    ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent``
-    when set — all BEFORE the host starts. Running in an init container means a failure
+    ``config.yaml`` under ``$OMNIGENT_CONFIG_HOME`` or the default
+    ``~/.omnigent`` when set — all BEFORE the host starts. Running in an init
+    container means a failure
     terminates the init container non-zero — surfaced fast by the start wait
     with the error as the container log tail — rather than silently leaving the
     host without its workspace or provider config.
@@ -484,7 +485,6 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repo_url is not None and clone_dir is not None:
-        # A resumed Pod may retain HOME on a PVC; preserve its clone and local work.
         script += f"if [ ! -d {shlex.quote(clone_dir)} ]; then\n"
         # Prefer the owner's per-user credential for the clone: when they've
         # connected GitHub, wire the broker as the sole github.com helper so a
