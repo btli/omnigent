@@ -530,21 +530,39 @@ def _render_workspace_prep_command(
                 else ""
             )
             target = shlex.quote(clone_dir)
+            gitfile = shlex.quote(f"{clone_dir}/.git")
             temporary = shlex.quote(f"{clone_dir}.tmp")
+            marker = shlex.quote(f"{clone_dir}.tmp/.omnigent-workspace-prep")
+            staged_clone = shlex.quote(f"{clone_dir}.tmp/clone")
             error = shlex.quote(
-                f"Workspace {clone_dir} has no .git/HEAD and is not an empty directory; "
+                f"Workspace {clone_dir} has no Git checkout and is not an empty directory; "
                 "refusing to overwrite it"
             )
-            script += f"if [ ! -e {target}/.git/HEAD ]; then\n"
+            staging_error = shlex.quote(
+                f"Staging path {clone_dir}.tmp is not owned by workspace prep; "
+                "refusing to remove it"
+            )
+            script += (
+                f"if [ ! -e {target}/.git/HEAD ] && "
+                f"! {{ [ -f {gitfile} ] && grep -q '^gitdir: ' {gitfile}; }}; then\n"
+            )
             script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             script += f"    if ! rmdir -- {target}; then\n"
             script += f"      printf '%s\\n' {error} >&2\n"
             script += "      exit 1\n    fi\n  fi\n"
-            script += f"  rm -rf -- {temporary}\n"
+            script += f"  if [ -e {temporary} ] || [ -L {temporary} ]; then\n"
+            script += f"    if [ -d {temporary} ] && [ ! -L {temporary} ] && [ -f {marker} ]; then\n"
+            script += f"      rm -rf -- {temporary}\n"
+            script += "    else\n"
+            script += f"      printf '%s\\n' {staging_error} >&2\n"
+            script += "      exit 1\n    fi\n  fi\n"
+            script += f"  mkdir -- {temporary}\n  touch -- {marker}\n"
             script += f"  if [ -z \"$wired\" ]; then python3 -c {shlex.quote(wire)} || true; wired=1; fi\n"
             script += (
-                f"  (git clone {branch}-- {shlex.quote(repo.url)} {temporary} "
-                f"&& mv -f -- {temporary} {target}) & pids=\"$pids $!\"\n"
+                f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
+                f"&& mv -f -- {staged_clone} {target} "
+                f"&& rm -f -- {marker} && rmdir -- {temporary}) "
+                f"& pids=\"$pids $!\"\n"
             )
             script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
