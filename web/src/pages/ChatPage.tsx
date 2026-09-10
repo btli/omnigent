@@ -67,6 +67,8 @@ import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  isStaleTempConvId,
+  isTempConvId,
   type PendingInitialPrompt,
   type QueuedMessage,
   useChatStore,
@@ -363,6 +365,10 @@ function truncateTitle(raw: string, max = 60): string {
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  // The id for every server-scoped fetch/hook — `undefined` while the URL holds
+  // a client-only temp id, so none of them hit `/v1/sessions/<temp>/*` before
+  // the session exists. `switchTo` still gets the raw `urlConvId`.
+  const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -413,7 +419,10 @@ export function ChatPage() {
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
   // (every 4 s) so messages arriving while viewing are marked seen.
-  useMarkConversationSeen(urlConvId, conversations?.find((c) => c.id === urlConvId)?.updated_at);
+  useMarkConversationSeen(
+    sessionConvId,
+    conversations?.find((c) => c.id === sessionConvId)?.updated_at,
+  );
 
   // Sync the store's active conversation to the URL. Single source of
   // truth: URL is what's "current"; store mirrors it. The effect is
@@ -426,8 +435,16 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
+    // conversation is gone) has no forward path: landing is URL-keyed, so the
+    // page would sit on a permanently read-only phantom chat. Redirect to
+    // landing instead of binding a nonexistent session.
+    if (isStaleTempConvId(urlConvId)) {
+      navigate("/", { replace: true });
+      return;
+    }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId]);
+  }, [urlConvId, navigate]);
 
   // Server-driven redirect: when the active conversation is superseded
   // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
@@ -490,8 +507,8 @@ export function ChatPage() {
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
-  const runnerOnline = useSessionRunnerOnline(urlConvId);
-  useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
+  const runnerOnline = useSessionRunnerOnline(sessionConvId);
+  useRefreshSessionStateOnRunnerOnline(sessionConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
@@ -504,7 +521,7 @@ export function ChatPage() {
   // agent object for the active session. Drives the picker's
   // name/description; the same react-query cache also feeds the header
   // info icon (AgentInfoButton) its tools & policies.
-  const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
+  const { data: boundAgentBySession } = useSessionAgent(sessionConvId ?? null);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
 
@@ -624,7 +641,7 @@ export function ChatPage() {
   // Must be declared BEFORE the early-return guards below — otherwise
   // the hook is skipped on renders that hit the loading/error branches,
   // tripping React's "rendered fewer hooks than expected".
-  const { session: activeSession, isLoading: sessionLoading } = useSession(urlConvId ?? null);
+  const { session: activeSession, isLoading: sessionLoading } = useSession(sessionConvId ?? null);
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
@@ -651,7 +668,7 @@ export function ChatPage() {
   const subAgentLabel = subAgentComposerLabel(activeSession);
 
   // Hoisted above the early-return guards so the title-update effect can read them.
-  const activeConv = urlConvId ? conversations?.find((c) => c.id === urlConvId) : null;
+  const activeConv = sessionConvId ? conversations?.find((c) => c.id === sessionConvId) : null;
 
   // `isWorking` gates the parent's OWN turn (Stop/Interrupt) and must NOT
   // include child-session activity. `showsWorking` is display-only (tab title
@@ -727,7 +744,7 @@ export function ChatPage() {
   const viewerId = getCurrentAuthorId();
   const sessionOwner = activeConv?.owner ?? null;
   const viewerOwnsSession = sessionOwner !== null && sessionOwner === viewerId;
-  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (urlConvId ?? null) : null);
+  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionConvId ?? null) : null);
   const isSessionShared = isSessionSharedWithOthers(sessionOwner, viewerId, ownerGrants);
 
   // The open session's derived liveness — the single signal the chat
@@ -775,7 +792,7 @@ export function ChatPage() {
   // Host-switch launch marker; see the store field. Keeps this surface's
   // liveness in step with AppShell's, which drives the startup spinner.
   const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
-  const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
+  const liveness = useSessionLiveness(sessionConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
     launchedAt: runnerLaunchedAt,
   });
@@ -848,6 +865,8 @@ export function ChatPage() {
   const onSend = useCallback(
     (text: string, files?: File[]) => {
       if (!agentId) return;
+      // No server session yet (still creating) — nothing to POST to.
+      if (isTempConvId(urlConvId)) return;
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
@@ -948,7 +967,11 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
+  // Client-only conversation: no server session to POST a follow-up to yet, so
+  // the composer stays read-only until the create resolves and the id hydrates.
+  const readOnlyReason = isTempConvId(urlConvId)
+    ? "Starting the session…"
+    : readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
@@ -1468,7 +1491,13 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
+  const [replyConversationId, setReplyConversationId] = useState(conversationId);
   const nextReplyQuoteId = useRef(0);
+
+  if (replyConversationId !== conversationId) {
+    setReplyConversationId(conversationId);
+    setReplyQuotes([]);
+  }
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1748,6 +1777,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showClaudePermissionMode={showClaudePermissionMode}
             showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
+            runnerOnline={runnerOnline}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
@@ -1873,6 +1903,8 @@ interface ComposerProps {
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
+  /** Whether the active session's runner tunnel is connected. */
+  runnerOnline?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
@@ -2168,6 +2200,10 @@ function ComposerStatusLine({
   onHostReconnect?: () => void;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
+  // A client-only temp id has no server session — gate the server-scoped hooks
+  // below on it so they never fetch `/v1/sessions/temp:*` during the create
+  // window (mirrors ChatPage's top-level `sessionConvId`).
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
@@ -2178,15 +2214,17 @@ function ComposerStatusLine({
 
   // Host binding drives whether the HostBadge has anything to show — read it
   // from the same source the badge does so the tray's render guard matches.
-  const { session } = useSession(conversationId);
+  const { session } = useSession(sessionId);
   const isHostBound = !!session?.hostId;
 
   // PR link → opens the workspace rail's GitHub tab. Shares the info query's
   // cache with the GitHub panel, so opening the tab is instant.
-  const github = useGithubInfo(conversationId ?? undefined);
+  const github = useGithubInfo(sessionId ?? undefined);
   const openGithubTab = useOpenGithubTab();
-  const prNumber = github.data?.pr?.number ?? null;
-  const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
+  const prs = github.data?.prs;
+  const prNumber = prs?.[0]?.number ?? github.data?.pr?.number ?? null;
+  const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  const showPr = !!conversationId && !isSubAgentSession && prCount > 0 && !!openGithubTab;
 
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
@@ -2237,11 +2275,15 @@ function ComposerStatusLine({
             type="button"
             data-testid="composer-pr-link"
             onClick={() => openGithubTab?.()}
-            title="View this PR in the GitHub tab"
+            title={
+              prCount > 1 ? "View these PRs in the GitHub tab" : "View this PR in the GitHub tab"
+            }
             className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <GithubMono size={14} aria-hidden />
-            <span className="tabular-nums underline underline-offset-2">#{prNumber}</span>
+            <span className="tabular-nums whitespace-nowrap underline underline-offset-2">
+              {prCount > 1 ? `${prCount} PRs` : `#${prNumber}`}
+            </span>
           </button>
         )}
       </div>
@@ -2508,6 +2550,7 @@ function ComposerImpl({
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
   showGoalControl = false,
+  runnerOnline,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
@@ -2578,7 +2621,10 @@ function ComposerImpl({
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
   // and for native wrappers the injected text could land in the vendor
-  // TUI's permission prompt. Lock the composer until the verdict is in.
+  // TUI's permission prompt. Lock the SEND path until the verdict is in
+  // (submit() guard + disabled Send button), but keep the textarea itself
+  // editable: disabling it ejects browser focus mid-word when a prompt
+  // lands while the user is typing, silently dropping their keystrokes.
   // Mirrored sub-agent prompts (targetSessionId set to a child session)
   // don't gate this session's inbox, so they don't lock it.
   const hasPendingElicitation = useChatStore((s) =>
@@ -2644,7 +2690,13 @@ function ComposerImpl({
     unreachable,
     maybeFlushQueuedHead,
   ]);
-  const { goal, setGoal: setGoalState } = useGoalState(conversationId, showGoalControl);
+  // No server session behind a temp id — gate goal/workspace fetches on it so
+  // the create window issues no `/v1/sessions/temp:*` requests.
+  const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  const { goal, setGoal: setGoalState } = useGoalState(
+    composerSessionId,
+    showGoalControl && runnerOnline === true,
+  );
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -2657,7 +2709,7 @@ function ComposerImpl({
   // so the composer's "@" entry point can't split-brain from the file viewer's
   // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
   const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
-  const workspaceFilesQuery = useWorkspaceAllFiles(conversationId ?? undefined, {
+  const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
   const valueRef = useRef(value);
@@ -3322,7 +3374,7 @@ function ComposerImpl({
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isStreaming) {
+    if (e.key === "Escape" && isWorking && !isReadOnly) {
       e.preventDefault();
       onStop();
       return;
@@ -3582,8 +3634,15 @@ function ComposerImpl({
                           : "Send a message…"
             }
             rows={1}
-            disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
+            // A pending elicitation must NOT disable the textarea: disabling
+            // ejects focus to <body> mid-word and later keystrokes vanish.
+            // The draft stays typable; sending is still gated (submit() +
+            // the disabled Send button) until the prompt is answered.
+            disabled={disabled || isReadOnly || unreachable}
             data-slash-command={composerIsCommand ? "true" : undefined}
+            // Full send intent (text OR attachments OR mentions) for the
+            // approve hotkey's drafting guard, which only sees this element.
+            data-has-draft={hasDraft ? "true" : undefined}
             className={cn(
               "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;
@@ -3665,7 +3724,10 @@ function ComposerImpl({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 px-2 pb-2">
+        <div
+          className="@container/composer-actions flex items-center justify-between gap-2 px-2 pb-2"
+          data-testid="composer-action-row"
+        >
           {/* Attach + mic — left side of the action row */}
           <div className="flex shrink-0 items-center gap-0.5">
             <Button
@@ -3718,7 +3780,7 @@ function ComposerImpl({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 gap-1.5 px-2 text-sm md:h-8",
+                      "h-9 w-9 gap-0 px-0 text-sm md:h-8 @lg/composer-actions:w-auto @lg/composer-actions:gap-1.5 @lg/composer-actions:px-2",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -3734,7 +3796,7 @@ function ComposerImpl({
                     ) : (
                       <FileTextIcon className="size-3.5" />
                     )}
-                    <span>Plan</span>
+                    <span className="hidden @lg/composer-actions:inline">Plan</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>
@@ -5109,7 +5171,10 @@ function ComposerModelSource({
           <span
             tabIndex={0}
             data-testid="composer-model-source"
-            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+            // `flex` keeps the min-width chain flowing through this wrapper:
+            // as a plain span the label inside loses its flex-imposed width
+            // and its `truncate` never engages, running under the Stop button.
+            className="flex min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
           >
             {children}
           </span>
