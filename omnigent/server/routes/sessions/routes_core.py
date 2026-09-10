@@ -38,7 +38,7 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -455,11 +455,22 @@ def register_core_routes(
             launch_result = {"status": "failed", "error": "host launch timed out"}
         launch_failed = launch_result.get("status") == "failed"
         if launch_failed:
+            # The runner failed to come up (generic launch-failure path with no
+            # structured error_code), blocking the session at launch. A coded
+            # deployment failure (harness_not_configured, etc.) is attributed
+            # CONFIG where it raises as OmnigentError.
             _logger.warning(
                 "Host %s failed to launch runner for session %s: %s",
                 host_id,
                 session_id,
                 launch_result.get("error"),
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=session_id,
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                ),
             )
         return runner_id, launch_failed
 
