@@ -131,6 +131,7 @@ class OmnigentWebViewHttpErrorTest {
         shouldInjectBridgeAtPageReady = { false },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
+        onRendererGone = { _, _ -> },
     )
 
     private fun request(

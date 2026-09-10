@@ -183,13 +183,13 @@ class MainActivityTest {
     fun `renderer death swaps in a fresh WebView and reloads the server`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val dead = activity.webView()
+        val dead = activity.testWebView()
         val container = dead.parent as ViewGroup
 
         val handled = dead.webViewClient.onRenderProcessGone(dead, rendererGone())
 
         assertTrue(handled)
-        val replacement = activity.webView()
+        val replacement = activity.testWebView()
         assertNotSame(dead, replacement)
         assertSame(container, replacement.parent)
         assertEquals("https://example.com", shadowOf(replacement).lastLoadedUrl)
@@ -199,14 +199,14 @@ class MainActivityTest {
     fun `a late renderer-death report for a replaced WebView is ignored`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val first = activity.webView()
+        val first = activity.testWebView()
         first.webViewClient.onRenderProcessGone(first, rendererGone())
-        val replacement = activity.webView()
+        val replacement = activity.testWebView()
 
         // The stale report names the WebView that was already torn down.
         replacement.webViewClient.onRenderProcessGone(first, rendererGone())
 
-        assertSame(replacement, activity.webView())
+        assertSame(replacement, activity.testWebView())
         assertFalse(shadowOf(replacement).wasDestroyCalled())
     }
 
@@ -214,7 +214,7 @@ class MainActivityTest {
     fun `renderer death reloads the last route, not the server root`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val dead = activity.webView()
+        val dead = activity.testWebView()
         // The user was on a deep same-origin route when the renderer died;
         // getUrl() reports the last-committed URL, which survives the death.
         dead.loadUrl("https://example.com/chat/abc123")
@@ -224,7 +224,7 @@ class MainActivityTest {
         // The rebuilt WebView returns to the route, not the landing page.
         assertEquals(
             "https://example.com/chat/abc123",
-            shadowOf(activity.webView()).lastLoadedUrl,
+            shadowOf(activity.testWebView()).lastLoadedUrl,
         )
     }
 
@@ -232,13 +232,13 @@ class MainActivityTest {
     fun `a foreign last URL falls back to the server root on recovery`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val dead = activity.webView()
+        val dead = activity.testWebView()
         // A foreign / error origin must not be restored into — reload the server.
         dead.loadUrl("https://accounts.google.com/o/oauth2/v2/auth")
 
         dead.webViewClient.onRenderProcessGone(dead, rendererGone())
 
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals("https://example.com", shadowOf(activity.testWebView()).lastLoadedUrl)
     }
 
     @Test
@@ -249,12 +249,12 @@ class MainActivityTest {
         // MAX_RENDERER_CRASHES + 1 clustered crashes. Each still rebuilds (manual
         // recovery reuses the webView field, so the corpse can't stay); the loop
         // is broken by what loads, not by refusing to rebuild.
-        var dead = activity.webView()
+        var dead = activity.testWebView()
         repeat(4) {
             dead.loadUrl("https://example.com/chat/loops")
             val container = dead.parent as ViewGroup
             dead.webViewClient.onRenderProcessGone(dead, rendererGone(crashed = true))
-            val rebuilt = activity.webView()
+            val rebuilt = activity.testWebView()
             // Every death — even the over-budget one — yields a fresh, attached,
             // non-destroyed WebView, so manual recovery always has a live target.
             assertNotSame(dead, rebuilt)
@@ -279,13 +279,13 @@ class MainActivityTest {
         // Common crash shape: page loads fine, then crashes seconds later. A
         // page-load reset would clear the budget each cycle and never trip; the
         // gap-based budget must accumulate these clustered crashes.
-        var dead = activity.webView()
+        var dead = activity.testWebView()
         repeat(4) {
             dead.loadUrl("https://example.com/chat/heavy")
             // Simulate the successful load that precedes each crash.
             dead.webViewClient.onPageFinished(dead, "https://example.com/chat/heavy")
             dead.webViewClient.onRenderProcessGone(dead, rendererGone(crashed = true))
-            dead = activity.webView()
+            dead = activity.testWebView()
         }
 
         // The 4th crash exceeded the budget even though every cycle had a healthy
@@ -304,13 +304,13 @@ class MainActivityTest {
         // Far more than MAX_RENDERER_CRASHES, but all system reclaims
         // (didCrash=false): each must recover, none counts against the budget.
         repeat(6) {
-            val live = activity.webView()
+            val live = activity.testWebView()
             live.webViewClient.onRenderProcessGone(live, rendererGone(crashed = false))
         }
-        val latest = activity.webView()
+        val latest = activity.testWebView()
 
         latest.webViewClient.onRenderProcessGone(latest, rendererGone(crashed = false))
-        assertNotSame(latest, activity.webView())
+        assertNotSame(latest, activity.testWebView())
     }
 
     private fun rendererGone(crashed: Boolean = false) =

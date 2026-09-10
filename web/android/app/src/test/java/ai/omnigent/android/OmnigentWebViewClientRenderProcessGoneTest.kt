@@ -51,7 +51,7 @@ class OmnigentWebViewClientRenderProcessGoneTest {
         OmnigentWebViewClient(
             pinnedOrigin = { "https://server.example" },
             shouldInjectBridgeAtPageReady = { false },
-            onPageReady = {},
+            onPageReady = { _, _, _, _ -> },
             onLoginRequired = {},
             onRendererGone = { _, _ -> },
         )
