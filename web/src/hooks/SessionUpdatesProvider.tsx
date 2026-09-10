@@ -69,9 +69,6 @@ function applyItemsToCache(
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
-  // Frames for a session with an optimistic delete in flight are dropped.
-  // For an optimistic archive the frame still merges with `archived` pinned
-  // to true, so a stale pre-commit frame can't resurrect or hide the row.
   const itemsById = new Map<string, SessionListWireItem>();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
@@ -324,6 +321,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+          return;
+        case "projects_changed":
+          // Another client created/renamed/deleted a project (or changed its
+          // config/icon). Only the mutating client invalidates locally, so
+          // refresh the project-row caches here to converge without a reload.
+          void queryClient.invalidateQueries({ queryKey: ["projects"] });
+          void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
