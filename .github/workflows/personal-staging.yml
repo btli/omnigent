@@ -308,6 +308,10 @@ jobs:
   # would be restored by future runs).
   android-build:
     needs: integrate
+    # `success()` spans the whole ancestry, so a failed sync-main would skip
+    # this job even though integrate cleared its own always() gate. The ring
+    # builds from integrate's commit and never reads fork main.
+    if: always() && needs.integrate.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -370,7 +374,7 @@ jobs:
   # this job — so the untrusted build's own signature never survives.
   android-sign:
     needs: android-build
-    if: github.ref == 'refs/heads/main'
+    if: always() && needs.android-build.result == 'success' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Server-enforced gate for the keystore secrets: the staging-signing
@@ -487,7 +491,10 @@ jobs:
 
   publish:
     needs: [integrate, android-sign]
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      always() && needs.integrate.result == 'success'
+      && needs.android-sign.result == 'success'
+      && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: staging-push
     timeout-minutes: 15
