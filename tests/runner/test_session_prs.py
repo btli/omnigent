@@ -160,6 +160,291 @@ def test_extract_completed_operations(
     assert [ref.url for ref in references] == urls
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 42 -R example/one --comments",
+        "gh pr diff 42 -R example/one",
+        "gh pr checks 42 -R example/one",
+        "gh pr list --json url",
+        "gh pr status --json url",
+        "gh pr checkout 42 -R example/one",
+        "gh pr comment 42 -R example/one --body test",
+        "gh pr review 42 -R example/one --comment --body test",
+        "gh pr review -c -R example/one 42 --body test",
+        "gh api repos/example/one/pulls/42",
+        "gh api repos/example/one/pulls --method GET -f state=open",
+        "gh api repos/example/one/pulls/42 -X HEAD",
+        "gh api graphql -f query='{ viewer { pullRequests(first: 10) { nodes { url } } } }'",
+        "gh api repos/example/one/issues/42/comments -f body=test",
+        "gh api repos/example/one/issues/comments/123 -X PATCH -f body=test",
+        "gh api repos/example/one/pulls/42/comments -f body=test",
+        "gh api repos/example/one/pulls/42/comments/123/replies -f body=test",
+        "gh api repos/example/one/pulls/comments/123 -X DELETE",
+        "gh api repos/example/one/pulls/42/reviews -f body=test -f event=COMMENT",
+        "gh api repos/example/one/pulls/42/reviews/123/events -f event=COMMENT",
+        "gh api repos/example/one/pulls/42/reviews -f body=test",
+    ],
+)
+@pytest.mark.parametrize("structured", [False, True])
+def test_reads_and_comments_do_not_attach_prs(command: str, structured: bool) -> None:
+    result = {"html_url": A, "body": B} if structured else A + "\n" + B
+    assert extract_prs("Bash", {"command": command}, result) == ([], False)
+
+
+@pytest.mark.parametrize(
+    "name,extra",
+    [
+        ("pull_request_read", {"method": "get"}),
+        ("get_pull_request", {}),
+        ("add_issue_comment", {}),
+        ("add_comment_to_pending_review", {}),
+        ("create_pull_request_review", {"event": "COMMENT"}),
+        ("submit_pending_pull_request_review", {"event": "COMMENT"}),
+        ("pull_request_review_write", {"method": "submit_pending", "event": "COMMENT"}),
+        ("pull_request_review_write", {"method": "create"}),
+    ],
+)
+def test_mcp_reads_and_comments_do_not_attach_prs(name: str, extra: dict) -> None:
+    refs, created = extract_prs(
+        f"mcp__github__{name}",
+        {"owner": "example", "repo": "one", "pullNumber": 42, **extra},
+        {"structuredContent": {"html_url": A}},
+    )
+    assert refs == []
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "ignored",
+    [
+        "gh pr view 42 -R example/one --json url",
+        "gh pr list --json url",
+        "gh pr comment 42 -R example/one --body test",
+        "gh api repos/example/one/issues/42/comments -f body=test",
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_reads_and_writes_use_only_write_targets(ignored: str, reverse: bool) -> None:
+    commands = [ignored, "gh pr edit 42 -R example/two --title test"]
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        {"stdout": json.dumps({"url": A}) + "\n" + B},
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "gh pr diff 42 -R example/one",
+        "gh pr view 42 -R example/one",
+        "gh pr comment 42 -R example/one --body test",
+        "gh api repos/example/one/pulls/42",
+    ],
+)
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_creation_uses_native_metadata(read: str, truncated: bool, reverse: bool) -> None:
+    commands = [read, "gh pr create --title test --body test"]
+    stdout = f"diff --git a/README b/README\n@@ -1 +1,2 @@\n {A}\n+fixture = '[exit code: 1]'\n"
+    if not truncated:
+        stdout += B + "\n"
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "cd /workspace && "
+            + " && ".join(reversed(commands) if reverse else commands)
+        },
+        {
+            "stdout": stdout,
+            "stderr": "",
+            "interrupted": False,
+            "gitOperation": {"pr": {"number": 42, "url": B, "action": "created"}},
+        },
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert created
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        "created",
+        {"pr": None},
+        {"pr": [B]},
+        {"pr": {"url": B}},
+        {"pr": {"url": B, "action": "updated"}},
+        {"pr": {"url": "not-a-pr", "action": "created"}},
+    ],
+)
+def test_mixed_creation_requires_explicit_metadata(metadata: object) -> None:
+    refs, _ = extract_prs(
+        "Bash",
+        {"command": "gh pr diff 42 && gh pr create"},
+        {"stdout": A + "\n" + B, "gitOperation": metadata},
+    )
+    assert refs == []
+
+
+@pytest.mark.parametrize("command", ["gh pr view 42", "gh pr comment 42 --body test"])
+def test_creation_metadata_does_not_enable_excluded_commands(command: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": command},
+        {"gitOperation": {"pr": {"url": A, "action": "created"}}},
+    )
+    assert refs == []
+    assert not created
+
+
+def test_creation_metadata_requires_a_creation_command() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr edit 42 -R example/two --title test"},
+        {"gitOperation": {"pr": {"url": A, "action": "created"}}},
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert not created
+
+
+def test_mixed_creation_metadata_preserves_explicit_write_targets() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr diff 7; gh pr edit 42 -R example/one; gh pr create"},
+        {"gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert {ref.url for ref in refs} == {A, B}
+    assert not created
+
+
+@pytest.mark.parametrize("as_text", [False, True])
+def test_creation_metadata_in_stdout_is_not_tool_metadata(as_text: bool) -> None:
+    stdout = json.dumps({"gitOperation": {"pr": {"url": A, "action": "created"}}})
+    refs, _ = extract_prs(
+        "Bash",
+        {"command": "gh pr diff 42 && gh pr create"},
+        stdout if as_text else {"stdout": stdout},
+    )
+    assert refs == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"exit_code": 1},
+        {"exitCode": -9},
+        {"interrupted": True},
+        {"isError": True},
+        {"cancelled": True},
+        {"session_id": 12, "exit_code": None},
+    ],
+)
+def test_creation_metadata_does_not_override_failed_or_unfinished_calls(status: dict) -> None:
+    assert extract_prs(
+        "Bash",
+        {"command": "gh pr diff 42 && gh pr create"},
+        {"gitOperation": {"pr": {"url": A, "action": "created"}}, **status},
+    ) == ([], False)
+
+
+@pytest.mark.parametrize(
+    "marker", ["[exit code: 1]", "Process exited with code 2", "[exit code: -9]"]
+)
+@pytest.mark.parametrize("footer", [False, True])
+def test_shell_exit_markers_must_be_footers(marker: str, footer: bool) -> None:
+    stdout = f"{B}\n{marker}\n" if footer else f"fixture = '{marker}'\n{B}\n"
+    refs, _ = extract_prs("Bash", {"command": "gh pr create"}, {"stdout": stdout})
+    assert [ref.url for ref in refs] == ([] if footer else [B])
+
+
+def test_creation_metadata_preserves_other_write_identities() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr create -R example/one; gh pr create -R example/two"},
+        {"stdout": A + "\n" + B, "gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert {ref.url for ref in refs} == {A, B}
+    assert created
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr close 42 -R example/one",
+        "gh pr reopen 42 -R example/one",
+        "gh pr ready 42 -R example/one",
+        "gh pr merge 42 -R example/one --squash",
+        "gh pr update-branch 42 -R example/one",
+        "gh pr review 42 -R example/one --approve",
+        "gh pr review 42 -R example/one -r --body test",
+        "gh api repos/example/one/pulls/42 -X PATCH -f title=test",
+        "gh api repos/example/one/pulls/42/merge -X PUT",
+        "gh api repos/example/one/pulls/42/reviews -f body=test -f event=APPROVE",
+        "gh api repos/example/one/pulls/42/reviews "
+        + "--raw-field=body=test --field=event=REQUEST_CHANGES",
+        "gh api repos/example/one/pulls/42/reviews/123/events -fevent=APPROVE",
+    ],
+)
+def test_pr_changes_still_use_command_targets(command: str) -> None:
+    refs, created = extract_prs("Bash", {"command": command}, "Done.")
+    assert [ref.url for ref in refs] == [A]
+    assert not created
+
+
+@pytest.mark.parametrize("repo", ["comments", "reviews"])
+def test_repository_name_does_not_classify_rest_operation(repo: str) -> None:
+    url = f"https://github.com/example/{repo}/pull/42"
+    refs, created = extract_prs(
+        "Bash", {"command": f"gh api repos/example/{repo}/pulls --input request.json"}, url
+    )
+    assert [ref.url for ref in refs] == [url]
+    assert created
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "create_pull_request_review",
+        "submit_pending_pull_request_review",
+        "pull_request_review_write",
+    ],
+)
+@pytest.mark.parametrize("event", ["APPROVE", "REQUEST_CHANGES"])
+def test_mcp_review_state_changes_still_attach_prs(name: str, event: str) -> None:
+    refs, created = extract_prs(
+        f"mcp__github__{name}",
+        {"owner": "example", "repo": "one", "pullNumber": 42, "event": event},
+        "Done.",
+    )
+    assert [ref.url for ref in refs] == [A]
+    assert not created
+
+
+def test_reads_and_comments_do_not_refresh_existing_associations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    store = SessionPrRegistry("conv_ignored")
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    original = store.list()
+    for index, command in enumerate((f"gh pr view {A}", f"gh pr comment {A} --body test")):
+        observe_hook(
+            "conv_ignored",
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "tool_response": {"stdout": A + "\n" + B, "exit_code": 0},
+                "tool_use_id": f"ignored-{index}",
+            },
+        )
+    assert store.list() == original
+
+
 def test_independent_repos_and_restart(tmp_path: Path) -> None:
     store = SessionPrRegistry("conv_a", root=tmp_path)
     store.record(
@@ -241,7 +526,7 @@ def test_hook_uses_bound_omnigent_session(tmp_path: Path, monkeypatch: pytest.Mo
         ("gh pr view || gh pr create", A, []),
         ("gh pr create", {"stdout": A, "metadata": {"exit_code": 1}}, []),
         ("gh pr create", {"output": A, "session_id": 12, "exit_code": None}, []),
-        ("gh pr comment -R example/one 42 -b test", "Posted", [A]),
+        ("gh pr comment -R example/one 42 -b test", "Posted", []),
     ],
 )
 def test_ambiguous_and_nonterminal_commands(command: str, result: object, urls: list[str]) -> None:
@@ -253,6 +538,120 @@ def test_mixed_operations_do_not_claim_creation() -> None:
     refs, created = extract_prs("Bash", {"command": "gh pr create; gh pr edit 42"}, A)
     assert [ref.url for ref in refs] == [A]
     assert not created
+
+
+@pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_auth_switch_before_creating_two_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str, structured: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    for index, url in enumerate((A, B)):
+        push = "git push -u origin topic && " if index else ""
+        command = (
+            "gh auth switch --user example-user 2>/dev/null; cd /worktree && "
+            + push
+            + '''gh pr create \\
+  --title 'README wording' \\
+  --body "$(cat <<'EOF'
+## Summary
+Update `README.md` wording.
+EOF
+)"'''
+        )
+        stdout = (
+            "remote: https://github.com/example/two/pull/new/topic\nPushed topic\n"
+            if index
+            else ""
+        ) + url
+        result = (
+            {
+                "stdout": stdout,
+                "stderr": "Shell cwd was reset to /workspace",
+                "interrupted": False,
+                "gitOperation": {"pr": {"number": 42, "url": url, "action": "created"}},
+            }
+            if structured
+            else {"content": stdout + "\nShell cwd was reset to /workspace", "is_error": False}
+        )
+        observe_hook(
+            "conv_auth_switch",
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool_name,
+                "tool_input": {"command": command},
+                "tool_response": result,
+                "tool_use_id": f"create-{index}",
+            },
+        )
+    entries = SessionPrRegistry("conv_auth_switch").list()
+    assert {entry.url for entry in entries} == {A, B}
+    assert all(entry.relationship == "created" for entry in entries)
+
+
+@pytest.mark.parametrize(
+    "command,result,urls,created",
+    [
+        ("gh auth status; gh pr create", A, [A], True),
+        ("gh auth setup-git && gh pr edit 42 -R example/one", "Updated", [A], False),
+        (
+            "gh auth switch --user example-user; "
+            "gh api repos/example/one/pulls -X POST --jq .html_url",
+            A,
+            [A],
+            True,
+        ),
+        ("gh auth status", A, [], False),
+        ("gh auth switch --user example-user; gh pr list", A, [], False),
+        ("gh auth switch --user example-user; gh pr view; gh pr create", A, [], True),
+        (
+            "gh auth switch --user example-user; gh api repos/example/one/pulls/42; gh pr create",
+            A,
+            [],
+            True,
+        ),
+        ("gh auth switch --user example-user; gh pr create || true", A, [], False),
+        (
+            "gh auth switch --user example-user; gh pr create",
+            {"stdout": A, "exit_code": 1},
+            [],
+            False,
+        ),
+        (
+            "gh auth switch --user example-user; gh pr create",
+            {"stdout": A, "backgroundTaskId": "pending"},
+            [],
+            False,
+        ),
+    ],
+)
+def test_auth_commands_do_not_supply_pr_evidence(
+    command: str, result: object, urls: list[str], created: bool
+) -> None:
+    refs, was_created = extract_prs("Bash", {"command": command}, result)
+    assert [ref.url for ref in refs] == urls
+    assert was_created is created
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "gh repo set-default example/one",
+        "gh config set pager cat",
+        "gh arbitrary-extension --option value",
+        "git push -u origin topic",
+        "printf '%s' 'gh pr list'",
+    ],
+)
+@pytest.mark.parametrize("before", [False, True])
+@pytest.mark.parametrize(
+    "write", ["gh pr create", "gh api repos/example/one/pulls -X POST --jq .html_url"]
+)
+def test_unrelated_commands_do_not_hide_pr_write(other: str, before: bool, write: str) -> None:
+    command = f"{other}; {write}" if before else f"{write}; {other}"
+    refs, created = extract_prs("Bash", {"command": command}, {"stdout": A, "exit_code": 0})
+    assert [ref.url for ref in refs] == [A]
+    assert created
 
 
 def test_rest_proxy_wrapper() -> None:
@@ -481,13 +880,172 @@ def test_background_or_interrupted_shell_does_not_attach_target(result: dict) ->
     assert refs == []
 
 
-def test_read_api_output_is_not_attributed_to_later_create() -> None:
-    refs, _ = extract_prs(
+@pytest.mark.parametrize(
+    "commands,urls,created",
+    [
+        (["gh api repos/example/one/pulls/42 --jq .html_url", "gh pr create"], [], True),
+        (["gh pr view 42 --repo example/one", "gh pr create"], [], True),
+        (["gh api repos/example/one/pulls -X POST", "gh pr edit 42"], [A, B], False),
+        (
+            ["gh api repos/example/one/pulls -X POST", "gh api repos/example/two/pulls/42"],
+            [],
+            True,
+        ),
+        (
+            ["gh api repos/example/one/pulls -X POST", "gh api repos/example/two/pulls -X POST"],
+            [A, B],
+            True,
+        ),
+        (["gh api repos/example/one/pulls -X POST", "gh pr create"], [A, B], True),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_combined_operations_keep_prs_without_misattributing_creation(
+    commands: list[str], urls: list[str], created: bool, reverse: bool
+) -> None:
+    refs, was_created = extract_prs(
         "Bash",
-        {"command": "gh api repos/example/one/pulls/42 --jq .html_url; gh pr create"},
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
         A + "\n" + B,
     )
+    assert {ref.url for ref in refs} == set(urls)
+    assert was_created is created
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"html_url": A + "#issuecomment-123", "body": B},
+        {"stdout": json.dumps({"html_url": A + "#issuecomment-123", "body": B})},
+        A + "#issuecomment-123",
+        f"Comment posted: [view]({A}#issuecomment-123)",
+        {"body": B},
+        {"html_url": A.replace("/pull/", "/issues/") + "#issuecomment-123"},
+        {"stdout": A, "exit_code": 1},
+        {"stdout": A, "interrupted": True},
+        {"stdout": A, "backgroundTaskId": "pending"},
+    ],
+)
+def test_rest_comment_ignores_pr_identity(result: object) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"gh api repos/example/one/issues/42/comments -f body='{B}'"},
+        result,
+    )
     assert refs == []
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["gh pr view 42 --json url,body", "gh api repos/example/one/pulls/42"],
+)
+def test_pr_reads_ignore_structured_identity(command: str) -> None:
+    refs, created = extract_prs(
+        "Bash", {"command": command}, {"stdout": json.dumps({"url": A, "body": B})}
+    )
+    assert refs == []
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "result,urls",
+    [
+        (f"Fix typo\n\nSupersedes {B}.\nView this pull request on GitHub: {A}", []),
+        (f"posted: [view]({A}#issuecomment-9)", []),
+        (f"See {B} for background\n{A}", [A]),
+    ],
+)
+def test_rendered_output_requires_complete_url_line(result: str, urls: list[str]) -> None:
+    refs, created = extract_prs("Bash", {"command": "gh pr edit 42 --title test"}, result)
+    assert [ref.url for ref in refs] == urls
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr edit 42 -R example/one --title test",
+        f"gh pr merge {A} --squash",
+        "gh auth status; gh pr edit -R example/one 42 --title test; gh config set pager cat",
+        "gh pr review 42 -R example/one --approve",
+        "gh api repos/example/one/pulls/42 -X PATCH --jq .body",
+        "gh api repos/example/one/pulls/42/reviews -f event=APPROVE",
+    ],
+)
+def test_known_target_excludes_prs_mentioned_in_output(command: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": command},
+        {"stdout": f"Supersedes {B}\n{B}\nView this pull request on GitHub: {A}"},
+    )
+    assert [ref.url for ref in refs] == [A]
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr diff",
+        "gh pr diff 42",
+        "gh api repos/example/one/pulls -X POST --jq .body",
+        "gh api repos/example/one/pulls --jq '.[].body'",
+        "gh api repos/example/one/issues/42/comments --jq .body",
+        "gh pr view 42 --json body --jq .body",
+        "gh pr list --json body --jq '.[] | .body'",
+    ],
+)
+@pytest.mark.parametrize("output", [B, json.dumps({"url": B})])
+def test_content_only_output_does_not_supply_pr_identity(command: str, output: str) -> None:
+    refs, _ = extract_prs("Bash", {"command": command}, {"stdout": output})
+    assert refs == []
+
+
+def test_single_operation_prefers_structured_identity_over_text() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "gh pr create"},
+        {"structuredContent": {"html_url": A}, "stdout": B},
+    )
+    assert [ref.url for ref in refs] == [A]
+    assert created
+
+
+def test_plain_text_fallback_accepts_only_complete_url_lines() -> None:
+    refs, _ = extract_prs(
+        "Bash",
+        {"command": "gh pr edit 42 --title test; gh pr create"},
+        {
+            "stdout": (
+                f"Supersedes {A}\n+{A}\n[view]({A})\n"
+                f'42{A}\n"{A}" is mentioned\n{A}#comment is mentioned\n{B}\n'
+            )
+        },
+    )
+    assert [ref.url for ref in refs] == [B]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("second_json", [False, True])
+def test_compound_output_preserves_json_identities_and_url_lines(
+    reverse: bool, second_json: bool
+) -> None:
+    other = "https://github.com/unrelated/repo/pull/7"
+    commands = ["gh api repos/example/one/pulls -X POST", "gh pr create -R example/two"]
+    outputs = [json.dumps({"html_url": A, "body": other}, indent=2), B]
+    if second_json:
+        commands[1] = "gh api repos/example/two/pulls -X POST"
+        outputs[1] = json.dumps({"html_url": B, "body": other})
+    if reverse:
+        commands.reverse()
+        outputs.reverse()
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "; ".join(commands)},
+        {"stdout": "Preparing PRs\n" + "\n".join(outputs) + "\nShell cwd was reset"},
+    )
+    assert {ref.url for ref in refs} == {A, B}
+    assert created
 
 
 @pytest.mark.parametrize("envelope", [False, True])
@@ -521,14 +1079,18 @@ def test_rest_create_with_jq_and_multiline_shell(envelope: bool) -> None:
         ("gh api /repos/example/one/pulls/42 -X PATCH --jq .html_url", A, [A], False),
         ("gh api /repos/example/one/pulls/42 --jq .html_url", A, [], False),
         ("gh api /repos/example/one/pulls -X GET -f title=test --jq .html_url", A, [], False),
-        ("gh api /repos/example/one/pulls -X POST --jq .body", B, [], False),
-        ("gh api /repos/example/one/pulls -X POST --jq .html_url", B, [], False),
-        ("gh api /repos/example/one/pulls/99 -X PATCH --jq .html_url", A, [], False),
+        ("gh api /repos/example/one/pulls --jq '.[].html_url'", A + "\n" + B, [], False),
+        (
+            "gh api /repos/example/one/pulls/99 -X PATCH --jq .body",
+            A,
+            [A.replace("/42", "/99")],
+            False,
+        ),
         (
             "gh api --input /repos/example/one/pulls -X POST "
             "/repos/example/one/issues --jq .html_url",
             A,
-            [],
+            [A],
             False,
         ),
         (
@@ -546,8 +1108,9 @@ def test_rest_url_projection(command: str, result: object, urls: list[str], crea
         assert was_created is created
 
 
-@pytest.mark.parametrize("quote,urls", [('"', [A]), ("'", [])])
-def test_shell_continuation_respects_quoting(quote: str, urls: list[str]) -> None:
+@pytest.mark.parametrize("quote,created", [('"', True), ("'", False)])
+def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
     command = f"gh api {quote}/repos/example/one/pul\\\nls{quote} -X POST --jq .html_url"
-    refs, _ = extract_prs("Bash", {"command": command}, A)
-    assert [pr.url for pr in refs] == urls
+    refs, was_created = extract_prs("Bash", {"command": command}, A)
+    assert [pr.url for pr in refs] == [A]
+    assert was_created is created

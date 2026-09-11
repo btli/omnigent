@@ -38,11 +38,16 @@ async def test_native_session_tracks_prs_across_repositories(
         f"#!{sys.executable}\n"
         "import json, sys\n"
         "args = sys.argv[1:]\n"
-        "repo = (args[1].strip('/').removeprefix('repos/').removesuffix('/pulls')\n"
+        "if args[0] not in {'pr', 'api'}: sys.exit(0)\n"
+        "repo = ('/'.join(args[1].strip('/').split('/')[1:3])\n"
         "        if args[0] == 'api' else "
         "args[args.index('-R') + 1].removeprefix('github.com/'))\n"
         "url = f'https://github.com/{repo}/pull/42'\n"
         "if args[:2] == ['pr', 'create'] or args[0] == 'api': print(url)\n"
+        "elif args[:2] == ['pr', 'view'] and '--comments' in args:\n"
+        "    print('Supersedes https://github.com/unrelated/repo/pull/7')\n"
+        "    print('https://github.com/unrelated/repo/pull/7')\n"
+        "    print('View this pull request on GitHub: ' + url)\n"
         "elif args[:2] == ['pr', 'view']: "
         "print(json.dumps({'number': 42, 'url': url, 'title': repo, 'state': 'OPEN'}))\n"
         "elif args[:2] == ['pr', 'diff']: print('patch for ' + repo)\n"
@@ -63,9 +68,25 @@ async def test_native_session_tracks_prs_across_repositories(
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
     command = shlex.split(str(hook["command"]))
     try:
-        shell_command = "gh pr create -R example/one"
-        output = subprocess.check_output(shlex.split(shell_command), text=True, cwd=workspace)
+        shell_command = (
+            "gh auth switch --user example-user; gh repo set-default example/one && "
+            + ("gh pr diff 42 -R example/read && " if harness == "claude_native" else "")
+            + "gh pr create -R example/one; gh config set pager cat"
+        )
+        output = subprocess.check_output(
+            ["/bin/sh", "-c", shell_command], text=True, cwd=workspace
+        )
+        shell_response: dict[str, object] = {"stdout": output, "exit_code": 0}
+        if harness == "claude_native":
+            # Claude retains creation metadata when a long diff truncates stdout.
+            url = "https://github.com/example/one/pull/42"
+            shell_response = {
+                "stdout": output[: output.index(url)],
+                "interrupted": False,
+                "gitOperation": {"pr": {"number": 42, "url": url, "action": "created"}},
+            }
         rest_command = (
+            "gh auth switch --user example-user; "
             "printf 'HEAD SHA: fixture\\n' && gh api /repos/example/three/pulls \\\n"
             "  --method POST \\\n"
             "  --field title='fixture PR' \\\n"
@@ -75,11 +96,22 @@ async def test_native_session_tracks_prs_across_repositories(
         rest_output = subprocess.check_output(
             ["/bin/sh", "-c", rest_command], text=True, cwd=workspace
         )
+        mixed_command = (
+            "gh api /repos/example/commented/issues/42/comments -f body=fixture; "
+            "gh pr view 42 -R example/read --json url"
+        )
+        mixed_output = subprocess.check_output(
+            ["/bin/sh", "-c", mixed_command], text=True, cwd=workspace
+        )
+        view_command = "gh pr view 42 -R example/one --comments"
+        view_output = subprocess.check_output(
+            ["/bin/sh", "-c", view_command], text=True, cwd=workspace
+        )
         payloads = [
             {
                 "tool_name": "Bash",
                 "tool_input": {"command": shell_command},
-                "tool_response": {"stdout": output, "exit_code": 0},
+                "tool_response": shell_response,
             },
             {
                 "tool_name": "Bash",
@@ -122,6 +154,31 @@ async def test_native_session_tracks_prs_across_repositories(
                     }
                 ),
             },
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": view_command},
+                "tool_response": {"stdout": view_output, "exit_code": 0},
+            },
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": mixed_command},
+                "tool_response": {"stdout": mixed_output, "exit_code": 0},
+            },
+            {
+                "tool_name": "mcp__custom__create_pull_request_review",
+                "tool_input": {
+                    "owner": "example",
+                    "repo": "commented",
+                    "pullNumber": 42,
+                    "event": "COMMENT",
+                },
+                "tool_response": {"html_url": "https://github.com/example/commented/pull/42"},
+            },
+            {
+                "tool_name": "mcp__custom__update_pull_request",
+                "tool_input": {"owner": "example", "repo": "five", "pullNumber": 42},
+                "tool_response": {"html_url": "https://github.com/example/five/pull/42"},
+            },
         ]
         for index, payload in enumerate(payloads):
             payload.update(
@@ -140,6 +197,29 @@ async def test_native_session_tracks_prs_across_repositories(
                 )
                 assert completed.returncode == 0, completed.stderr
                 assert completed.stdout == ""
+        registry = SessionPrRegistry("conv_owned")
+        entries = registry.list()
+        assert len(entries) == 5
+        assert {entry.repository: entry.relationship for entry in entries} == {
+            "example/one": "created",
+            "example/two": "created",
+            "example/three": "created",
+            "example/four": "created",
+            "example/five": "worked_on",
+        }
+        registry.remove("https://github.com/example/five/pull/42")
+        # A new observation, as well as hook replay, must respect explicit unlinking.
+        for call_id in (payloads[-1]["tool_use_id"], "new-update"):
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                input=json.dumps({**payloads[-1], "tool_use_id": call_id}),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            assert completed.returncode == 0, completed.stderr
+            assert completed.stdout == ""
         info = json.loads((bridge_dir / "tool_relay.json").read_text())
         async with httpx.AsyncClient() as client:
             denied = await client.post(info["url"] + "/hook/observe-tool", json=payloads[0])

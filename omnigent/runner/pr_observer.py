@@ -17,25 +17,28 @@ from omnigent.policies.builtins._shell import (
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
 
 _logger = logging.getLogger(__name__)
-_PR_ACTIONS = {
+_PR_WRITES = {
     "create",
     "edit",
-    "review",
-    "checkout",
     "merge",
-    "ready",
-    "reopen",
     "close",
-    "comment",
+    "reopen",
+    "ready",
+    "lock",
+    "unlock",
+    "update-branch",
+}
+_MCP_REVIEWS = {
+    "create_pull_request_review",
+    "submit_pending_pull_request_review",
+    "pull_request_review_write",
 }
 _MCP_ACTIONS = {
     "create_pull_request",
     "update_pull_request",
     "merge_pull_request",
     "update_pull_request_branch",
-    "create_pull_request_review",
-    "submit_pending_pull_request_review",
-    "pull_request_review_write",
+    *_MCP_REVIEWS,
 }
 
 
@@ -53,10 +56,33 @@ def _result_parts(result: object, depth: int = 0) -> list[dict[str, object] | st
     if depth > 6:
         return []
     if isinstance(result, str):
-        try:
-            return _result_parts(json.loads(result), depth + 1)
-        except ValueError:
-            return [result]
+        # Compound shell output can interleave JSON responses, URL lines, and logs.
+        parts: list[dict[str, object] | str] = []
+        decoder = json.JSONDecoder()
+        index = 0
+        while index < len(result):
+            if result[index].isspace():
+                index += 1
+                continue
+            position = index
+            if result[index] in '{["':
+                try:
+                    value, position = decoder.raw_decode(result, index)
+                except ValueError as error:
+                    # Keep incomplete JSON together instead of re-parsing its nested lines.
+                    position = error.pos if isinstance(error, json.JSONDecodeError) else index
+                else:
+                    line_end = result.find("\n", position)
+                    if not result[position : line_end if line_end != -1 else len(result)].strip():
+                        parts.extend(_result_parts(value, depth + 1))
+                        index = position
+                        continue
+            end = result.find("\n", position)
+            if end == -1:
+                end = len(result)
+            parts.append(result[index:end])
+            index = end
+        return parts
     if isinstance(result, list):
         return [part for item in result[:100] for part in _result_parts(item, depth + 1)]
     if not isinstance(result, dict):
@@ -229,6 +255,69 @@ def _api_endpoint(tokens: list[str]) -> str | None:
     return None
 
 
+def _api_method(tokens: list[str]) -> str:
+    method = _flag(tokens, "--method", "-X")
+    if method is None:
+        method = (
+            "POST" if _flag(tokens, "--field", "--raw-field", "-f", "-F", "--input") else "GET"
+        )
+    return method.upper()
+
+
+def _api_field(tokens: list[str], field: str) -> str | None:
+    flags = ("--field", "--raw-field", "-f", "-F")
+    index = 0
+    while index < len(tokens):
+        value = _flag(tokens[index : index + 2], *flags)
+        if value is not None:
+            key, separator, content = value.partition("=")
+            if key == field and separator:
+                return content
+            if tokens[index] in flags:
+                index += 1
+        index += 1
+    return None
+
+
+def _changes_review_state(event: object) -> bool:
+    return isinstance(event, str) and event.upper() in {"APPROVE", "REQUEST_CHANGES"}
+
+
+def _tracks_pr(tokens: list[str]) -> bool:
+    """Track PR changes, excluding reads and comment-only interactions."""
+    if tokens[0] == "pr":
+        if len(tokens) < 2:
+            return False
+        if tokens[1] == "review":
+            return bool({"--approve", "-a", "--request-changes", "-r"}.intersection(tokens[2:]))
+        return tokens[1] in _PR_WRITES
+    if tokens[0] != "api" or _api_method(tokens) not in {"POST", "PATCH", "PUT", "DELETE"}:
+        return False
+    endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
+    path = endpoint.strip("/").split("/")
+    # GraphQL POSTs can be queries or comment mutations; HTTP method alone is insufficient.
+    if path[0] != "repos" or len(path) < 4:
+        return False
+    resource = path[3:]
+    if "comments" in resource:
+        return False
+    if "reviews" in resource:
+        return _changes_review_state(_api_field(tokens, "event"))
+    return True
+
+
+def _creates_pr(tokens: list[str]) -> bool:
+    if tokens[:2] == ["pr", "create"]:
+        return True
+    if tokens[0] != "api":
+        return False
+    endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
+    return (
+        _api_method(tokens) == "POST"
+        and re.fullmatch(r"/?repos/[^/]+/[^/]+/pulls/?", endpoint) is not None
+    )
+
+
 def _positional_target(tokens: list[str]) -> str | None:
     # Unknown flags are deliberately ambiguous; output URLs can still identify the PR.
     values = {
@@ -257,6 +346,11 @@ def _positional_target(tokens: list[str]) -> str | None:
         "--match-head-commit",
         "--branch",
         "--reason",
+        "--json",
+        "--jq",
+        "-q",
+        "--template",
+        "--color",
     }
     switches = {
         "--approve",
@@ -285,6 +379,9 @@ def _positional_target(tokens: list[str]) -> str | None:
         "--yes",
         "--web",
         "-w",
+        "--comments",
+        "--patch",
+        "--name-only",
     }
     index = 0
     while index < len(tokens):
@@ -310,6 +407,47 @@ def _target(repository: object, number: object, host: str = "github.com") -> Pul
             host, repository = parts[0], "/".join(parts[1:])
         return _reference(f"https://{host}/{repository}/pull/{number}")
     return None
+
+
+def _command_target(tokens: list[str]) -> PullRequestRef | None:
+    host = _flag(tokens, "--hostname") or "github.com"
+    if tokens[0] == "api":
+        endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
+        match = re.match(r"/?repos/([^/]+/[^/]+)/pulls/([1-9][0-9]*)(?:/|$)", endpoint)
+        return _target(match[1], match[2], host) if match else None
+    if tokens[0] == "pr" and len(tokens) > 1 and tokens[1] != "create":
+        target = _positional_target(tokens[2:])
+        if ref := _reference(target):
+            return ref
+        if target and target.isdigit():
+            return _target(_flag(tokens, "--repo", "-R"), target, host)
+    return None
+
+
+def _content_only(tokens: list[str]) -> bool:
+    fields = _flag(tokens, "--json")
+    return (
+        tokens[:2] == ["pr", "diff"]
+        or _flag(tokens, "--jq", "-q") in {".body", ".[].body"}
+        or (
+            tokens[0] == "pr"
+            and fields is not None
+            and set(fields.split(",")) <= {"body", "title"}
+        )
+    )
+
+
+def _created_pr_metadata(result: object) -> PullRequestRef | None:
+    """Read Claude's creation identity from tool metadata, never rendered stdout."""
+    if not isinstance(result, dict):
+        return None
+    operation = result.get("gitOperation")
+    if not isinstance(operation, dict):
+        return None
+    pr = operation.get("pr")
+    if not isinstance(pr, dict) or pr.get("action") != "created":
+        return None
+    return _reference(pr.get("url"))
 
 
 def _mcp_prs(
@@ -361,69 +499,38 @@ def extract_prs(
         command = arguments.get("command", arguments.get("cmd"))
         if not isinstance(command, str) or len(command) > 100_000:
             return [], False
-        commands = _gh_commands(command)
-        text = _output_text(result)
-        if re.search(r"\[exit code: [1-9]|Process exited with code [1-9]", text):
+        # Unrelated setup commands do not affect PR associations.
+        gh_commands = [
+            tokens for tokens in _gh_commands(command) if tokens and tokens[0] in {"pr", "api"}
+        ]
+        commands = [tokens for tokens in gh_commands if _tracks_pr(tokens)]
+        if not commands:
             return [], False
-        actions = [tokens[1] for tokens in commands if len(tokens) > 1 and tokens[0] == "pr"]
-        # A combined output cannot establish which conditional command produced a URL.
-        if any(action not in _PR_ACTIONS for action in actions) or (
-            len(commands) > 1 and len(actions) != len(commands)
+        text = _output_text(result)
+        if re.search(
+            r"(?:^|\n)(?:\[exit code: -?[1-9][0-9]*\]"
+            r"|Process exited with code -?[1-9][0-9]*)\s*\Z",
+            text,
         ):
             return [], False
-        created = bool(actions) and all(action == "create" for action in actions)
-        for tokens in commands:
-            if tokens and tokens[0] == "pr":
-                index = 0
-                if len(tokens) <= index + 1 or tokens[index + 1] not in _PR_ACTIONS:
-                    continue
-                action = tokens[index + 1]
-                # Standalone URLs are gh's operation result, not links embedded in a body.
+        created = all(_creates_pr(tokens) for tokens in commands)
+        references = [ref for tokens in commands if (ref := _command_target(tokens))]
+        if any(_creates_pr(tokens) for tokens in commands) and (
+            ref := _created_pr_metadata(result)
+        ):
+            references.append(ref)
+        # Shared stdout cannot attribute a result to a write when reads/comments also ran.
+        if len(commands) == len(gh_commands) and (
+            len(commands) > 1 or not _content_only(commands[0])
+        ):
+            for obj in _objects(result):
+                if ref := _reference(obj.get("html_url", obj.get("url"))):
+                    references.append(ref)
+            # A single operation's known identity makes rendered body links redundant.
+            if len(commands) > 1 or not references:
                 for line in text.splitlines():
-                    ref = _reference(line.strip())
-                    if ref:
+                    if len(line.split()) == 1 and (ref := _reference(line.strip())):
                         references.append(ref)
-                if action != "create":
-                    target = _positional_target(tokens[index + 2 :])
-                    ref = _reference(target)
-                    if ref is None and target and target.isdigit():
-                        ref = _target(
-                            _flag(tokens, "--repo", "-R"),
-                            target,
-                            _flag(tokens, "--hostname") or "github.com",
-                        )
-                    if ref:
-                        references.append(ref)
-            elif tokens and tokens[0] == "api":
-                method = _flag(tokens, "--method", "-X")
-                writes = method in {"POST", "PATCH", "PUT"} or (
-                    method is None and _flag(tokens, "--field", "--raw-field", "-f", "-F")
-                )
-                if not writes:
-                    continue
-                for obj in _objects(result):
-                    if ref := _reference(obj.get("html_url", obj.get("url"))):
-                        references.append(ref)
-                endpoint = _api_endpoint(tokens[1:])
-                pr_endpoint = re.fullmatch(
-                    r"/?repos/([^/]+/[^/]+)/pulls(?:/([1-9][0-9]*))?/?",
-                    (endpoint or "").split("?", 1)[0],
-                )
-                created = bool(pr_endpoint and pr_endpoint[2] is None and method in {None, "POST"})
-                # A direct URL projection omits the JSON envelope. Body/list projections
-                # can contain unrelated PR links and are not association evidence.
-                if pr_endpoint and _flag(tokens, "--jq", "-q") in {".html_url", ".url"}:
-                    projected = {
-                        ref.url: ref
-                        for line in text.splitlines()
-                        if (ref := _reference(line.strip()))
-                    }
-                    if len(projected) == 1:
-                        ref = next(iter(projected.values()))
-                        if ref.repository == pr_endpoint[1].lower() and (
-                            pr_endpoint[2] is None or ref.number == int(pr_endpoint[2])
-                        ):
-                            references.append(ref)
     else:
         name = tool_name.rsplit("__", 1)[-1].removeprefix("github_")
         if name == "write_api_call":
@@ -441,6 +548,8 @@ def extract_prs(
             if isinstance(params, dict):
                 arguments = {**params, "owner": params.get("owner", params.get("org"))}
         if name not in _MCP_ACTIONS:
+            return [], False
+        if name in _MCP_REVIEWS and not _changes_review_state(arguments.get("event")):
             return [], False
         created = name == "create_pull_request"
         references = _mcp_prs(arguments, result, created=created)
