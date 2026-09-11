@@ -1103,9 +1103,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
   if (eventType === "response.elicitation_resolved") {
     const elicitationId = data.elicitation_id;
     if (typeof elicitationId !== "string" || !elicitationId) return null;
+    const action = data.action;
+    const hasVerdict = action === "accept" || action === "decline" || action === "cancel";
     return {
       type: "elicitation_resolved",
       elicitationId,
+      // Keep the verdict when present so the card can show it instead
+      // of the ambiguous "Resolved elsewhere" pill.
+      ...(hasVerdict ? { action } : {}),
+      // Only a verdict-less clear may say why: "unanswered" means the
+      // prompt expired, so the card can tell the user what to do next.
+      ...(!hasVerdict && data.reason === "unanswered" ? { reason: data.reason } : {}),
     } satisfies ElicitationResolved;
   }
 

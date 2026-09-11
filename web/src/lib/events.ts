@@ -290,6 +290,20 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
+  /**
+   * Why the prompt resolved without a verdict, when the server knows:
+   * `"unanswered"` means the hook stopped waiting (a severed poll never
+   * re-parked, the ask timed out) before anyone answered, so the prompt
+   * is gone rather than decided. Never present alongside `action`.
+   */
+  reason?: "unanswered";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */

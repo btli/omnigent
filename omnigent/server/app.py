@@ -2941,7 +2941,9 @@ def create_app(
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
         # flip offline at once. Not on our own shutdown: the runner is alive and
         # re-tunnels to the replacement, which must not settle its turns to idle.
-        if not shutdown_state.server_shutting_down():
+        if shutdown_state.server_shutting_down():
+            session_live_state.touch_runner_liveness([runner_id])
+        else:
             session_live_state.clear_runner_liveness(runner_id)
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
