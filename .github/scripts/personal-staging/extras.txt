@@ -17,4 +17,23 @@
 # 1234              # keep the composer hotfix until upstream merges it
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
-6656  # draft feat/3d-preview-large-models (btli); keep pinned if the PR closes before landing
+#
+# btli open+draft PRs — force-included so a compose never drops one (drafts are
+# not covered by the open-PR stream; ready PRs are pinned redundantly on purpose
+# so nothing is left out of a staging build). Remove each once it lands upstream.
+6856  # draft fix/background-battery-drain-main
+6788  # open  fix/agent-sandbox-wake-workspace
+6776  # draft fix/agent-sandbox-display-name
+6656  # draft feat/3d-preview-large-models
+6449  # draft fix/kimi-trust-preseed
+6436  # draft fix/kimi-permission-label-main
+6370  # draft fix/kimi-provider-resolution
+6319  # open  fix/unified-touch-input
+6136  # open  feat/terminal-extra-keys
+5554  # open  pollux/terminal-backpressure-v2
+5381  # open  automation-project-assignment (alembic merge-head re-parented on rebase)
+5264  # open  fix/terminal-scrollbar-bleed-5225
+4650  # open  fix/oidc-browser-handoff
+4438  # open  pollux/server-disconnect-attribution
+4058  # open  feat/graph-view-agent-icons-v2
+2923  # draft polly/font-loader-catalog

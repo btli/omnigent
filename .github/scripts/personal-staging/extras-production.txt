@@ -8,11 +8,23 @@
 # marked ready for review (the open-PR stream then covers it) or lands
 # upstream. Bot-authored pins are never covered by the open-PR stream;
 # remove them once merged upstream, or replace them when superseded.
-6856  # draft fix/background-battery-drain-main (btli) supersedes bot #5825 on v0.13.0; force-promoted into production; remove once marked ready or merged upstream
-6370  # draft fix/kimi-provider-resolution (btli) force-promoted into production; remove once marked ready or merged upstream
-6436  # draft fix/kimi-permission-label-main (btli) force-promoted into production; remove once marked ready or merged upstream
-6439  # draft fix/kimi-steer-ctrl-s-main (btli) force-promoted into production; remove once marked ready or merged upstream
-6449  # draft fix/kimi-trust-preseed (btli) force-promoted into production; remove once marked ready or merged upstream
-6656  # draft feat/3d-preview-large-models (btli) force-promoted into production; remove once marked ready or merged upstream
-2923  # draft polly/font-loader-catalog (btli, PR 1/2 for #2921) force-promoted into production; remove once marked ready or merged upstream
-6776  # draft fix/agent-sandbox-display-name (btli) force-promoted into production; remove once marked ready or merged upstream
+# All btli open+draft PRs force-promoted into production so a nightly compose
+# never drops one. Drafts override the draft gate; ready PRs are pinned
+# redundantly on purpose (belt-and-suspenders over the open-PR stream). Remove
+# each once it lands upstream. #6439 (fix/kimi-steer-ctrl-s) removed — merged.
+6856  # draft fix/background-battery-drain-main (supersedes bot #5825 on v0.13.0)
+6788  # open  fix/agent-sandbox-wake-workspace
+6776  # draft fix/agent-sandbox-display-name
+6656  # draft feat/3d-preview-large-models
+6449  # draft fix/kimi-trust-preseed
+6436  # draft fix/kimi-permission-label-main
+6370  # draft fix/kimi-provider-resolution
+6319  # open  fix/unified-touch-input
+6136  # open  feat/terminal-extra-keys
+5554  # open  pollux/terminal-backpressure-v2
+5381  # open  automation-project-assignment (alembic merge-head re-parented on rebase)
+5264  # open  fix/terminal-scrollbar-bleed-5225
+4650  # open  fix/oidc-browser-handoff
+4438  # open  pollux/server-disconnect-attribution
+4058  # open  feat/graph-view-agent-icons-v2
+2923  # draft polly/font-loader-catalog (PR 1/2 for #2921)
