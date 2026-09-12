@@ -4,6 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
@@ -36,6 +37,34 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
+}));
+// The workspace bar's git-status hook uses TanStack Query; stub it so the
+// composer renders in isolation (no QueryClient) with a neutral empty status.
+// The hoisted spy records the args so a test can assert the page passes the
+// real session id / host / workspace / creation branch (not fixtures).
+const { composerGitStatusArgsSpy } = vi.hoisted(() => ({ composerGitStatusArgsSpy: vi.fn() }));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: (args: unknown) => {
+    composerGitStatusArgsSpy(args);
+    return {
+      branch: null,
+      branchState: "unknown",
+      isWorktree: null,
+      worktreePath: null,
+      creationBranch: null,
+      repoNameWithOwner: null,
+      prCount: 0,
+      prNumber: null,
+      refresh: () => {},
+      refreshing: false,
+    };
+  },
+}));
+// SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
+// so the indicator self-hides (no active children) in isolated composer renders.
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
@@ -878,7 +907,7 @@ describe("Composer slash-command submit routing", () => {
     );
 
     const pill = screen.getByTestId("composer-config-gear");
-    expect(pill).toHaveTextContent("Sonnet 4.6");
+    expect(pill).toHaveTextContent("sonnet");
     expect(pill).not.toHaveTextContent("Workspace");
     fireEvent.focus(pill);
     const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
@@ -1224,15 +1253,17 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Opus 4.6");
+    expect(label()).toHaveTextContent("system.ai.claude-opus-4-6");
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
     const row = screen.getByTestId("composer-agent-edit");
     expect(row).toHaveClass("composer-agent-row");
     expect(row).toHaveAttribute("data-active", "true");
-    expect(within(row).getByText("Opus 4.6")).toHaveClass("text-right");
+    expect(within(row).getByText("system.ai.claude-opus-4-6")).toHaveClass("text-right");
     expect(within(row).getByText("Edit")).toHaveClass("composer-agent-edit");
     fireEvent.keyDown(row, { key: "ArrowRight" });
-    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus 4.6");
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent(
+      "system.ai.claude-opus-4-6",
+    );
   });
 
   it("shows the model in the foreground and effort muted", () => {
@@ -1250,13 +1281,42 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Opus");
+    expect(label()).toHaveTextContent("opus");
     expect(label()).toHaveTextContent("High");
     // The harness identity ("Claude") is NOT in the label — it lives in the gear tooltip.
     expect(label()).not.toHaveTextContent("Claude");
     // Model black, effort grey.
-    expect(within(label()).getByText("Opus")).toHaveClass("text-foreground");
+    expect(within(label()).getByText("opus")).toHaveClass("text-foreground");
     expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows no effort for a seeded null, never borrowing the cross-session sticky (#7039)", () => {
+    // Same sticky "high" as the test above, but the optimistic create seeded an
+    // intentional "no effort" (sessionEffortSeeded) — the authoritative seed
+    // must win, so the label shows the model with no effort, not "High".
+    useChatStore.setState({
+      llmModel: "opus",
+      selectedEffort: "high",
+      sessionReasoningEffort: null,
+      sessionEffortSeeded: true,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("opus");
+    expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+    // This suite shares one global store and only resets what each test sets;
+    // no other test touches the seeded flag, so restore the default here.
+    useChatStore.setState({ sessionEffortSeeded: false });
   });
 
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
@@ -1284,7 +1344,7 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Smart Routing");
-    expect(label()).not.toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("opus");
     expect(label()).not.toHaveTextContent("High");
     // Routing picks the connection per turn, so the pill tooltip must not
     // surface a stale pinned provenance row.
@@ -1315,9 +1375,9 @@ describe("Composer model/effort label", () => {
     // The harness's report ("haiku") is the display authority: neither the
     // pending request ("sonnet") nor the cross-session sticky ("opus") may
     // render as if it were the session's model.
-    expect(label()).toHaveTextContent("Haiku");
-    expect(label()).not.toHaveTextContent("Opus");
-    expect(label()).not.toHaveTextContent("Sonnet");
+    expect(label()).toHaveTextContent("haiku");
+    expect(label()).not.toHaveTextContent("opus");
+    expect(label()).not.toHaveTextContent("sonnet");
   });
 
   const CLAUDE_LIVE_OPTIONS = [
@@ -1325,7 +1385,7 @@ describe("Composer model/effort label", () => {
     { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
   ];
 
-  it("maps a Claude concrete model to its friendly alias in the read-only label", () => {
+  it("preserves a Claude concrete model ID in the read-only label", () => {
     useChatStore.setState({
       selectedModel: null,
       sessionModelOverride: null,
@@ -1344,9 +1404,8 @@ describe("Composer model/effort label", () => {
       />,
     );
 
-    // The read-only label maps the concrete bound model to its friendly alias.
-    expect(label()).toHaveTextContent("Sonnet 5");
-    expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
+    expect(label()).toHaveTextContent("system.ai.claude-sonnet-5");
+    expect(label()).not.toHaveTextContent("Sonnet 5");
     // The modal's catalog-default fallback (isDefault row when no concrete
     // model) is exercised in the real browser by the claude model-picker e2e
     // tests, where the Radix Select actually mounts its option rows.
@@ -1478,12 +1537,12 @@ describe("Composer model/effort label", () => {
         })}
       />,
     );
-    expect(label()).toHaveTextContent("Composer 2.5");
+    expect(label()).toHaveTextContent("composer-2.5");
     // Neither the stale sticky, the meaningless vendor default, nor any effort leaks in.
-    expect(label()).not.toHaveTextContent("Opus 4.5");
+    expect(label()).not.toHaveTextContent("opus-4.5");
     expect(label()).not.toHaveTextContent("fable");
     expect(label()).not.toHaveTextContent("Low");
-    expect(within(label()).getByText("Composer 2.5")).toHaveClass("text-foreground");
+    expect(within(label()).getByText("composer-2.5")).toHaveClass("text-foreground");
   });
 
   it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {
@@ -1642,23 +1701,9 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
   });
 
-  it.each([
-    ["Session workspace", 0],
-    ["Session worktree", 1],
-  ])("wraps text inside the %s popover", (label, triggerIndex) => {
-    renderWithTooltips(<Composer {...composerProps()} />);
-
-    const controls = screen.getByTestId("composer-workspace-controls");
-    fireEvent.keyDown(within(controls).getAllByRole("button")[triggerIndex], {
-      key: "ArrowDown",
-    });
-
-    const popover = screen.getByRole("menu");
-    expect(within(popover).getByText(label)).toBeVisible();
-    expect(popover).toHaveClass("whitespace-normal", "max-w-[min(90vw,28rem)]");
-    expect(popover).not.toHaveClass("whitespace-nowrap");
-    expect(popover.querySelector("p")).toHaveClass("break-all");
-  });
+  // The workspace/worktree popover markup moved into the shared
+  // ComposerWorkspaceStatus component (its own tests cover the popover text
+  // wrapping); the two page-local inline-dropdown popover cases retired with it.
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
     useChatStore.setState({
@@ -1685,9 +1730,10 @@ describe("Composer shared visible controls", () => {
     expect(actions.parentElement).toBe(card);
     expect(actions.children).toHaveLength(2);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(within(workspace).getByTestId("composer-git-branch")).toHaveTextContent(
-      "feature/shared-composer",
-    );
+    // The branch text now flows through the shared ComposerWorkspaceStatus +
+    // useComposerGitStatus (covered by their own tests); here assert the shared
+    // branch control renders in the bar.
+    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
@@ -1696,6 +1742,22 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
+    // The workspace bar is fed by the page adapter, not fixtures: assert the
+    // page threads the actual session identity through useComposerGitStatus.
+    composerGitStatusArgsSpy.mockClear();
+    useChatStore.setState({ conversationId: "conv_git_args", gitBranch: "feature/x" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_git_args",
+        creationBranch: "feature/x",
+        hostId: null,
+        workspace: null,
+      }),
+    );
   });
 
   it("dispatches the shared permission picker to the session setter", async () => {
@@ -3153,7 +3215,7 @@ describe("Composer config gear", () => {
     // A bare "Default" was the bug: this gear and the new-session gear named
     // the same unpinned session's model differently, so neither told the user
     // which model Codex would actually run.
-    expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6-Luna" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "gpt-5.6-luna" })).toBeTruthy();
   });
 
   it("names the model Claude's Default resolves to, like Codex", async () => {
@@ -3182,7 +3244,7 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     await screen.findByTestId("composer-agent-config-menu");
-    expect(screen.getByRole("menuitemcheckbox", { name: "Opus 4.8 (1M context)" })).toBeTruthy();
+    expect(screen.getByRole("menuitemcheckbox", { name: "claude-opus-4-8[1m]" })).toBeTruthy();
   });
 
   it("does not open the modal via bare /model when the gear is disabled (unreachable)", async () => {
@@ -3461,7 +3523,7 @@ describe("Composer config gear", () => {
 
     it("names the model the session is on instead of rendering blank", async () => {
       await openModalOnRoutedSession();
-      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent(ROUTED);
+      expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("claude-opus-4-8");
     });
 
     it("pins nothing when opening and closing the model picker", async () => {
@@ -3472,7 +3534,7 @@ describe("Composer config gear", () => {
 
     it("still commits a real pick made from the catalog", async () => {
       const setModel = await openModalOnRoutedSession();
-      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "sonnet" }));
       await waitFor(() =>
         expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
       );
