@@ -30,6 +30,8 @@ import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { useSessionAgent } from "@/hooks/useAgents";
+import { AgentIcon, resolveAgentIcon } from "@/lib/agentIcon";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -48,7 +50,7 @@ import {
   type AgentActivity,
   type AgentStatus,
 } from "./subagentStatus";
-import { resolveAgentIcon } from "./subagentIcons";
+import { resolveAgentIcon as resolveCatalogIcon } from "./subagentIcons";
 import { AddAgentDialog } from "./AddAgentDialog";
 
 // Session-scoped URL params that the file viewer / Files panel write
@@ -413,12 +415,24 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
-  const Icon = resolveAgentIcon({
-    kind: "root",
-    wrapper: wrapper ?? null,
-    harness: session?.harness ?? null,
-    agentName: session?.agentName ?? null,
-  });
+  // The session's bound agent may declare a custom spec icon (emoji or image
+  // path). Resolve it declared-first via the shared resolver — the same one
+  // AgentCard uses — falling back to the wrapper/harness glyph when it has
+  // none. ``useSessionAgent`` is the icon's source (GET /v1/sessions/{id}/agent);
+  // its id addresses the icon endpoint for a path-valued icon. The fallback
+  // reuses the catalog resolver's root-glyph selection so the graph-view rail
+  // and this row stay in lockstep.
+  const { data: boundAgent } = useSessionAgent(rootSessionId);
+  const iconResolution = resolveAgentIcon(
+    { icon: boundAgent?.icon ?? null, id: boundAgent?.id ?? session?.agentId ?? null },
+    () =>
+      resolveCatalogIcon({
+        kind: "root",
+        wrapper: wrapper ?? null,
+        harness: session?.harness ?? null,
+        agentName: session?.agentName ?? null,
+      }),
+  );
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -445,7 +459,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         )}
       >
         <div className="flex w-full items-center gap-1">
-          <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+          <AgentIcon resolution={iconResolution} className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="shrink-0 truncate text-sm font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
@@ -493,7 +507,7 @@ function SubagentRow({
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = railLinkSearch(useLocation().search);
-  const Icon = resolveAgentIcon({
+  const Icon = resolveCatalogIcon({
     kind: "child",
     wrapper: child.labels?.[WRAPPER_LABEL_KEY] ?? null,
     tool: child.tool,
