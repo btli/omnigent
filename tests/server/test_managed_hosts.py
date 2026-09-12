@@ -3484,12 +3484,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     host_store.set_offline(first.host_id)
     assert host_resume_supported(host_store.get_host(first.host_id), config) is True
 
-    await resume_managed_host(
-        first.host_id,
-        host_store,
-        config,
-        repos=[parse_repo_workspace(raw_repo)] if raw_repo is not None else [],
-    )
+    await resume_managed_host(first.host_id, host_store, config)
 
     assert fake.resumed == ["sb-fake-1"]
     assert not any("git clone" in command for command in fake.commands)

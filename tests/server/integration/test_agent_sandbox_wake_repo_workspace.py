@@ -35,6 +35,7 @@ PASSES once the wake re-clones it.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import ClassVar
 
 import pytest
@@ -58,6 +59,7 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
+    RepoWorkspace,
 )
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -117,9 +119,7 @@ class _AgentSandboxFake(FakeSandboxLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage=None,
     ) -> str:
@@ -133,21 +133,20 @@ class _AgentSandboxFake(FakeSandboxLauncher):
         workspace = f"{self._home}/workspace"
         # `mkdir -p <workspace>` always runs in ExecModelHostLauncher.start_host.
         self.live_dirs.add(workspace)
-        if repo_url is not None:
-            # materialize_workspace clones into <workspace>/<repo_name>.
-            self.live_dirs.add(f"{workspace}/{repo_name}")
-        return super().start_host(
-            sandbox_id,
-            token=token,
-            host_id=host_id,
-            host_name=host_name,
-            server_url=server_url,
-            repo_url=repo_url,
-            repo_branch=repo_branch,
-            repo_name=repo_name,
-            host_config=host_config,
-            on_stage=on_stage,
-        )
+        for repo in repos:
+            self.live_dirs.add(f"{workspace}/{repo.repo_name}")
+        if on_stage is not None:
+            on_stage("starting")
+        if self._on_host_start is not None:
+            self._on_host_start(
+                HostStartInvocation(
+                    host_id=host_id,
+                    host_name=host_name,
+                    token=token,
+                    command="",
+                )
+            )
+        return f"{workspace}/{repos[0].repo_name}" if len(repos) == 1 else workspace
 
     def resume(self, sandbox_id: str) -> None:
         """Resume in place — the Pod recreates with a FRESH, EMPTY HOME."""

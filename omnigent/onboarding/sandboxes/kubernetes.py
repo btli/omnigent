@@ -552,18 +552,22 @@ def _render_workspace_prep_command(
             script += f"      printf '%s\\n' {error} >&2\n"
             script += "      exit 1\n    fi\n  fi\n"
             script += f"  if [ -e {temporary} ] || [ -L {temporary} ]; then\n"
-            script += f"    if [ -d {temporary} ] && [ ! -L {temporary} ] && [ -f {marker} ]; then\n"
+            script += (
+                f"    if [ -d {temporary} ] && [ ! -L {temporary} ] && [ -f {marker} ]; then\n"
+            )
             script += f"      rm -rf -- {temporary}\n"
             script += "    else\n"
             script += f"      printf '%s\\n' {staging_error} >&2\n"
             script += "      exit 1\n    fi\n  fi\n"
             script += f"  mkdir -- {temporary}\n  touch -- {marker}\n"
-            script += f"  if [ -z \"$wired\" ]; then python3 -c {shlex.quote(wire)} || true; wired=1; fi\n"
+            script += (
+                f'  if [ -z "$wired" ]; then python3 -c {shlex.quote(wire)} || true; wired=1; fi\n'
+            )
             script += (
                 f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
                 f"&& mv -f -- {staged_clone} {target} "
                 f"&& rm -f -- {marker} && rmdir -- {temporary}) "
-                f"& pids=\"$pids $!\"\n"
+                f'& pids="$pids $!"\n'
             )
             script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
