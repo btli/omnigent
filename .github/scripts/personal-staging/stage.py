@@ -472,11 +472,15 @@ def sync_main(cwd: str | Path, upstream: str = "upstream", fork: str = "origin")
 
 
 def assert_descendant(cwd: str | Path, base_sha: str, candidate_sha: str) -> None:
-    if (
-        base_sha == candidate_sha
-        or git(cwd, "merge-base", "--is-ancestor", base_sha, candidate_sha, check=False).returncode
-    ):
-        raise StageError("base must be a strict ancestor of the candidate")
+    if git(cwd, "merge-base", "--is-ancestor", base_sha, candidate_sha, check=False).returncode:
+        raise StageError("base must be an ancestor of the candidate")
+
+
+def _main_lease(base_sha: str) -> tuple[str, str]:
+    return (
+        f"--force-with-lease=refs/heads/main:{base_sha}",
+        f"{base_sha}:refs/heads/main",
+    )
 
 
 def assert_publish_base(cwd: str | Path, fork: str, base_sha: str, candidate_sha: str) -> None:
@@ -780,14 +784,13 @@ def merge_prs(
                 assert_publish_base(
                     cwd, fork, base_sha, git(cwd, "rev-parse", "HEAD").stdout.strip()
                 )
-            push = git(
-                cwd,
-                "push",
-                f"--force-with-lease=refs/heads/{branch}:{rebased_from}",
-                fork,
-                f"{oid}:refs/heads/{branch}",
-                check=False,
-            )
+            push_args = [f"--force-with-lease=refs/heads/{branch}:{rebased_from}"]
+            refspecs = [f"{oid}:refs/heads/{branch}"]
+            if base_sha:
+                main_lease, main_refspec = _main_lease(base_sha)
+                push_args[:0] = ["--atomic", main_lease]
+                refspecs.insert(0, main_refspec)
+            push = git(cwd, "push", *push_args, fork, *refspecs, check=False)
             entry["rebased_from"] = rebased_from
             entry["pushed_back"] = push.returncode == 0
         applied.append(entry)
@@ -833,6 +836,7 @@ def _blocked_label(n: object) -> str:
 def push_causes(
     old: tuple[str, dict[int | str, tuple[str, str]]] | None,
     base_sha: str,
+    upstream_sha: str,
     applied: list[dict],
 ) -> list[str]:
     """One-line answer to "why did staging move": which composition inputs
@@ -872,7 +876,8 @@ def push_causes(
         entry = new.get(num)
         if entry is None:
             if num == "upstream":
-                causes.append("upstream HEAD")
+                if old_merges[num][1] != upstream_sha[:12]:
+                    causes.append("upstream HEAD")
                 continue
             # No longer composed at all (unpinned extra, closed PR, skip) —
             # say so rather than guessing which input it used to come from.
@@ -979,16 +984,15 @@ MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
 def migration_touched(
     cwd: str | Path,
     candidate_sha: str,
-    upstream_sha: str,
+    base_sha: str,
     prev_pin_sha: str | None,
     prefix: str = MIGRATIONS_PATH_PREFIX,
 ) -> bool:
     """True when the candidate composition carries a schema change: either
-    ``upstream..candidate`` touches the migrations path (a composed PR adds,
-    edits, or deletes one) or ``prev_pin..candidate`` does (a migration-bearing
-    PR *removed* between compositions — invisible to the upstream leg). With no
-    previous pin only the upstream diff is consulted."""
-    for base in (upstream_sha, prev_pin_sha):
+    ``base..candidate`` touches the migrations path (a composed PR adds, edits,
+    or deletes one) or ``prev_pin..candidate`` does (including a migration
+    added to main or removed between compositions)."""
+    for base in (base_sha, prev_pin_sha):
         if not base:
             continue
         out = git(cwd, "diff", "--name-only", f"{base}..{candidate_sha}").stdout
@@ -1041,9 +1045,12 @@ def stage(
     git(cwd, "fetch", upstream, "main")
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "fetch", fork, "main")
+    published_base_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     base_sha = git(
         cwd, "rev-parse", "--verify", f"{base_ref or 'FETCH_HEAD'}^{{commit}}"
     ).stdout.strip()
+    if base_sha != published_base_sha:
+        raise StageError(f"base ref {base_ref} is not published fork main")
     git(cwd, "checkout", "--detach", base_sha)
 
     infrastructure_error = None
@@ -1105,14 +1112,19 @@ def stage(
         report["causes"] = push_causes(
             composition_of(cwd, expected_staging, ring),
             base_sha,
+            upstream_sha,
             ([entry_zero] if entry_zero else []) + applied,
         )
         assert_publish_base(cwd, fork, base_sha, staging_sha)
+        main_lease, main_refspec = _main_lease(base_sha)
         git(
             cwd,
             "push",
+            "--atomic",
+            main_lease,
             f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}",
             fork,
+            main_refspec,
             f"{staging_sha}:refs/heads/{ring.branch}",
         )
         return report
@@ -1142,7 +1154,7 @@ def stage(
             "prev_pin": prev_pin_sha,
         }
         if (
-            migration_touched(cwd, staging_sha, upstream_sha, prev_pin_sha)
+            migration_touched(cwd, staging_sha, base_sha, prev_pin_sha)
             and migration_approval != staging_sha
         ):
             gate["blocked"] = True
@@ -1187,7 +1199,8 @@ def stage(
             leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
     if refspecs:
         assert_publish_base(cwd, fork, base_sha, staging_sha)
-        git(cwd, "push", "--atomic", *leases, fork, *refspecs)
+        main_lease, main_refspec = _main_lease(base_sha)
+        git(cwd, "push", "--atomic", main_lease, *leases, fork, main_refspec, *refspecs)
 
     return {
         "date": datestamp,

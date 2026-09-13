@@ -10,18 +10,18 @@ name: Personal Staging Hourly
 on:
   schedule:
     # Off the top of the hour on purpose: :00 would collide with the nightly's
-    # 10:00 UTC slot, and GitHub delays or drops runs
-    # scheduled on the congested :00 minute.
-    - cron: "17 * * * *"
+    # 10:00 UTC slot, and GitHub delays or drops runs scheduled on the
+    # congested :00 minute. Production owns the 10:00-11:10 ring window.
+    - cron: "17 0-9,11-23 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Keep privileged composition alive through publication.
+# Coalesce stale hourly runs before they reach the privileged compose job.
 concurrency:
   group: personal-staging-hourly
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   # Secretless test gate: `uv run` installs third-party dev deps, so this job
@@ -54,7 +54,7 @@ jobs:
   # Composes from published fork main; only production syncs main.
   compose:
     concurrency:
-      group: personal-ring-compose
+      group: personal-staging-hourly-compose
       cancel-in-progress: false
     needs: test-composer
     # Accident prevention for non-main dispatches (schedule always runs main);

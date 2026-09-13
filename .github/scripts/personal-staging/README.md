@@ -16,7 +16,7 @@ It:
    conflict paths land in `merge-report.json` — and the run continues.
    Extras are never rebased (their refs are frozen pins), and the
    production ring never rescues. All PRs conflicting is a reported
-   outcome, provided entry zero still makes staging a strict descendant of fork main.
+   outcome. If upstream is already contained, staging may equal fork main.
 2. Pins an immutable, canonical `nightly-YYYYMMDD` tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
    deprecated same-name compatibility branch slated for removal in v0.12.0
@@ -52,7 +52,7 @@ rebases it, never recomposes it). Nothing here flips any existing behavior.
 
 ## Hourly staging refresh (`personal-staging-hourly.yml`)
 
-`Personal Staging Hourly` (cron `17 * * * *`, plus `workflow_dispatch`)
+`Personal Staging Hourly` (cron `17 0-9,11-23 * * *`, plus `workflow_dispatch`)
 keeps branch `staging` fresh between nightlies. The odd minute is
 deliberate: GitHub delays or drops runs scheduled on the congested `:00` minute. It runs the same composer
 with `--staging-only`: compose fork main + fresh upstream main + open btli PRs + extras
@@ -67,11 +67,12 @@ result names which of upstream HEAD, the open PR set, or the extras
 changed.
 
 Neither staging workflow advances main. Only the scheduled production compose
-runs `stage.py sync-main`. All three privileged composition jobs share
-`personal-ring-compose` with `cancel-in-progress: false`; their outer workflow
-groups also do not cancel running jobs. A human main push still invalidates an
-in-flight composition: the composer checks fresh remote main before publication
-and fails closed if it differs from `base_sha`.
+runs `stage.py sync-main`. Each privileged composition job has its own
+non-cancelling concurrency group, so GitHub's single pending slot cannot evict a
+different ring. Hourly runs coalesce and skip 10:17 UTC, leaving the nightly and
+production window clear. A human main push invalidates an in-flight composition:
+every ring, pin, or rescue update is atomically coupled to an explicit lease and
+no-op refspec for main, so the entire push fails if `base_sha` is stale.
 
 ## Bases and sync ownership
 
@@ -87,10 +88,10 @@ upstream/main -- scheduled production sync-main --> published fork main
 `stage --base-ref REF` defaults to freshly fetched fork main. An explicit ref
 must resolve to that same published commit before anything can be published.
 Every report, including hourly infrastructure/extra blocks and migration blocks,
-carries `base_sha` and `upstream_sha`. `base_sha` anchors ancestry and production's
-first-parent identity validation. `upstream_sha` remains the PR fetch/rescue,
-dev-version and upstream migration baseline. The previous production pin remains
-the second migration baseline.
+carries `base_sha` and `upstream_sha`. `base_sha` anchors ancestry, production's
+first-parent identity validation, and the first migration-gate diff.
+`upstream_sha` remains the PR fetch/rescue and dev-version baseline. The previous
+production pin is the second migration baseline.
 
 Staging reports also carry `entry_zero` (`source: upstream`, `pr: 0`, `oid`,
 `minted`, and `rerere_paths` when used), separately from the existing PR lists.
@@ -112,7 +113,21 @@ Only a confirmed stale-ref rejection gets one retry, rebuilt from fresh main;
 a second race, merge conflict, hook, auth or transport failure stops publication.
 Scheduled production invokes it only with empty migration approval. Manual and
 approval dispatches compose from already-published main, which is fetched again
-by `stage` after sync. Neither ring can publish a candidate equal to its base.
+by `stage` after sync. A candidate equal to its base is valid and pins main when
+there are no new composition commits.
+
+### Main-sync recovery
+
+Rerere seeds apply to composition and staging entry zero, not `sync-main`. If
+sync-main or entry zero conflicts, check out fork main in a disposable clone,
+fetch and merge upstream main, resolve and commit, then use a normal
+`git push origin main`. Never use `--force` or `--force-with-lease` to rewrite
+main. After main contains the resolved merge, use **Re-run jobs** on the failed
+scheduled production run; an empty workflow dispatch intentionally skips sync.
+
+If this base-on-main design must be rolled back, revert the change on main.
+`--base-ref upstream/main` is not an escape hatch: an explicit base must equal
+published fork main.
 
 See the [staging ring README](../../../docs/rings/staging/README.md) and
 [production ring README](../../../docs/rings/production/README.md) for verification.
@@ -146,9 +161,9 @@ rings can never cancel each other.
 
 ### Migration gate
 
-A candidate that touches `omnigent/db/migrations/versions/**` — on EITHER
-`upstream/main..candidate` OR `previous-production-pin..candidate` (the
-second leg catches a migration-bearing PR *removed* between compositions) —
+A candidate that touches `omnigent/db/migrations/versions/**` — on either
+`base_sha..candidate` or `previous-production-pin..candidate` (the second leg
+catches a migration arriving on main or removed between compositions) —
 is never auto-published. `stage.py` itself refuses the atomic push, so **no
 ring refs move** (the scheduled main sync may already have advanced main): the run stays green (blocked is a success outcome), the
 step summary shows a BLOCKED row with the candidate sha, and a best-effort

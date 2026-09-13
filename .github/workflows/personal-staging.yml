@@ -63,7 +63,7 @@ jobs:
 
   integrate:
     concurrency:
-      group: personal-ring-compose
+      group: personal-staging-nightly-compose
       cancel-in-progress: false
     # Privileged (pushes refs) but runs ONLY the stdlib composer — no
     # third-party code. Requires the secretless test gate to pass.
@@ -257,10 +257,7 @@ jobs:
   # would be restored by future runs).
   android-build:
     needs: integrate
-    # `success()` spans the whole ancestry, so a failed sync-main would skip
-    # this job even though integrate cleared its own always() gate. The ring
-    # builds from integrate's commit and never reads fork main.
-    if: always() && needs.integrate.result == 'success'
+    # Build only after the ring composition succeeds.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:

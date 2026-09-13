@@ -312,6 +312,29 @@ def test_rescue_lease_spares_a_branch_that_moved(env):
     assert env.fork_ref("refs/heads/pr-5") == moved
 
 
+def test_rescue_main_race_keeps_pr_branch_unchanged(env, monkeypatch):
+    pr = _rescuable_pr(env)
+    real_git = stage_mod.git
+    preflight_complete = False
+
+    def race(cwd, *args, **kwargs):
+        nonlocal preflight_complete
+        if args[:3] == ("ls-remote", "origin", "refs/heads/main"):
+            result = real_git(cwd, *args, **kwargs)
+            preflight_complete = True
+            return result
+        if args[:1] == ("push",) and preflight_complete:
+            preflight_complete = False
+            git(env.fork, "fetch", str(env.seed), pr["headRefOid"])
+            git(env.fork, "update-ref", "refs/heads/main", pr["headRefOid"])
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", race)
+    with pytest.raises(stage_mod.StageError, match="fork main changed"):
+        env.run([pr], staging_only=True)
+    assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
+
+
 def test_rescue_refuses_a_merge_containing_branch(env):
     _rescuable_pr(env)
     # Graft a merge commit onto the PR head: a linear replay would drop it
@@ -874,8 +897,11 @@ def test_staging_only_pushes_only_staging_with_lease(env, pushes):
     assert pushes == [
         (
             "push",
+            "--atomic",
+            f"--force-with-lease=refs/heads/main:{report['base_sha']}",
             "--force-with-lease=refs/heads/staging:",
             "origin",
+            f"{report['base_sha']}:refs/heads/main",
             f"{report['staging_sha']}:refs/heads/staging",
         )
     ]
@@ -901,8 +927,11 @@ def test_staging_only_lease_pins_the_previous_remote_sha(env, pushes):
     assert pushes == [
         (
             "push",
+            "--atomic",
+            f"--force-with-lease=refs/heads/main:{second['base_sha']}",
             f"--force-with-lease=refs/heads/staging:{first['staging_sha']}",
             "origin",
+            f"{second['base_sha']}:refs/heads/main",
             f"{second['staging_sha']}:refs/heads/staging",
         )
     ]
@@ -1607,11 +1636,19 @@ def test_production_identity_tampering_fails_before_push(env, monkeypatch, tampe
     assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
 
 
-def test_production_zero_merge_candidate_is_rejected(env, pushes):
-    with pytest.raises(stage_mod.StageError, match="strict ancestor"):
-        env.run([], ring=stage_mod.PRODUCTION)
-    assert pushes == []
-    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
+def test_production_zero_merge_candidate_pins_main(env):
+    report = env.run([], ring=stage_mod.PRODUCTION)
+    assert report["staging_sha"] == report["base_sha"]
+    assert report["applied"] == []
+    assert env.fork_ref("refs/heads/production") == report["base_sha"]
+
+
+def test_staging_contained_upstream_pins_main_without_entry_zero(env):
+    stage_mod.sync_main(env.work)
+    report = env.run([])
+    assert report["staging_sha"] == report["base_sha"]
+    assert report["entry_zero"]["minted"] is False
+    assert env.fork_ref("refs/heads/staging") == report["base_sha"]
 
 
 def test_notes_production_ring_has_apk_section(tmp_path, capsys):
@@ -1656,7 +1693,7 @@ def test_migration_touched_on_add(env):
     pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
     report = env.run([pr], ring=stage_mod.PRODUCTION)
     assert (
-        stage_mod.migration_touched(env.work, report["staging_sha"], report["upstream_sha"], None)
+        stage_mod.migration_touched(env.work, report["staging_sha"], report["base_sha"], None)
         is True
     )
 
@@ -1674,13 +1711,12 @@ def test_migration_touched_on_removal(env):
     cur = env.run([other], ring=stage_mod.PRODUCTION)
     # the upstream leg alone is clean...
     assert (
-        stage_mod.migration_touched(env.work, cur["staging_sha"], cur["upstream_sha"], None)
-        is False
+        stage_mod.migration_touched(env.work, cur["staging_sha"], cur["base_sha"], None) is False
     )
     # ...but prev_pin..candidate shows the dropped migration
     assert (
         stage_mod.migration_touched(
-            env.work, cur["staging_sha"], cur["upstream_sha"], prev["staging_sha"]
+            env.work, cur["staging_sha"], cur["base_sha"], prev["staging_sha"]
         )
         is True
     )
@@ -1695,14 +1731,14 @@ def test_no_migration_change(env):
     cur = env.run([pr], ring=stage_mod.PRODUCTION)
     assert (
         stage_mod.migration_touched(
-            env.work, cur["staging_sha"], cur["upstream_sha"], prev["staging_sha"]
+            env.work, cur["staging_sha"], cur["base_sha"], prev["staging_sha"]
         )
         is False
     )
     # the watched path prefix is a parameter, not a baked-in constant
     assert (
         stage_mod.migration_touched(
-            env.work, cur["staging_sha"], cur["upstream_sha"], None, prefix="feat.txt"
+            env.work, cur["staging_sha"], cur["base_sha"], None, prefix="feat.txt"
         )
         is True
     )
@@ -2043,6 +2079,38 @@ def test_main_race_blocks_all_publication(env, monkeypatch, pushes, ring, stagin
     assert pushes == []
 
 
+@pytest.mark.parametrize(
+    "ring,staging_only,publication_ref",
+    [
+        (stage_mod.STAGING, True, "refs/heads/staging"),
+        (stage_mod.STAGING, False, "refs/heads/staging"),
+        (stage_mod.PRODUCTION, False, "refs/heads/production"),
+    ],
+)
+def test_main_race_at_push_is_atomic(env, monkeypatch, ring, staging_only, publication_ref):
+    pr = env.add_pr(2, "two.txt", "two\n")
+    real_git = stage_mod.git
+    preflight_complete = False
+
+    def race(cwd, *args, **kwargs):
+        nonlocal preflight_complete
+        if args[:3] == ("ls-remote", "origin", "refs/heads/main"):
+            result = real_git(cwd, *args, **kwargs)
+            preflight_complete = True
+            return result
+        if args[:1] == ("push",) and preflight_complete:
+            preflight_complete = False
+            git(env.fork, "fetch", str(env.seed), pr["headRefOid"])
+            git(env.fork, "update-ref", "refs/heads/main", pr["headRefOid"])
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", race)
+    with pytest.raises(stage_mod.StageError, match=r"git push .* failed"):
+        env.run([pr], ring=ring, staging_only=staging_only)
+    assert env.fork_ref(publication_ref) == ""
+    assert env.fork_ref(f"refs/tags/{ring.pin_prefix}{STAMP}") == ""
+
+
 @pytest.mark.parametrize("ring", [stage_mod.STAGING, stage_mod.PRODUCTION])
 def test_unrelated_candidate_blocks_publication(env, monkeypatch, pushes, ring):
     pr = env.add_pr(1, "one.txt", "one\n")
@@ -2057,7 +2125,7 @@ def test_unrelated_candidate_blocks_publication(env, monkeypatch, pushes, ring):
         return result
 
     monkeypatch.setattr(stage_mod, "merge_prs", unrelated)
-    with pytest.raises(stage_mod.StageError, match="strict ancestor"):
+    with pytest.raises(stage_mod.StageError, match="base must be an ancestor"):
         env.run([pr], ring=ring)
     assert pushes == []
 
@@ -2122,6 +2190,16 @@ def test_base_ref_cli_fetches_fork_main(env, tmp_path):
     assert env.fork_ref("refs/heads/main") == base
 
 
+def test_base_ref_rejects_non_main_fork_ref_before_composition(env, pushes):
+    env.add_fork_branch("other", "other.txt", "other\n")
+    git(env.work, "fetch", "origin", "other:refs/remotes/origin/other")
+    with pytest.raises(
+        stage_mod.StageError, match="base ref origin/other is not published fork main"
+    ):
+        env.run([], base_ref="origin/other", staging_only=True)
+    assert pushes == []
+
+
 def test_rescue_keeps_upstream_target_with_fork_base(env, monkeypatch):
     pr = _rescuable_pr(env)
     base = env.add_fork_branch("fork-main", "fork.txt", "fork only\n")
@@ -2141,27 +2219,37 @@ def test_rescue_keeps_upstream_target_with_fork_base(env, monkeypatch):
     assert git(env.work, "merge-base", "--is-ancestor", base, rescued, check=False).returncode == 1
 
 
-@pytest.mark.parametrize("baseline", ["upstream", "previous-pin"])
-def test_migration_gate_retains_both_baselines_on_fork_main(env, baseline, pushes):
+def test_migration_gate_checks_new_main_once_then_previous_pin(env, pushes):
     pr = env.add_pr(3, "three.txt", "three\n")
-    if baseline == "previous-pin":
-        (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-        migration = env.add_pr(4, f"{MIGRATIONS_DIR}/old.py", "old\n")
-        first = env.run([pr, migration], ring=stage_mod.PRODUCTION)
-        env.run(
-            [pr, migration], ring=stage_mod.PRODUCTION, migration_approval=first["staging_sha"]
-        )
-        base = env.add_fork_branch("fork-main", "fork.txt", "fork\n")
-    else:
-        (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-        base = env.add_fork_branch("fork-main", f"{MIGRATIONS_DIR}/fork.py", "fork\n")
+    previous = env.run([pr], ring=stage_mod.PRODUCTION)
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    base = env.add_fork_branch("fork-main", f"{MIGRATIONS_DIR}/fork.py", "fork\n")
     git(env.seed, "push", str(env.fork), "fork-main:main")
     pushes.clear()
-    report = env.run([pr], ring=stage_mod.PRODUCTION)
-    assert report["base_sha"] == base != report["upstream_sha"]
-    assert report["migration_gate"]["blocked"] is True
+    blocked = env.run([], ring=stage_mod.PRODUCTION)
+    assert blocked["base_sha"] == base != blocked["upstream_sha"]
+    assert blocked["migration_gate"] == {
+        "blocked": True,
+        "candidate": base,
+        "prev_pin": previous["staging_sha"],
+        "approval_hint": f"re-dispatch with approve_migration={base}",
+    }
     assert pushes == []
-    assert base in stage_mod.summarize(report, stage_mod.PRODUCTION)
+    approved = env.run([], ring=stage_mod.PRODUCTION, migration_approval=base)
+    assert approved["migration_gate"]["blocked"] is False
+
+    unrelated = env.add_pr(5, "plain.txt", "plain\n")
+    later = env.run([unrelated], ring=stage_mod.PRODUCTION)
+    assert later["migration_gate"]["blocked"] is False
+
+
+def test_hourly_cause_drops_consumed_entry_zero_without_upstream_move(env):
+    first = env.run([], staging_only=True)
+    assert first["entry_zero"]["minted"] is True
+    stage_mod.sync_main(env.work)
+    second = env.run([], staging_only=True)
+    assert second["entry_zero"]["minted"] is False
+    assert second["causes"] == ["fork main"]
 
 
 @pytest.mark.parametrize("race_count", [0, 1, 2])
@@ -2217,6 +2305,32 @@ def test_sync_main_failure_leaves_main_untouched(env, pushes, failure):
     assert git(env.work, "ls-files", "-u").stdout == ""
 
 
+def test_sync_main_does_not_use_composition_rerere_seeds(env):
+    base = env.add_fork_branch("fork-main", "a.txt", "fork\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    upstream = env.advance_main("a.txt", "upstream\n")
+    git(env.work, "fetch", "origin", "main")
+    git(env.work, "checkout", "--detach", "FETCH_HEAD")
+    git(env.work, "fetch", "upstream", "main")
+    git(
+        env.work,
+        "-c",
+        "rerere.enabled=true",
+        "merge",
+        "--no-ff",
+        "--no-commit",
+        upstream,
+        check=False,
+    )
+    (env.work / "a.txt").write_text("resolved\n")
+    git(env.work, "-c", "rerere.enabled=true", "rerere")
+    git(env.work, "merge", "--abort")
+
+    with pytest.raises(stage_mod.StageError, match="sync-main: merge failed"):
+        stage_mod.sync_main(env.work)
+    assert env.fork_ref("refs/heads/main") == base
+
+
 def test_sync_main_cli(env, capsys):
     assert stage_mod.main(["sync-main", "--workdir", str(env.work)]) == 0
     assert capsys.readouterr().out.strip() == env.fork_ref("refs/heads/main")
@@ -2226,20 +2340,22 @@ def test_only_scheduled_production_owns_main_sync():
     import yaml
 
     workflows = Path(__file__).resolve().parents[2] / "workflows"
-    for filename, job in (
-        ("personal-staging-hourly.yml", "compose"),
-        ("personal-staging.yml", "integrate"),
-        ("personal-production.yml", "compose"),
+    for filename, job, group in (
+        ("personal-staging-hourly.yml", "compose", "personal-staging-hourly-compose"),
+        ("personal-staging.yml", "integrate", "personal-staging-nightly-compose"),
+        ("personal-production.yml", "compose", "personal-production-compose"),
     ):
         text = (workflows / filename).read_text()
         workflow = yaml.safe_load(text)
         assert "sync-main" not in workflow["jobs"]
-        assert workflow["concurrency"]["cancel-in-progress"] is False
+        assert workflow["concurrency"]["cancel-in-progress"] is (
+            filename == "personal-staging-hourly.yml"
+        )
         compose = workflow["jobs"][job]
         assert compose["needs"] == "test-composer"
         assert compose["environment"] == "staging-push"
         assert compose["concurrency"] == {
-            "group": "personal-ring-compose",
+            "group": group,
             "cancel-in-progress": False,
         }
         scripts = "\n".join(step.get("run", "") for step in compose["steps"])
@@ -2254,3 +2370,16 @@ def test_only_scheduled_production_owns_main_sync():
             )
         else:
             assert "stage.py sync-main" not in text
+        if filename == "personal-staging-hourly.yml":
+            cron = workflow[True]["schedule"][0]["cron"]
+            assert cron == "17 0-9,11-23 * * *"
+
+
+def test_android_build_requires_successful_integration():
+    import yaml
+
+    workflow_path = Path(__file__).resolve().parents[2] / "workflows/personal-staging.yml"
+    workflow = yaml.safe_load(workflow_path.read_text())
+    android_build = workflow["jobs"]["android-build"]
+    assert android_build["needs"] == "integrate"
+    assert "if" not in android_build

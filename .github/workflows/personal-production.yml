@@ -44,10 +44,8 @@ on:
 permissions:
   contents: read
 
-# Own group: the production compose must never cancel (or be cancelled by)
-# the staging nightly/hourly runs — different groups already guarantee that.
-# cancel-in-progress stays false so an operator approve_migration dispatch
-# queues behind a running compose instead of killing it mid-push.
+# The workflow group serializes production runs. Its compose job uses a
+# production-only group so staging jobs cannot replace a pending promotion.
 concurrency:
   group: personal-production
   cancel-in-progress: false
@@ -86,7 +84,7 @@ jobs:
 
   compose:
     concurrency:
-      group: personal-ring-compose
+      group: personal-production-compose
       cancel-in-progress: false
     needs: test-composer
     # Accident prevention for non-main dispatches (schedule always runs main);
