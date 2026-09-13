@@ -1684,19 +1684,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
   }, [scroller]);
 
-  // Persistent terminal surfaces for terminal-first sessions. Each is
-  // mounted from the moment its terminal is reachable — not just when the
-  // view is open — and kept mounted as a visibility-toggled overlay, so
-  // the attach (WS dial through the host tunnel + a forked `tmux attach`
-  // + full repaint) pre-warms in the background and survives both
-  // Chat/Terminal flips AND session switches: a small LRU keeps the last
-  // few sessions' surfaces alive after navigating away, so coming back is
-  // near-instant instead of re-dialing from scratch. `invisible` (not
-  // display:none) keeps a hidden overlay's layout size, so FitAddon
-  // geometry stays correct and no resize churn hits tmux; hidden elements
-  // don't paint, hit-test, or take focus. The chat surface still unmounts
-  // while the terminal is shown — a heavy transcript shouldn't render
-  // behind a live terminal.
+  // Pre-warm terminal attaches across Chat/Terminal flips and session switches.
+  // Hidden overlays retain layout so FitAddon geometry stays stable; the chat
+  // surface unmounts while Terminal is shown.
   const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
   // Non-owners attach read-only: a shared PTY can't attribute input
   // per-user, so only the owner may type. They drive the agent via the
@@ -1731,7 +1721,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     return (
       <div
         key={entry.conversationId}
-        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible")}
+        // xterm's .visible scrollbar overrides inherited visibility. Opacity
+        // hides the entire subtree without disturbing its layout or connection.
+        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
         aria-hidden={!isShown}
       >
         <MainTerminalView
@@ -3351,18 +3343,20 @@ function ComposerImpl(
             onRefreshBranch={composerGit.refresh}
             refreshing={composerGit.refreshing}
           />
-          {/* Trailing status cluster — the wrapper owns the right alignment so
-              it holds even when the self-nulling indicators render nothing. */}
-          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            <ComposerPrLink
-              prCount={composerGit.prCount}
-              prNumber={composerGit.prNumber}
-              onOpen={openComposerGithubTab}
-            />
-            <ComposerContextRing
-              contextWindow={composerContextWindow}
-              tokensUsed={composerTokensUsed}
-            />
+          {/* Reserve two workspace triggers' icon-safe minima and two gaps;
+              only PR text truncates when the remaining status space runs out. */}
+          <div className="ml-auto flex min-w-0 max-w-[calc(100%-5.25rem)] shrink-0 items-center gap-1 md:max-w-[calc(100%-6.5rem)]">
+            <div className="flex min-w-0 items-center gap-2 empty:hidden">
+              <ComposerPrLink
+                prCount={composerGit.prCount}
+                prNumber={composerGit.prNumber}
+                onOpen={openComposerGithubTab}
+              />
+              <ComposerContextRing
+                contextWindow={composerContextWindow}
+                tokensUsed={composerTokensUsed}
+              />
+            </div>
             <BackgroundTaskIndicator />
             <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
@@ -3518,7 +3512,7 @@ function ComposerImpl(
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
+              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
             >
               {(() => {
                 const split = splitSlashCommand(value);
@@ -3641,8 +3635,8 @@ function ComposerImpl(
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
                 <ComposerPermissionPicker
-                  label="Permissions"
-                  value={permissionLabel || "Permissions"}
+                  label="Permission mode"
+                  value={permissionLabel || "Permission mode"}
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}
@@ -4390,14 +4384,14 @@ function SessionHarnessPicker({
           ? {
               testId: "composer-agent-efforts",
               header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-              choices: [null, ...availableEfforts].map((effort) => ({
-                key: effort ?? "default",
-                label: formatStatusEffortLabel(effort) ?? "Default",
+              choices: availableEfforts.map((effort) => ({
+                key: effort,
+                label: formatStatusEffortLabel(effort) ?? effort,
                 checked: !routingOn && effort === selectedEffort,
                 disabled: routingOn || busy || pendingModelChange !== null,
                 onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
-                testId: `composer-agent-effort-${effort ?? "default"}`,
-                data: { "data-effort-level": effort ?? "default" },
+                testId: `composer-agent-effort-${effort}`,
+                data: { "data-effort-level": effort },
               })),
             }
           : undefined
@@ -4535,7 +4529,7 @@ function useSessionConfigSummary({
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort);
-    rows.push({ label: "Effort", value: effortValue ?? "Default" });
+    if (effortValue) rows.push({ label: "Effort", value: effortValue });
   }
   if (!routingOn) {
     const source =
