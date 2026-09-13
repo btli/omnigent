@@ -1219,6 +1219,15 @@ def _skip_reason(p: dict) -> str:
     return f"merge conflict: {paths or 'unknown paths'}"
 
 
+def _summary_base_rows(report: dict) -> list[str]:
+    rows = [f"| Upstream main | `{report['upstream_sha']}` |"]
+    if report.get("base_sha"):
+        rows.append(f"| Fork main base | `{report['base_sha']}` |")
+    if report.get("entry_zero"):
+        rows.append(f"| Entry zero | `{report['entry_zero']['oid']}` |")
+    return rows
+
+
 def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines = [
         f"Nightly personal {ring.name} ring for {report['date']} (UTC).",
@@ -1306,13 +1315,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
             "",
             "| | |",
             "| --- | --- |",
-            f"| Upstream main | `{report['upstream_sha']}` |",
-            *([f"| Fork main base | `{report['base_sha']}` |"] if report.get("base_sha") else []),
-            *(
-                [f"| Entry zero | `{report['entry_zero']['oid']}` |"]
-                if report.get("entry_zero")
-                else []
-            ),
+            *_summary_base_rows(report),
             *sha_rows,
             f"| Result | {result} |",
         ]
@@ -1333,13 +1336,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
             "",
             "| | |",
             "| --- | --- |",
-            f"| Upstream main | `{report['upstream_sha']}` |",
-            *([f"| Fork main base | `{report['base_sha']}` |"] if report.get("base_sha") else []),
-            *(
-                [f"| Entry zero | `{report['entry_zero']['oid']}` |"]
-                if report.get("entry_zero")
-                else []
-            ),
+            *_summary_base_rows(report),
             f"| candidate (not pushed) | `{report['staging_sha']}` |",
             f"| Previous pin | `{gate.get('prev_pin') or '(none)'}` |",
             (
@@ -1358,13 +1355,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
         "",
         "| | |",
         "| --- | --- |",
-        f"| Upstream main | `{report['upstream_sha']}` |",
-        *([f"| Fork main base | `{report['base_sha']}` |"] if report.get("base_sha") else []),
-        *(
-            [f"| Entry zero | `{report['entry_zero']['oid']}` |"]
-            if report.get("entry_zero")
-            else []
-        ),
+        *_summary_base_rows(report),
         f"| {tier} | `{report['staging_sha']}` |",
         f"| Pin | `{report['tag']}`{pin_note} |",
         *([f"| Dev tag | `{report['dev_tag']}` |"] if report.get("dev_tag") else []),
