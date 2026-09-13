@@ -184,6 +184,27 @@ def test_write_then_read_cache_roundtrip(tmp_path: Path, monkeypatch: pytest.Mon
     assert result.head_sha == "abc123"
 
 
+def test_cache_roundtrip_preserves_compared_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clone caches retain the ref named in update notices."""
+    cache_file = tmp_path / ".update_check.json"
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=1716100000.0,
+            commits_behind=5,
+            compared_ref="upstream/homelab",
+        )
+    )
+
+    result = _read_cache()
+    assert result is not None
+    assert result.compared_ref == "upstream/homelab"
+
+
 # ------------------------------------------------------------------
 # _is_stale
 # ------------------------------------------------------------------
@@ -300,6 +321,99 @@ def test_run_check_both_branches_fail(tmp_path: Path) -> None:
         assert _run_check(tmp_path) is None
 
 
+def test_run_check_uses_branch_upstream(tmp_path: Path) -> None:
+    """A tracking branch fetches and compares its configured upstream."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if "symbolic-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/homelab\n")
+        if "for-each-ref" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="upstream/homelab\0upstream\0refs/heads/homelab\n"
+            )
+        if "rev-list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="3\n")
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+        result = _run_check(tmp_path)
+
+    assert result is not None
+    assert result.commits_behind == 3
+    assert result.compared_ref == "upstream/homelab"
+    assert [
+        "git",
+        "-C",
+        str(tmp_path),
+        "fetch",
+        "upstream",
+        "homelab",
+        "--quiet",
+    ] in calls
+    assert [
+        "git",
+        "-C",
+        str(tmp_path),
+        "rev-list",
+        "HEAD..@{upstream}",
+        "--count",
+    ] in calls
+
+
+def test_run_check_uses_matching_remote_ref_for_detached_head(tmp_path: Path) -> None:
+    """A detached pin uses a locally known remote branch at the same SHA."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if "symbolic-ref" in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+        if "for-each-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="origin/production\0production\0\n")
+        if "rev-list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+        result = _run_check(tmp_path)
+
+    assert result is not None
+    assert result.commits_behind == 2
+    assert result.compared_ref == "origin/production"
+    assert [
+        "git",
+        "-C",
+        str(tmp_path),
+        "fetch",
+        "origin",
+        "production",
+        "--quiet",
+    ] in calls
+    assert [
+        "git",
+        "-C",
+        str(tmp_path),
+        "rev-list",
+        "HEAD..origin/production",
+        "--count",
+    ] in calls
+
+
+def test_print_notice_names_compared_ref(capsys: pytest.CaptureFixture[str]) -> None:
+    """The notice identifies the ref used for the comparison."""
+    from omnigent.update_check import _print_notice
+
+    _print_notice(2, "upstream/homelab")
+
+    assert "upstream/homelab is 2 commit(s) ahead" in capsys.readouterr().err
+
+
 # ------------------------------------------------------------------
 # maybe_show_update_notice (top-level)
 # ------------------------------------------------------------------
@@ -397,6 +511,35 @@ def test_fresh_cache_clears_after_pull(
     assert refreshed is not None
     assert refreshed.commits_behind == 0
     assert refreshed.head_sha == "new_sha"
+
+
+def test_fresh_cache_recounts_against_cached_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A post-pull recount uses the ref from the cached comparison."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=3,
+            head_sha="old_sha",
+            compared_ref="upstream/homelab",
+        )
+    )
+
+    with (
+        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
+        patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
+        patch("omnigent.update_check._local_rev_list_count", return_value=0) as recount,
+    ):
+        maybe_show_update_notice()
+
+    assert capsys.readouterr().err == ""
+    recount.assert_called_once_with(tmp_path, "upstream/homelab")
 
 
 def test_fresh_cache_no_notice_when_up_to_date(

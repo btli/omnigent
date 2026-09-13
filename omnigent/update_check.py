@@ -5,7 +5,9 @@ Two install shapes are supported:
 * **Dev clone** (``git clone … && uv sync`` / ``pip install -e .``): we
   walk up from this module to find a ``.git/`` directory, then run
   ``git fetch`` and ``rev-list`` to count how many commits ``HEAD`` is
-  behind ``origin/main`` (or ``origin/master``). The result is cached
+  behind its tracked ref. Detached checkouts use a local remote ref at
+  the same commit when available; otherwise the check falls back to
+  ``origin/main`` (or ``origin/master``). The result is cached
   to ``~/.omnigent/.update_check.json`` so the (potentially slow)
   ``git fetch`` only runs once per staleness window. The notice points
   the user at ``git pull``.
@@ -121,6 +123,8 @@ class _CacheEntry:
         last shown for, e.g. ``"0.2.0"``. Used to fire the "update
         available" notice exactly once per new release rather than on
         every invocation. Empty string when no notice has been shown.
+    :param compared_ref: The ref used for the commits-behind count and
+        named in clone notices, e.g. ``"origin/main"``.
     """
 
     last_check_epoch: float
@@ -129,6 +133,7 @@ class _CacheEntry:
     kind: str = "clone"
     latest_version: str = ""
     last_notified_version: str = ""
+    compared_ref: str = "origin/main"
 
 
 @dataclass
@@ -185,6 +190,16 @@ class _InstalledWheelInfo:
     extras: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _GitComparison:
+    """Remote branch details for a commits-behind comparison."""
+
+    remote: str
+    branch: str
+    display_ref: str
+    revision: str
+
+
 def maybe_show_update_notice() -> None:
     """Print an update reminder to stderr if this install is stale.
 
@@ -224,7 +239,7 @@ def _run_dev_clone_check(repo_root: Path) -> None:
             if behind > 0 and cached.head_sha:
                 cur_sha = _get_head_sha(repo_root)
                 if cur_sha and cur_sha != cached.head_sha:
-                    recounted = _local_rev_list_count(repo_root)
+                    recounted = _local_rev_list_count(repo_root, cached.compared_ref)
                     if recounted is not None:
                         behind = recounted
                         _write_cache(
@@ -232,10 +247,11 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                                 last_check_epoch=cached.last_check_epoch,
                                 commits_behind=behind,
                                 head_sha=cur_sha,
+                                compared_ref=cached.compared_ref,
                             )
                         )
             if behind > 0:
-                _print_notice(behind)
+                _print_notice(behind, cached.compared_ref)
             return
 
         result = _run_check(repo_root)
@@ -247,7 +263,7 @@ def _run_dev_clone_check(repo_root: Path) -> None:
 
         _write_cache(result)
         if result.commits_behind > 0:
-            _print_notice(result.commits_behind)
+            _print_notice(result.commits_behind, result.compared_ref)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         # Never let the update check break the CLI.
         pass
@@ -743,6 +759,7 @@ def _read_cache() -> _CacheEntry | None:
             kind=str(data.get("kind", "clone")),
             latest_version=str(data.get("latest_version", "")),
             last_notified_version=str(data.get("last_notified_version", "")),
+            compared_ref=str(data.get("compared_ref", "origin/main")),
         )
     except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
         return None
@@ -774,6 +791,7 @@ def _write_cache(entry: _CacheEntry) -> None:
             "kind": entry.kind,
             "latest_version": entry.latest_version,
             "last_notified_version": entry.last_notified_version,
+            "compared_ref": entry.compared_ref,
         }
     )
     # ``dir=`` on the same filesystem guarantees atomic replace.
@@ -795,13 +813,32 @@ def _write_cache(entry: _CacheEntry) -> None:
 def _run_check(repo_root: Path) -> _CacheEntry | None:
     """Fetch upstream and count how many commits HEAD is behind.
 
-    Tries ``origin/main`` first; falls back to ``origin/master``.
+    Uses the current branch's upstream, or a local remote ref pointing at
+    a detached ``HEAD``. Checkouts without either context fall back to
+    ``origin/main`` and then ``origin/master``.
 
     :param repo_root: Absolute path to the Git repository root,
         e.g. ``Path("/home/user/omnigent-2")``.
     :returns: A ``_CacheEntry`` with the result, or ``None`` if
-        ``git`` is not available or both branches fail.
+        ``git`` is not available or the comparison fails.
     """
+    tracked = _tracked_comparison(repo_root)
+    if tracked is not None:
+        behind = _fetch_and_count(
+            repo_root,
+            tracked.branch,
+            remote=tracked.remote,
+            comparison_ref=tracked.revision,
+        )
+        if behind is None:
+            return None
+        return _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=behind,
+            head_sha=_get_head_sha(repo_root) or "",
+            compared_ref=tracked.display_ref,
+        )
+
     for branch in ("main", "master"):
         behind = _fetch_and_count(repo_root, branch)
         if behind is not None:
@@ -809,21 +846,111 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
                 last_check_epoch=time.time(),
                 commits_behind=behind,
                 head_sha=_get_head_sha(repo_root) or "",
+                compared_ref=f"origin/{branch}",
             )
     return None
 
 
-def _fetch_and_count(repo_root: Path, branch: str) -> int | None:
-    """Fetch ``origin/<branch>`` and return commits-behind count.
+def _tracked_comparison(repo_root: Path) -> _GitComparison | None:
+    """Return the comparison for the attached branch or a detached pin."""
+    try:
+        branch_result = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "--quiet", "HEAD"],
+            timeout=_GIT_TIMEOUT_SECONDS,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return _detached_remote_comparison(repo_root)
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "for-each-ref",
+                "--format=%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
+                (branch_result.stdout or "").strip(),
+            ],
+            timeout=_GIT_TIMEOUT_SECONDS,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        display_ref, remote, remote_ref = (result.stdout or "").strip().split("\0")
+        if not display_ref or not remote or not remote_ref.startswith("refs/heads/"):
+            return None
+        return _GitComparison(
+            remote=remote,
+            branch=remote_ref.removeprefix("refs/heads/"),
+            display_ref=display_ref,
+            revision="@{upstream}",
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def _detached_remote_comparison(repo_root: Path) -> _GitComparison | None:
+    """Return a local remote ref already pointing at detached ``HEAD``."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "for-each-ref",
+                "--format=%(refname:short)%00%(refname:lstrip=3)%00%(symref)",
+                "--points-at",
+                "HEAD",
+                "refs/remotes",
+            ],
+            timeout=_GIT_TIMEOUT_SECONDS,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    for line in (result.stdout or "").splitlines():
+        try:
+            display_ref, branch, symbolic_target = line.split("\0")
+        except ValueError:
+            continue
+        suffix = f"/{branch}"
+        if symbolic_target or not branch or not display_ref.endswith(suffix):
+            continue
+        return _GitComparison(
+            remote=display_ref.removesuffix(suffix),
+            branch=branch,
+            display_ref=display_ref,
+            revision=display_ref,
+        )
+    return None
+
+
+def _fetch_and_count(
+    repo_root: Path,
+    branch: str,
+    *,
+    remote: str = "origin",
+    comparison_ref: str | None = None,
+) -> int | None:
+    """Fetch a remote branch and return its commits-behind count.
 
     :param repo_root: Absolute path to the Git repository root.
-    :param branch: Remote branch name, e.g. ``"main"``.
+    :param branch: Remote branch name, e.g. ``"homelab"``.
+    :param remote: Configured remote name, e.g. ``"origin"``.
+    :param comparison_ref: Revision to compare with ``HEAD``. Defaults
+        to ``<remote>/<branch>``.
     :returns: Number of commits HEAD is behind, or ``None`` on
         any failure (timeout, missing remote, missing branch).
     """
     try:
         subprocess.run(
-            ["git", "-C", str(repo_root), "fetch", "origin", branch, "--quiet"],
+            ["git", "-C", str(repo_root), "fetch", remote, branch, "--quiet"],
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
             check=True,
@@ -838,7 +965,7 @@ def _fetch_and_count(repo_root: Path, branch: str) -> int | None:
                 "-C",
                 str(repo_root),
                 "rev-list",
-                f"HEAD..origin/{branch}",
+                f"HEAD..{comparison_ref or f'{remote}/{branch}'}",
                 "--count",
             ],
             timeout=_GIT_TIMEOUT_SECONDS,
@@ -870,16 +997,18 @@ def _get_head_sha(repo_root: Path) -> str | None:
         return None
 
 
-def _local_rev_list_count(repo_root: Path) -> int | None:
-    """Count commits HEAD is behind origin/main (or master), locally only.
+def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") -> int | None:
+    """Count commits HEAD is behind the cached ref, locally only.
 
-    No ``git fetch`` — uses whatever ``origin/main`` ref is already
-    available.  This is cheap and handles the post-pull case.
+    No ``git fetch`` is performed. Legacy caches still try
+    ``origin/master`` when their default ``origin/main`` is unavailable.
 
     :param repo_root: Absolute path to the Git repository root.
+    :param compared_ref: Ref recorded with the cached count.
     :returns: Number of commits behind, or ``None`` on failure.
     """
-    for branch in ("main", "master"):
+    refs = (compared_ref, "origin/master") if compared_ref == "origin/main" else (compared_ref,)
+    for ref in refs:
         try:
             result = subprocess.run(
                 [
@@ -887,7 +1016,7 @@ def _local_rev_list_count(repo_root: Path) -> int | None:
                     "-C",
                     str(repo_root),
                     "rev-list",
-                    f"HEAD..origin/{branch}",
+                    f"HEAD..{ref}",
                     "--count",
                 ],
                 timeout=_GIT_TIMEOUT_SECONDS,
@@ -901,11 +1030,12 @@ def _local_rev_list_count(repo_root: Path) -> int | None:
     return None
 
 
-def _print_notice(commits_behind: int) -> None:
+def _print_notice(commits_behind: int, compared_ref: str = "origin/main") -> None:
     """Print the update notice to stderr.
 
     :param commits_behind: Number of commits the local clone is
         behind, e.g. ``3``.
+    :param compared_ref: Ref whose commits are ahead of ``HEAD``.
     """
     from rich.console import Console
     from rich.panel import Panel
@@ -914,7 +1044,7 @@ def _print_notice(commits_behind: int) -> None:
     console = Console(stderr=True)
     body = Text.assemble(
         ("Update available", "bold yellow"),
-        " — origin/main is ",
+        f" — {compared_ref} is ",
         (f"{commits_behind}", "bold"),
         " commit(s) ahead.\nRun ",
         ("git pull", "bold"),
