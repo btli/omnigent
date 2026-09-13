@@ -243,8 +243,9 @@ dev-sync:
 dev-down:
     {{ DEV_KUBECTL }} scale deploy/omnigent-test --replicas=0
 
-# Rebuild `staging` = upstream/main + manifest PR tips + homelab overlay.
-# Never touches PR branches, so upstream approvals survive. See dev/fork/.
+# Rebuild `staging` from fork `origin/main`; both rings use that Design D base.
+# Production nightly advances it once daily; automated staging adds fresh
+# upstream main as entry zero. PR branches remain untouched. See dev/fork/.
 [group('dev-env')]
 sync-staging *args:
     dev/fork/sync-staging.sh {{ args }}

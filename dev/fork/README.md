@@ -1,14 +1,21 @@
 # Fork staging pipeline (NOT upstream)
 
-`staging` is a **derived build artifact**: upstream `main` + our open upstream
-PRs + the `homelab` overlay. It is rebuilt, never rebased, and never used as a
-base for PR branches.
+`staging` is a **derived build artifact** based on the fork's published
+`origin/main`, plus our upstream PRs and the `homelab` overlay. It is rebuilt,
+never rebased, and never used as a base for PR branches.
 
 ```
-upstream/main ──┐
+origin/main ──┐
 PR tips (pinned in staging-manifest.txt, merged as-is) ──┼──▶ staging
 homelab overlay (merged last) ──┘
 ```
+
+This follows Design D: both deployment rings base on published fork main, and
+only the scheduled production nightly advances `origin/main`, once daily.
+The automated staging composer then merges fresh `upstream/main` as entry zero
+before its PR entries, retaining upstream freshness while keeping fork-main
+ancestry. Production has no entry zero. This manual manifest builder uses the
+published `origin/main` directly and keeps its pinned-PR workflow unchanged.
 
 Rules that keep upstream approvals intact:
 
@@ -25,9 +32,12 @@ Rules that keep upstream approvals intact:
 ## Syncing
 
 ```sh
-just sync-staging            # rebuild on latest upstream/main, no push
+just sync-staging            # rebuild on latest origin/main, no push
 just sync-staging --push     # rebuild and force-with-lease push origin staging
 ```
+
+The script fetches `origin/main` before resolving its default base. Pass
+`--base <ref>` only for an intentional alternate-base composition.
 
 The rebuild happens in a separate worktree (`../omnigent-worktrees/
 staging-rebuild`); your checkout is untouched. On a conflict rerere can't
@@ -38,7 +48,7 @@ rerun; already-resolved merges replay instantly.
 
 `staging-manifest.txt` pins each upstream PR's reviewed head sha.
 
-- PR merged upstream → delete its line (content arrives via `upstream/main`).
+- PR merged upstream → delete its line (content arrives after fork main advances).
 - You pushed a new revision to a PR → update its pinned sha.
 - New PR opened → append a line (`<pr> <head-sha> <label>`).
 
