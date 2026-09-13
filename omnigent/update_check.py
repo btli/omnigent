@@ -246,8 +246,15 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                 cur_sha = _get_head_sha(repo_root)
                 if cur_sha and cur_sha != cached.head_sha:
                     comparison = _tracked_comparison(repo_root)
-                    revision = cached.compared_ref
-                    if comparison is not None:
+                    if comparison is None:
+                        compared_ref = (
+                            cached.compared_ref
+                            if cached.compared_ref in {"origin/main", "origin/master"}
+                            else "origin/main"
+                        )
+                        detached = False
+                        revision = compared_ref
+                    else:
                         compared_ref = comparison.display_ref
                         detached = comparison.detached
                         revision = comparison.revision
@@ -263,6 +270,8 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                                 detached=detached,
                             )
                         )
+                    elif compared_ref != cached.compared_ref:
+                        return
             if behind > 0:
                 _print_notice(behind, compared_ref, detached=detached)
             return

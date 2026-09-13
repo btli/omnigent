@@ -720,6 +720,41 @@ def test_fresh_cache_recounts_against_current_ref_after_branch_switch(
     assert refreshed.compared_ref == "upstream/new"
 
 
+def test_fresh_cache_hides_stale_count_when_current_recount_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed recount cannot relabel an old branch's cached count."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=3,
+            head_sha="old_sha",
+            compared_ref="upstream/old",
+        )
+    )
+    current = _GitComparison(
+        remote="upstream",
+        branch="refs/heads/new",
+        display_ref="upstream/new",
+        revision="@{upstream}",
+    )
+
+    with (
+        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
+        patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
+        patch("omnigent.update_check._tracked_comparison", return_value=current),
+        patch("omnigent.update_check._local_rev_list_count", return_value=None),
+    ):
+        maybe_show_update_notice()
+
+    assert capsys.readouterr().err == ""
+
+
 def test_fresh_detached_cache_suggests_redeploy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
