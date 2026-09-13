@@ -150,6 +150,11 @@ class BrandingInfo(BaseModel):
     powered_by: bool
 
 
+class VersionResponse(BaseModel):
+    version: str
+    webapp_build_id: str | None
+
+
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     single_user: bool
@@ -2376,11 +2381,12 @@ def create_app(
 
     from omnigent.version import webapp_build_id
 
-    # Snapshot the served bundle once per app startup, including API-only installs.
+    # Snapshot the served bundle once per app startup, including API-only installs;
+    # assets swapped under a running process are not detected until the next boot.
     build_id = webapp_build_id(_WEB_UI_DIST / "index.html")
 
     @app.get("/api/version")
-    async def version() -> dict[str, str | None]:
+    async def version() -> VersionResponse:
         """
         Return the installed package version and built SPA fingerprint.
 
@@ -2388,7 +2394,7 @@ def create_app(
 
         :returns: Package version and nullable ``webapp_build_id``.
         """
-        return {"version": _server_version(), "webapp_build_id": build_id}
+        return VersionResponse(version=_server_version(), webapp_build_id=build_id)
 
     @app.get("/.well-known/omnigent.json")
     async def well_known_manifest() -> dict[str, object]:
