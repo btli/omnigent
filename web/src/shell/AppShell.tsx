@@ -2688,6 +2688,7 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
+            {!isEmbedded && <WebUpdateBanner />}
             {/* Settings and the sidebar toggle live HERE on the macOS shell so
           they hold one fixed position beside the traffic lights no matter what
           the sidebar does. Search sits with the wordmark while the sidebar is
