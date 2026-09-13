@@ -125,6 +125,8 @@ class _CacheEntry:
         every invocation. Empty string when no notice has been shown.
     :param compared_ref: The ref used for the commits-behind count and
         named in clone notices, e.g. ``"origin/main"``.
+    :param detached: Whether the clone comparison was made from a
+        detached ``HEAD``.
     """
 
     last_check_epoch: float
@@ -134,6 +136,7 @@ class _CacheEntry:
     latest_version: str = ""
     last_notified_version: str = ""
     compared_ref: str = "origin/main"
+    detached: bool = False
 
 
 @dataclass
@@ -198,6 +201,7 @@ class _GitComparison:
     branch: str
     display_ref: str
     revision: str
+    detached: bool = False
 
 
 def maybe_show_update_notice() -> None:
@@ -234,12 +238,20 @@ def _run_dev_clone_check(repo_root: Path) -> None:
         cached = _read_cache()
         if cached is not None and cached.kind == "clone" and not _is_stale(cached):
             behind = cached.commits_behind
+            compared_ref = cached.compared_ref
+            detached = cached.detached
             # If HEAD moved since the cache was written (e.g. the user
             # ran ``git pull``), do a cheap local recount — no fetch.
             if behind > 0 and cached.head_sha:
                 cur_sha = _get_head_sha(repo_root)
                 if cur_sha and cur_sha != cached.head_sha:
-                    recounted = _local_rev_list_count(repo_root, cached.compared_ref)
+                    comparison = _tracked_comparison(repo_root)
+                    revision = cached.compared_ref
+                    if comparison is not None:
+                        compared_ref = comparison.display_ref
+                        detached = comparison.detached
+                        revision = comparison.revision
+                    recounted = _local_rev_list_count(repo_root, revision)
                     if recounted is not None:
                         behind = recounted
                         _write_cache(
@@ -247,11 +259,12 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                                 last_check_epoch=cached.last_check_epoch,
                                 commits_behind=behind,
                                 head_sha=cur_sha,
-                                compared_ref=cached.compared_ref,
+                                compared_ref=compared_ref,
+                                detached=detached,
                             )
                         )
             if behind > 0:
-                _print_notice(behind, cached.compared_ref)
+                _print_notice(behind, compared_ref, detached=detached)
             return
 
         result = _run_check(repo_root)
@@ -263,7 +276,11 @@ def _run_dev_clone_check(repo_root: Path) -> None:
 
         _write_cache(result)
         if result.commits_behind > 0:
-            _print_notice(result.commits_behind, result.compared_ref)
+            _print_notice(
+                result.commits_behind,
+                result.compared_ref,
+                detached=result.detached,
+            )
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         # Never let the update check break the CLI.
         pass
@@ -760,6 +777,7 @@ def _read_cache() -> _CacheEntry | None:
             latest_version=str(data.get("latest_version", "")),
             last_notified_version=str(data.get("last_notified_version", "")),
             compared_ref=str(data.get("compared_ref", "origin/main")),
+            detached=bool(data.get("detached", False)),
         )
     except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
         return None
@@ -792,6 +810,7 @@ def _write_cache(entry: _CacheEntry) -> None:
             "latest_version": entry.latest_version,
             "last_notified_version": entry.last_notified_version,
             "compared_ref": entry.compared_ref,
+            "detached": entry.detached,
         }
     )
     # ``dir=`` on the same filesystem guarantees atomic replace.
@@ -830,14 +849,14 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
             remote=tracked.remote,
             comparison_ref=tracked.revision,
         )
-        if behind is None:
-            return None
-        return _CacheEntry(
-            last_check_epoch=time.time(),
-            commits_behind=behind,
-            head_sha=_get_head_sha(repo_root) or "",
-            compared_ref=tracked.display_ref,
-        )
+        if behind is not None:
+            return _CacheEntry(
+                last_check_epoch=time.time(),
+                commits_behind=behind,
+                head_sha=_get_head_sha(repo_root) or "",
+                compared_ref=tracked.display_ref,
+                detached=tracked.detached,
+            )
 
     for branch in ("main", "master"):
         behind = _fetch_and_count(repo_root, branch)
@@ -882,7 +901,7 @@ def _tracked_comparison(repo_root: Path) -> _GitComparison | None:
             return None
         return _GitComparison(
             remote=remote,
-            branch=remote_ref.removeprefix("refs/heads/"),
+            branch=remote_ref,
             display_ref=display_ref,
             revision="@{upstream}",
         )
@@ -896,7 +915,7 @@ def _detached_remote_comparison(repo_root: Path) -> _GitComparison | None:
         output = _git_output(
             repo_root,
             "for-each-ref",
-            "--format=%(refname:short)%00%(refname:lstrip=3)%00%(symref)",
+            "--format=%(refname)%00%(refname:short)%00%(symref)",
             "--points-at",
             "HEAD",
             "refs/remotes",
@@ -906,18 +925,57 @@ def _detached_remote_comparison(repo_root: Path) -> _GitComparison | None:
 
     for line in output.splitlines():
         try:
-            display_ref, branch, symbolic_target = line.split("\0")
+            tracking_ref, display_ref, symbolic_target = line.split("\0")
         except ValueError:
             continue
-        suffix = f"/{branch}"
-        if symbolic_target or not branch or not display_ref.endswith(suffix):
+        if symbolic_target:
             continue
+        mapped = _remote_branch_for_tracking_ref(repo_root, tracking_ref)
+        if mapped is None:
+            continue
+        remote, branch = mapped
         return _GitComparison(
-            remote=display_ref.removesuffix(suffix),
+            remote=remote,
             branch=branch,
             display_ref=display_ref,
-            revision=display_ref,
+            revision=tracking_ref,
+            detached=True,
         )
+    return None
+
+
+def _remote_branch_for_tracking_ref(repo_root: Path, tracking_ref: str) -> tuple[str, str] | None:
+    """Map a remote-tracking ref back to its remote branch."""
+    try:
+        mappings = _git_output(
+            repo_root,
+            "config",
+            "--get-regexp",
+            r"^remote\..*\.fetch$",
+        ).splitlines()
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    for mapping in mappings:
+        try:
+            key, refspec = mapping.split(maxsplit=1)
+        except ValueError:
+            continue
+        remote = key.removeprefix("remote.").removesuffix(".fetch")
+        source, separator, destination = refspec.removeprefix("+").partition(":")
+        if not separator or source.startswith("^"):
+            continue
+        if destination == tracking_ref and source.startswith("refs/heads/"):
+            return remote, source
+        if destination.count("*") != 1 or source.count("*") != 1:
+            continue
+        prefix, suffix = destination.split("*")
+        if not tracking_ref.startswith(prefix) or not tracking_ref.endswith(suffix):
+            continue
+        end = len(tracking_ref) - len(suffix) if suffix else len(tracking_ref)
+        branch = source.replace("*", tracking_ref[len(prefix) : end])
+        if branch.startswith("refs/heads/"):
+            return remote, branch
     return None
 
 
@@ -931,16 +989,18 @@ def _fetch_and_count(
     """Fetch a remote branch and return its commits-behind count.
 
     :param repo_root: Absolute path to the Git repository root.
-    :param branch: Remote branch name, e.g. ``"homelab"``.
+    :param branch: Remote branch name or full source ref, e.g.
+        ``"homelab"`` or ``"refs/heads/homelab"``.
     :param remote: Configured remote name, e.g. ``"origin"``.
     :param comparison_ref: Revision to compare with ``HEAD``. Defaults
         to ``<remote>/<branch>``.
     :returns: Number of commits HEAD is behind, or ``None`` on
         any failure (timeout, missing remote, missing branch).
     """
+    source_ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
     try:
         subprocess.run(
-            ["git", "-C", str(repo_root), "fetch", remote, branch, "--quiet"],
+            ["git", "-C", str(repo_root), "fetch", remote, source_ref, "--quiet"],
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
             check=True,
@@ -949,10 +1009,11 @@ def _fetch_and_count(
         return None
 
     try:
+        branch_name = source_ref.removeprefix("refs/heads/")
         output = _git_output(
             repo_root,
             "rev-list",
-            f"HEAD..{comparison_ref or f'{remote}/{branch}'}",
+            f"HEAD..{comparison_ref or f'{remote}/{branch_name}'}",
             "--count",
         )
         return int(output.strip())
@@ -997,25 +1058,38 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
     return None
 
 
-def _print_notice(commits_behind: int, compared_ref: str = "origin/main") -> None:
+def _print_notice(
+    commits_behind: int,
+    compared_ref: str = "origin/main",
+    *,
+    detached: bool = False,
+) -> None:
     """Print the update notice to stderr.
 
     :param commits_behind: Number of commits the local clone is
         behind, e.g. ``3``.
     :param compared_ref: Ref whose commits are ahead of ``HEAD``.
+    :param detached: Whether ``HEAD`` is detached from a local branch.
     """
     from rich.console import Console
     from rich.panel import Panel
     from rich.text import Text
 
     console = Console(stderr=True)
+    if detached:
+        action = Text.assemble(
+            "Check out or redeploy ",
+            (compared_ref, "bold"),
+            " to update.",
+        )
+    else:
+        action = Text.assemble("Run ", ("git pull", "bold"), " to update.")
     body = Text.assemble(
         ("Update available", "bold yellow"),
         f" — {compared_ref} is ",
         (f"{commits_behind}", "bold"),
-        " commit(s) ahead.\nRun ",
-        ("git pull", "bold"),
-        " to update.",
+        " commit(s) ahead.\n",
+        action,
     )
     console.print(Panel(body, border_style="yellow", expand=False))
 

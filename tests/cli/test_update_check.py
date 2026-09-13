@@ -18,12 +18,41 @@ from omnigent.update_check import (
     _CacheEntry,
     _fetch_and_count,
     _find_repo_root,
+    _GitComparison,
     _is_stale,
     _read_cache,
     _run_check,
     _write_cache,
     maybe_show_update_notice,
 )
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _tracking_clone(tmp_path: Path) -> tuple[Path, Path]:
+    remote = tmp_path / "remote.git"
+    upstream = tmp_path / "upstream"
+    clone = tmp_path / "clone"
+    remote.mkdir()
+    upstream.mkdir()
+    _git(remote, "init", "--bare", "--quiet")
+    _git(upstream, "init", "--initial-branch=homelab", "--quiet")
+    _git(upstream, "config", "user.name", "Test User")
+    _git(upstream, "config", "user.email", "test@example.com")
+    _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "base")
+    _git(upstream, "remote", "add", "origin", str(remote))
+    _git(upstream, "push", "--quiet", "--set-upstream", "origin", "homelab")
+    _git(tmp_path, "clone", "--quiet", "--branch", "homelab", str(remote), str(clone))
+    return upstream, clone
+
 
 # ------------------------------------------------------------------
 # _find_repo_root
@@ -197,12 +226,14 @@ def test_cache_roundtrip_preserves_compared_ref(
             last_check_epoch=1716100000.0,
             commits_behind=5,
             compared_ref="upstream/homelab",
+            detached=True,
         )
     )
 
     result = _read_cache()
     assert result is not None
     assert result.compared_ref == "upstream/homelab"
+    assert result.detached is True
 
 
 # ------------------------------------------------------------------
@@ -293,32 +324,57 @@ def test_fetch_and_count_revlist_fails(tmp_path: Path) -> None:
 
 def test_run_check_falls_back_to_master(tmp_path: Path) -> None:
     """Falls back to ``origin/master`` when ``origin/main`` fetch fails."""
-    call_count = 0
+    calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        nonlocal call_count
-        call_count += 1
-        # Calls 1 (fetch main) -> fail, 2 (fetch master) -> ok,
-        # 3 (rev-list master) -> 2 commits
-        if call_count == 1:
-            raise subprocess.CalledProcessError(1, "git")
-        if call_count == 2:
-            return subprocess.CompletedProcess(cmd, 0)
-        return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
+        calls.append(cmd)
+        args = cmd[3:]
+        if args[:1] == ["symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/local\n")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="\0\0\n")
+        if args[:2] == ["fetch", "origin"] and args[2] in {"main", "refs/heads/main"}:
+            raise subprocess.CalledProcessError(1, cmd)
+        if args[:1] == ["rev-list"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
+        if args[:1] == ["rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
 
     with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
         result = _run_check(tmp_path)
     assert result is not None
     assert result.commits_behind == 2
+    assert result.compared_ref == "origin/master"
+    assert [
+        "git",
+        "-C",
+        str(tmp_path),
+        "fetch",
+        "origin",
+        "refs/heads/master",
+        "--quiet",
+    ] in calls
 
 
 def test_run_check_both_branches_fail(tmp_path: Path) -> None:
     """Returns None when both main and master fail."""
-    with patch(
-        "omnigent.update_check.subprocess.run",
-        side_effect=subprocess.CalledProcessError(1, "git"),
-    ):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        args = cmd[3:]
+        if args[:1] == ["symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/homelab\n")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="upstream/homelab\0upstream\0refs/heads/homelab\n"
+            )
+        raise subprocess.CalledProcessError(1, cmd)
+
+    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
         assert _run_check(tmp_path) is None
+    assert [cmd[4] for cmd in calls if cmd[3] == "fetch"] == ["upstream", "origin", "origin"]
 
 
 def test_run_check_uses_branch_upstream(tmp_path: Path) -> None:
@@ -351,7 +407,7 @@ def test_run_check_uses_branch_upstream(tmp_path: Path) -> None:
         str(tmp_path),
         "fetch",
         "upstream",
-        "homelab",
+        "refs/heads/homelab",
         "--quiet",
     ] in calls
     assert [
@@ -364,6 +420,86 @@ def test_run_check_uses_branch_upstream(tmp_path: Path) -> None:
     ] in calls
 
 
+def test_run_check_falls_back_when_upstream_is_unset(tmp_path: Path) -> None:
+    """An attached branch without an upstream compares with origin/main."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        args = cmd[3:]
+        if args[:1] == ["symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/local\n")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="\0\0\n")
+        if args[:1] == ["rev-list"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="1\n")
+        if args[:1] == ["rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+        result = _run_check(tmp_path)
+
+    assert result is not None
+    assert result.compared_ref == "origin/main"
+    assert ["git", "-C", str(tmp_path), "fetch", "origin", "refs/heads/main", "--quiet"] in calls
+
+
+def test_run_check_falls_back_when_detached_ref_is_unknown(tmp_path: Path) -> None:
+    """A detached commit without a matching remote ref compares with origin/main."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        args = cmd[3:]
+        if args[:1] == ["symbolic-ref"]:
+            raise subprocess.CalledProcessError(1, cmd)
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+        if args[:1] == ["rev-list"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="1\n")
+        if args[:1] == ["rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+        result = _run_check(tmp_path)
+
+    assert result is not None
+    assert result.compared_ref == "origin/main"
+    assert ["git", "-C", str(tmp_path), "fetch", "origin", "refs/heads/main", "--quiet"] in calls
+
+
+def test_run_check_falls_back_when_tracked_fetch_fails(tmp_path: Path) -> None:
+    """A missing tracked branch still permits the origin/main comparison."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        args = cmd[3:]
+        if args[:1] == ["symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/homelab\n")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="upstream/homelab\0upstream\0refs/heads/homelab\n"
+            )
+        if args[:2] == ["fetch", "upstream"]:
+            raise subprocess.CalledProcessError(1, cmd)
+        if args[:1] == ["rev-list"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
+        if args[:1] == ["rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+        result = _run_check(tmp_path)
+
+    assert result is not None
+    assert result.commits_behind == 2
+    assert result.compared_ref == "origin/main"
+    assert ["git", "-C", str(tmp_path), "fetch", "origin", "refs/heads/main", "--quiet"] in calls
+
+
 def test_run_check_uses_matching_remote_ref_for_detached_head(tmp_path: Path) -> None:
     """A detached pin uses a locally known remote branch at the same SHA."""
     calls: list[list[str]] = []
@@ -373,7 +509,13 @@ def test_run_check_uses_matching_remote_ref_for_detached_head(tmp_path: Path) ->
         if "symbolic-ref" in cmd:
             raise subprocess.CalledProcessError(1, cmd)
         if "for-each-ref" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, stdout="origin/production\0production\0\n")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="refs/remotes/origin/production\0origin/production\0\n"
+            )
+        if cmd[3:5] == ["config", "--get-regexp"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="remote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n"
+            )
         if "rev-list" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
         if "rev-parse" in cmd:
@@ -386,23 +528,49 @@ def test_run_check_uses_matching_remote_ref_for_detached_head(tmp_path: Path) ->
     assert result is not None
     assert result.commits_behind == 2
     assert result.compared_ref == "origin/production"
+    assert result.detached is True
     assert [
         "git",
         "-C",
         str(tmp_path),
         "fetch",
         "origin",
-        "production",
+        "refs/heads/production",
         "--quiet",
     ] in calls
-    assert [
-        "git",
-        "-C",
-        str(tmp_path),
-        "rev-list",
-        "HEAD..origin/production",
-        "--count",
-    ] in calls
+
+
+def test_run_check_fetches_branch_when_tag_has_same_name(tmp_path: Path) -> None:
+    """A same-named tag cannot shadow the tracked branch during fetch."""
+    upstream, clone = _tracking_clone(tmp_path)
+    _git(upstream, "tag", "homelab")
+    _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "ahead")
+    _git(upstream, "push", "--quiet", "origin", "refs/heads/homelab", "refs/tags/homelab")
+
+    result = _run_check(clone)
+
+    assert result is not None
+    assert result.commits_behind == 1
+    assert result.compared_ref == "origin/homelab"
+
+
+def test_run_check_maps_ambiguous_detached_ref_to_slash_remote(tmp_path: Path) -> None:
+    """A detached tracking ref uses its configured slash-named remote."""
+    upstream, clone = _tracking_clone(tmp_path)
+    _git(clone, "remote", "rename", "origin", "team/prod")
+    _git(clone, "tag", "team/prod/homelab")
+    _git(clone, "switch", "--quiet", "--detach")
+    _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "ahead")
+    _git(upstream, "push", "--quiet")
+
+    result = _run_check(clone)
+
+    assert result is not None
+    assert result.commits_behind == 1
+    assert result.detached is True
+    assert _git(clone, "rev-parse", "refs/remotes/team/prod/homelab") == _git(
+        upstream, "rev-parse", "HEAD"
+    )
 
 
 def test_print_notice_names_compared_ref(capsys: pytest.CaptureFixture[str]) -> None:
@@ -513,12 +681,12 @@ def test_fresh_cache_clears_after_pull(
     assert refreshed.head_sha == "new_sha"
 
 
-def test_fresh_cache_recounts_against_cached_ref(
+def test_fresh_cache_recounts_against_current_ref_after_branch_switch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A post-pull recount uses the ref from the cached comparison."""
+    """A moved HEAD recounts against the current branch after a switch."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
     monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
@@ -527,19 +695,56 @@ def test_fresh_cache_recounts_against_cached_ref(
             last_check_epoch=time.time(),
             commits_behind=3,
             head_sha="old_sha",
-            compared_ref="upstream/homelab",
+            compared_ref="upstream/old",
         )
+    )
+    current = _GitComparison(
+        remote="upstream",
+        branch="refs/heads/new",
+        display_ref="upstream/new",
+        revision="@{upstream}",
     )
 
     with (
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
         patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
+        patch("omnigent.update_check._tracked_comparison", return_value=current),
         patch("omnigent.update_check._local_rev_list_count", return_value=0) as recount,
     ):
         maybe_show_update_notice()
 
     assert capsys.readouterr().err == ""
-    recount.assert_called_once_with(tmp_path, "upstream/homelab")
+    recount.assert_called_once_with(tmp_path, "@{upstream}")
+    refreshed = _read_cache()
+    assert refreshed is not None
+    assert refreshed.compared_ref == "upstream/new"
+
+
+def test_fresh_detached_cache_suggests_redeploy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A detached checkout notice avoids suggesting an invalid pull."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=3,
+            compared_ref="origin/production",
+            detached=True,
+        )
+    )
+
+    with patch("omnigent.update_check._find_repo_root", return_value=tmp_path):
+        maybe_show_update_notice()
+
+    notice = capsys.readouterr().err
+    assert "origin/production is 3 commit(s) ahead" in notice
+    assert "check out or redeploy" in notice.lower()
+    assert "git pull" not in notice
 
 
 def test_fresh_cache_no_notice_when_up_to_date(
