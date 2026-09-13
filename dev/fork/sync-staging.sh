@@ -69,7 +69,8 @@ if command -v gh >/dev/null 2>&1; then
       --jq '.state + " " + (.merged|tostring) + " " + .head.sha' 2>/dev/null)" || continue
     read -r state merged head <<<"$info"
     if [ "$merged" = "true" ]; then
-      echo "NOTE: PR #$num ($label) merged upstream — remove it from the manifest."
+      echo "NOTE: PR #$num ($label) merged upstream — retain its pin until $BASE contains"
+      echo "the merged result, then remove it; for squash merges, check by content or subject."
     elif [ "$state" = "closed" ]; then
       echo "NOTE: PR #$num ($label) is closed unmerged — remove or keep deliberately."
     elif [ "$head" != "$sha" ]; then
