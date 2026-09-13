@@ -192,10 +192,22 @@ def test_status_counts_and_pr_share_workspace_bar(
     collapsed = bar.get_attribute("data-labels") == "collapsed"
     assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_number)
     expect(pr_label).to_have_attribute("title", f"#{pr_number}")
-    if collapsed:
-        expect(pr_label).to_be_hidden()
-        expect(context.locator("span")).to_be_hidden()
-    else:
+    # The PR number and the context percentage always show; a crowded bar
+    # collapses the directory and branch text to their icons, which gives the
+    # PR number the room it needs.
+    expect(pr_label).to_be_visible()
+    expect(context.locator("span")).to_be_visible()
+    for chip in ("composer-workspace-dir", "composer-git-branch"):
+        chip_label = bar.get_by_test_id(chip).locator("[data-workspace-collapse-label]")
+        if collapsed:
+            expect(chip_label).to_be_hidden()
+        else:
+            expect(chip_label).to_be_visible()
+    # From 390px up the number shows in full. A 375px bar with the large font
+    # setting is the one place it may still ellipsize even with the directory
+    # and branch text gone (CI's fonts run wider than macOS's, so it is
+    # font-dependent there); its full value stays in the title.
+    if viewport_width >= 390:
         assert pr_label.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
     for test_id in status_ids:
         rect = control_bounds[test_id]
