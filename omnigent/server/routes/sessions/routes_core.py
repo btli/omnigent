@@ -69,6 +69,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -1825,6 +1826,55 @@ def register_core_routes(
     )
 
     # ── PATCH /sessions/{session_id} ────────────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/agent-title",
+        response_model=AutomaticSessionRenameResponse,
+    )
+    async def rename_session_from_agent(
+        request: Request,
+        session_id: str,
+        body: AutomaticSessionRenameRequest,
+    ) -> AutomaticSessionRenameResponse:
+        """Apply title requirements to an agent proposal before a guarded rename."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.parent_conversation_id is not None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="not_top_level")
+
+        title = " ".join(body.title.split())
+        if "\n" in body.title or "\r" in body.title or len(title) < 2:
+            raise OmnigentError(
+                "title must be a single non-empty line",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if background_title_coordinator is not None:
+            title = await background_title_coordinator.format_agent_title(
+                BackgroundTitleRequest(
+                    session_id=session_id,
+                    prompt=title,
+                    agent_id=conv.agent_id,
+                    harness_override=conv.harness_override,
+                    model_override=conv.model_override,
+                    sub_agent_name=conv.sub_agent_name,
+                )
+            )
+            if title is None:
+                return AutomaticSessionRenameResponse(renamed=False, reason="generation_failed")
+        updated = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            conv.title or "",
+            title,
+        )
+        if updated is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.post(
         "/sessions/{session_id}/auto-title",

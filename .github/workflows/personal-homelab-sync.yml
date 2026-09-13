@@ -1,0 +1,88 @@
+# Nightly upstream refresh for the fork's `homelab` overlay branch.
+#
+# `homelab` holds everything fork-only (dev/fork composer + manifest, justfile
+# dev-env recipes) and is ALSO the branch the omnigent host fleet's shared
+# workspace checkout tracks: k3s-infra k8s/omnigent-host/project-sync.sh
+# fast-forwards /data/projects/btli/omnigent to origin/homelab at every pod
+# boot and refreshes the editable venv. Nothing else advances the branch's
+# upstream base, so without this job it keeps whatever it forked from —
+# measured drift before this existed: the checkout's version.py still said
+# 0.10.0.dev0 while the fleet ran 0.12.0.dev0 (two upstream minors behind).
+#
+# Merge-only, push-only-on-success: a conflict fails THIS job with the
+# conflicted paths in the step summary and pushes NOTHING. The host-side
+# consumer is --ff-only, so a failed night leaves the fleet exactly one day
+# staler — never half-merged, never diverged. Resolution is manual (merge
+# upstream/main into homelab anywhere with credentials and push).
+#
+# This deliberately mirrors personal-staging.yml's sync-main job: same
+# environment (staging-push), same PAT-with-fallback checkout (a merge from
+# upstream routinely touches .github/workflows/**, which the default
+# github.token cannot push), same conflict-to-summary reporting.
+name: Personal Homelab Sync
+
+on:
+  schedule:
+    # 09:00 UTC — comfortably before Personal Staging Nightly's 10:00 UTC
+    # compose (GitHub cron slop is real), so tonight's staging build stacks
+    # the refreshed overlay rather than yesterday's.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-homelab-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-homelab:
+    # Fork-only, mirroring upstream's `if: github.repository == 'omnigent-ai/omnigent'` guards.
+    if: github.repository == 'btli/omnigent'
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork homelab with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          ref: homelab
+          fetch-depth: 0
+
+      - name: Merge upstream main and push
+        env:
+          HAS_PAT: ${{ secrets.STAGING_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+          if [ "$HAS_PAT" = "true" ]; then
+            merge_command=(git merge --no-ff -m "Merge upstream main into homelab [skip ci]" FETCH_HEAD)
+          else
+            merge_command=(git merge --no-edit FETCH_HEAD)
+          fi
+          if ! "${merge_command[@]}"; then
+            {
+              echo "## sync-homelab: merge conflict with upstream main"
+              echo ""
+              git diff --name-only --diff-filter=U | while read -r f; do printf -- '- %s\n' "\`$f\`"; done
+              echo ""
+              echo "Nothing was pushed; the host fleet's checkout stays on yesterday's"
+              echo "homelab (its consumer is --ff-only, so it cannot half-apply this)."
+              echo "Resolve manually: merge upstream/main into homelab and push."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git push origin homelab
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal homelab sync — sync-homelab job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,4 @@
+# Personal-staging exclusions manifest: one PR number per line.
+#
+# PR numbers only. Blank lines and `#` comments are ignored. A listed PR is
+# held out of every ring's composition until removed.
