@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Rebuild the `staging` branch: upstream base + manifest PR tips + homelab.
+# Rebuild the `staging` branch: fork-main base + manifest PR tips + homelab.
 #
 # staging is a derived build artifact, never rebased and never a PR source.
-# Each rebuild starts fresh from upstream/main and merges the pinned PR heads
+# Each rebuild starts fresh from origin/main and merges the pinned PR heads
 # from staging-manifest.txt as-is, so upstream PR branches are never touched
 # and maintainer approvals survive every sync. Conflicts are resolved once in
 # the merge commits; git rerere replays those resolutions on later rebuilds.
 #
 # Usage: sync-staging.sh [--base <ref>] [--push] [--tag]
-#   --base   base ref to build on (default: upstream/main)
+#   --base   base ref to build on (default: origin/main)
 #   --push   force-with-lease push the result to origin staging
 #   --tag    tag the result staging-build/<utc timestamp>
 set -euo pipefail
 
-BASE="upstream/main"
+BASE="origin/main"
 PUSH=0
 TAG=0
 while [ $# -gt 0 ]; do
@@ -40,7 +40,10 @@ cp "$MANIFEST" "$MANIFEST_SNAP"
 git config rerere.enabled true
 git config rerere.autoupdate true
 
-echo "── fetching upstream"
+echo "── fetching fork main"
+git fetch origin main:refs/remotes/origin/main
+
+echo "── fetching upstream PR refs"
 git fetch upstream
 
 # Ensure every pinned sha is present; PR heads are fetchable from upstream.
@@ -66,7 +69,8 @@ if command -v gh >/dev/null 2>&1; then
       --jq '.state + " " + (.merged|tostring) + " " + .head.sha' 2>/dev/null)" || continue
     read -r state merged head <<<"$info"
     if [ "$merged" = "true" ]; then
-      echo "NOTE: PR #$num ($label) merged upstream — remove it from the manifest."
+      echo "NOTE: PR #$num ($label) merged upstream — retain its pin until $BASE contains"
+      echo "the merged result, then remove it; for squash merges, check by content or subject."
     elif [ "$state" = "closed" ]; then
       echo "NOTE: PR #$num ($label) is closed unmerged — remove or keep deliberately."
     elif [ "$head" != "$sha" ]; then
