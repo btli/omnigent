@@ -851,35 +851,33 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
     return None
 
 
+def _git_output(repo_root: Path, *args: str) -> str:
+    """Run a Git query and return its standard output."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        timeout=_GIT_TIMEOUT_SECONDS,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return result.stdout or ""
+
+
 def _tracked_comparison(repo_root: Path) -> _GitComparison | None:
     """Return the comparison for the attached branch or a detached pin."""
     try:
-        branch_result = subprocess.run(
-            ["git", "-C", str(repo_root), "symbolic-ref", "--quiet", "HEAD"],
-            timeout=_GIT_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=True,
-            text=True,
-        )
+        branch_ref = _git_output(repo_root, "symbolic-ref", "--quiet", "HEAD")
     except (subprocess.SubprocessError, OSError):
         return _detached_remote_comparison(repo_root)
 
     try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "for-each-ref",
-                "--format=%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
-                (branch_result.stdout or "").strip(),
-            ],
-            timeout=_GIT_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=True,
-            text=True,
+        output = _git_output(
+            repo_root,
+            "for-each-ref",
+            "--format=%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
+            branch_ref.strip(),
         )
-        display_ref, remote, remote_ref = (result.stdout or "").strip().split("\0")
+        display_ref, remote, remote_ref = output.strip().split("\0")
         if not display_ref or not remote or not remote_ref.startswith("refs/heads/"):
             return None
         return _GitComparison(
@@ -895,26 +893,18 @@ def _tracked_comparison(repo_root: Path) -> _GitComparison | None:
 def _detached_remote_comparison(repo_root: Path) -> _GitComparison | None:
     """Return a local remote ref already pointing at detached ``HEAD``."""
     try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "for-each-ref",
-                "--format=%(refname:short)%00%(refname:lstrip=3)%00%(symref)",
-                "--points-at",
-                "HEAD",
-                "refs/remotes",
-            ],
-            timeout=_GIT_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=True,
-            text=True,
+        output = _git_output(
+            repo_root,
+            "for-each-ref",
+            "--format=%(refname:short)%00%(refname:lstrip=3)%00%(symref)",
+            "--points-at",
+            "HEAD",
+            "refs/remotes",
         )
     except (subprocess.SubprocessError, OSError):
         return None
 
-    for line in (result.stdout or "").splitlines():
+    for line in output.splitlines():
         try:
             display_ref, branch, symbolic_target = line.split("\0")
         except ValueError:
@@ -959,21 +949,13 @@ def _fetch_and_count(
         return None
 
     try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "rev-list",
-                f"HEAD..{comparison_ref or f'{remote}/{branch}'}",
-                "--count",
-            ],
-            timeout=_GIT_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=True,
-            text=True,
+        output = _git_output(
+            repo_root,
+            "rev-list",
+            f"HEAD..{comparison_ref or f'{remote}/{branch}'}",
+            "--count",
         )
-        return int(result.stdout.strip())
+        return int(output.strip())
     except (subprocess.SubprocessError, OSError, ValueError):
         return None
 
@@ -985,14 +967,7 @@ def _get_head_sha(repo_root: Path) -> str | None:
     :returns: The full SHA-1 hex string, or ``None``.
     """
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            timeout=_GIT_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-        return result.stdout.strip()
+        return _git_output(repo_root, "rev-parse", "HEAD").strip()
     except (subprocess.SubprocessError, OSError):
         return None
 
@@ -1010,21 +985,13 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
     refs = (compared_ref, "origin/master") if compared_ref == "origin/main" else (compared_ref,)
     for ref in refs:
         try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo_root),
-                    "rev-list",
-                    f"HEAD..{ref}",
-                    "--count",
-                ],
-                timeout=_GIT_TIMEOUT_SECONDS,
-                capture_output=True,
-                check=True,
-                text=True,
+            output = _git_output(
+                repo_root,
+                "rev-list",
+                f"HEAD..{ref}",
+                "--count",
             )
-            return int(result.stdout.strip())
+            return int(output.strip())
         except (subprocess.SubprocessError, OSError, ValueError):
             continue
     return None
