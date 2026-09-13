@@ -10,12 +10,10 @@ PR tips (pinned in staging-manifest.txt, merged as-is) ──┼──▶ stagin
 homelab overlay (merged last) ──┘
 ```
 
-This follows Design D: both deployment rings base on published fork main, and
-only the scheduled production nightly advances `origin/main`, once daily.
-The automated staging composer then merges fresh `upstream/main` as entry zero
-before its PR entries, retaining upstream freshness while keeping fork-main
-ancestry. Production has no entry zero. This manual manifest builder uses the
-published `origin/main` directly and keeps its pinned-PR workflow unchanged.
+Under Design D, both deployment rings base on published fork main. The
+scheduled production nightly advances `origin/main` once daily; automated
+staging then merges fresh `upstream/main` as entry zero before its PR entries,
+while production has no entry zero.
 
 Rules that keep upstream approvals intact:
 
