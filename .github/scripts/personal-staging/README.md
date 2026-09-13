@@ -125,6 +125,12 @@ fetch and merge upstream main, resolve and commit, then use a normal
 main. After main contains the resolved merge, use **Re-run jobs** on the failed
 scheduled production run; an empty workflow dispatch intentionally skips sync.
 
+Git may elide the no-op main refspec after advertising a matching main, leaving
+a residual window during the atomic push. The composer therefore re-reads main
+after every publication and records `base_matches_remote_main`. If main moved,
+the run fails after publication; ring or rescue refs may already have moved and
+are not rolled back. The next compose reconciles them from the new main.
+
 If this base-on-main design must be rolled back, revert the change on main.
 `--base-ref upstream/main` is not an escape hatch: an explicit base must equal
 published fork main.

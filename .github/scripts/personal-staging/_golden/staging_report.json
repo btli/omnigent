@@ -51,6 +51,7 @@
         "ref": "refs/heads/nightly-20260820"
       }
     ],
+    "base_matches_remote_main": true,
     "base_sha": "22353f5fceba131785461953b028309894382cf5",
     "branch": "nightly-20260820",
     "date": "20260820",

@@ -18,6 +18,12 @@ update check reports main is not behind. Compare the report's `base_sha` with
 main at publication; a later main push or blocked production run can leave the
 immutable pin behind.
 
+Git can elide the matching no-op main refspec from an atomic push. A
+post-publication read records `base_matches_remote_main` and detects a main move
+after advertisement. That detection fails the run, but ring or rescue refs may
+already have moved; they are not rolled back, and the next compose reconciles
+them from the new main.
+
 If sync-main conflicts, check out fork main, fetch and merge upstream main,
 resolve and commit, then use a normal `git push origin main`. Never force or
 force-with-lease main. Use **Re-run jobs** on the failed scheduled run afterward;

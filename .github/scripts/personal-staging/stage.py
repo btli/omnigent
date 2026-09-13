@@ -489,6 +489,17 @@ def assert_publish_base(cwd: str | Path, fork: str, base_sha: str, candidate_sha
         raise StageError("fork main changed since composition; refusing to publish a stale base")
 
 
+def audit_published_base(cwd: str | Path, fork: str, report: dict) -> dict:
+    matches = remote_ref(cwd, fork, "refs/heads/main") == report["base_sha"]
+    report["base_matches_remote_main"] = matches
+    if not matches:
+        raise StageError(
+            "fork main moved after publication; refs may already have moved; "
+            "the next compose reconciles"
+        )
+    return report
+
+
 def conflict_paths(cwd: str | Path) -> list[str]:
     out = git(cwd, "diff", "--name-only", "--diff-filter=U").stdout
     return sorted(p for p in out.splitlines() if p)
@@ -1107,7 +1118,7 @@ def stage(
             "skipped": skipped,
         }
         if not report["pushed"]:
-            return report
+            return audit_published_base(cwd, fork, report)
         git(cwd, "fetch", fork, f"refs/heads/{ring.branch}", check=False)
         report["causes"] = push_causes(
             composition_of(cwd, expected_staging, ring),
@@ -1127,7 +1138,7 @@ def stage(
             main_refspec,
             f"{staging_sha}:refs/heads/{ring.branch}",
         )
-        return report
+        return audit_published_base(cwd, fork, report)
 
     # The nightly publishes releases from this composition, and its downstream
     # jobs consume the report's sha/tag — so refuse loudly before any ref moves
@@ -1159,15 +1170,19 @@ def stage(
         ):
             gate["blocked"] = True
             gate["approval_hint"] = f"re-dispatch with approve_migration={staging_sha}"
-            return {
-                "date": datestamp,
-                **base_fields,
-                "staging_sha": staging_sha,
-                "pushed": False,
-                "migration_gate": gate,
-                "applied": applied,
-                "skipped": skipped,
-            }
+            return audit_published_base(
+                cwd,
+                fork,
+                {
+                    "date": datestamp,
+                    **base_fields,
+                    "staging_sha": staging_sha,
+                    "pushed": False,
+                    "migration_gate": gate,
+                    "applied": applied,
+                    "skipped": skipped,
+                },
+            )
 
     dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
     name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
@@ -1202,7 +1217,7 @@ def stage(
         main_lease, main_refspec = _main_lease(base_sha)
         git(cwd, "push", "--atomic", main_lease, *leases, fork, main_refspec, *refspecs)
 
-    return {
+    report = {
         "date": datestamp,
         **base_fields,
         "staging_sha": staging_sha,
@@ -1223,6 +1238,7 @@ def stage(
         "applied": applied,
         "skipped": skipped,
     }
+    return audit_published_base(cwd, fork, report)
 
 
 def _skip_reason(p: dict) -> str:

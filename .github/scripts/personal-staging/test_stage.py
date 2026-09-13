@@ -2111,6 +2111,44 @@ def test_main_race_at_push_is_atomic(env, monkeypatch, ring, staging_only, publi
     assert env.fork_ref(f"refs/tags/{ring.pin_prefix}{STAMP}") == ""
 
 
+@pytest.mark.parametrize(
+    "ring,staging_only",
+    [
+        (stage_mod.STAGING, True),
+        (stage_mod.STAGING, False),
+        (stage_mod.PRODUCTION, False),
+    ],
+)
+def test_main_move_after_publication_is_reported(env, monkeypatch, ring, staging_only):
+    first_pr = env.add_pr(2, "two.txt", "two\n")
+    published = env.run([first_pr], ring=ring, staging_only=staging_only)
+    unchanged = env.run([first_pr], ring=ring, staging_only=staging_only)
+    before = env.fork_ref(f"refs/heads/{ring.branch}")
+    second_pr = env.add_pr(3, "three.txt", "three\n")
+    real_remote_ref = stage_mod.remote_ref
+    main_reads = 0
+
+    def moving_main(cwd, remote, ref):
+        nonlocal main_reads
+        result = real_remote_ref(cwd, remote, ref)
+        if ref == "refs/heads/main":
+            main_reads += 1
+            if main_reads == 2:
+                return second_pr["headRefOid"]
+        return result
+
+    monkeypatch.setattr(stage_mod, "remote_ref", moving_main)
+    with pytest.raises(
+        stage_mod.StageError,
+        match=r"main moved after publication.*next compose reconciles",
+    ):
+        env.run([first_pr, second_pr], ring=ring, staging_only=staging_only)
+
+    assert published["base_matches_remote_main"] is True
+    assert unchanged["base_matches_remote_main"] is True
+    assert env.fork_ref(f"refs/heads/{ring.branch}") != before
+
+
 @pytest.mark.parametrize("ring", [stage_mod.STAGING, stage_mod.PRODUCTION])
 def test_unrelated_candidate_blocks_publication(env, monkeypatch, pushes, ring):
     pr = env.add_pr(1, "one.txt", "one\n")
