@@ -234,6 +234,8 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 
+export { isMobileViewport };
+
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
 // archive + kebab take its place; on mobile those controls are gone, so the
