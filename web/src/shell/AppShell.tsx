@@ -2047,7 +2047,7 @@ export function AppShell() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            <WebUpdateBanner />
+            {!isEmbedded && <WebUpdateBanner />}
             {/* The Search/Settings/toggle cluster lives HERE on the macOS shell,
           not in the sidebar, so the three icons hold one fixed position beside
           the traffic lights no matter what the sidebar does. Inside the sidebar
