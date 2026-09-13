@@ -51,6 +51,8 @@ class Env:
         commit_file(
             self.seed, "pyproject.toml", '[project]\nname = "x"\nversion = "1.2.3.dev0"\n', "base"
         )
+        git(self.seed, "push", str(self.fork), "main")
+        self.initial_refs = git(self.seed, "ls-remote", str(self.fork)).stdout.strip()
         commit_file(self.seed, "a.txt", "base\n", "add a")
         git(self.seed, "push", str(self.upstream), "main")
 
@@ -333,9 +335,11 @@ def test_rescue_refuses_a_merge_containing_branch(env):
 
 def test_production_ring_never_rescues(env):
     pr = _rescuable_pr(env)
-
-    report = env.run([pr], ring=stage_mod.PRODUCTION)
-    assert report["applied"] == []
+    stage_mod.sync_main(env.work)
+    good = env.add_pr(6, "good.txt", "good\n")
+    report = env.run([pr, good], ring=stage_mod.PRODUCTION)
+    assert [p["pr"] for p in report["applied"]] == [6]
+    assert report["base_sha"] == env.fork_ref("refs/heads/main")
     assert [p["pr"] for p in report["skipped"]] == [5]
     # the PR branch is untouched — production composes what the PRs say
     assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
@@ -347,8 +351,9 @@ def test_all_prs_conflicting_is_not_a_failure(env):
     report = env.run([bad])
     assert report["applied"] == []
     assert [p["pr"] for p in report["skipped"]] == [5]
-    assert report["staging_sha"] == report["upstream_sha"]
-    assert env.fork_ref("refs/heads/staging") == report["upstream_sha"]
+    assert report["staging_sha"] != report["upstream_sha"]
+    assert report["entry_zero"]["minted"] is True
+    assert env.fork_ref("refs/heads/staging") == report["staging_sha"]
 
 
 def test_same_day_rerun_noop_then_rerun_suffix(env):
@@ -456,7 +461,8 @@ def test_only_allowed_refs_pushed(env):
     git(env.seed, "push", str(env.fork), "main:refs/heads/testing")
     env.advance_main("f.txt", "f\n")
 
-    env.run([env.add_pr(8, "g.txt", "g\n")])
+    report = env.run([env.add_pr(8, "g.txt", "g\n")])
+    assert report["base_sha"] == env.fork_ref("refs/heads/main")
     assert env.fork_ref("refs/heads/testing") == testing_sha
 
     refs = [
@@ -468,7 +474,9 @@ def test_only_allowed_refs_pushed(env):
         r"|refs/(heads|tags)/nightly-\d{8}(-rerun\d+)?$"
         r"|refs/tags/v\d+\.\d+\.\d+\.dev\d{8}$"
     )
-    assert all(allowed.search(r) for r in refs if r != "refs/heads/testing"), refs
+    assert all(
+        allowed.search(r) for r in refs if r not in {"refs/heads/testing", "refs/heads/main"}
+    ), refs
 
 
 def test_non_conflict_merge_failure_raises(env):
@@ -494,8 +502,9 @@ def test_already_merged_pr_applies_without_commit(env):
 
     report = env.run([pr])
     assert [p["pr"] for p in report["applied"]] == [13]
-    # nothing to merge: staging is upstream HEAD itself, no merge commit minted
-    assert report["staging_sha"] == report["upstream_sha"]
+    # The PR is already covered by entry zero; it mints no additional merge.
+    assert report["staging_sha"] != report["upstream_sha"]
+    assert report["entry_zero"]["minted"] is True
 
 
 def test_notes_escape_untrusted_names_and_signed_variant():
@@ -874,7 +883,8 @@ def test_staging_only_pushes_only_staging_with_lease(env, pushes):
         line.split("\t")[1]
         for line in git(env.work, "ls-remote", str(env.fork)).stdout.strip().splitlines()
     ]
-    assert refs == ["refs/heads/staging"]
+    assert refs == ["refs/heads/main", "refs/heads/staging"]
+    assert report["base_sha"] == env.fork_ref("refs/heads/main")
     for key in ("branch", "tag", "dev_tag", "pin_created"):
         assert key not in report
 
@@ -1218,8 +1228,11 @@ def test_branch_pin_composition_decodes_and_reruns_reproducibly(env):
 
     first = env.run([pin], staging_only=True)
     assert stage_mod.composition_of(env.work, first["staging_sha"]) == (
-        first["upstream_sha"],
-        {"branch:homelab": ("homelab", oid[:12])},
+        first["base_sha"],
+        {
+            "upstream": ("upstream/main", first["upstream_sha"][:12]),
+            "branch:homelab": ("homelab", oid[:12]),
+        },
     )
 
     same = env.run([pin], staging_only=True)
@@ -1400,10 +1413,10 @@ def test_production_extras_reject_branch_pins(tmp_path):
 @pytest.mark.parametrize("source", ["extra-branch"])
 def test_direct_production_stage_rejects_branch_extras_before_git(env, source):
     with pytest.raises(stage_mod.StageError, match=r"production.*extras"):
-        env.run([{"source": source}], ring=stage_mod.PRODUCTION)
+        env.run([{"source": source}], ring=stage_mod.PRODUCTION, base_ref="missing-ref")
 
     assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
-    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
 
 
 def test_production_pin_prefix(env):
@@ -1432,7 +1445,7 @@ def test_production_subject_roundtrip(env):
     subject = env.fork_log("production").splitlines()[0]
     assert subject == f"production: merge PR #6 (pr-6 @ {pr['headRefOid'][:12]})"
     assert stage_mod.composition_of(env.work, report["staging_sha"], stage_mod.PRODUCTION) == (
-        report["upstream_sha"],
+        report["base_sha"],
         {6: ("pr-6", pr["headRefOid"][:12])},
     )
     assert stage_mod.merge_re().fullmatch(subject) is None
@@ -1471,6 +1484,8 @@ def test_production_rejects_staging_only(env, tmp_path, capsys):
                 STAMP,
                 "--ring",
                 "production",
+                "--base-ref",
+                "missing-ref",
                 "--staging-only",
                 "--prs-json",
                 str(prs_json),
@@ -1481,7 +1496,7 @@ def test_production_rejects_staging_only(env, tmp_path, capsys):
     assert exc.value.code == 2
     assert "--staging-only is only valid for --ring staging" in capsys.readouterr().err
     # rejected before any git work: nothing fetched, no ref reached the fork
-    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
     assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
 
 
@@ -1543,9 +1558,10 @@ def test_production_identity_tampering_fails_before_push(env, monkeypatch, tampe
     real_merge_prs = stage_mod.merge_prs
 
     def tampered_merge_prs(
-        cwd, prs, upstream, fork="origin", ring=stage_mod.STAGING, upstream_sha=""
+        cwd, prs, upstream, fork="origin", ring=stage_mod.STAGING, upstream_sha="", **kwargs
     ):
-        applied, skipped = real_merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
+        applied, skipped = real_merge_prs(cwd, prs, upstream, fork, ring, upstream_sha, **kwargs)
+        assert git(cwd, "rev-parse", "HEAD^1").stdout.strip() == env.fork_ref("refs/heads/main")
         subject = "production: merge PR #21 (pr-21 @ " + pr["headRefOid"][:12] + ")"
         if tampering == "first-parent":
             stage_mod.git(
@@ -1588,16 +1604,14 @@ def test_production_identity_tampering_fails_before_push(env, monkeypatch, tampe
     with pytest.raises(stage_mod.StageError, match="production identity"):
         env.run([pr], ring=stage_mod.PRODUCTION)
 
-    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
 
 
-def test_production_zero_merge_candidate_is_valid(env):
-    report = env.run([], ring=stage_mod.PRODUCTION)
-
-    assert report["staging_sha"] == report["upstream_sha"]
-    assert report["applied"] == []
-    assert env.fork_ref("refs/heads/production") == report["upstream_sha"]
-    assert env.fork_ref(f"refs/tags/production-{STAMP}") == report["upstream_sha"]
+def test_production_zero_merge_candidate_is_rejected(env, pushes):
+    with pytest.raises(stage_mod.StageError, match="strict ancestor"):
+        env.run([], ring=stage_mod.PRODUCTION)
+    assert pushes == []
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
 
 
 def test_notes_production_ring_has_apk_section(tmp_path, capsys):
@@ -1703,6 +1717,7 @@ def test_production_migration_gate_blocks_push(env):
     report = env.run([pr], ring=stage_mod.PRODUCTION)
 
     assert report["pushed"] is False
+    assert report["base_sha"] == env.fork_ref("refs/heads/main")
     gate = report["migration_gate"]
     assert gate["blocked"] is True
     assert gate["candidate"] == report["staging_sha"]
@@ -1711,7 +1726,7 @@ def test_production_migration_gate_blocks_push(env):
     # nothing was pinned, so the report carries no pin fields at all
     assert "tag" not in report and "pin_created" not in report
     # the fork fixture remote received no refs whatsoever
-    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
     text = stage_mod.summarize(report, stage_mod.PRODUCTION)
     assert "BLOCKED" in text and report["staging_sha"] in text
 
@@ -1747,6 +1762,7 @@ def test_production_migration_gate_clean_composes(env):
     assert env.fork_ref("refs/heads/production") == report["staging_sha"]
 
     env.advance_main("more.txt", "m\n")
+    stage_mod.sync_main(env.work)
     second = env.run([pr], ring=stage_mod.PRODUCTION)
     assert second["migration_gate"]["blocked"] is False
     assert second["migration_gate"]["prev_pin"] == report["staging_sha"]
@@ -1947,3 +1963,294 @@ def test_own_prs_fails_loud_on_missing_author():
     for record in ({"number": 7}, {"number": 7, "author": {}}, {"number": 7, "author": "btli"}):
         with pytest.raises(stage_mod.StageError, match="no author login"):
             stage_mod.own_prs([record])
+
+
+@pytest.mark.parametrize("staging_only", [False, True])
+def test_fork_base_and_entry_zero_order(env, staging_only):
+    base = env.add_fork_branch("fork-main", "fork.txt", "fork only\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    upstream = env.advance_main("fresh.txt", "upstream only\n")
+    pr9 = env.add_pr(9, "nine.txt", "nine\n")
+    pr4 = env.add_pr(4, "four.txt", "four\n")
+    overlay = env.add_fork_branch("homelab", "overlay.txt", "overlay\n")
+    prs = [pr9, {"number": None, "source": "extra-branch", "headRefName": "homelab"}, pr4]
+    report = env.run(prs, staging_only=staging_only)
+    assert report["base_sha"] == base == env.fork_ref("refs/heads/main")
+    assert report["upstream_sha"] == upstream
+    assert report["entry_zero"] == {
+        "pr": 0,
+        "branch": "upstream/main",
+        "oid": upstream,
+        "source": "upstream",
+        "minted": True,
+    }
+    subjects = git(
+        env.work, "log", "--first-parent", "--reverse", "--format=%s", f"{base}..HEAD"
+    ).stdout.splitlines()
+    assert subjects == [
+        f"staging: merge upstream {upstream[:12]}",
+        f"staging: merge PR #4 (pr-4 @ {pr4['headRefOid'][:12]})",
+        f"staging: merge PR #9 (pr-9 @ {pr9['headRefOid'][:12]})",
+        f"staging: merge branch homelab (homelab @ {overlay[:12]})",
+    ]
+    assert (
+        git(env.work, "rev-list", "--left-right", "--count", f"{base}...HEAD").stdout.split()[0]
+        == "0"
+    )
+    decoded = stage_mod.composition_of(env.work, report["staging_sha"])
+    assert decoded[0] == base
+    assert decoded[1]["upstream"] == ("upstream/main", upstream[:12])
+    assert env.run(prs, staging_only=staging_only)["staging_sha"] == report["staging_sha"]
+    assert base in stage_mod.notes(report, signed=True)
+    assert base in stage_mod.summarize(report)
+
+
+def test_production_uses_fork_base_without_entry_zero(env):
+    pr = env.add_pr(5, "pr.txt", "reviewed\n")
+    base = env.add_fork_branch("fork-main", "fork.txt", "fork only\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    upstream = env.advance_main("fresh.txt", "upstream only\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert report["base_sha"] == base
+    assert report["upstream_sha"] == upstream
+    assert "entry_zero" not in report
+    assert (env.work / "fork.txt").read_text() == "fork only\n"
+    assert not (env.work / "fresh.txt").exists()
+    assert (
+        git(env.work, "rev-list", "--first-parent", "--count", f"{base}..HEAD").stdout.strip()
+        == "1"
+    )
+    stage_mod.assert_production_identity(env.work, report["staging_sha"], base, report["applied"])
+
+
+@pytest.mark.parametrize(
+    "ring,staging_only",
+    [(stage_mod.STAGING, False), (stage_mod.STAGING, True), (stage_mod.PRODUCTION, False)],
+)
+def test_main_race_blocks_all_publication(env, monkeypatch, pushes, ring, staging_only):
+    pr = env.add_pr(1, "one.txt", "one\n")
+    real_merge = stage_mod.merge_prs
+
+    def race(*args, **kwargs):
+        result = real_merge(*args, **kwargs)
+        if args[1] == [pr]:
+            git(env.seed, "push", str(env.fork), "main")
+        return result
+
+    monkeypatch.setattr(stage_mod, "merge_prs", race)
+    with pytest.raises(stage_mod.StageError, match="fork main changed"):
+        env.run([pr], ring=ring, staging_only=staging_only)
+    assert pushes == []
+
+
+@pytest.mark.parametrize("ring", [stage_mod.STAGING, stage_mod.PRODUCTION])
+def test_unrelated_candidate_blocks_publication(env, monkeypatch, pushes, ring):
+    pr = env.add_pr(1, "one.txt", "one\n")
+    real_merge = stage_mod.merge_prs
+
+    def unrelated(*args, **kwargs):
+        result = real_merge(*args, **kwargs)
+        if args[1] == [pr]:
+            tree = git(env.work, "rev-parse", "HEAD^{tree}").stdout.strip()
+            orphan = git(env.work, "commit-tree", tree, "-m", "unrelated").stdout.strip()
+            git(env.work, "checkout", "--detach", orphan)
+        return result
+
+    monkeypatch.setattr(stage_mod, "merge_prs", unrelated)
+    with pytest.raises(stage_mod.StageError, match="strict ancestor"):
+        env.run([pr], ring=ring)
+    assert pushes == []
+
+
+def test_entry_zero_conflict_fails_closed_and_accepts_seed(env, tmp_path, pushes):
+    base = env.add_fork_branch("fork-main", "a.txt", "fork\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    upstream = env.advance_main("a.txt", "upstream\n")
+    with pytest.raises(stage_mod.StageError, match=r"entry zero conflicts: a.txt"):
+        env.run([], staging_only=True)
+    assert pushes == []
+    assert git(env.work, "rev-parse", "HEAD").stdout.strip() == base
+    shutil.rmtree(env.work / ".git/rr-cache")
+    git(
+        env.work,
+        "-c",
+        "rerere.enabled=true",
+        "merge",
+        "--no-ff",
+        "--no-commit",
+        upstream,
+        check=False,
+    )
+    (env.work / "a.txt").write_text("resolved\n")
+    git(env.work, "-c", "rerere.enabled=true", "rerere")
+    seed = tmp_path / "entry-zero-seed"
+    shutil.copytree(env.work / ".git/rr-cache", seed)
+    git(env.work, "merge", "--abort")
+    shutil.rmtree(env.work / ".git/rr-cache")
+    report = env.run([], rr_cache_dir=seed)
+    assert report["entry_zero"]["rerere_paths"] == ["a.txt"]
+    assert (env.work / "a.txt").read_text() == "resolved\n"
+    assert env.run([], rr_cache_dir=seed)["staging_sha"] == report["staging_sha"]
+
+
+def test_base_ref_cli_fetches_fork_main(env, tmp_path):
+    pr = env.add_pr(3, "three.txt", "three\n")
+    base = env.fork_ref("refs/heads/main")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([pr]))
+    report_path = tmp_path / "report.json"
+    assert (
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--base-ref",
+                "origin/main",
+                "--prs-json",
+                str(prs_json),
+                "--extras",
+                str(tmp_path / "absent"),
+                "--report",
+                str(report_path),
+                "--staging-only",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(report_path.read_text())["base_sha"] == base
+    assert env.fork_ref("refs/heads/main") == base
+
+
+def test_rescue_keeps_upstream_target_with_fork_base(env, monkeypatch):
+    pr = _rescuable_pr(env)
+    base = env.add_fork_branch("fork-main", "fork.txt", "fork only\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    real_rescue = stage_mod.rebase_rescue
+    targets = []
+
+    def rescue(cwd, oid, upstream_sha, ring):
+        targets.append(upstream_sha)
+        return real_rescue(cwd, oid, upstream_sha, ring)
+
+    monkeypatch.setattr(stage_mod, "rebase_rescue", rescue)
+    report = env.run([pr])
+    assert report["base_sha"] == base != report["upstream_sha"]
+    assert targets == [report["upstream_sha"]]
+    rescued = report["applied"][0]["oid"]
+    assert git(env.work, "merge-base", "--is-ancestor", base, rescued, check=False).returncode == 1
+
+
+@pytest.mark.parametrize("baseline", ["upstream", "previous-pin"])
+def test_migration_gate_retains_both_baselines_on_fork_main(env, baseline, pushes):
+    pr = env.add_pr(3, "three.txt", "three\n")
+    if baseline == "previous-pin":
+        (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+        migration = env.add_pr(4, f"{MIGRATIONS_DIR}/old.py", "old\n")
+        first = env.run([pr, migration], ring=stage_mod.PRODUCTION)
+        env.run(
+            [pr, migration], ring=stage_mod.PRODUCTION, migration_approval=first["staging_sha"]
+        )
+        base = env.add_fork_branch("fork-main", "fork.txt", "fork\n")
+    else:
+        (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+        base = env.add_fork_branch("fork-main", f"{MIGRATIONS_DIR}/fork.py", "fork\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    pushes.clear()
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert report["base_sha"] == base != report["upstream_sha"]
+    assert report["migration_gate"]["blocked"] is True
+    assert pushes == []
+    assert base in stage_mod.summarize(report, stage_mod.PRODUCTION)
+
+
+@pytest.mark.parametrize("race_count", [0, 1, 2])
+def test_sync_main_lease_and_bounded_retry(env, monkeypatch, race_count):
+    upstream = env.advance_main("fresh.txt", "upstream\n")
+    real_git = stage_mod.git
+    attempts = []
+
+    def race(cwd, *args, **kwargs):
+        if args[:1] == ("push",):
+            expected = env.fork_ref("refs/heads/main")
+            attempts.append(args)
+            assert f"--force-with-lease=refs/heads/main:{expected}" in args
+            assert "--force" not in args and "-f" not in args
+            candidate = args[-1].split(":")[0]
+            git(env.work, "merge-base", "--is-ancestor", expected, candidate)
+            if len(attempts) <= race_count:
+                if len(attempts) == 1:
+                    git(env.seed, "checkout", "-b", "racer", expected)
+                    commit_file(env.seed, "race.txt", "1\n", "racer")
+                else:
+                    env.advance_fork_branch("racer", "race.txt", "2\n")
+                git(env.seed, "push", str(env.fork), "racer:main")
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", race)
+    if race_count == 2:
+        with pytest.raises(stage_mod.StageError, match="sync-main: push failed"):
+            stage_mod.sync_main(env.work)
+    else:
+        sha = stage_mod.sync_main(env.work)
+        assert env.fork_ref("refs/heads/main") == sha
+        git(env.work, "merge-base", "--is-ancestor", upstream, sha)
+        if race_count:
+            assert (env.work / "race.txt").read_text() == "1\n"
+        assert stage_mod.sync_main(env.work) == sha
+    assert len(attempts) == min(race_count + 1, 2)
+
+
+@pytest.mark.parametrize("failure", ["conflict", "hook"])
+def test_sync_main_failure_leaves_main_untouched(env, pushes, failure):
+    base = env.add_fork_branch("fork-main", "a.txt", "fork\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    env.advance_main("a.txt" if failure == "conflict" else "fresh.txt", "upstream\n")
+    if failure == "hook":
+        hook = env.fork / "hooks/pre-receive"
+        hook.write_text("#!/bin/sh\necho 'fetch first' >&2\nexit 1\n")
+        hook.chmod(0o755)
+    with pytest.raises(stage_mod.StageError, match=r"sync-main: (merge|push) failed"):
+        stage_mod.sync_main(env.work)
+    assert env.fork_ref("refs/heads/main") == base
+    assert len(pushes) == (0 if failure == "conflict" else 1)
+    assert git(env.work, "ls-files", "-u").stdout == ""
+
+
+def test_sync_main_cli(env, capsys):
+    assert stage_mod.main(["sync-main", "--workdir", str(env.work)]) == 0
+    assert capsys.readouterr().out.strip() == env.fork_ref("refs/heads/main")
+
+
+def test_only_scheduled_production_owns_main_sync():
+    import yaml
+
+    workflows = Path(__file__).resolve().parents[2] / "workflows"
+    for filename, job in (
+        ("personal-staging-hourly.yml", "compose"),
+        ("personal-staging.yml", "integrate"),
+        ("personal-production.yml", "compose"),
+    ):
+        text = (workflows / filename).read_text()
+        workflow = yaml.safe_load(text)
+        assert "sync-main" not in workflow["jobs"]
+        assert workflow["concurrency"]["cancel-in-progress"] is False
+        compose = workflow["jobs"][job]
+        assert compose["needs"] == "test-composer"
+        assert compose["environment"] == "staging-push"
+        assert compose["concurrency"] == {
+            "group": "personal-ring-compose",
+            "cancel-in-progress": False,
+        }
+        scripts = "\n".join(step.get("run", "") for step in compose["steps"])
+        assert not re.search(r"git push.*(?:main|refs/heads/main)", text)
+        if filename == "personal-production.yml":
+            assert scripts.count("stage.py sync-main") == 1
+            assert (
+                'if [ "$EVENT_NAME" = "schedule" ] && [ -z "$APPROVE_MIGRATION" ]; then' in scripts
+            )
+            assert scripts.index("stage.py sync-main") < scripts.index(
+                "stage.py stage --ring production"
+            )
+        else:
+            assert "stage.py sync-main" not in text

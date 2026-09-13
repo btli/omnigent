@@ -1,9 +1,10 @@
 {
   "merge_commits": [
-    "tree cb819bf55c4832e796cb89f06de277782a39c094\nparent d50e4666d789a86c2500f06370afb0f7f8bcc520\nparent a3cd760d1b37c73f15c3a3557cf26108ba463c01\nauthor omnigent-staging <staging@invalid> 1785662100 +0000\ncommitter omnigent-staging <staging@invalid> 1785662100 +0000\n\nstaging: merge PR #4 (pr-4 @ a3cd760d1b37)\n",
-    "tree b8bdf2cfb550046b8629f706efa219ced2ca01d9\nparent 46d2d1f30d542867c1d6b54f0907fac00a46e0fa\nparent 30297b0a8b5c44a5b6f9555f527e5975173149a7\nauthor omnigent-staging <staging@invalid> 1785781800 +0000\ncommitter omnigent-staging <staging@invalid> 1785781800 +0000\n\nstaging: merge PR #9 (pr-9 @ 30297b0a8b5c)\n"
+    "tree a960968423f9c7e7e8a2c42ae52ee09e25f4ac2b\nparent 22353f5fceba131785461953b028309894382cf5\nparent e0985219daf5c4f5cf419c821238751235f30785\nauthor omnigent-staging <staging@invalid> 1785542400 +0000\ncommitter omnigent-staging <staging@invalid> 1785542400 +0000\n\nstaging: merge upstream e0985219daf5\n",
+    "tree 765920e9e4a40d48b880752060f92c9de3d29d5d\nparent cf987410f4f7ae7e642211649181d7102b1cb5a5\nparent 911616a1157c064345e617daa4a7eb50db182449\nauthor omnigent-staging <staging@invalid> 1785662100 +0000\ncommitter omnigent-staging <staging@invalid> 1785662100 +0000\n\nstaging: merge PR #4 (pr-4 @ 911616a1157c)\n",
+    "tree d7b1402174dc790e38ca8c4bbe2294a2fd71f9e0\nparent 9b0909ecf42e9d527587d9b0db3dda3ed6b346eb\nparent 1ad50a152831fa4517312079d2fad4c6db432b56\nauthor omnigent-staging <staging@invalid> 1785781800 +0000\ncommitter omnigent-staging <staging@invalid> 1785781800 +0000\n\nstaging: merge PR #9 (pr-9 @ 1ad50a152831)\n"
   ],
-  "notes": "Nightly personal staging ring for 20260820 (UTC).\n\n- Upstream main: `d50e4666d789a86c2500f06370afb0f7f8bcc520`\n- Staging commit: `6a1c119077ab9279705945f51755b803c07411ee`\n- Dev tag: `v1.2.3.dev20260820`\n\n## Applied PRs (2)\n- #4 `pr-4` @ `a3cd760d1b37`\n- #9 `pr-9` @ `30297b0a8b5c`\n\n## Skipped PRs (0)\n- none\n\n## APK signing\nDebug APK signed with the shared debug keystore \u2014 installs upgrade in place.\n",
+  "notes": "Nightly personal staging ring for 20260820 (UTC).\n\n- Upstream main: `e0985219daf5c4f5cf419c821238751235f30785`\n- Fork main base: `22353f5fceba131785461953b028309894382cf5`\n- Entry zero: `e0985219daf5c4f5cf419c821238751235f30785`\n- Staging commit: `4cd66030779beffa0160d8203930daa5c7b3598b`\n- Dev tag: `v1.2.3.dev20260820`\n\n## Applied PRs (2)\n- #4 `pr-4` @ `911616a1157c`\n- #9 `pr-9` @ `1ad50a152831`\n\n## Skipped PRs (0)\n- none\n\n## APK signing\nDebug APK signed with the shared debug keystore \u2014 installs upgrade in place.\n",
   "pushed": [
     [
       "push",
@@ -13,10 +14,10 @@
       "--force-with-lease=refs/tags/nightly-20260820:",
       "--force-with-lease=refs/tags/v1.2.3.dev20260820:",
       "origin",
-      "6a1c119077ab9279705945f51755b803c07411ee:refs/heads/staging",
-      "6a1c119077ab9279705945f51755b803c07411ee:refs/heads/nightly-20260820",
-      "6a1c119077ab9279705945f51755b803c07411ee:refs/tags/nightly-20260820",
-      "6a1c119077ab9279705945f51755b803c07411ee:refs/tags/v1.2.3.dev20260820"
+      "4cd66030779beffa0160d8203930daa5c7b3598b:refs/heads/staging",
+      "4cd66030779beffa0160d8203930daa5c7b3598b:refs/heads/nightly-20260820",
+      "4cd66030779beffa0160d8203930daa5c7b3598b:refs/tags/nightly-20260820",
+      "4cd66030779beffa0160d8203930daa5c7b3598b:refs/tags/v1.2.3.dev20260820"
     ]
   ],
   "report": {
@@ -24,39 +25,47 @@
       {
         "branch": "pr-4",
         "minted": true,
-        "oid": "a3cd760d1b37c73f15c3a3557cf26108ba463c01",
+        "oid": "911616a1157c064345e617daa4a7eb50db182449",
         "pr": 4,
         "source": "open"
       },
       {
         "branch": "pr-9",
         "minted": true,
-        "oid": "30297b0a8b5c44a5b6f9555f527e5975173149a7",
+        "oid": "1ad50a152831fa4517312079d2fad4c6db432b56",
         "pr": 9,
         "source": "open"
       }
     ],
     "audit": [
       {
-        "expected": "6a1c119077ab9279705945f51755b803c07411ee",
-        "observed": "6a1c119077ab9279705945f51755b803c07411ee",
+        "expected": "4cd66030779beffa0160d8203930daa5c7b3598b",
+        "observed": "4cd66030779beffa0160d8203930daa5c7b3598b",
         "ref": "refs/tags/nightly-20260820"
       },
       {
-        "expected": "6a1c119077ab9279705945f51755b803c07411ee",
-        "observed": "6a1c119077ab9279705945f51755b803c07411ee",
+        "expected": "4cd66030779beffa0160d8203930daa5c7b3598b",
+        "observed": "4cd66030779beffa0160d8203930daa5c7b3598b",
         "ref": "refs/heads/nightly-20260820"
       }
     ],
+    "base_sha": "22353f5fceba131785461953b028309894382cf5",
     "branch": "nightly-20260820",
     "date": "20260820",
     "dev_tag": "v1.2.3.dev20260820",
+    "entry_zero": {
+      "branch": "upstream/main",
+      "minted": true,
+      "oid": "e0985219daf5c4f5cf419c821238751235f30785",
+      "pr": 0,
+      "source": "upstream"
+    },
     "pin_created": true,
     "pin_ref": "refs/tags/nightly-20260820",
     "skipped": [],
-    "staging_sha": "6a1c119077ab9279705945f51755b803c07411ee",
+    "staging_sha": "4cd66030779beffa0160d8203930daa5c7b3598b",
     "tag": "nightly-20260820",
-    "upstream_sha": "d50e4666d789a86c2500f06370afb0f7f8bcc520"
+    "upstream_sha": "e0985219daf5c4f5cf419c821238751235f30785"
   },
-  "summary": "## Personal staging nightly\n\n| | |\n| --- | --- |\n| Upstream main | `d50e4666d789a86c2500f06370afb0f7f8bcc520` |\n| Staging | `6a1c119077ab9279705945f51755b803c07411ee` |\n| Pin | `nightly-20260820` |\n| Dev tag | `v1.2.3.dev20260820` |\n| Applied / skipped | 2 / 0 |\n"
+  "summary": "## Personal staging nightly\n\n| | |\n| --- | --- |\n| Upstream main | `e0985219daf5c4f5cf419c821238751235f30785` |\n| Fork main base | `22353f5fceba131785461953b028309894382cf5` |\n| Entry zero | `e0985219daf5c4f5cf419c821238751235f30785` |\n| Staging | `4cd66030779beffa0160d8203930daa5c7b3598b` |\n| Pin | `nightly-20260820` |\n| Dev tag | `v1.2.3.dev20260820` |\n| Applied / skipped | 2 / 0 |\n"
 }

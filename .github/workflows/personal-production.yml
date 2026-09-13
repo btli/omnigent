@@ -1,6 +1,6 @@
 # Nightly personal production ring for the btli fork.
 #
-# Composes fork branch `production` = upstream main + every open NON-draft
+# Composes fork branch `production` = published fork main + every open NON-draft
 # btli PR plus the extras-production.txt pins (its own manifest — a listed
 # draft is force-promoted past the draft gate; no dev tag) and
 # pins an immutable production-YYYYMMDD branch + tag, the pin homelab's
@@ -85,6 +85,9 @@ jobs:
         run: echo "## Personal production nightly — test-composer job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
 
   compose:
+    concurrency:
+      group: personal-ring-compose
+      cancel-in-progress: false
     needs: test-composer
     # Accident prevention for non-main dispatches (schedule always runs main);
     # a dispatched ref executes its own workflow copy, so this is not a
@@ -110,11 +113,12 @@ jobs:
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 
-      - name: Compose production from upstream main + open non-draft btli PRs
+      - name: Compose production from fork main + open non-draft btli PRs
         env:
           GH_TOKEN: ${{ github.token }}
           # Empty on schedule runs; the gate compares it to the candidate sha.
           APPROVE_MIGRATION: ${{ inputs.approve_migration }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # Preflight identity for git merge --no-ff --no-commit; stage.py's
@@ -123,6 +127,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          if [ "$EVENT_NAME" = "schedule" ] && [ -z "$APPROVE_MIGRATION" ]; then
+            python3 .github/scripts/personal-staging/stage.py sync-main \
+              --upstream-remote upstream --fork-remote origin
+          fi
           python3 .github/scripts/personal-staging/stage.py stage --ring production \
             --migration-approval "$APPROVE_MIGRATION" \
             --upstream-remote upstream --fork-remote origin \

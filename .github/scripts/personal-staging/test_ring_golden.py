@@ -94,6 +94,12 @@ def build_scenario(tmp_path: Path):
     )
     commit_file(seed, "a.txt", "base\n", "add a", BASE_DATE)
     git(seed, "push", str(upstream), "main")
+    git(seed, "checkout", "-b", "fork-main")
+    commit_file(seed, "fork.txt", "fork only\n", "fork main", BASE_DATE)
+    git(seed, "push", str(fork), "fork-main:main")
+    git(seed, "checkout", "main")
+    commit_file(seed, "upstream.txt", "fresh\n", "fresh upstream", BASE_DATE)
+    git(seed, "push", str(upstream), "main")
 
     heads = {}
     for number, fname, content, date in (
@@ -145,7 +151,7 @@ def compose_snapshot(tmp_path: Path, monkeypatch) -> dict:
         "rev-list",
         "--first-parent",
         "--reverse",
-        f"{report['upstream_sha']}..{report['staging_sha']}",
+        f"{report['base_sha']}..{report['staging_sha']}",
     ).stdout.split()
     merge_commits = [real_git(work, "cat-file", "-p", sha).stdout for sha in shas]
 

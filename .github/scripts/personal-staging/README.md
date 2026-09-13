@@ -4,7 +4,8 @@
 `0 10 * * *` — plus `workflow_dispatch`) on the `btli/omnigent` fork only.
 It:
 
-1. Composes fork branch `staging` = upstream `omnigent-ai/omnigent` main +
+1. Composes fork branch `staging` from published fork main, merges fresh
+   upstream `omnigent-ai/omnigent` main as entry zero, then adds
    every open btli PR plus the [`extras.txt`](#extras-manifest-extrastxt)
    pins, merged sequentially ascending by PR number (`stage.py`). A
    conflicting open PR gets one rebase rescue: its head is replayed onto
@@ -15,7 +16,7 @@ It:
    conflict paths land in `merge-report.json` — and the run continues.
    Extras are never rebased (their refs are frozen pins), and the
    production ring never rescues. All PRs conflicting is a reported
-   outcome, not a failure.
+   outcome, provided entry zero still makes staging a strict descendant of fork main.
 2. Pins an immutable, canonical `nightly-YYYYMMDD` tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
    deprecated same-name compatibility branch slated for removal in v0.12.0
@@ -53,10 +54,8 @@ rebases it, never recomposes it). Nothing here flips any existing behavior.
 
 `Personal Staging Hourly` (cron `17 * * * *`, plus `workflow_dispatch`)
 keeps branch `staging` fresh between nightlies. The odd minute is
-deliberate: `:00` would collide with the nightly's 10:00 UTC slot (both
-push fork main) and GitHub delays or drops runs scheduled on that
-congested minute. It runs the same composer
-with `--staging-only`: compose upstream main + open btli PRs + extras
+deliberate: GitHub delays or drops runs scheduled on the congested `:00` minute. It runs the same composer
+with `--staging-only`: compose fork main + fresh upstream main + open btli PRs + extras
 exactly as the nightly does, then push ONLY `refs/heads/staging`
 (`--force-with-lease`). It mints no `nightly-*` pins and no dev tags, and
 builds no APK/releases/images — those stay nightly-only.
@@ -67,21 +66,56 @@ the summary reports "unchanged". When it does push, the summary's one-line
 result names which of upstream HEAD, the open PR set, or the extras
 changed.
 
-Its `sync-main` job soft-fails on a merge *conflict* (abort + `::warning::`
-+ summary, exit 0) — unlike the nightly's, which hard-fails — because the
-compose job stacks from upstream HEAD and never reads fork main. Only a
-genuine content conflict is soft-failed: a merge that fails with no
-unmerged paths (bad object, corrupt repo) still fails the job loudly. If
-its `git push origin main` is rejected as a confirmed stale ref
-(`! [rejected]` with `non-fast-forward` / `fetch first` / `stale info` —
-typically a race with the nightly or a human push), it re-fetches and
-retries once, then warns and exits 0. Auth, permissions, or transport
-failures still fail the job. `main` is never force-pushed.
+Neither staging workflow advances main. Only the scheduled production compose
+runs `stage.py sync-main`. All three privileged composition jobs share
+`personal-ring-compose` with `cancel-in-progress: false`; their outer workflow
+groups also do not cancel running jobs. A human main push still invalidates an
+in-flight composition: the composer checks fresh remote main before publication
+and fails closed if it differs from `base_sha`.
 
-The workflow uses its own concurrency group (`personal-staging-hourly`,
-`cancel-in-progress: true`) so stale hourly runs coalesce and can never
-cancel a running nightly; if an hourly push loses a `--force-with-lease`
-race with the nightly, the next hour retries.
+## Bases and sync ownership
+
+```text
+upstream/main -- scheduled production sync-main --> published fork main
+                                                   | base_sha
+                                                   +-- production PRs --> production pin
+                                                   |
+                                                   +-- fresh upstream (entry zero)
+                                                       --> staging PRs --> homelab --> staging pin
+```
+
+`stage --base-ref REF` defaults to freshly fetched fork main. An explicit ref
+must resolve to that same published commit before anything can be published.
+Every report, including hourly infrastructure/extra blocks and migration blocks,
+carries `base_sha` and `upstream_sha`. `base_sha` anchors ancestry and production's
+first-parent identity validation. `upstream_sha` remains the PR fetch/rescue,
+dev-version and upstream migration baseline. The previous production pin remains
+the second migration baseline.
+
+Staging reports also carry `entry_zero` (`source: upstream`, `pr: 0`, `oid`,
+`minted`, and `rerere_paths` when used), separately from the existing PR lists.
+A real entry-zero merge has subject `staging: merge upstream <sha12>` and uses
+the upstream committer date and staging identity. The composition decoder includes
+it under `upstream`. If upstream is already contained, `minted` is false and
+no redundant commit is made. A conflict without a complete verified rerere
+resolution fails closed. Production has no entry zero.
+
+```sh
+python3 .github/scripts/personal-staging/stage.py sync-main \
+  --workdir /path/to/disposable-clone --upstream-remote upstream --fork-remote origin
+```
+
+This command writes fork main: use it only in the production sync path or an
+intentional operator sync. It merges from fresh main, verifies fast-forward
+ancestry, and pushes with an explicit old-value lease. It never rewrites main.
+Only a confirmed stale-ref rejection gets one retry, rebuilt from fresh main;
+a second race, merge conflict, hook, auth or transport failure stops publication.
+Scheduled production invokes it only with empty migration approval. Manual and
+approval dispatches compose from already-published main, which is fetched again
+by `stage` after sync. Neither ring can publish a candidate equal to its base.
+
+See the [staging ring README](../../../docs/rings/staging/README.md) and
+[production ring README](../../../docs/rings/production/README.md) for verification.
 
 ## Personal production nightly (`personal-production.yml`)
 
@@ -96,7 +130,7 @@ download; the default is 90 seconds.
 
 `Personal Production Nightly` (cron `30 10 * * *`, plus `workflow_dispatch`)
 runs the same composer with `--ring production`: fork branch `production` =
-upstream main + every open **non-draft** btli PR plus numeric pins from
+published fork main + every open **non-draft** btli PR plus numeric pins from
 `extras-production.txt`, and no dev tag. Draft status gates the automatic
 stream: `filter_drafts()` runs before the extras union, so a numeric production
 extra bypasses it (both current pins are non-draft). The current bot-owned pins
@@ -105,8 +139,8 @@ canonical `production-YYYYMMDD` tag
 pin (same rerun/no-op semantics as `nightly-*`) plus a deprecated same-name
 compatibility branch slated for removal in v0.12.0, which homelab's
 `build-omnigent-production.yml` resolves at 11:10 UTC to build and
-digest-pin the prod server + host images. Compose + pin only: no
-APK/releases/images. Its concurrency group (`personal-production`,
+digest-pin the prod server + host images. The workflow also builds APK and
+desktop release artifacts and dispatches image publication. Its concurrency group (`personal-production`,
 `cancel-in-progress: false`) is disjoint from the staging groups, so the
 rings can never cancel each other.
 
@@ -116,7 +150,7 @@ A candidate that touches `omnigent/db/migrations/versions/**` — on EITHER
 `upstream/main..candidate` OR `previous-production-pin..candidate` (the
 second leg catches a migration-bearing PR *removed* between compositions) —
 is never auto-published. `stage.py` itself refuses the atomic push, so **no
-refs move at all**: the run stays green (blocked is a success outcome), the
+ring refs move** (the scheduled main sync may already have advanced main): the run stays green (blocked is a success outcome), the
 step summary shows a BLOCKED row with the candidate sha, and a best-effort
 HMAC-signed alert goes to `hooks.bryanli.net/hooks/ha-notify` (repo secret
 `HA_NOTIFY_HMAC`; absent secret or unreachable receiver only warns — CI
