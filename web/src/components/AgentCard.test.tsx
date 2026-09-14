@@ -73,7 +73,8 @@ describe("AgentCard icon selection", () => {
     { name: "x", harness: "antigravity", expected: "antigravity" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
-    { name: "grok", harness: "grok", expected: "grok" },
+    { name: "x", harness: "grok", expected: "grok" },
+    { name: "x", harness: "grok-native", expected: "grok" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },
   ])("uses the $expected glyph for harness $harness", ({ name, harness, expected }) => {
