@@ -5,10 +5,9 @@ Two install shapes are supported:
 * **Dev clone** (``git clone … && uv sync`` / ``pip install -e .``): we
   walk up from this module to find a ``.git/`` directory, then run
   ``git fetch`` and ``rev-list`` to count how many commits ``HEAD`` is
-  behind its tracked ref. Detached checkouts use a local remote ref at
-  the same commit when available; otherwise the check falls back to
-  ``origin/main`` (or ``origin/master``). Each invocation fetches a
-  fresh comparison and records the result in
+  behind its configured upstream. Detached checkouts and branches
+  without an upstream skip the notice. Each invocation fetches a fresh
+  comparison and records the result in
   ``~/.omnigent/.update_check.json``. The notice points the user at
   ``git pull``.
 
@@ -123,10 +122,8 @@ class _CacheEntry:
         every invocation. Empty string when no notice has been shown.
     :param compared_ref: The ref used for the commits-behind count and
         named in clone notices, e.g. ``"origin/main"``.
-    :param detached: Whether the clone comparison was made from a
-        detached ``HEAD``.
-    :param fallback: Whether the clone comparison used the legacy
-        ``origin/main`` or ``origin/master`` fallback.
+    :param detached: Legacy clone-cache field retained for compatibility.
+    :param fallback: Legacy clone-cache field retained for compatibility.
     """
 
     last_check_epoch: float
@@ -200,9 +197,8 @@ class _GitComparison:
 
     remote: str
     branch: str
+    tracking_ref: str
     display_ref: str
-    revision: str
-    detached: bool = False
 
 
 def maybe_show_update_notice() -> None:
@@ -241,12 +237,7 @@ def _run_dev_clone_check(repo_root: Path) -> None:
 
         _write_cache(result)
         if result.commits_behind > 0:
-            _print_notice(
-                result.commits_behind,
-                result.compared_ref,
-                detached=result.detached,
-                fallback=result.fallback,
-            )
+            _print_notice(result.commits_behind, result.compared_ref)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         # Never let the update check break the CLI.
         pass
@@ -800,10 +791,8 @@ def _write_cache(entry: _CacheEntry) -> None:
 def _run_check(repo_root: Path) -> _CacheEntry | None:
     """Fetch upstream and count how many commits HEAD is behind.
 
-    Uses the current branch's upstream, or a local remote ref pointing at
-    a detached ``HEAD``. Checkouts without either context, or with a
-    confirmed missing upstream, fall back to ``origin/main`` and then
-    ``origin/master``.
+    Uses only the current branch's configured upstream. Detached
+    checkouts and branches without an upstream are skipped.
 
     :param repo_root: Absolute path to the Git repository root,
         e.g. ``Path("/home/user/omnigent-2")``.
@@ -811,43 +800,24 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
         ``git`` is not available or the comparison fails.
     """
     tracked = _tracked_comparison(repo_root)
-    if tracked is not None:
-        behind, missing = _fetch_and_count_result(
-            repo_root,
-            tracked.branch,
-            remote=tracked.remote,
-            comparison_ref=tracked.revision,
-        )
-        if behind is not None:
-            return _CacheEntry(
-                last_check_epoch=time.time(),
-                commits_behind=behind,
-                head_sha=_get_head_sha(repo_root) or "",
-                compared_ref=tracked.display_ref,
-                detached=tracked.detached,
-            )
-        if not missing:
-            return None
+    if tracked is None:
+        return None
 
-    detached = tracked.detached if tracked is not None else _is_detached_checkout(repo_root)
-    for branch in ("main", "master"):
-        behind, missing = _fetch_and_count_result(
-            repo_root,
-            branch,
-            comparison_ref=f"refs/remotes/origin/{branch}",
-        )
-        if behind is not None:
-            return _CacheEntry(
-                last_check_epoch=time.time(),
-                commits_behind=behind,
-                head_sha=_get_head_sha(repo_root) or "",
-                compared_ref=f"origin/{branch}",
-                detached=detached,
-                fallback=True,
-            )
-        if not missing:
-            return None
-    return None
+    behind = _fetch_and_count(
+        repo_root,
+        tracked.branch,
+        remote=tracked.remote,
+        tracking_ref=tracked.tracking_ref,
+        comparison_ref="@{upstream}",
+    )
+    if behind is None:
+        return None
+    return _CacheEntry(
+        last_check_epoch=time.time(),
+        commits_behind=behind,
+        head_sha=_get_head_sha(repo_root) or "",
+        compared_ref=tracked.display_ref,
+    )
 
 
 def _git_output(repo_root: Path, *args: str) -> str:
@@ -862,109 +832,36 @@ def _git_output(repo_root: Path, *args: str) -> str:
     return result.stdout or ""
 
 
-def _is_detached_checkout(repo_root: Path) -> bool:
-    """Return whether ``HEAD`` is detached from a local branch."""
-    try:
-        return not _git_output(repo_root, "symbolic-ref", "--quiet", "HEAD").strip()
-    except (subprocess.SubprocessError, OSError):
-        return True
-
-
 def _tracked_comparison(repo_root: Path) -> _GitComparison | None:
-    """Return the comparison for the attached branch or a detached pin."""
+    """Return the current attached branch's upstream comparison."""
     try:
         branch_ref = _git_output(repo_root, "symbolic-ref", "--quiet", "HEAD")
     except (subprocess.SubprocessError, OSError):
-        return _detached_remote_comparison(repo_root)
+        return None
 
     try:
         output = _git_output(
             repo_root,
             "for-each-ref",
-            "--format=%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
+            "--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
             branch_ref.strip(),
         )
-        display_ref, remote, remote_ref = output.strip().split("\0")
-        if not display_ref or not remote or not remote_ref.startswith("refs/heads/"):
+        tracking_ref, display_ref, remote, remote_ref = output.strip().split("\0")
+        if (
+            not tracking_ref
+            or not display_ref
+            or not remote
+            or not remote_ref.startswith("refs/heads/")
+        ):
             return None
         return _GitComparison(
             remote=remote,
             branch=remote_ref,
+            tracking_ref=tracking_ref,
             display_ref=display_ref,
-            revision="@{upstream}",
         )
     except (subprocess.SubprocessError, OSError, ValueError):
         return None
-
-
-def _detached_remote_comparison(repo_root: Path) -> _GitComparison | None:
-    """Return a local remote ref already pointing at detached ``HEAD``."""
-    try:
-        output = _git_output(
-            repo_root,
-            "for-each-ref",
-            "--format=%(refname)%00%(refname:short)%00%(symref)",
-            "--points-at",
-            "HEAD",
-            "refs/remotes",
-        )
-    except (subprocess.SubprocessError, OSError):
-        return None
-
-    for line in output.splitlines():
-        try:
-            tracking_ref, display_ref, symbolic_target = line.split("\0")
-        except ValueError:
-            continue
-        if symbolic_target:
-            continue
-        mapped = _remote_branch_for_tracking_ref(repo_root, tracking_ref)
-        if mapped is None:
-            continue
-        remote, branch = mapped
-        return _GitComparison(
-            remote=remote,
-            branch=branch,
-            display_ref=display_ref,
-            revision=tracking_ref,
-            detached=True,
-        )
-    return None
-
-
-def _remote_branch_for_tracking_ref(repo_root: Path, tracking_ref: str) -> tuple[str, str] | None:
-    """Map a remote-tracking ref back to its remote branch."""
-    try:
-        mappings = _git_output(
-            repo_root,
-            "config",
-            "--get-regexp",
-            r"^remote\..*\.fetch$",
-        ).splitlines()
-    except (subprocess.SubprocessError, OSError):
-        return None
-
-    for mapping in mappings:
-        try:
-            key, refspec = mapping.split(maxsplit=1)
-        except ValueError:
-            continue
-        remote = key.removeprefix("remote.").removesuffix(".fetch")
-        source, separator, destination = refspec.removeprefix("+").partition(":")
-        if not separator or source.startswith("^"):
-            continue
-        if destination == tracking_ref and source.startswith("refs/heads/"):
-            return remote, source
-        if destination.count("*") != 1 or source.count("*") != 1:
-            continue
-        prefix, suffix = destination.split("*")
-        if not tracking_ref.startswith(prefix) or not tracking_ref.endswith(suffix):
-            continue
-        end = len(tracking_ref) - len(suffix) if suffix else len(tracking_ref)
-        branch = source.replace("*", tracking_ref[len(prefix) : end])
-        if branch.startswith("refs/heads/"):
-            return remote, branch
-    return None
 
 
 def _fetch_and_count(
@@ -972,6 +869,7 @@ def _fetch_and_count(
     branch: str,
     *,
     remote: str = "origin",
+    tracking_ref: str | None = None,
     comparison_ref: str | None = None,
 ) -> int | None:
     """Fetch a remote branch and return its commits-behind count.
@@ -980,75 +878,45 @@ def _fetch_and_count(
     :param branch: Remote branch name or full source ref, e.g.
         ``"homelab"`` or ``"refs/heads/homelab"``.
     :param remote: Configured remote name, e.g. ``"origin"``.
+    :param tracking_ref: Local tracking ref to update. Defaults to
+        ``refs/remotes/<remote>/<branch>``.
     :param comparison_ref: Revision to compare with ``HEAD``. Defaults
-        to ``<remote>/<branch>``.
+        to *tracking_ref*.
     :returns: Number of commits HEAD is behind, or ``None`` on
         any failure (timeout, missing remote, missing branch).
     """
-    behind, _ = _fetch_and_count_result(
-        repo_root,
-        branch,
-        remote=remote,
-        comparison_ref=comparison_ref,
-    )
-    return behind
-
-
-def _fetch_and_count_result(
-    repo_root: Path,
-    branch: str,
-    *,
-    remote: str = "origin",
-    comparison_ref: str | None = None,
-) -> tuple[int | None, bool]:
-    """Return the count and whether a failed fetch confirmed a missing ref."""
     source_ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
-    try:
-        subprocess.run(
-            ["git", "-C", str(repo_root), "fetch", remote, source_ref, "--quiet"],
-            timeout=_GIT_TIMEOUT_SECONDS,
-            capture_output=True,
-            check=True,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return None, _remote_ref_is_missing(repo_root, remote, source_ref)
-
-    try:
-        branch_name = source_ref.removeprefix("refs/heads/")
-        revision = comparison_ref or f"refs/remotes/{remote}/{branch_name}"
-        output = _git_output(
-            repo_root,
-            "rev-list",
-            f"HEAD..{revision}",
-            "--count",
-        )
-        return int(output.strip()), False
-    except (subprocess.SubprocessError, OSError, ValueError):
-        return None, False
-
-
-def _remote_ref_is_missing(repo_root: Path, remote: str, source_ref: str) -> bool:
-    """Return whether the remote confirms that a source ref is absent."""
+    branch_name = source_ref.removeprefix("refs/heads/")
+    fetched_ref = tracking_ref or f"refs/remotes/{remote}/{branch_name}"
     try:
         subprocess.run(
             [
                 "git",
                 "-C",
                 str(repo_root),
-                "ls-remote",
-                "--exit-code",
+                "fetch",
                 remote,
-                source_ref,
+                f"+{source_ref}:{fetched_ref}",
+                "--quiet",
             ],
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
             check=True,
         )
-    except subprocess.CalledProcessError as exc:
-        return exc.returncode == 2
     except (subprocess.SubprocessError, OSError):
-        pass
-    return False
+        return None
+
+    try:
+        revision = comparison_ref or fetched_ref
+        output = _git_output(
+            repo_root,
+            "rev-list",
+            f"HEAD..{revision}",
+            "--count",
+        )
+        return int(output.strip())
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
 
 
 def _get_head_sha(repo_root: Path) -> str | None:
@@ -1063,64 +931,22 @@ def _get_head_sha(repo_root: Path) -> str | None:
         return None
 
 
-def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") -> int | None:
-    """Count commits HEAD is behind a comparison ref, locally only.
-
-    No ``git fetch`` is performed. Legacy caches still try
-    ``origin/master`` when their default ``origin/main`` is unavailable.
-
-    :param repo_root: Absolute path to the Git repository root.
-    :param compared_ref: Ref recorded with the cached count.
-    :returns: Number of commits behind, or ``None`` on failure.
-    """
-    if compared_ref in {"origin/main", "refs/remotes/origin/main"}:
-        refs = ("refs/remotes/origin/main", "refs/remotes/origin/master")
-    elif compared_ref in {"origin/master", "refs/remotes/origin/master"}:
-        refs = ("refs/remotes/origin/master",)
-    else:
-        refs = (compared_ref,)
-    for ref in refs:
-        try:
-            output = _git_output(
-                repo_root,
-                "rev-list",
-                f"HEAD..{ref}",
-                "--count",
-            )
-            return int(output.strip())
-        except (subprocess.SubprocessError, OSError, ValueError):
-            continue
-    return None
-
-
 def _print_notice(
     commits_behind: int,
     compared_ref: str = "origin/main",
-    *,
-    detached: bool = False,
-    fallback: bool = False,
 ) -> None:
     """Print the update notice to stderr.
 
     :param commits_behind: Number of commits the local clone is
         behind, e.g. ``3``.
     :param compared_ref: Ref whose commits are ahead of ``HEAD``.
-    :param detached: Whether ``HEAD`` is detached from a local branch.
-    :param fallback: Whether the compared ref is not the checkout's upstream.
     """
     from rich.console import Console
     from rich.panel import Panel
     from rich.text import Text
 
     console = Console(stderr=True)
-    if detached or fallback:
-        action = Text.assemble(
-            "Check out or redeploy ",
-            (compared_ref, "bold"),
-            " to update.",
-        )
-    else:
-        action = Text.assemble("Run ", ("git pull", "bold"), " to update.")
+    action = Text.assemble("Run ", ("git pull", "bold"), " to update.")
     body = Text.assemble(
         ("Update available", "bold yellow"),
         f" — {compared_ref} is ",
