@@ -127,6 +127,11 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
     activity: "idle",
     statusLabel: "Idle",
     preview: null,
+    nodeKind: "root",
+    wrapper: null,
+    tool: null,
+    harness: null,
+    agentName: null,
     children: [],
     ...overrides,
   };
@@ -500,8 +505,58 @@ describe("buildTree", () => {
       activity: "idle",
       statusLabel: "Idle",
       preview: null,
+      nodeKind: "root",
+      wrapper: null,
+      tool: null,
+      harness: null,
+      agentName: null,
       children: [],
     });
+  });
+
+  it("carries root and child identity through layout without changing geometry", () => {
+    const map = new Map<string, ChildSessionInfo[]>();
+    map.set("root", [
+      childInfo({
+        id: "child",
+        tool: "Explore",
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      }),
+    ]);
+
+    const tree = buildTree("root", "Codex", "idle", "Idle", null, map, 0, {
+      nodeKind: "root",
+      wrapper: "codex-native-ui",
+      tool: null,
+      harness: "codex-native",
+      agentName: "codex-native-ui",
+    });
+    const { nodes } = layoutTree(tree, "root");
+
+    expect(nodes.map(({ id, position, data }) => ({ id, position, data }))).toMatchObject([
+      {
+        id: "root",
+        position: { x: -90, y: 0 },
+        data: {
+          nodeKind: "root",
+          wrapper: "codex-native-ui",
+          tool: null,
+          harness: "codex-native",
+          agentName: "codex-native-ui",
+        },
+      },
+      {
+        id: "child",
+        position: { x: -90, y: 90 },
+        data: {
+          nodeKind: "child",
+          wrapper: "codex-native-ui-subagent",
+          tool: "Explore",
+          harness: null,
+          agentName: null,
+        },
+      },
+    ]);
   });
 
   it("builds nested tree from children map", () => {
