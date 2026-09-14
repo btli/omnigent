@@ -127,6 +127,8 @@ class _CacheEntry:
         named in clone notices, e.g. ``"origin/main"``.
     :param detached: Whether the clone comparison was made from a
         detached ``HEAD``.
+    :param fallback: Whether the clone comparison used the legacy
+        ``origin/main`` or ``origin/master`` fallback.
     """
 
     last_check_epoch: float
@@ -137,6 +139,7 @@ class _CacheEntry:
     last_notified_version: str = ""
     compared_ref: str = "origin/main"
     detached: bool = False
+    fallback: bool = False
 
 
 @dataclass
@@ -240,6 +243,7 @@ def _run_dev_clone_check(repo_root: Path) -> None:
             behind = cached.commits_behind
             compared_ref = cached.compared_ref
             detached = cached.detached
+            fallback = cached.fallback
             # If HEAD moved since the cache was written (e.g. the user
             # ran ``git pull``), do a cheap local recount — no fetch.
             if behind > 0 and cached.head_sha:
@@ -252,11 +256,13 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                             if cached.compared_ref in {"origin/main", "origin/master"}
                             else "origin/main"
                         )
-                        detached = False
-                        revision = compared_ref
+                        detached = _is_detached_checkout(repo_root)
+                        fallback = True
+                        revision = f"refs/remotes/{compared_ref}"
                     else:
                         compared_ref = comparison.display_ref
                         detached = comparison.detached
+                        fallback = False
                         revision = comparison.revision
                     recounted = _local_rev_list_count(repo_root, revision)
                     if recounted is not None:
@@ -268,12 +274,18 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                                 head_sha=cur_sha,
                                 compared_ref=compared_ref,
                                 detached=detached,
+                                fallback=fallback,
                             )
                         )
                     elif compared_ref != cached.compared_ref:
                         return
             if behind > 0:
-                _print_notice(behind, compared_ref, detached=detached)
+                _print_notice(
+                    behind,
+                    compared_ref,
+                    detached=detached,
+                    fallback=fallback,
+                )
             return
 
         result = _run_check(repo_root)
@@ -289,6 +301,7 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                 result.commits_behind,
                 result.compared_ref,
                 detached=result.detached,
+                fallback=result.fallback,
             )
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         # Never let the update check break the CLI.
@@ -787,6 +800,7 @@ def _read_cache() -> _CacheEntry | None:
             last_notified_version=str(data.get("last_notified_version", "")),
             compared_ref=str(data.get("compared_ref", "origin/main")),
             detached=bool(data.get("detached", False)),
+            fallback=bool(data.get("fallback", False)),
         )
     except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
         return None
@@ -820,6 +834,7 @@ def _write_cache(entry: _CacheEntry) -> None:
             "last_notified_version": entry.last_notified_version,
             "compared_ref": entry.compared_ref,
             "detached": entry.detached,
+            "fallback": entry.fallback,
         }
     )
     # ``dir=`` on the same filesystem guarantees atomic replace.
@@ -867,14 +882,21 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
                 detached=tracked.detached,
             )
 
+    detached = tracked.detached if tracked is not None else _is_detached_checkout(repo_root)
     for branch in ("main", "master"):
-        behind = _fetch_and_count(repo_root, branch)
+        behind = _fetch_and_count(
+            repo_root,
+            branch,
+            comparison_ref=f"refs/remotes/origin/{branch}",
+        )
         if behind is not None:
             return _CacheEntry(
                 last_check_epoch=time.time(),
                 commits_behind=behind,
                 head_sha=_get_head_sha(repo_root) or "",
                 compared_ref=f"origin/{branch}",
+                detached=detached,
+                fallback=True,
             )
     return None
 
@@ -889,6 +911,14 @@ def _git_output(repo_root: Path, *args: str) -> str:
         text=True,
     )
     return result.stdout or ""
+
+
+def _is_detached_checkout(repo_root: Path) -> bool:
+    """Return whether ``HEAD`` is detached from a local branch."""
+    try:
+        return not _git_output(repo_root, "symbolic-ref", "--quiet", "HEAD").strip()
+    except (subprocess.SubprocessError, OSError):
+        return True
 
 
 def _tracked_comparison(repo_root: Path) -> _GitComparison | None:
@@ -1019,10 +1049,11 @@ def _fetch_and_count(
 
     try:
         branch_name = source_ref.removeprefix("refs/heads/")
+        revision = comparison_ref or f"refs/remotes/{remote}/{branch_name}"
         output = _git_output(
             repo_root,
             "rev-list",
-            f"HEAD..{comparison_ref or f'{remote}/{branch_name}'}",
+            f"HEAD..{revision}",
             "--count",
         )
         return int(output.strip())
@@ -1052,7 +1083,12 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
     :param compared_ref: Ref recorded with the cached count.
     :returns: Number of commits behind, or ``None`` on failure.
     """
-    refs = (compared_ref, "origin/master") if compared_ref == "origin/main" else (compared_ref,)
+    if compared_ref == "origin/main":
+        refs = ("refs/remotes/origin/main", "refs/remotes/origin/master")
+    elif compared_ref == "origin/master":
+        refs = ("refs/remotes/origin/master",)
+    else:
+        refs = (compared_ref,)
     for ref in refs:
         try:
             output = _git_output(
@@ -1072,6 +1108,7 @@ def _print_notice(
     compared_ref: str = "origin/main",
     *,
     detached: bool = False,
+    fallback: bool = False,
 ) -> None:
     """Print the update notice to stderr.
 
@@ -1079,13 +1116,14 @@ def _print_notice(
         behind, e.g. ``3``.
     :param compared_ref: Ref whose commits are ahead of ``HEAD``.
     :param detached: Whether ``HEAD`` is detached from a local branch.
+    :param fallback: Whether the compared ref is not the checkout's upstream.
     """
     from rich.console import Console
     from rich.panel import Panel
     from rich.text import Text
 
     console = Console(stderr=True)
-    if detached:
+    if detached or fallback:
         action = Text.assemble(
             "Check out or redeploy ",
             (compared_ref, "bold"),

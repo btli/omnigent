@@ -20,6 +20,7 @@ from omnigent.update_check import (
     _find_repo_root,
     _GitComparison,
     _is_stale,
+    _local_rev_list_count,
     _read_cache,
     _run_check,
     _write_cache,
@@ -52,6 +53,13 @@ def _tracking_clone(tmp_path: Path) -> tuple[Path, Path]:
     _git(upstream, "push", "--quiet", "--set-upstream", "origin", "homelab")
     _git(tmp_path, "clone", "--quiet", "--branch", "homelab", str(remote), str(clone))
     return upstream, clone
+
+
+def _advance_main_and_delete_upstream(upstream: Path) -> None:
+    _git(upstream, "switch", "--quiet", "-C", "main")
+    _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "main ahead")
+    _git(upstream, "push", "--quiet", "--set-upstream", "origin", "refs/heads/main")
+    _git(upstream, "push", "--quiet", "origin", "--delete", "homelab")
 
 
 # ------------------------------------------------------------------
@@ -571,6 +579,63 @@ def test_run_check_maps_ambiguous_detached_ref_to_slash_remote(tmp_path: Path) -
     assert _git(clone, "rev-parse", "refs/remotes/team/prod/homelab") == _git(
         upstream, "rev-parse", "HEAD"
     )
+
+
+def test_deleted_upstream_fallback_ignores_shadowing_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local tag cannot shadow the fallback remote-tracking branch."""
+    upstream, clone = _tracking_clone(tmp_path)
+    _advance_main_and_delete_upstream(upstream)
+    _git(clone, "tag", "origin/main")
+
+    result = _run_check(clone)
+
+    assert result is not None
+    assert result.commits_behind == 1
+    assert result.compared_ref == "origin/main"
+    assert _local_rev_list_count(clone) == 1
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    with patch("omnigent.update_check._find_repo_root", return_value=clone):
+        maybe_show_update_notice()
+
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.commits_behind == 1
+    assert cached.compared_ref == "origin/main"
+
+
+@pytest.mark.parametrize("detach", [False, True], ids=["attached", "detached"])
+def test_fallback_notice_avoids_pull_when_checkout_cannot_pull(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    detach: bool,
+) -> None:
+    """Fallback notices give actionable guidance when pull cannot update."""
+    upstream, clone = _tracking_clone(tmp_path)
+    _advance_main_and_delete_upstream(upstream)
+    if detach:
+        _git(clone, "switch", "--quiet", "--detach")
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    with patch("omnigent.update_check._find_repo_root", return_value=clone):
+        maybe_show_update_notice()
+
+    notice = capsys.readouterr().err
+    assert "origin/main is 1 commit(s) ahead" in notice
+    assert "check out or redeploy origin/main" in notice.lower()
+    assert "git pull" not in notice
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.detached is detach
+    assert cached.fallback is True
 
 
 def test_print_notice_names_compared_ref(capsys: pytest.CaptureFixture[str]) -> None:
