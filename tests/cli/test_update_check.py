@@ -609,6 +609,47 @@ def test_deleted_upstream_fallback_ignores_shadowing_tag(
     assert cached.compared_ref == "origin/main"
 
 
+def test_legacy_cache_recounts_against_master_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A moved HEAD clears a legacy count in a master-only repository."""
+    upstream, clone = _tracking_clone(tmp_path)
+    _git(upstream, "switch", "--quiet", "-C", "master")
+    _git(upstream, "push", "--quiet", "--set-upstream", "origin", "master")
+    _git(upstream, "push", "--quiet", "origin", "--delete", "homelab")
+    _git(clone, "branch", "--unset-upstream")
+    _git(clone, "fetch", "--quiet", "origin")
+    _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "master ahead")
+    _git(upstream, "push", "--quiet")
+    _git(clone, "fetch", "--quiet", "origin")
+
+    cache_file = tmp_path / "cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "last_check_epoch": time.time(),
+                "commits_behind": 1,
+                "head_sha": _git(clone, "rev-parse", "HEAD"),
+            }
+        )
+    )
+    _git(clone, "merge", "--quiet", "--ff-only", "refs/remotes/origin/master")
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    with patch("omnigent.update_check._find_repo_root", return_value=clone):
+        maybe_show_update_notice()
+
+    assert capsys.readouterr().err == ""
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.commits_behind == 0
+    assert cached.head_sha == _git(clone, "rev-parse", "HEAD")
+
+
 @pytest.mark.parametrize("detach", [False, True], ids=["attached", "detached"])
 def test_fallback_notice_avoids_pull_when_checkout_cannot_pull(
     tmp_path: Path,

@@ -1083,9 +1083,9 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
     :param compared_ref: Ref recorded with the cached count.
     :returns: Number of commits behind, or ``None`` on failure.
     """
-    if compared_ref == "origin/main":
+    if compared_ref in {"origin/main", "refs/remotes/origin/main"}:
         refs = ("refs/remotes/origin/main", "refs/remotes/origin/master")
-    elif compared_ref == "origin/master":
+    elif compared_ref in {"origin/master", "refs/remotes/origin/master"}:
         refs = ("refs/remotes/origin/master",)
     else:
         refs = (compared_ref,)
