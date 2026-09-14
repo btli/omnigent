@@ -6,8 +6,8 @@
 # rebuild never rewrites a PR branch and never invalidates approvals.
 #
 # - Update a line only when you deliberately push a new revision to that PR.
-# - Remove a line once its PR merges upstream (the content then arrives via
-#   upstream/main on the next rebuild).
+# - Retain a merged PR's pin until the selected base contains its result; then
+#   remove it (for squash merges, check by content or subject).
 # - The homelab overlay branch is not listed here; sync-staging.sh always
 #   merges it last.
 2923 f8b150d8947a742f046d14bc0337d5045884c1e2 polly/font-loader-catalog
