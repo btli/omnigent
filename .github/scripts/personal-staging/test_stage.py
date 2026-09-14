@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2147,6 +2148,55 @@ def test_main_move_after_publication_is_reported(env, monkeypatch, ring, staging
     assert published["base_matches_remote_main"] is True
     assert unchanged["base_matches_remote_main"] is True
     assert env.fork_ref(f"refs/heads/{ring.branch}") != before
+
+
+def test_cli_saves_report_when_main_moves_after_advertisement(env, tmp_path):
+    pr = env.add_pr(4, "four.txt", "four\n")
+    base = env.fork_ref("refs/heads/main")
+    git(env.seed, "checkout", "-b", "human-racer", base)
+    racer = commit_file(env.seed, "human.txt", "human\n", "human main advance")
+    git(env.seed, "push", str(env.fork), "human-racer:refs/heads/race-ready")
+    hook = env.work / ".git/hooks/pre-push"
+    hook.write_text(
+        "#!/bin/sh\nset -eu\n"
+        f"git --git-dir={shlex.quote(str(env.fork))} update-ref "
+        f"refs/heads/main {racer} {base}\n"
+    )
+    hook.chmod(0o755)
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([pr]))
+    report_path = tmp_path / "report.json"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            stage_mod.__file__,
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(tmp_path / "absent-extras"),
+            "--exclude",
+            str(tmp_path / "absent-exclude"),
+            "--rr-cache",
+            str(tmp_path / "absent-rr-cache"),
+            "--report",
+            str(report_path),
+            "--staging-only",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert proc.returncode != 0
+    report = json.loads(report_path.read_text())
+    assert report["base_matches_remote_main"] is False
+    assert env.fork_ref("refs/heads/staging") == report["staging_sha"]
+    assert "refs may already have moved" in proc.stderr
 
 
 @pytest.mark.parametrize("ring", [stage_mod.STAGING, stage_mod.PRODUCTION])

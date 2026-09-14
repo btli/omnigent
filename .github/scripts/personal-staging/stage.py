@@ -166,6 +166,12 @@ class StageError(RuntimeError):
     pass
 
 
+class PublicationDriftError(StageError):
+    def __init__(self, message: str, report: dict):
+        super().__init__(message)
+        self.report = report
+
+
 class GitLockError(StageError):
     pass
 
@@ -493,9 +499,10 @@ def audit_published_base(cwd: str | Path, fork: str, report: dict) -> dict:
     matches = remote_ref(cwd, fork, "refs/heads/main") == report["base_sha"]
     report["base_matches_remote_main"] = matches
     if not matches:
-        raise StageError(
+        raise PublicationDriftError(
             "fork main moved after publication; refs may already have moved; "
-            "the next compose reconciles"
+            "the next compose reconciles",
+            report,
         )
     return report
 
@@ -1532,6 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         report["excluded"] = excluded
     except Exception as e:
+        if isinstance(e, PublicationDriftError):
+            Path(args.report).write_text(json.dumps(e.report, indent=2) + "\n")
         # The step summary is the failure surface — never exit without one.
         append_summary(f"## {title}\n\n**FAILED:** {e}\n")
         raise
