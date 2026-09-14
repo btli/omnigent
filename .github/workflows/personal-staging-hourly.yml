@@ -18,10 +18,10 @@ on:
 permissions:
   contents: read
 
-# Coalesce stale hourly runs before they reach the privileged compose job.
+# Never interrupt a run that may be publishing or persisting its audit.
 concurrency:
   group: personal-staging-hourly
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   # Secretless test gate: `uv run` installs third-party dev deps, so this job
@@ -93,6 +93,7 @@ jobs:
             --report merge-report.json
 
       - name: Upload merge report
+        if: always() && hashFiles('merge-report.json') != ''
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -2436,9 +2436,7 @@ def test_only_scheduled_production_owns_main_sync():
         text = (workflows / filename).read_text()
         workflow = yaml.safe_load(text)
         assert "sync-main" not in workflow["jobs"]
-        assert workflow["concurrency"]["cancel-in-progress"] is (
-            filename == "personal-staging-hourly.yml"
-        )
+        assert workflow["concurrency"]["cancel-in-progress"] is False
         compose = workflow["jobs"][job]
         assert compose["needs"] == "test-composer"
         assert compose["environment"] == "staging-push"
@@ -2461,6 +2459,24 @@ def test_only_scheduled_production_owns_main_sync():
         if filename == "personal-staging-hourly.yml":
             cron = workflow[True]["schedule"][0]["cron"]
             assert cron == "17 0-9,11-23 * * *"
+
+
+def test_failed_composition_uploads_saved_report():
+    import yaml
+
+    workflows = Path(__file__).resolve().parents[2] / "workflows"
+    for filename, job in (
+        ("personal-staging-hourly.yml", "compose"),
+        ("personal-staging.yml", "integrate"),
+        ("personal-production.yml", "compose"),
+    ):
+        workflow = yaml.safe_load((workflows / filename).read_text())
+        [upload] = [
+            step
+            for step in workflow["jobs"][job]["steps"]
+            if step.get("name") == "Upload merge report"
+        ]
+        assert upload["if"] == "always() && hashFiles('merge-report.json') != ''"
 
 
 def test_android_build_requires_successful_integration():

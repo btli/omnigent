@@ -69,8 +69,9 @@ changed.
 Neither staging workflow advances main. Only the scheduled production compose
 runs `stage.py sync-main`. Each privileged composition job has its own
 non-cancelling concurrency group, so GitHub's single pending slot cannot evict a
-different ring. Hourly runs coalesce and skip 10:17 UTC, leaving the nightly and
-production window clear. A human main push invalidates an in-flight composition:
+different ring. Hourly runs are also non-cancelling and skip 10:17 UTC, leaving
+the nightly and production window clear. A human main push invalidates an
+in-flight composition:
 every ring, pin, or rescue update is atomically coupled to an explicit lease and
 no-op refspec for main, so the entire push fails if `base_sha` is stale.
 
