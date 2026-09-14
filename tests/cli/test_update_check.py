@@ -18,7 +18,6 @@ from omnigent.update_check import (
     _CacheEntry,
     _fetch_and_count,
     _find_repo_root,
-    _GitComparison,
     _is_stale,
     _local_rev_list_count,
     _read_cache,
@@ -343,6 +342,8 @@ def test_run_check_falls_back_to_master(tmp_path: Path) -> None:
             return subprocess.CompletedProcess(cmd, 0, stdout="\0\0\n")
         if args[:2] == ["fetch", "origin"] and args[2] in {"main", "refs/heads/main"}:
             raise subprocess.CalledProcessError(1, cmd)
+        if args[:1] == ["ls-remote"]:
+            raise subprocess.CalledProcessError(2, cmd)
         if args[:1] == ["rev-list"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
         if args[:1] == ["rev-parse"]:
@@ -366,7 +367,7 @@ def test_run_check_falls_back_to_master(tmp_path: Path) -> None:
 
 
 def test_run_check_both_branches_fail(tmp_path: Path) -> None:
-    """Returns None when both main and master fail."""
+    """Returns None when both fallback branches are missing."""
     calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -375,14 +376,17 @@ def test_run_check_both_branches_fail(tmp_path: Path) -> None:
         if args[:1] == ["symbolic-ref"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/homelab\n")
         if args[:1] == ["for-each-ref"]:
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout="upstream/homelab\0upstream\0refs/heads/homelab\n"
-            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="\0\0\n")
+        if args[:1] == ["ls-remote"]:
+            raise subprocess.CalledProcessError(2, cmd)
         raise subprocess.CalledProcessError(1, cmd)
 
     with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
         assert _run_check(tmp_path) is None
-    assert [cmd[4] for cmd in calls if cmd[3] == "fetch"] == ["upstream", "origin", "origin"]
+    assert [cmd[5] for cmd in calls if cmd[3] == "fetch"] == [
+        "refs/heads/main",
+        "refs/heads/master",
+    ]
 
 
 def test_run_check_uses_branch_upstream(tmp_path: Path) -> None:
@@ -478,8 +482,12 @@ def test_run_check_falls_back_when_detached_ref_is_unknown(tmp_path: Path) -> No
     assert ["git", "-C", str(tmp_path), "fetch", "origin", "refs/heads/main", "--quiet"] in calls
 
 
-def test_run_check_falls_back_when_tracked_fetch_fails(tmp_path: Path) -> None:
-    """A missing tracked branch still permits the origin/main comparison."""
+def test_run_check_suppresses_transient_tracked_fetch_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A transient tracked fetch failure cannot select an unrelated ref."""
     calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -493,6 +501,47 @@ def test_run_check_falls_back_when_tracked_fetch_fails(tmp_path: Path) -> None:
             )
         if args[:2] == ["fetch", "upstream"]:
             raise subprocess.CalledProcessError(1, cmd)
+        if args[:1] == ["ls-remote"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\trefs/heads/homelab\n")
+        if args[:1] == ["rev-list"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
+        if args[:1] == ["rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    cached = _CacheEntry(last_check_epoch=time.time(), commits_behind=4)
+    _write_cache(cached)
+    with (
+        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
+        patch("omnigent.update_check.subprocess.run", side_effect=fake_run),
+    ):
+        maybe_show_update_notice()
+
+    assert capsys.readouterr().err == ""
+    assert not any(cmd[3:5] == ["fetch", "origin"] for cmd in calls)
+    assert _read_cache() == cached
+
+
+def test_run_check_falls_back_when_tracked_branch_is_missing(tmp_path: Path) -> None:
+    """A confirmed missing tracked branch permits the origin/main comparison."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        args = cmd[3:]
+        if args[:1] == ["symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="refs/heads/homelab\n")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="upstream/homelab\0upstream\0refs/heads/homelab\n"
+            )
+        if args[:2] == ["fetch", "upstream"]:
+            raise subprocess.CalledProcessError(1, cmd)
+        if args[:1] == ["ls-remote"]:
+            raise subprocess.CalledProcessError(2, cmd)
         if args[:1] == ["rev-list"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
         if args[:1] == ["rev-parse"]:
@@ -505,6 +554,15 @@ def test_run_check_falls_back_when_tracked_fetch_fails(tmp_path: Path) -> None:
     assert result is not None
     assert result.commits_behind == 2
     assert result.compared_ref == "origin/main"
+    assert [
+        "git",
+        "-C",
+        str(tmp_path),
+        "ls-remote",
+        "--exit-code",
+        "upstream",
+        "refs/heads/homelab",
+    ] in calls
     assert ["git", "-C", str(tmp_path), "fetch", "origin", "refs/heads/main", "--quiet"] in calls
 
 
@@ -603,6 +661,38 @@ def test_deleted_upstream_fallback_ignores_shadowing_tag(
     with patch("omnigent.update_check._find_repo_root", return_value=clone):
         maybe_show_update_notice()
 
+    cached = _read_cache()
+    assert cached is not None
+    assert cached.commits_behind == 1
+    assert cached.compared_ref == "origin/main"
+
+
+def test_head_advance_rechecks_deleted_upstream_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A moved HEAD cannot reactivate a stale deleted upstream ref."""
+    upstream, clone = _tracking_clone(tmp_path)
+    _advance_main_and_delete_upstream(upstream)
+
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
+    with patch("omnigent.update_check._find_repo_root", return_value=clone):
+        maybe_show_update_notice()
+        capsys.readouterr()
+
+        _git(clone, "merge", "--quiet", "--ff-only", "refs/remotes/origin/main")
+        _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "main ahead twice")
+        _git(upstream, "push", "--quiet")
+        _git(clone, "fetch", "--quiet", "origin", "refs/heads/main")
+        assert _local_rev_list_count(clone) == 1
+
+        maybe_show_update_notice()
+
+    notice = capsys.readouterr().err
+    assert "origin/main is 1 commit(s) ahead" in notice
     cached = _read_cache()
     assert cached is not None
     assert cached.commits_behind == 1
@@ -745,196 +835,42 @@ def test_no_repo_root_routes_to_wheel_check(
     assert capsys.readouterr().err == ""
 
 
-def test_fresh_cache_shows_notice(
+def test_clone_check_replaces_fresh_cached_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Prints notice when cache is fresh and ``commits_behind > 0``."""
+    """Clone checks replace a fresh cache with a new comparison."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
     monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
     monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
-
-    # Write a fresh cache entry with commits_behind=3.
-    entry = _CacheEntry(last_check_epoch=time.time(), commits_behind=3)
-    _write_cache(entry)
-
-    with patch("omnigent.update_check._find_repo_root", return_value=tmp_path):
-        maybe_show_update_notice()
-
-    err = capsys.readouterr().err
-    assert "3 commit(s) ahead" in err
-    assert "git pull" in err
-
-
-def test_fresh_cache_clears_after_pull(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Notice disappears when HEAD moves (user ran ``git pull``)."""
-    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
-
-    # Cache says 3 behind, recorded at old HEAD sha.
-    entry = _CacheEntry(
+    _write_cache(_CacheEntry(last_check_epoch=time.time(), commits_behind=3))
+    fresh = _CacheEntry(
         last_check_epoch=time.time(),
-        commits_behind=3,
-        head_sha="old_sha",
-    )
-    _write_cache(entry)
-
-    # Simulate: HEAD has moved (pull), and local rev-list now says 0.
-    with (
-        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
-        patch(
-            "omnigent.update_check._local_rev_list",
-            return_value=(0, "refs/remotes/origin/master"),
-        ),
-    ):
-        maybe_show_update_notice()
-
-    # No notice — the user is up to date.
-    assert capsys.readouterr().err == ""
-
-    # Cache was updated with new count and new HEAD.
-    refreshed = _read_cache()
-    assert refreshed is not None
-    assert refreshed.commits_behind == 0
-    assert refreshed.head_sha == "new_sha"
-
-
-def test_fresh_cache_recounts_against_current_ref_after_branch_switch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A moved HEAD recounts against the current branch after a switch."""
-    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
-    _write_cache(
-        _CacheEntry(
-            last_check_epoch=time.time(),
-            commits_behind=3,
-            head_sha="old_sha",
-            compared_ref="upstream/old",
-        )
-    )
-    current = _GitComparison(
-        remote="upstream",
-        branch="refs/heads/new",
-        display_ref="upstream/new",
-        revision="@{upstream}",
+        commits_behind=1,
+        head_sha="fresh-head",
+        compared_ref="upstream/current",
     )
 
     with (
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
-        patch("omnigent.update_check._tracked_comparison", return_value=current),
-        patch("omnigent.update_check._local_rev_list", return_value=(0, "@{upstream}")) as recount,
+        patch("omnigent.update_check._run_check", return_value=fresh),
     ):
-        maybe_show_update_notice()
-
-    assert capsys.readouterr().err == ""
-    recount.assert_called_once_with(tmp_path, "@{upstream}")
-    refreshed = _read_cache()
-    assert refreshed is not None
-    assert refreshed.compared_ref == "upstream/new"
-
-
-def test_fresh_cache_hides_stale_count_when_current_recount_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A failed recount cannot relabel an old branch's cached count."""
-    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
-    _write_cache(
-        _CacheEntry(
-            last_check_epoch=time.time(),
-            commits_behind=3,
-            head_sha="old_sha",
-            compared_ref="upstream/old",
-        )
-    )
-    current = _GitComparison(
-        remote="upstream",
-        branch="refs/heads/new",
-        display_ref="upstream/new",
-        revision="@{upstream}",
-    )
-
-    with (
-        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
-        patch("omnigent.update_check._tracked_comparison", return_value=current),
-        patch("omnigent.update_check._local_rev_list", return_value=None),
-    ):
-        maybe_show_update_notice()
-
-    assert capsys.readouterr().err == ""
-
-
-def test_fresh_detached_cache_suggests_redeploy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A detached checkout notice avoids suggesting an invalid pull."""
-    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "cache.json")
-    _write_cache(
-        _CacheEntry(
-            last_check_epoch=time.time(),
-            commits_behind=3,
-            compared_ref="origin/production",
-            detached=True,
-        )
-    )
-
-    with patch("omnigent.update_check._find_repo_root", return_value=tmp_path):
         maybe_show_update_notice()
 
     notice = capsys.readouterr().err
-    assert "origin/production is 3 commit(s) ahead" in notice
-    assert "check out or redeploy" in notice.lower()
-    assert "git pull" not in notice
+    assert "upstream/current is 1 commit(s) ahead" in notice
+    assert "3 commit(s) ahead" not in notice
+    assert _read_cache() == fresh
 
 
-def test_fresh_cache_no_notice_when_up_to_date(
+def test_clone_check_refreshes_stale_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """No notice when cache is fresh and ``commits_behind == 0``."""
-    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
-
-    entry = _CacheEntry(last_check_epoch=time.time(), commits_behind=0)
-    _write_cache(entry)
-
-    with patch("omnigent.update_check._find_repo_root", return_value=tmp_path):
-        maybe_show_update_notice()
-
-    assert capsys.readouterr().err == ""
-
-
-def test_stale_cache_triggers_check(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Stale cache triggers a fresh check; notice printed if behind."""
+    """A fresh result replaces a stale clone cache."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
     monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
@@ -947,18 +883,11 @@ def test_stale_cache_triggers_check(
     )
     _write_cache(old_entry)
 
-    call_count = 0
-
-    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return subprocess.CompletedProcess(cmd, 0)
-        return subprocess.CompletedProcess(cmd, 0, stdout="4\n")
+    fresh = _CacheEntry(last_check_epoch=time.time(), commits_behind=4)
 
     with (
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch("omnigent.update_check.subprocess.run", side_effect=fake_run),
+        patch("omnigent.update_check._run_check", return_value=fresh),
     ):
         maybe_show_update_notice()
 
@@ -971,33 +900,28 @@ def test_stale_cache_triggers_check(
     assert refreshed.commits_behind == 4
 
 
-def test_check_failure_caches_zero(
+def test_clone_check_failure_does_not_reuse_or_replace_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """When git check fails, caches ``commits_behind=0`` to avoid retry storm."""
+    """A failed fresh check stays silent without changing cached data."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
     monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
     monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
 
+    cached = _CacheEntry(last_check_epoch=time.time(), commits_behind=3)
+    _write_cache(cached)
+
     with (
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch(
-            "omnigent.update_check.subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "git"),
-        ),
+        patch("omnigent.update_check._run_check", return_value=None),
     ):
         maybe_show_update_notice()
 
-    # No notice printed.
     assert capsys.readouterr().err == ""
-
-    # Cache was written with 0 to suppress retries.
-    cached = _read_cache()
-    assert cached is not None
-    assert cached.commits_behind == 0
+    assert _read_cache() == cached
 
 
 # ------------------------------------------------------------------

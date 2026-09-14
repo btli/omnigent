@@ -7,10 +7,10 @@ Two install shapes are supported:
   ``git fetch`` and ``rev-list`` to count how many commits ``HEAD`` is
   behind its tracked ref. Detached checkouts use a local remote ref at
   the same commit when available; otherwise the check falls back to
-  ``origin/main`` (or ``origin/master``). The result is cached
-  to ``~/.omnigent/.update_check.json`` so the (potentially slow)
-  ``git fetch`` only runs once per staleness window. The notice points
-  the user at ``git pull``.
+  ``origin/main`` (or ``origin/master``). Each invocation fetches a
+  fresh comparison and records the result in
+  ``~/.omnigent/.update_check.json``. The notice points the user at
+  ``git pull``.
 
 * **Installed wheel** (``uv tool install omnigent``,
   ``pip install omnigent``, ``pipx install``, Homebrew, etc.): no clone
@@ -108,9 +108,7 @@ class _CacheEntry:
     :param commits_behind: Number of commits HEAD is behind
         the upstream branch, e.g. ``3``.
     :param head_sha: The HEAD commit hash at the time the cache was
-        written, e.g. ``"abc123..."``.  Used to detect when the user
-        has pulled (HEAD moves) so the stale count can be rechecked
-        cheaply without a fresh ``git fetch``.
+        written, e.g. ``"abc123..."``.
     :param kind: Which detection path wrote this entry —
         ``"clone"`` for the dev-clone (``git fetch``) path or
         ``"wheel"`` for the installed-wheel (PyPI) path. Defaults to
@@ -229,72 +227,16 @@ def maybe_show_update_notice() -> None:
 def _run_dev_clone_check(repo_root: Path) -> None:
     """Run the dev-clone update check (``git fetch`` + ``rev-list``).
 
-    Caches the commits-behind count to avoid running ``git fetch`` on
-    every CLI invocation. Re-counts cheaply when ``HEAD`` has moved
-    (the user ran ``git pull``). Any failure is swallowed — the check
-    must never break the CLI.
+    Fetches a fresh commits-behind count on every invocation. Any
+    failure is swallowed so the check never breaks the CLI or shows a
+    notice based on an unrelated ref.
 
     :param repo_root: Absolute path to the dev clone's Git repo root,
         e.g. ``Path("/Users/me/omnigent")``.
     """
     try:
-        cached = _read_cache()
-        if cached is not None and cached.kind == "clone" and not _is_stale(cached):
-            behind = cached.commits_behind
-            compared_ref = cached.compared_ref
-            detached = cached.detached
-            fallback = cached.fallback
-            # If HEAD moved since the cache was written (e.g. the user
-            # ran ``git pull``), do a cheap local recount — no fetch.
-            if behind > 0 and cached.head_sha:
-                cur_sha = _get_head_sha(repo_root)
-                if cur_sha and cur_sha != cached.head_sha:
-                    comparison = _tracked_comparison(repo_root)
-                    if comparison is None:
-                        compared_ref = (
-                            cached.compared_ref
-                            if cached.compared_ref in {"origin/main", "origin/master"}
-                            else "origin/main"
-                        )
-                        detached = _is_detached_checkout(repo_root)
-                        fallback = True
-                        revision = f"refs/remotes/{compared_ref}"
-                    else:
-                        compared_ref = comparison.display_ref
-                        detached = comparison.detached
-                        fallback = False
-                        revision = comparison.revision
-                    recounted = _local_rev_list(repo_root, revision)
-                    if recounted is not None:
-                        behind, revision = recounted
-                        if fallback:
-                            compared_ref = revision.removeprefix("refs/remotes/")
-                        _write_cache(
-                            _CacheEntry(
-                                last_check_epoch=cached.last_check_epoch,
-                                commits_behind=behind,
-                                head_sha=cur_sha,
-                                compared_ref=compared_ref,
-                                detached=detached,
-                                fallback=fallback,
-                            )
-                        )
-                    elif compared_ref != cached.compared_ref:
-                        return
-            if behind > 0:
-                _print_notice(
-                    behind,
-                    compared_ref,
-                    detached=detached,
-                    fallback=fallback,
-                )
-            return
-
         result = _run_check(repo_root)
         if result is None:
-            # git unavailable or fetch/rev-list failed — record a
-            # fresh timestamp so we don't retry on every invocation.
-            _write_cache(_CacheEntry(last_check_epoch=time.time(), commits_behind=0, head_sha=""))
             return
 
         _write_cache(result)
@@ -859,8 +801,9 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
     """Fetch upstream and count how many commits HEAD is behind.
 
     Uses the current branch's upstream, or a local remote ref pointing at
-    a detached ``HEAD``. Checkouts without either context fall back to
-    ``origin/main`` and then ``origin/master``.
+    a detached ``HEAD``. Checkouts without either context, or with a
+    confirmed missing upstream, fall back to ``origin/main`` and then
+    ``origin/master``.
 
     :param repo_root: Absolute path to the Git repository root,
         e.g. ``Path("/home/user/omnigent-2")``.
@@ -869,7 +812,7 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
     """
     tracked = _tracked_comparison(repo_root)
     if tracked is not None:
-        behind = _fetch_and_count(
+        behind, missing = _fetch_and_count_result(
             repo_root,
             tracked.branch,
             remote=tracked.remote,
@@ -883,10 +826,12 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
                 compared_ref=tracked.display_ref,
                 detached=tracked.detached,
             )
+        if not missing:
+            return None
 
     detached = tracked.detached if tracked is not None else _is_detached_checkout(repo_root)
     for branch in ("main", "master"):
-        behind = _fetch_and_count(
+        behind, missing = _fetch_and_count_result(
             repo_root,
             branch,
             comparison_ref=f"refs/remotes/origin/{branch}",
@@ -900,6 +845,8 @@ def _run_check(repo_root: Path) -> _CacheEntry | None:
                 detached=detached,
                 fallback=True,
             )
+        if not missing:
+            return None
     return None
 
 
@@ -1038,6 +985,23 @@ def _fetch_and_count(
     :returns: Number of commits HEAD is behind, or ``None`` on
         any failure (timeout, missing remote, missing branch).
     """
+    behind, _ = _fetch_and_count_result(
+        repo_root,
+        branch,
+        remote=remote,
+        comparison_ref=comparison_ref,
+    )
+    return behind
+
+
+def _fetch_and_count_result(
+    repo_root: Path,
+    branch: str,
+    *,
+    remote: str = "origin",
+    comparison_ref: str | None = None,
+) -> tuple[int | None, bool]:
+    """Return the count and whether a failed fetch confirmed a missing ref."""
     source_ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
     try:
         subprocess.run(
@@ -1047,7 +1011,7 @@ def _fetch_and_count(
             check=True,
         )
     except (subprocess.SubprocessError, OSError):
-        return None
+        return None, _remote_ref_is_missing(repo_root, remote, source_ref)
 
     try:
         branch_name = source_ref.removeprefix("refs/heads/")
@@ -1058,9 +1022,33 @@ def _fetch_and_count(
             f"HEAD..{revision}",
             "--count",
         )
-        return int(output.strip())
+        return int(output.strip()), False
     except (subprocess.SubprocessError, OSError, ValueError):
-        return None
+        return None, False
+
+
+def _remote_ref_is_missing(repo_root: Path, remote: str, source_ref: str) -> bool:
+    """Return whether the remote confirms that a source ref is absent."""
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "ls-remote",
+                "--exit-code",
+                remote,
+                source_ref,
+            ],
+            timeout=_GIT_TIMEOUT_SECONDS,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode == 2
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return False
 
 
 def _get_head_sha(repo_root: Path) -> str | None:
@@ -1076,7 +1064,7 @@ def _get_head_sha(repo_root: Path) -> str | None:
 
 
 def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") -> int | None:
-    """Count commits HEAD is behind the cached ref, locally only.
+    """Count commits HEAD is behind a comparison ref, locally only.
 
     No ``git fetch`` is performed. Legacy caches still try
     ``origin/master`` when their default ``origin/main`` is unavailable.
@@ -1085,12 +1073,6 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
     :param compared_ref: Ref recorded with the cached count.
     :returns: Number of commits behind, or ``None`` on failure.
     """
-    result = _local_rev_list(repo_root, compared_ref)
-    return result[0] if result is not None else None
-
-
-def _local_rev_list(repo_root: Path, compared_ref: str) -> tuple[int, str] | None:
-    """Return the commits-behind count and the revision that succeeded."""
     if compared_ref in {"origin/main", "refs/remotes/origin/main"}:
         refs = ("refs/remotes/origin/main", "refs/remotes/origin/master")
     elif compared_ref in {"origin/master", "refs/remotes/origin/master"}:
@@ -1105,7 +1087,7 @@ def _local_rev_list(repo_root: Path, compared_ref: str) -> tuple[int, str] | Non
                 f"HEAD..{ref}",
                 "--count",
             )
-            return int(output.strip()), ref
+            return int(output.strip())
         except (subprocess.SubprocessError, OSError, ValueError):
             continue
     return None
