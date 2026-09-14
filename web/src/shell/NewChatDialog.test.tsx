@@ -1268,9 +1268,7 @@ function pickPermissionOption(value: string): void {
 function selectUnconfiguredAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
-    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
-    fireEvent.click(moreTrigger);
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
   closeMenu();

@@ -3938,6 +3938,10 @@ function ConversationRowImpl({
     if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
   }
 
+  function runUnarchive() {
+    archive.mutate({ id: conversation.id, archived: false });
+  }
+
   function confirmLeave() {
     // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
     // gated on the row NOT being owned by the viewer, which is only decidable
@@ -4399,7 +4403,11 @@ function ConversationRowImpl({
                       // Keep the toggle click off the surrounding Link (no navigation).
                       e.preventDefault();
                       e.stopPropagation();
-                      runArchive();
+                      if (!isArchived) {
+                        runArchive();
+                      } else {
+                        runUnarchive();
+                      }
                     }}
                   >
                     {isArchived ? (

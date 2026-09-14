@@ -7,6 +7,8 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseGithubModule from "@/hooks/useGithub";
+import type * as UseIsMobileViewportModule from "@/hooks/useIsMobileViewport";
+import type * as BreakpointsModule from "@/lib/breakpoints";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -51,6 +53,14 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
+vi.mock("@/hooks/useIsMobileViewport", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseIsMobileViewportModule>()),
+  useIsMobileViewport: vi.fn(() => false),
+}));
+vi.mock("@/lib/breakpoints", async (importOriginal) => ({
+  ...(await importOriginal<typeof BreakpointsModule>()),
+  isMobileViewport: vi.fn(() => false),
+}));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
   useCreateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
@@ -82,8 +92,9 @@ vi.mock("./TerminalsPanel", () => ({
 
 import { AppShell } from "./AppShell";
 import { useOpenGithubTab } from "./FileViewerContext";
-import { isMobileViewport } from "./Sidebar";
 import { useGithubInfo } from "@/hooks/useGithub";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { useConversations } from "@/hooks/useConversations";
 
 const useGithubInfoMock = vi.mocked(useGithubInfo);
@@ -95,6 +106,7 @@ beforeEach(() => {
   // localStorage; clear it so one test's writes can't leak into another.
   localStorage.clear();
   sessionStorage.clear();
+  vi.mocked(useIsMobileViewport).mockReturnValue(false);
   vi.mocked(isMobileViewport).mockReturnValue(false);
   useGithubInfoMock.mockReset();
   useGithubInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
@@ -213,6 +225,7 @@ describe("opening GitHub from the composer", () => {
   });
 
   it("opens and dismisses the mobile drawer without opening the hidden desktop rail", () => {
+    vi.mocked(useIsMobileViewport).mockReturnValue(true);
     vi.mocked(isMobileViewport).mockReturnValue(true);
     renderShell();
 
@@ -249,6 +262,7 @@ describe("opening GitHub from the composer", () => {
   });
 
   it("closes the mobile GitHub drawer when navigating to another session", () => {
+    vi.mocked(useIsMobileViewport).mockReturnValue(true);
     vi.mocked(isMobileViewport).mockReturnValue(true);
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Open PR" }));

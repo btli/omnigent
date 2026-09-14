@@ -847,7 +847,7 @@ describe("WorkspacePanel browser tab", () => {
 // ── Resize handle geometry ────────────────────────────────────────────────────
 
 describe("WorkspacePanel resize handle geometry", () => {
-  it("renders the hook's resize target as a real flex gutter", () => {
+  it("renders the hook's resize target as a real flex gutter inside the landmark", () => {
     const resize = renderHook(() => useResizableInlinePanel(null));
     renderWorkspace({
       handleProps: resize.result.current.handleProps,
@@ -857,9 +857,12 @@ describe("WorkspacePanel resize handle geometry", () => {
     const separator = screen.getByRole("separator", { name: "Resize panel" });
 
     expect(separator).toHaveAttribute("data-workspace-panel-resize-gutter");
-    expect(separator.nextElementSibling).toBe(panel);
-    expect(panel).toHaveClass("md:overflow-hidden");
-    expect(panel).not.toContainElement(separator);
+    expect(panel).toContainElement(separator);
+    expect(panel.firstElementChild).toBe(separator);
+    expect(panel).toHaveClass("md:flex-row");
+    expect(panel).not.toHaveClass("md:overflow-hidden");
+    expect(separator.nextElementSibling).toHaveAttribute("data-workspace-panel-body");
+    expect(separator.nextElementSibling).toHaveClass("overflow-hidden");
     expect(separator).not.toHaveClass("md:absolute", "md:inset-y-0");
     expect(separator).toHaveClass("relative", "z-50");
     expect(panel).toHaveClass("z-40");
