@@ -1,6 +1,7 @@
 import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
+  BotIcon,
   Code2Icon,
   CompassIcon,
   FileTextIcon,
@@ -9,6 +10,7 @@ import {
   SearchIcon,
 } from "lucide-react";
 import { iconForAgent } from "@/components/AgentCard";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
 
@@ -51,13 +53,16 @@ export function iconForAgentType(tool: string | null): AgentIcon {
 export function resolveSubagentIcon(source: SubagentIconSource): AgentIcon {
   const nativeAgent = nativeCodingAgentForWrapper(source.wrapper);
   if (source.kind === "root") {
+    if (nativeAgent === undefined && source.harness?.includes("opencode")) return OpenCodeIcon;
     return iconForAgent({
       name: nativeAgent?.agentName ?? source.agentName ?? "",
       harness: nativeAgent?.harness ?? source.harness,
     });
   }
   if (nativeAgent !== undefined) {
-    return iconForAgent({ name: nativeAgent.agentName, harness: nativeAgent.harness });
+    const icon = iconForAgent({ name: nativeAgent.agentName, harness: nativeAgent.harness });
+    // A generic fallback means the wrapper has no branded glyph, so preserve the role icon.
+    if (icon !== BotIcon) return icon;
   }
   if (source.tool === "pi") return iconForAgent({ name: "", harness: "pi" });
   return iconForAgentType(source.tool);
