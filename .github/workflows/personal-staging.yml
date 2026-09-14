@@ -1,6 +1,6 @@
 # Nightly personal staging ring for the btli fork.
 #
-# Composes upstream main + every open btli PR (sequential merges, conflicts
+# Composes fork main + fresh upstream main + every open btli PR (sequential merges, conflicts
 # skipped and reported) onto fork branch `staging`, pins an immutable
 # nightly-YYYYMMDD branch + tag and a PEP 440 vX.Y.Z.devYYYYMMDD tag, builds
 # Android debug APK + unsigned release AAB from that commit, and publishes a
@@ -31,58 +31,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Keep fork main tracking upstream with a plain merge commit (no force). A
-  # conflict fails THIS job with the paths in the summary — resolution is
-  # manual — but the staging ring below still runs: it stacks from upstream
-  # HEAD directly and never reads fork main.
-  sync-main:
-    # Fork-only, mirroring upstream's `if: github.repository == 'omnigent-ai/omnigent'` guards.
-    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    environment: staging-push
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout fork main with full history
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          # App tokens cannot push workflow-file changes; prefer the
-          # workflows-scoped PAT, with GitHub token as fallback.
-          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
-          ref: main
-          fetch-depth: 0
-
-      - name: Merge upstream main and push
-        env:
-          HAS_PAT: ${{ secrets.STAGING_PUSH_TOKEN != '' }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/omnigent-ai/omnigent.git
-          git fetch upstream main
-          if [ "$HAS_PAT" = "true" ]; then
-            merge_command=(git merge --no-ff -m "Merge upstream main [skip ci]" FETCH_HEAD)
-          else
-            merge_command=(git merge --no-edit FETCH_HEAD)
-          fi
-          if ! "${merge_command[@]}"; then
-            {
-              echo "## sync-main: merge conflict with upstream main"
-              echo ""
-              git diff --name-only --diff-filter=U | while read -r f; do printf -- '- %s\n' "\`$f\`"; done
-              echo ""
-              echo "Resolve manually; tonight's staging ring still ran from upstream HEAD."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          git push origin main
-
-      - name: Report failure
-        if: failure()
-        run: echo "## Personal staging nightly — sync-main job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
-
   # Secretless test gate: `uv run` installs third-party dev deps, so this job
   # never holds a write token (the repo's default pytest testpaths never
   # collect .github/scripts/**, hence the explicit run here).
@@ -114,17 +62,18 @@ jobs:
         run: echo "## Personal staging nightly — test-composer job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
 
   integrate:
+    concurrency:
+      group: personal-staging-nightly-compose
+      cancel-in-progress: false
     # Privileged (pushes refs) but runs ONLY the stdlib composer — no
-    # third-party code. Requires the secretless test gate to pass; still runs
-    # when sync-main failed on a conflict (the ring stacks from upstream
-    # HEAD, not fork main).
-    needs: [sync-main, test-composer]
+    # third-party code. Requires the secretless test gate to pass.
+    needs: test-composer
     # The ref guard blocks accidental non-main dispatches of privileged jobs
     # (schedule always runs main). It is accident prevention only: a
     # dispatched ref executes its own workflow copy, so file-level guards
     # can't stop a malicious ref — the keystore's real protection is the
     # server-enforced staging-signing Environment on android-sign.
-    if: always() && needs.test-composer.result == 'success' && needs.sync-main.result != 'cancelled' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: staging-push
     timeout-minutes: 20
@@ -143,7 +92,7 @@ jobs:
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 
-      - name: Compose staging from upstream main + open btli PRs
+      - name: Compose staging from fork main + fresh upstream main + open btli PRs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -171,6 +120,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload merge report
+        if: always() && hashFiles('merge-report.json') != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: merge-report
@@ -308,10 +258,7 @@ jobs:
   # would be restored by future runs).
   android-build:
     needs: integrate
-    # `success()` spans the whole ancestry, so a failed sync-main would skip
-    # this job even though integrate cleared its own always() gate. The ring
-    # builds from integrate's commit and never reads fork main.
-    if: always() && needs.integrate.result == 'success'
+    # Build only after the ring composition succeeds.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:

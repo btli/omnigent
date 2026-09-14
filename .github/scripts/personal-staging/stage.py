@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compose the personal staging ring on the fork.
 
-Builds branch ``staging`` = upstream main + every open btli PR plus the
+Builds branch ``staging`` = fork main + fresh upstream main + every open btli PR plus the
 ``extras.txt`` pins, merged sequentially (ascending PR number; conflicting
 PRs are skipped and reported — but an open PR whose merge conflicts gets
 one rebase rescue onto upstream main first, and a clean rescue is pushed
@@ -113,7 +113,7 @@ STAGING = Ring(
 )
 
 
-# The production ring: upstream main + open NON-draft PRs — draft status is
+# The production ring: fork main + open NON-draft PRs — draft status is
 # the promotion gate — plus the extras-production.txt pins (its own manifest,
 # so nothing staged-only reaches prod by accident; a listed draft is
 # force-promoted past the gate). No dev tag (nothing downstream consumes
@@ -164,6 +164,12 @@ def commit_ident(ring: Ring = STAGING) -> list[str]:
 
 class StageError(RuntimeError):
     pass
+
+
+class PublicationDriftError(StageError):
+    def __init__(self, message: str, report: dict):
+        super().__init__(message)
+        self.report = report
 
 
 class GitLockError(StageError):
@@ -431,6 +437,76 @@ def remote_ref(cwd: str | Path, remote: str, ref: str) -> str:
     return out.split("\t")[0] if out else ""
 
 
+def sync_main(cwd: str | Path, upstream: str = "upstream", fork: str = "origin") -> str:
+    """Merge upstream into published main; retry only a stale lease, once."""
+    for attempt in range(2):
+        git(cwd, "fetch", fork, "main")
+        base_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
+        git(cwd, "checkout", "--detach", base_sha)
+        git(cwd, "fetch", upstream, "main")
+        merge = git(
+            cwd,
+            "merge",
+            "--no-ff",
+            "-m",
+            "Merge upstream main [skip ci]",
+            "FETCH_HEAD",
+            check=False,
+        )
+        if merge.returncode:
+            git(cwd, "merge", "--abort", check=False)
+            raise StageError(f"sync-main: merge failed: {merge.stderr.strip()}")
+        candidate = git(cwd, "rev-parse", "HEAD").stdout.strip()
+        if candidate == base_sha:
+            return candidate
+        # The explicit lease guards the race; ancestry forbids rewriting main.
+        assert_descendant(cwd, base_sha, candidate)
+        push = git(
+            cwd,
+            "push",
+            "--porcelain",
+            f"--force-with-lease=refs/heads/main:{base_sha}",
+            fork,
+            f"{candidate}:refs/heads/main",
+            check=False,
+        )
+        if push.returncode == 0:
+            return candidate
+        if attempt or not is_stale_ref_push_rejection(push.stdout):
+            raise StageError(f"sync-main: push failed: {push.stdout}\n{push.stderr}")
+    raise AssertionError("unreachable")
+
+
+def assert_descendant(cwd: str | Path, base_sha: str, candidate_sha: str) -> None:
+    if git(cwd, "merge-base", "--is-ancestor", base_sha, candidate_sha, check=False).returncode:
+        raise StageError("base must be an ancestor of the candidate")
+
+
+def _main_lease(base_sha: str) -> tuple[str, str]:
+    return (
+        f"--force-with-lease=refs/heads/main:{base_sha}",
+        f"{base_sha}:refs/heads/main",
+    )
+
+
+def assert_publish_base(cwd: str | Path, fork: str, base_sha: str, candidate_sha: str) -> None:
+    assert_descendant(cwd, base_sha, candidate_sha)
+    if remote_ref(cwd, fork, "refs/heads/main") != base_sha:
+        raise StageError("fork main changed since composition; refusing to publish a stale base")
+
+
+def audit_published_base(cwd: str | Path, fork: str, report: dict) -> dict:
+    matches = remote_ref(cwd, fork, "refs/heads/main") == report["base_sha"]
+    report["base_matches_remote_main"] = matches
+    if not matches:
+        raise PublicationDriftError(
+            "fork main moved after publication; refs may already have moved; "
+            "the next compose reconciles",
+            report,
+        )
+    return report
+
+
 def conflict_paths(cwd: str | Path) -> list[str]:
     out = git(cwd, "diff", "--name-only", "--diff-filter=U").stdout
     return sorted(p for p in out.splitlines() if p)
@@ -439,9 +515,8 @@ def conflict_paths(cwd: str | Path) -> list[str]:
 def seed_rerere(cwd: str | Path, seed_dir: Path | None) -> int:
     """Copy committed conflict resolutions into the workspace's rr-cache.
 
-    Returns the count of seeded entries. Must run BEFORE the compose detaches
-    onto upstream HEAD: the seed lives on fork main and leaves the worktree at
-    that point (the same reason extras are read early). A malformed entry
+    Returns the count of seeded entries. Run before detaching: seeds and
+    extras belong to the trusted checkout, not a composed input ref. A malformed entry
     fails loud — silently dropping one would turn a resolved PR back into a
     skip."""
     if seed_dir is None:
@@ -513,6 +588,8 @@ def dev_version(cwd: str | Path, upstream_sha: str, datestamp: str) -> str:
 
 
 def _pin_label(p: dict) -> str:
+    if p.get("source") == "upstream":
+        return "upstream"
     if p.get("source") == "extra-branch":
         return f"branch:{p['branch']}"
     return f"#{p['pr']}"
@@ -576,12 +653,15 @@ def merge_prs(
     fork: str = "origin",
     ring: Ring = STAGING,
     upstream_sha: str = "",
+    base_sha: str = "",
 ) -> tuple[list[dict], list[dict]]:
     applied: list[dict] = []
     skipped: list[dict] = []
     for pr in sorted(prs, key=lambda p: (p["number"] is None, p["number"])):
         num, source = pr.get("number"), pr.get("source", "open")
-        if source == "extra-branch":
+        if source == "upstream":
+            branch, oid = "upstream/main", upstream_sha
+        elif source == "extra-branch":
             branch = pr["headRefName"]
             oid, reason = fetch_extra(cwd, fork, f"refs/heads/{branch}")
             if not oid:
@@ -659,6 +739,8 @@ def merge_prs(
                 rerere_paths = resolved
             else:
                 git(cwd, "merge", "--abort")
+                if source == "upstream":
+                    raise StageError("staging entry zero conflicts: " + ", ".join(paths))
                 # One rescue per conflicting open PR: rebase its head onto
                 # upstream main and retry the merge with the rescued head.
                 # Extras stay verbatim — their refs are frozen pins.
@@ -692,7 +774,9 @@ def merge_prs(
             # nothing new is detected as a no-op instead of minting -rerunN.
             when = git(cwd, "show", "-s", "--format=%cI", oid).stdout.strip()
             subject = (
-                f"{ring.merge_subject_prefix}: merge branch {branch} ({branch} @ {oid[:12]})"
+                f"staging: merge upstream {oid[:12]}"
+                if source == "upstream"
+                else f"{ring.merge_subject_prefix}: merge branch {branch} ({branch} @ {oid[:12]})"
                 if source == "extra-branch"
                 else f"{ring.merge_subject_prefix}: merge PR #{num} ({branch} @ {oid[:12]})"
             )
@@ -714,14 +798,17 @@ def merge_prs(
             # on the normal path. The lease pins the pre-rescue head: a branch
             # that moved meanwhile keeps its newer work (this run still ships
             # the rescue, and the next run rescues from the newer head).
-            push = git(
-                cwd,
-                "push",
-                f"--force-with-lease=refs/heads/{branch}:{rebased_from}",
-                fork,
-                f"{oid}:refs/heads/{branch}",
-                check=False,
-            )
+            if base_sha:
+                assert_publish_base(
+                    cwd, fork, base_sha, git(cwd, "rev-parse", "HEAD").stdout.strip()
+                )
+            push_args = [f"--force-with-lease=refs/heads/{branch}:{rebased_from}"]
+            refspecs = [f"{oid}:refs/heads/{branch}"]
+            if base_sha:
+                main_lease, main_refspec = _main_lease(base_sha)
+                push_args[:0] = ["--atomic", main_lease]
+                refspecs.insert(0, main_refspec)
+            push = git(cwd, "push", *push_args, fork, *refspecs, check=False)
             entry["rebased_from"] = rebased_from
             entry["pushed_back"] = push.returncode == 0
         applied.append(entry)
@@ -731,7 +818,7 @@ def merge_prs(
 def composition_of(
     cwd: str | Path, sha: str, ring: Ring = STAGING
 ) -> tuple[str, dict[int | str, tuple[str, str]]] | None:
-    """Decode a pushed ring-tip commit into (upstream base sha, {pr: (branch,
+    """Decode a pushed ring-tip commit into (fork base sha, {pr: (branch,
     head12)}) from its first-parent merge subjects, walking to the real base —
     the merge count is unbounded. None when the sha isn't readable."""
     if not sha or git(cwd, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
@@ -742,6 +829,9 @@ def composition_of(
     out = git(cwd, "log", "--first-parent", "--format=%H%x09%s", sha).stdout
     for line in out.splitlines():
         commit, _, subject = line.partition("\t")
+        if ring == STAGING and re.fullmatch(r"staging: merge upstream [0-9a-f]{12}", subject):
+            merges["upstream"] = ("upstream/main", subject.rsplit(" ", 1)[1])
+            continue
         m = pr_re.fullmatch(subject)
         if m:
             merges[int(m.group(1))] = (m.group(2), m.group(3))
@@ -763,6 +853,7 @@ def _blocked_label(n: object) -> str:
 
 def push_causes(
     old: tuple[str, dict[int | str, tuple[str, str]]] | None,
+    base_sha: str,
     upstream_sha: str,
     applied: list[dict],
 ) -> list[str]:
@@ -774,7 +865,13 @@ def push_causes(
     # Only minted merges are comparable: the decoded old composition knows
     # merge subjects, and an already-merged PR mints none.
     new = {
-        (f"branch:{p['branch']}" if p.get("source") == "extra-branch" else p["pr"]): (
+        (
+            "upstream"
+            if p.get("source") == "upstream"
+            else f"branch:{p['branch']}"
+            if p.get("source") == "extra-branch"
+            else p["pr"]
+        ): (
             p["branch"],
             str(p["oid"])[:12],
             p["source"],
@@ -782,15 +879,24 @@ def push_causes(
         for p in applied
         if p.get("minted", True)
     }
-    label = {"open": "open PR set", "extra": "extras", "extra-branch": "extras"}
+    label = {
+        "open": "open PR set",
+        "extra": "extras",
+        "extra-branch": "extras",
+        "upstream": "upstream HEAD",
+    }
     causes: list[str] = []
-    if old_base != upstream_sha:
-        causes.append("upstream HEAD")
+    if old_base != base_sha:
+        causes.append("fork main")
     dropped: list[str] = []
     # ints (PR numbers) sort before str keys (branch: pins)
     for num in sorted(old_merges.keys() | new.keys(), key=lambda k: (isinstance(k, str), k)):
         entry = new.get(num)
         if entry is None:
+            if num == "upstream":
+                if old_merges[num][1] != upstream_sha[:12]:
+                    causes.append("upstream HEAD")
+                continue
             # No longer composed at all (unpinned extra, closed PR, skip) —
             # say so rather than guessing which input it used to come from.
             dropped.append(_blocked_label(num))
@@ -834,18 +940,10 @@ def pin_name(
 
 
 def assert_production_identity(
-    cwd: str | Path, candidate_sha: str, upstream_sha: str, applied: list[dict]
+    cwd: str | Path, candidate_sha: str, base_sha: str, applied: list[dict]
 ) -> None:
     """Fail closed unless a production candidate is the expected merge chain."""
-    if git(
-        cwd,
-        "merge-base",
-        "--is-ancestor",
-        upstream_sha,
-        candidate_sha,
-        check=False,
-    ).returncode:
-        raise StageError("production identity: upstream is not an ancestor of the candidate")
+    assert_descendant(cwd, base_sha, candidate_sha)
 
     if any(p.get("source") == "extra-branch" for p in applied):
         raise StageError("production identity: branch extras are not valid production inputs")
@@ -857,7 +955,7 @@ def assert_production_identity(
         "rev-list",
         "--first-parent",
         "--reverse",
-        f"{upstream_sha}..{candidate_sha}",
+        f"{base_sha}..{candidate_sha}",
     ).stdout.splitlines()
     if len(commits) != len(expected):
         raise StageError(
@@ -904,16 +1002,15 @@ MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
 def migration_touched(
     cwd: str | Path,
     candidate_sha: str,
-    upstream_sha: str,
+    base_sha: str,
     prev_pin_sha: str | None,
     prefix: str = MIGRATIONS_PATH_PREFIX,
 ) -> bool:
     """True when the candidate composition carries a schema change: either
-    ``upstream..candidate`` touches the migrations path (a composed PR adds,
-    edits, or deletes one) or ``prev_pin..candidate`` does (a migration-bearing
-    PR *removed* between compositions — invisible to the upstream leg). With no
-    previous pin only the upstream diff is consulted."""
-    for base in (upstream_sha, prev_pin_sha):
+    ``base..candidate`` touches the migrations path (a composed PR adds, edits,
+    or deletes one) or ``prev_pin..candidate`` does (including a migration
+    added to main or removed between compositions)."""
+    for base in (base_sha, prev_pin_sha):
         if not base:
             continue
         out = git(cwd, "diff", "--name-only", f"{base}..{candidate_sha}").stdout
@@ -951,31 +1048,49 @@ def stage(
     ring: Ring = STAGING,
     migration_approval: str = "",
     rr_cache_dir: Path | None = None,
+    base_ref: str | None = None,
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
     if ring == PRODUCTION and any(p.get("source") == "extra-branch" for p in prs):
         raise StageError("production compositions do not accept branch extras")
 
-    # Seed before the detach: the seed directory is part of the trusted fork
-    # checkout and disappears from the worktree once HEAD moves to upstream.
+    # Read seeds from the trusted checkout before detaching at the base.
     seed_rerere(cwd, rr_cache_dir)
     # Git 2.54+ uses this task key to prevent background rerere-gc races.
     # The lock stderr classifier remains the backstop if maintenance changes.
     git(cwd, "config", "maintenance.rerere-gc.auto", "0")
     git(cwd, "fetch", upstream, "main")
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
-    git(cwd, "checkout", "--detach", upstream_sha)
+    git(cwd, "fetch", fork, "main")
+    published_base_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
+    base_sha = git(
+        cwd, "rev-parse", "--verify", f"{base_ref or 'FETCH_HEAD'}^{{commit}}"
+    ).stdout.strip()
+    if base_sha != published_base_sha:
+        raise StageError(f"base ref {base_ref} is not published fork main")
+    git(cwd, "checkout", "--detach", base_sha)
 
     infrastructure_error = None
+    entry_zero = None
     try:
-        applied, skipped = merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
+        if ring == STAGING:
+            entries, _ = merge_prs(
+                cwd, [{"number": 0, "source": "upstream"}], upstream, fork, ring, upstream_sha
+            )
+            entry_zero = entries[0]
+        applied, skipped = merge_prs(
+            cwd, prs, upstream, fork, ring, upstream_sha, base_sha=base_sha
+        )
     except GitLockError as error:
         if not staging_only:
             raise
         applied, skipped = [], []
         infrastructure_error = str(error)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
+    base_fields: dict = {"base_sha": base_sha, "upstream_sha": upstream_sha}
+    if ring == STAGING:
+        base_fields["entry_zero"] = entry_zero
 
     # An extra we could not even reach is an infrastructure failure, not a
     # composition: publishing without it would silently regress staging.
@@ -986,7 +1101,7 @@ def stage(
     ]
 
     if ring == PRODUCTION:
-        assert_production_identity(cwd, staging_sha, upstream_sha, applied)
+        assert_production_identity(cwd, staging_sha, base_sha, applied)
 
     if staging_only:
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
@@ -995,7 +1110,7 @@ def stage(
         expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
         report = {
             "date": datestamp,
-            "upstream_sha": upstream_sha,
+            **base_fields,
             "staging_sha": staging_sha,
             # Pre-push remote tip: distinct from the local candidate when the
             # push is blocked or a no-op, so the summary never labels an
@@ -1010,19 +1125,27 @@ def stage(
             "skipped": skipped,
         }
         if not report["pushed"]:
-            return report
+            return audit_published_base(cwd, fork, report)
         git(cwd, "fetch", fork, f"refs/heads/{ring.branch}", check=False)
         report["causes"] = push_causes(
-            composition_of(cwd, expected_staging, ring), upstream_sha, applied
+            composition_of(cwd, expected_staging, ring),
+            base_sha,
+            upstream_sha,
+            ([entry_zero] if entry_zero else []) + applied,
         )
+        assert_publish_base(cwd, fork, base_sha, staging_sha)
+        main_lease, main_refspec = _main_lease(base_sha)
         git(
             cwd,
             "push",
+            "--atomic",
+            main_lease,
             f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}",
             fork,
+            main_refspec,
             f"{staging_sha}:refs/heads/{ring.branch}",
         )
-        return report
+        return audit_published_base(cwd, fork, report)
 
     # The nightly publishes releases from this composition, and its downstream
     # jobs consume the report's sha/tag — so refuse loudly before any ref moves
@@ -1049,20 +1172,24 @@ def stage(
             "prev_pin": prev_pin_sha,
         }
         if (
-            migration_touched(cwd, staging_sha, upstream_sha, prev_pin_sha)
+            migration_touched(cwd, staging_sha, base_sha, prev_pin_sha)
             and migration_approval != staging_sha
         ):
             gate["blocked"] = True
             gate["approval_hint"] = f"re-dispatch with approve_migration={staging_sha}"
-            return {
-                "date": datestamp,
-                "upstream_sha": upstream_sha,
-                "staging_sha": staging_sha,
-                "pushed": False,
-                "migration_gate": gate,
-                "applied": applied,
-                "skipped": skipped,
-            }
+            return audit_published_base(
+                cwd,
+                fork,
+                {
+                    "date": datestamp,
+                    **base_fields,
+                    "staging_sha": staging_sha,
+                    "pushed": False,
+                    "migration_gate": gate,
+                    "applied": applied,
+                    "skipped": skipped,
+                },
+            )
 
     dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
     name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
@@ -1093,11 +1220,13 @@ def stage(
             refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
             leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
     if refspecs:
-        git(cwd, "push", "--atomic", *leases, fork, *refspecs)
+        assert_publish_base(cwd, fork, base_sha, staging_sha)
+        main_lease, main_refspec = _main_lease(base_sha)
+        git(cwd, "push", "--atomic", main_lease, *leases, fork, main_refspec, *refspecs)
 
-    return {
+    report = {
         "date": datestamp,
-        "upstream_sha": upstream_sha,
+        **base_fields,
         "staging_sha": staging_sha,
         "branch": name,
         "tag": name,
@@ -1116,6 +1245,7 @@ def stage(
         "applied": applied,
         "skipped": skipped,
     }
+    return audit_published_base(cwd, fork, report)
 
 
 def _skip_reason(p: dict) -> str:
@@ -1125,11 +1255,22 @@ def _skip_reason(p: dict) -> str:
     return f"merge conflict: {paths or 'unknown paths'}"
 
 
+def _summary_base_rows(report: dict) -> list[str]:
+    rows = [f"| Upstream main | `{report['upstream_sha']}` |"]
+    if report.get("base_sha"):
+        rows.append(f"| Fork main base | `{report['base_sha']}` |")
+    if report.get("entry_zero"):
+        rows.append(f"| Entry zero | `{report['entry_zero']['oid']}` |")
+    return rows
+
+
 def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines = [
         f"Nightly personal {ring.name} ring for {report['date']} (UTC).",
         "",
         f"- Upstream main: `{report['upstream_sha']}`",
+        *([f"- Fork main base: `{report['base_sha']}`"] if report.get("base_sha") else []),
+        *([f"- Entry zero: `{report['entry_zero']['oid']}`"] if report.get("entry_zero") else []),
         f"- {ring.name.capitalize()} commit: `{report['staging_sha']}`",
         *([f"- Dev tag: `{report['dev_tag']}`"] if report.get("dev_tag") else []),
         "",
@@ -1210,7 +1351,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
             "",
             "| | |",
             "| --- | --- |",
-            f"| Upstream main | `{report['upstream_sha']}` |",
+            *_summary_base_rows(report),
             *sha_rows,
             f"| Result | {result} |",
         ]
@@ -1231,7 +1372,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
             "",
             "| | |",
             "| --- | --- |",
-            f"| Upstream main | `{report['upstream_sha']}` |",
+            *_summary_base_rows(report),
             f"| candidate (not pushed) | `{report['staging_sha']}` |",
             f"| Previous pin | `{gate.get('prev_pin') or '(none)'}` |",
             (
@@ -1250,7 +1391,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
         "",
         "| | |",
         "| --- | --- |",
-        f"| Upstream main | `{report['upstream_sha']}` |",
+        *_summary_base_rows(report),
         f"| {tier} | `{report['staging_sha']}` |",
         f"| Pin | `{report['tag']}`{pin_note} |",
         *([f"| Dev tag | `{report['dev_tag']}` |"] if report.get("dev_tag") else []),
@@ -1274,6 +1415,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_stage.add_argument("--upstream-remote", default="upstream")
     p_stage.add_argument("--fork-remote", default="origin")
+    p_stage.add_argument(
+        "--base-ref", help="composition base (default: freshly fetched fork main)"
+    )
     p_stage.add_argument("--date", help="UTC datestamp YYYYMMDD (default: today)")
     p_stage.add_argument("--prs-json", help="read PRs from this JSON file instead of gh")
     p_stage.add_argument("--report", default="merge-report.json")
@@ -1325,7 +1469,21 @@ def main(argv: list[str] | None = None) -> int:
         help="destination ref to classify (default: refs/heads/main)",
     )
 
+    p_sync = sub.add_parser("sync-main", help="merge upstream into fork main without rewriting it")
+    p_sync.add_argument("--workdir", default=".")
+    p_sync.add_argument("--upstream-remote", default="upstream")
+    p_sync.add_argument("--fork-remote", default="origin")
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "sync-main":
+        try:
+            sha = sync_main(args.workdir, args.upstream_remote, args.fork_remote)
+        except StageError as error:
+            append_summary(f"## sync-main FAILED\n\n{error}\n")
+            raise
+        print(sha)
+        return 0
 
     if args.cmd == "is-stale-ref-rejection":
         return 0 if is_stale_ref_push_rejection(sys.stdin.read(), ref=args.ref) else 1
@@ -1377,9 +1535,12 @@ def main(argv: list[str] | None = None) -> int:
             ring=ring,
             migration_approval=args.migration_approval,
             rr_cache_dir=Path(args.rr_cache),
+            base_ref=args.base_ref,
         )
         report["excluded"] = excluded
     except Exception as e:
+        if isinstance(e, PublicationDriftError):
+            Path(args.report).write_text(json.dumps(e.report, indent=2) + "\n")
         # The step summary is the failure surface — never exit without one.
         append_summary(f"## {title}\n\n**FAILED:** {e}\n")
         raise
