@@ -264,9 +264,11 @@ def _run_dev_clone_check(repo_root: Path) -> None:
                         detached = comparison.detached
                         fallback = False
                         revision = comparison.revision
-                    recounted = _local_rev_list_count(repo_root, revision)
+                    recounted = _local_rev_list(repo_root, revision)
                     if recounted is not None:
-                        behind = recounted
+                        behind, revision = recounted
+                        if fallback:
+                            compared_ref = revision.removeprefix("refs/remotes/")
                         _write_cache(
                             _CacheEntry(
                                 last_check_epoch=cached.last_check_epoch,
@@ -1083,6 +1085,12 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
     :param compared_ref: Ref recorded with the cached count.
     :returns: Number of commits behind, or ``None`` on failure.
     """
+    result = _local_rev_list(repo_root, compared_ref)
+    return result[0] if result is not None else None
+
+
+def _local_rev_list(repo_root: Path, compared_ref: str) -> tuple[int, str] | None:
+    """Return the commits-behind count and the revision that succeeded."""
     if compared_ref in {"origin/main", "refs/remotes/origin/main"}:
         refs = ("refs/remotes/origin/main", "refs/remotes/origin/master")
     elif compared_ref in {"origin/master", "refs/remotes/origin/master"}:
@@ -1097,7 +1105,7 @@ def _local_rev_list_count(repo_root: Path, compared_ref: str = "origin/main") ->
                 f"HEAD..{ref}",
                 "--count",
             )
-            return int(output.strip())
+            return int(output.strip()), ref
         except (subprocess.SubprocessError, OSError, ValueError):
             continue
     return None

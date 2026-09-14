@@ -614,7 +614,7 @@ def test_legacy_cache_recounts_against_master_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A moved HEAD clears a legacy count in a master-only repository."""
+    """Legacy recounts name the master fallback and clear after catch-up."""
     upstream, clone = _tracking_clone(tmp_path)
     _git(upstream, "switch", "--quiet", "-C", "master")
     _git(upstream, "push", "--quiet", "--set-upstream", "origin", "master")
@@ -622,6 +622,7 @@ def test_legacy_cache_recounts_against_master_fallback(
     _git(clone, "branch", "--unset-upstream")
     _git(clone, "fetch", "--quiet", "origin")
     _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "master ahead")
+    _git(upstream, "commit", "--allow-empty", "--quiet", "-m", "master ahead twice")
     _git(upstream, "push", "--quiet")
     _git(clone, "fetch", "--quiet", "origin")
 
@@ -630,17 +631,34 @@ def test_legacy_cache_recounts_against_master_fallback(
         json.dumps(
             {
                 "last_check_epoch": time.time(),
-                "commits_behind": 1,
+                "commits_behind": 2,
                 "head_sha": _git(clone, "rev-parse", "HEAD"),
             }
         )
     )
-    _git(clone, "merge", "--quiet", "--ff-only", "refs/remotes/origin/master")
+    _git(clone, "merge", "--quiet", "--ff-only", "refs/remotes/origin/master^")
 
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
     monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
     with patch("omnigent.update_check._find_repo_root", return_value=clone):
+        maybe_show_update_notice()
+        fresh_notice = capsys.readouterr().err
+        maybe_show_update_notice()
+        cached_notice = capsys.readouterr().err
+
+        for notice in (fresh_notice, cached_notice):
+            assert "origin/master is 1 commit(s) ahead" in notice
+            assert "Check out or redeploy origin/master" in notice
+            assert "origin/main" not in notice
+
+        cached = _read_cache()
+        assert cached is not None
+        assert cached.commits_behind == 1
+        assert cached.compared_ref == "origin/master"
+        assert cached.head_sha == _git(clone, "rev-parse", "HEAD")
+
+        _git(clone, "merge", "--quiet", "--ff-only", "refs/remotes/origin/master")
         maybe_show_update_notice()
 
     assert capsys.readouterr().err == ""
@@ -773,7 +791,10 @@ def test_fresh_cache_clears_after_pull(
     with (
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
         patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
-        patch("omnigent.update_check._local_rev_list_count", return_value=0),
+        patch(
+            "omnigent.update_check._local_rev_list",
+            return_value=(0, "refs/remotes/origin/master"),
+        ),
     ):
         maybe_show_update_notice()
 
@@ -815,7 +836,7 @@ def test_fresh_cache_recounts_against_current_ref_after_branch_switch(
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
         patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
         patch("omnigent.update_check._tracked_comparison", return_value=current),
-        patch("omnigent.update_check._local_rev_list_count", return_value=0) as recount,
+        patch("omnigent.update_check._local_rev_list", return_value=(0, "@{upstream}")) as recount,
     ):
         maybe_show_update_notice()
 
@@ -854,7 +875,7 @@ def test_fresh_cache_hides_stale_count_when_current_recount_fails(
         patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
         patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
         patch("omnigent.update_check._tracked_comparison", return_value=current),
-        patch("omnigent.update_check._local_rev_list_count", return_value=None),
+        patch("omnigent.update_check._local_rev_list", return_value=None),
     ):
         maybe_show_update_notice()
 
