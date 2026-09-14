@@ -1,11 +1,11 @@
 """Merge the scheduled-project and managed-sandbox migration heads.
 
 Revision ID: c18e2f7a4b90
-Revises: a5363b7c9d2e, gb1b2c3d4e5f
+Revises: a5363b7c9d2e, gg1b2c3d4e5f
 
-The scheduled-project revision shipped downstream before the managed-sandbox
-revision landed on main. Keep both revisions as siblings so databases already
-stamped at ``a5363b7c9d2e`` still run ``gb1b2c3d4e5f`` on their next upgrade.
+The scheduled-project revision shipped downstream before the later main-line
+revisions landed. Keep both revisions as siblings so databases already stamped
+at ``a5363b7c9d2e`` still run ``gg1b2c3d4e5f`` on their next upgrade.
 """
 
 from __future__ import annotations
