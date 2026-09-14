@@ -15,8 +15,10 @@ multi-agent case where the badge and rows grow once sub-agents exist.
 
 from __future__ import annotations
 
+import json
 import re
 
+import httpx
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
@@ -52,3 +54,69 @@ def test_agents_tab_lists_lone_agent(
     # and a lone agent has no sub-agent rows beneath it.
     expect(rail.locator(_SUBAGENT_MAIN_ROW)).to_be_visible(timeout=30_000)
     expect(rail.locator(_SUBAGENT_ROW)).to_have_count(0)
+
+
+def test_agents_graph_shows_root_branded_role_and_fallback_icons(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The real graph journey identifies every supported node category."""
+    base_url, session_id = seeded_session
+    bundle = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent/contents", timeout=10.0)
+    bundle.raise_for_status()
+
+    children: list[str] = []
+    child_specs = [
+        ("reviewer", "branded-child", {"omnigent.wrapper": "codex-native-ui"}),
+        (
+            "Explore",
+            "role-child",
+            {
+                "omnigent.wrapper": "codex-native-ui-subagent",
+                "omnigent.codex_native.agent_role": "Explore",
+            },
+        ),
+        ("general-purpose", "fallback-child", None),
+    ]
+    try:
+        for tool, name, labels in child_specs:
+            child = httpx.post(
+                f"{base_url}/v1/sessions",
+                data={
+                    "metadata": json.dumps(
+                        {
+                            "parent_session_id": session_id,
+                            "title": f"{tool}:{name}",
+                        }
+                    )
+                },
+                files={"bundle": ("agent.tar.gz", bundle.content, "application/gzip")},
+                timeout=30.0,
+            )
+            child.raise_for_status()
+            child_id = child.json()["session_id"]
+            children.append(child_id)
+            if labels is not None:
+                patched = httpx.patch(
+                    f"{base_url}/v1/sessions/{child_id}",
+                    json={"labels": labels},
+                    timeout=10.0,
+                )
+                patched.raise_for_status()
+
+        page.goto(f"{base_url}/c/{session_id}")
+        open_right_rail(page)
+        rail = page.get_by_role("complementary", name="Workspace")
+        rail.get_by_role("tab", name=re.compile("^Agents")).click()
+        rail.get_by_role("button", name="Graph view").click()
+
+        expected_labels = ["hello_world", "branded-child", "Explore", "fallback-child"]
+        for label in expected_labels:
+            node = rail.locator(".react-flow__node").filter(has_text=label)
+            expect(node).to_be_visible(timeout=30_000)
+            icon = node.get_by_test_id("agent-node-icon")
+            expect(icon).to_have_count(1)
+            expect(icon).to_have_attribute("aria-hidden", "true")
+    finally:
+        for child_id in children:
+            httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)

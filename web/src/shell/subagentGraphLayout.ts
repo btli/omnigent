@@ -5,7 +5,15 @@ import { childStatus, type AgentActivity } from "./subagentStatus";
 
 export type { AgentActivity };
 
-export interface AgentNodeData {
+export interface AgentIdentity {
+  nodeKind: "root" | "child";
+  wrapper: string | null;
+  tool: string | null;
+  harness: string | null;
+  agentName: string | null;
+}
+
+export interface AgentNodeData extends AgentIdentity {
   label: string;
   activity: AgentActivity;
   statusLabel: string;
@@ -15,7 +23,7 @@ export interface AgentNodeData {
   [key: string]: unknown;
 }
 
-export interface TreeNode {
+export interface TreeNode extends AgentIdentity {
   id: string;
   label: string;
   activity: AgentActivity;
@@ -23,6 +31,22 @@ export interface TreeNode {
   preview: string | null;
   children: TreeNode[];
 }
+
+export interface RootAgentIdentity {
+  wrapper: string | null;
+  harness: string | null;
+  agentName: string | null;
+}
+
+type NodeIdentity =
+  | ({ nodeKind: "root"; tool: null } & RootAgentIdentity)
+  | {
+      nodeKind: "child";
+      wrapper: string | null;
+      tool: string | null;
+      harness: null;
+      agentName: null;
+    };
 
 interface LayoutNode {
   id: string;
@@ -92,6 +116,11 @@ export function layoutTree(
         sessionId: node.id,
         isActive: node.id === activeId,
         preview: node.preview,
+        nodeKind: node.nodeKind,
+        wrapper: node.wrapper,
+        tool: node.tool,
+        harness: node.harness,
+        agentName: node.agentName,
       },
     });
 
@@ -137,6 +166,13 @@ export function buildTree(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
+  identity: NodeIdentity = {
+    nodeKind: "root",
+    wrapper: null,
+    tool: null,
+    harness: null,
+    agentName: null,
+  },
   visited = new Set<string>(),
 ): TreeNode {
   visited.add(rootId);
@@ -147,6 +183,11 @@ export function buildTree(
     activity: rootActivity,
     statusLabel: rootStatusLabel,
     preview: rootPreview,
+    nodeKind: identity.nodeKind,
+    wrapper: identity.wrapper,
+    tool: identity.tool,
+    harness: identity.harness,
+    agentName: identity.agentName,
     children:
       depth >= MAX_TREE_DEPTH
         ? []
@@ -180,6 +221,13 @@ export function buildTree(
                 child.last_message_preview,
                 childrenMap,
                 depth + 1,
+                {
+                  nodeKind: "child",
+                  wrapper: child.labels?.[WRAPPER_LABEL_KEY] ?? null,
+                  tool: child.tool,
+                  harness: null,
+                  agentName: null,
+                },
                 visited,
               );
             }),
@@ -194,6 +242,7 @@ export function buildGraphLayout(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
+  rootIdentity: RootAgentIdentity,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const tree = buildTree(
     rootId,
@@ -203,6 +252,7 @@ export function buildGraphLayout(
     rootPreview,
     childrenMap,
     0,
+    { nodeKind: "root", tool: null, ...rootIdentity },
   );
   return layoutTree(tree, activeId);
 }
