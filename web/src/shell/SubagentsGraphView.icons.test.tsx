@@ -135,20 +135,22 @@ describe("SubagentsGraphView agent icons", () => {
     render(<SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" />);
 
     const cases = [
-      ["conv_root", "Codex", '[data-icon="codex"]'],
-      ["conv_brand", "brand-child", '[data-icon="codex"]'],
-      ["conv_role", "Explore", ".lucide-search"],
-      ["conv_unknown", "unknown-child", '[data-icon="otto"]'],
+      ["conv_root", "Codex", '[data-icon="codex"]', "Codex"],
+      ["conv_brand", "brand-child", '[data-icon="codex"]', "Codex"],
+      ["conv_role", "Explore", ".lucide-search", "Explore"],
+      ["conv_unknown", "unknown-child", '[data-icon="otto"]', "general-purpose"],
     ] as const;
     await Promise.all(
-      cases.map(async ([id, label, selector]) => {
+      cases.map(async ([id, label, selector, accessibleIdentity]) => {
         const node = await screen.findByTestId(`graph-node-${id}`);
         const icon = node.querySelector(selector);
         const labelElement = screen.getByText(label);
+        const identityElement = node.querySelector(".sr-only");
         expect(icon).not.toBeNull();
         expect(icon).toHaveAttribute("aria-hidden", "true");
         expect(icon).toHaveAttribute("data-testid", "agent-node-icon");
         expect(labelElement.previousElementSibling).toBe(icon);
+        expect(identityElement).toHaveTextContent(`Agent identity: ${accessibleIdentity}`);
       }),
     );
   });
