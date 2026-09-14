@@ -68,14 +68,7 @@ def test_agents_graph_shows_root_branded_role_and_fallback_icons(
     children: list[str] = []
     child_specs = [
         ("reviewer", "branded-child", {"omnigent.wrapper": "codex-native-ui"}),
-        (
-            "Explore",
-            "role-child",
-            {
-                "omnigent.wrapper": "codex-native-ui-subagent",
-                "omnigent.codex_native.agent_role": "Explore",
-            },
-        ),
+        ("Explore", "role-child", None),
         ("general-purpose", "fallback-child", None),
     ]
     try:
@@ -110,13 +103,28 @@ def test_agents_graph_shows_root_branded_role_and_fallback_icons(
         rail.get_by_role("tab", name=re.compile("^Agents")).click()
         rail.get_by_role("button", name="Graph view").click()
 
-        expected_labels = ["hello_world", "branded-child", "Explore", "fallback-child"]
+        nodes = {}
+        expected_labels = ["hello_world", "branded-child", "role-child", "fallback-child"]
         for label in expected_labels:
             node = rail.locator(".react-flow__node").filter(has_text=label)
             expect(node).to_be_visible(timeout=30_000)
+            nodes[label] = node
             icon = node.get_by_test_id("agent-node-icon")
             expect(icon).to_have_count(1)
             expect(icon).to_have_attribute("aria-hidden", "true")
+
+        expect(
+            nodes["branded-child"].get_by_test_id("agent-node-icon").locator("title")
+        ).to_have_text("Codex")
+        expect(
+            nodes["role-child"].locator('[data-testid="agent-node-icon"].lucide-search')
+        ).to_have_count(1)
+        expect(
+            nodes["hello_world"].locator('[data-testid="agent-node-icon"].lucide-bot')
+        ).to_have_count(1)
+        expect(nodes["fallback-child"].get_by_test_id("agent-node-icon")).to_have_attribute(
+            "viewBox", "0 0 1024 1024"
+        )
     finally:
         for child_id in children:
             httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)

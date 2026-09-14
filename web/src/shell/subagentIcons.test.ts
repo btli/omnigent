@@ -5,6 +5,7 @@ import { HermesIcon } from "@/components/icons/HermesIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
+import { PiIcon } from "@/components/icons/PiIcon";
 import { resolveSubagentIcon } from "./subagentIcons";
 
 describe("resolveSubagentIcon", () => {
@@ -26,6 +27,17 @@ describe("resolveSubagentIcon", () => {
         kind: "root",
         wrapper: null,
         harness: "claude-sdk",
+        agentName: "nessie",
+      }),
+    ).toBe(NessieIcon);
+  });
+
+  it("keeps the Nessie icon when its root runs on an OpenCode harness", () => {
+    expect(
+      resolveSubagentIcon({
+        kind: "root",
+        wrapper: null,
+        harness: "opencode",
         agentName: "nessie",
       }),
     ).toBe(NessieIcon);
@@ -53,6 +65,17 @@ describe("resolveSubagentIcon", () => {
     ).toBe(OpenCodeIcon);
   });
 
+  it("does not infer a root brand from agentName alone", () => {
+    expect(
+      resolveSubagentIcon({
+        kind: "root",
+        wrapper: null,
+        harness: "agents-sdk",
+        agentName: "codex-native-ui",
+      }),
+    ).toBe(BotIcon);
+  });
+
   it("uses a brand icon for a full native child wrapper", () => {
     expect(
       resolveSubagentIcon({ kind: "child", wrapper: "codex-native-ui", tool: "reviewer" }),
@@ -77,6 +100,14 @@ describe("resolveSubagentIcon", () => {
         tool: "Explore",
       }),
     ).toBe(SearchIcon);
+  });
+
+  it("uses the Pi brand only for the exact pi child tool", () => {
+    expect(resolveSubagentIcon({ kind: "child", wrapper: null, tool: "pi" })).toBe(PiIcon);
+  });
+
+  it("does not brand child tools that merely contain pi", () => {
+    expect(resolveSubagentIcon({ kind: "child", wrapper: null, tool: "pipeline" })).toBe(OttoIcon);
   });
 
   it("falls back for unknown root and child identities", () => {

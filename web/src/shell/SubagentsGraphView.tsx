@@ -51,24 +51,12 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
-  const {
-    label,
-    activity,
-    statusLabel,
-    isActive,
-    preview,
-    nodeKind,
-    wrapper,
-    tool,
-    harness,
-    agentName,
-  } = data;
+  const { label, activity, statusLabel, isActive, preview, identity } = data;
   const tint = ACTIVITY_TINT[activity];
-  const Icon = resolveSubagentIcon(
-    nodeKind === "root"
-      ? { kind: "root", wrapper, harness, agentName }
-      : { kind: "child", wrapper, tool },
-  );
+  const Icon = resolveSubagentIcon(identity);
+  const accessibleIdentity =
+    nativeCodingAgentForWrapper(identity.wrapper)?.displayName ??
+    (identity.kind === "root" ? identity.agentName : identity.tool);
 
   return (
     <>
@@ -87,6 +75,9 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
+          {accessibleIdentity && (
+            <span className="sr-only">Agent identity: {accessibleIdentity}</span>
+          )}
           <Icon
             aria-hidden="true"
             data-testid="agent-node-icon"
@@ -230,6 +221,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         childrenMap,
         conversationId,
         {
+          kind: "root",
           wrapper: wrapper ?? null,
           harness: rootHarness,
           agentName: rootAgentName,
