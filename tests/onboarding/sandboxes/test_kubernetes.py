@@ -166,6 +166,35 @@ def test_build_job_manifest_disambiguates_same_named_repos() -> None:
     assert "workspace/api " not in script  # no plain colliding dir
 
 
+def test_build_job_manifest_staging_never_collides_with_sibling_destination() -> None:
+    """Repo ``foo`` must not stage through ``foo.tmp`` when a sibling repo is
+    literally named ``foo.tmp`` — the staging-cleanup branch would refuse the
+    launch against that sibling's checkout, or remove it outright if it carried
+    a root-level ownership marker."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/foo.git", branch=None, repo_name="foo"),
+            RepoWorkspace(
+                url="https://github.com/org/foo.tmp.git", branch=None, repo_name="foo.tmp"
+            ),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    # foo stages through the suffixed name, not the sibling's destination.
+    assert "mkdir -- /home/omnigent/workspace/foo.tmp2\n" in script
+    assert (
+        "mv -f -- /home/omnigent/workspace/foo.tmp2/clone /home/omnigent/workspace/foo " in script
+    )
+    # No cleanup fragment ever targets the sibling's checkout directory.
+    assert "rm -rf -- /home/omnigent/workspace/foo.tmp\n" not in script
+    # The sibling still clones into its own destination via its own staging.
+    assert (
+        "mv -f -- /home/omnigent/workspace/foo.tmp.tmp/clone /home/omnigent/workspace/foo.tmp "
+        in script
+    )
+
+
 def test_build_job_manifest_without_repo_has_no_clone() -> None:
     """No repo → the init container only makes the workspace, no git clone."""
     manifest = build_job_manifest(**_MANIFEST_KW)
