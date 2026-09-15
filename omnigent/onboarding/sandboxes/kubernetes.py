@@ -499,16 +499,21 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repos:
-        # Prefer the owner's per-user credential for the clone: when they've
-        # connected GitHub, wire the broker as the sole github.com helper so a
-        # private clone authenticates as *them*. Wired ONCE (it configures the
-        # global github.com helper for every clone below). When they haven't
-        # connected this is a no-op that leaves the image's shared ``$GIT_TOKEN``
-        # helper in place; ``|| true`` keeps a broker hiccup from failing the
-        # clone (it then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN.
+        # Keep the launch token in the init container's environment: the helper
+        # reads it in-process instead of persisting it or putting it in argv.
+        helper_source = (
+            "import os,sys; from omnigent.git_credential_github import main; "
+            f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
+            "'--host-token',os.environ['OMNIGENT_HOST_TOKEN'],*sys.argv[1:]]))"
+        )
+        helper = f"!python3 -Ec {shlex.quote(helper_source)}"
+        helper_key = "credential.https://github.com.helper"
         wire = (
-            "from omnigent.git_credential_github import configure_clone_credentials; "
-            f"configure_clone_credentials({server_url!r}, {host_id!r})"
+            "import omnigent.git_credential_github as g; "
+            "g._install_broker_helper=lambda *_:("
+            f"g._git_config('--replace-all',{helper_key!r},''),"
+            f"g._git_config('--add',{helper_key!r},{helper!r})); "
+            f"g.configure_clone_credentials({server_url!r},{host_id!r})"
         )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
@@ -519,12 +524,35 @@ def _render_workspace_prep_command(
         # branch-pinned clones fast.
         # ponytail: unbounded fan-out; add `xargs -P <n>` if huge repo sets on a
         # 2-vCPU pod ever thrash.
-        script += "pids=''\nwired=''\n"
+        script += "pids=''\nwired=''\ncredential_config=''\n"
+        script += (
+            "cleanup_credentials() {\n"
+            '  if [ -n "$credential_config" ]; then rm -f -- "$credential_config"; fi\n'
+            "}\n"
+            "trap cleanup_credentials EXIT\n"
+        )
         # Define the wiring once so the script text carries a single
         # ``python3 -c`` line for every clone; each clone branch calls it at
         # most once overall via the ``$wired`` runtime guard, and a preserved
         # workspace never calls it at all.
-        script += f"wire_credentials() {{ python3 -c {shlex.quote(wire)} || true; }}\n"
+        script += (
+            "wire_credentials() {\n"
+            "  credential_config=$(mktemp)\n"
+            '  export GIT_CONFIG_GLOBAL="$credential_config"\n'
+            f"  python3 -c {shlex.quote(wire)} || true\n"
+            "}\n"
+        )
+        # Replacing an empty reserved directory is atomic; a writer that adds
+        # anything to it makes os.rename fail instead of nesting the clone.
+        script += (
+            "replace_empty_dir() {\n"
+            '  python3 - "$1" "$2" <<\'PY\'\n'
+            "import os\n"
+            "import sys\n"
+            "os.rename(sys.argv[1], sys.argv[2])\n"
+            "PY\n"
+            "}\n"
+        )
         # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
         # shared clone dir would fail the concurrent clones, so disambiguate.
         dirnames = clone_dir_names(repos)
@@ -564,9 +592,9 @@ def _render_workspace_prep_command(
                 f"Staging path {staging_dir} is not owned by workspace prep; refusing to remove it"
             )
             script += (
-                f"if [ ! -e {target}/.git/HEAD ] && "
-                f"! {{ [ -f {gitfile} ] && git -C {target} rev-parse "
-                f"--resolve-git-dir {gitfile} >/dev/null 2>&1; }}; then\n"
+                f"if ! {{ [ ! -f {gitfile} ] || "
+                f"awk 'END {{ exit (NR == 1 ? 0 : 1) }}' {gitfile}; }} ||\n"
+                f"   ! git -C {target} rev-parse --git-dir >/dev/null 2>&1; then\n"
             )
             script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             script += f"    if ! rmdir -- {target}; then\n"
@@ -580,12 +608,13 @@ def _render_workspace_prep_command(
             script += "    else\n"
             script += f"      printf '%s\\n' {staging_error} >&2\n"
             script += "      exit 1\n    fi\n  fi\n"
-            script += f"  mkdir -- {temporary}\n  touch -- {marker}\n"
+            script += f"  mkdir -- {target}\n  mkdir -- {temporary}\n  touch -- {marker}\n"
             script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
             script += (
                 f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
-                f"&& mv -f -- {staged_clone} {target} "
-                f"&& rm -f -- {marker} && rmdir -- {temporary}) "
+                f"&& replace_empty_dir {staged_clone} {target} "
+                f"&& rm -f -- {marker} && rmdir -- {temporary} "
+                f"|| {{ rmdir -- {target} 2>/dev/null || true; exit 1; }}) "
                 f'& pids="$pids $!"\n'
             )
             script += "fi\n"
