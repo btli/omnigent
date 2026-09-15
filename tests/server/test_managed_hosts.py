@@ -3211,7 +3211,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         ).stdout
 
     if workspace_state in {"persistent", "gitfile"}:
-        initial_dir = tmp_path / "main checkout" if workspace_state == "gitfile" else clone_dir
+        initial_dir = clone_dir
         initial_dir.mkdir(parents=True)
         _git("init", "--initial-branch=main", directory=initial_dir)
         _git("config", "user.name", "Test", directory=initial_dir)
@@ -3221,12 +3221,14 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         (initial_dir / "unstaged.txt").write_text("original unstaged\n")
         _git("add", ".", directory=initial_dir)
         _git("commit", "-m", "Initial commit", directory=initial_dir)
+        _git("checkout", "-b", "local-work")
         if workspace_state == "gitfile":
-            _git("worktree", "add", "-b", "local-work", str(clone_dir), directory=initial_dir)
+            internal_git_dir = clone_dir / ".git-data"
+            (clone_dir / ".git").rename(internal_git_dir)
+            (clone_dir / ".git").write_text(f"gitdir: {internal_git_dir}\n")
+            (internal_git_dir / "info" / "exclude").write_text(".git-data/\n")
             before_gitfile = (clone_dir / ".git").read_bytes()
             assert before_gitfile.startswith(b"gitdir: ")
-        else:
-            _git("checkout", "-b", "local-work")
         (clone_dir / "staged.txt").write_text("staged change\n")
         _git("add", "staged.txt")
         (clone_dir / "unstaged.txt").write_text("unstaged change\n")
@@ -3363,10 +3365,11 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     assert host_store.is_online(host.host_id) is not failed
     assert workspace.is_dir()
     calls = call_log.read_text().splitlines() if call_log.exists() else []
+    git_dir_probe = f"git -C {clone_dir} rev-parse --absolute-git-dir"
     checkout_probe = f"git -C {clone_dir} rev-parse --show-prefix"
     credential_calls = [call for call in calls if call == "credentials"]
     clone_calls = [call for call in calls if call.startswith("git clone ")]
-    probe_calls = [call for call in calls if call == checkout_probe]
+    probe_calls = [call for call in calls if call in {git_dir_probe, checkout_probe}]
     if workspace_state in {"ephemeral", "empty", "stale_tmp", "clone_failure"}:
         assert repo is not None
         assert credential_calls == ["credentials"]
@@ -3386,7 +3389,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     elif workspace_state in {"persistent", "gitfile"}:
         assert credential_calls == []
         assert clone_calls == []
-        assert probe_calls == [checkout_probe]
+        assert probe_calls == [git_dir_probe, checkout_probe]
         assert _git("branch", "--show-current") == before_branch == "local-work\n"
         assert _git("rev-parse", "HEAD") == before_head
         assert _git("status", "--porcelain") == before_status
@@ -3400,14 +3403,14 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     elif broken_gitfile:
         assert credential_calls == []
         assert clone_calls == []
-        assert probe_calls == ([] if workspace_state == "malformed_gitfile" else [checkout_probe])
+        assert probe_calls == ([] if workspace_state == "malformed_gitfile" else [git_dir_probe])
         assert {
             path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()
         } == before_files
     elif malformed_head:
         assert credential_calls == []
         assert clone_calls == []
-        assert probe_calls == [checkout_probe]
+        assert probe_calls == [git_dir_probe]
         assert {
             path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()
         } == before_files
@@ -3421,7 +3424,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     elif workspace_state == "non_repo":
         assert credential_calls == []
         assert clone_calls == []
-        assert probe_calls == [checkout_probe]
+        assert probe_calls == [git_dir_probe]
         assert (clone_dir / ".git" / "config").read_text() == "incomplete repository\n"
         assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
         assert (temporary / "partial-clone.txt").read_text() == "keep this too\n"

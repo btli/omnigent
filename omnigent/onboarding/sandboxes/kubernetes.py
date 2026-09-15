@@ -599,6 +599,9 @@ def _render_workspace_prep_command(
                 f"if ! {{ [ ! -f {gitfile} ] || "
                 f"awk 'END {{ exit (NR == 1 ? 0 : 1) }}' {gitfile}; }} ||\n"
                 f"   ! {{ [ -e {gitfile} ] && ( unset GIT_DIR GIT_WORK_TREE; "
+                f"target_dir=$(cd -P -- {target} && pwd) || exit 1; "
+                f"git_dir=$(git -C {target} rev-parse --absolute-git-dir 2>/dev/null) || exit 1; "
+                'case "$git_dir" in "$target_dir"/*) ;; *) exit 1;; esac; '
                 f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
                 '[ -z "$prefix" ] ); }; then\n'
             )

@@ -470,6 +470,14 @@ def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
         relative = str(path.relative_to(workspace))
         if path.is_symlink():
             snapshot[relative] = ("link", os.readlink(path))
+            resolved = path.resolve()
+            if resolved.is_dir():
+                for linked_path in resolved.rglob("*"):
+                    linked_relative = f"{relative}=>{linked_path.relative_to(resolved)}"
+                    if linked_path.is_symlink():
+                        snapshot[linked_relative] = ("link", os.readlink(linked_path))
+                    elif linked_path.is_file():
+                        snapshot[linked_relative] = ("file", linked_path.read_bytes())
         elif path.is_file():
             snapshot[relative] = ("file", path.read_bytes())
     return snapshot
@@ -489,6 +497,8 @@ def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
         ("plain_empty", "clone"),
         ("bare", "refuse"),
         ("ancestor_core_worktree", "clone"),
+        ("gitfile_to_ancestor", "refuse"),
+        ("ambient_work_tree_malformed", "refuse"),
     ],
 )
 def test_workspace_prep_classifies_checkout_at_target(
@@ -501,7 +511,7 @@ def test_workspace_prep_classifies_checkout_at_target(
     monkeypatch.delenv("GIT_DIR", raising=False)
     monkeypatch.delenv("GIT_WORK_TREE", raising=False)
     workspace = tmp_path / "workspace"
-    if shape in {"ancestor_checkout", "ancestor_core_worktree"}:
+    if shape in {"ancestor_checkout", "ancestor_core_worktree", "gitfile_to_ancestor"}:
         ancestor = tmp_path / "ancestor"
         subprocess.run(["git", "init", "-q", str(ancestor)], check=True)
         workspace = ancestor / "workspace"
@@ -511,7 +521,7 @@ def test_workspace_prep_classifies_checkout_at_target(
         subprocess.run(["git", "init", "-q", str(target)], check=True)
     elif shape == "gitfile":
         subprocess.run(["git", "init", "-q", str(target)], check=True)
-        separate_git_dir = tmp_path / "separate.git"
+        separate_git_dir = target / ".git-data"
         (target / ".git").rename(separate_git_dir)
         (target / ".git").write_text(f"gitdir: {separate_git_dir}\n")
     elif shape == "symlink_checkout":
@@ -522,6 +532,14 @@ def test_workspace_prep_classifies_checkout_at_target(
     elif shape == "missing_head":
         subprocess.run(["git", "init", "-q", str(target)], check=True)
         (target / ".git" / "HEAD").unlink()
+        (target / "keep.txt").write_text("preserve me\n")
+    elif shape == "gitfile_to_ancestor":
+        target.mkdir(parents=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_path / "ancestor"), "config", "core.worktree", str(target)],
+            check=True,
+        )
+        (target / ".git").write_text(f"gitdir: {tmp_path / 'ancestor' / '.git'}\n")
         (target / "keep.txt").write_text("preserve me\n")
     elif shape in {"ancestor_checkout", "plain_empty", "ancestor_core_worktree"}:
         target.mkdir(parents=True)
@@ -537,6 +555,14 @@ def test_workspace_prep_classifies_checkout_at_target(
         monkeypatch.setenv("GIT_DIR", str(ambient / ".git"))
         if shape == "git_dir_work_tree":
             monkeypatch.setenv("GIT_WORK_TREE", str(target))
+    elif shape == "ambient_work_tree_malformed":
+        (target / ".git").mkdir(parents=True)
+        (target / ".git" / "config").write_text("incomplete repository\n")
+        (target / "keep.txt").write_text("preserve me\n")
+        ambient_git_dir = target / ".ambient-git"
+        subprocess.run(["git", "init", "--bare", "-q", str(ambient_git_dir)], check=True)
+        monkeypatch.setenv("GIT_DIR", str(ambient_git_dir))
+        monkeypatch.setenv("GIT_WORK_TREE", str(target))
     elif shape == "symlink_empty":
         empty = tmp_path / "empty"
         empty.mkdir()
