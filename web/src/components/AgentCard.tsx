@@ -1,10 +1,11 @@
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { AgentIcon, resolveAgentIcon } from "@/lib/agentIcon";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentHoverCard } from "@/components/AgentHoverCard";
-import { resolveAgentIcon } from "@/shell/subagentIcons";
+import { resolveAgentIcon as resolveCatalogIcon } from "@/shell/subagentIcons";
 
 export function iconForAgent(agent: Pick<AvailableAgent, "name" | "harness">) {
-  return resolveAgentIcon({ kind: "catalog", name: agent.name, harness: agent.harness });
+  return resolveCatalogIcon({ kind: "catalog", name: agent.name, harness: agent.harness });
 }
 
 /**
@@ -41,7 +42,10 @@ export function AgentCard({
   compact?: boolean;
   hover?: boolean;
 }) {
-  const Icon = iconForAgent(agent);
+  // Declared spec icon first (emoji grapheme or path served via the icon
+  // endpoint), then the harness/iconKind glyph. The precedence lives in
+  // resolveAgentIcon so this card and the Agents-rail row stay in lockstep.
+  const iconResolution = resolveAgentIcon(agent, () => iconForAgent(agent));
   const card = (
     <button
       type="button"
@@ -51,7 +55,7 @@ export function AgentCard({
         selected ? "border-primary bg-primary/5" : "border-border hover:border-muted-foreground/30"
       } cursor-pointer`}
     >
-      <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      <AgentIcon resolution={iconResolution} className="size-4 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
         <span className="text-sm font-semibold">{agent.display_name}</span>
         {!compact && agent.description && (
