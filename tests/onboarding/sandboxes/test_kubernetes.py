@@ -488,6 +488,8 @@ def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
     [
         ("git_directory", "preserve"),
         ("gitfile", "preserve"),
+        ("real_worktree", "preserve"),
+        ("separate_git_dir", "preserve"),
         ("symlink_checkout", "preserve"),
         ("missing_head", "refuse"),
         ("ancestor_checkout", "clone"),
@@ -521,9 +523,39 @@ def test_workspace_prep_classifies_checkout_at_target(
         subprocess.run(["git", "init", "-q", str(target)], check=True)
     elif shape == "gitfile":
         subprocess.run(["git", "init", "-q", str(target)], check=True)
-        separate_git_dir = target / ".git-data"
+        separate_git_dir = tmp_path / "separate.git"
         (target / ".git").rename(separate_git_dir)
         (target / ".git").write_text(f"gitdir: {separate_git_dir}\n")
+    elif shape == "real_worktree":
+        main_checkout = tmp_path / "main-checkout"
+        subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_checkout),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(main_checkout), "worktree", "add", "-q", "-b", "test", str(target)],
+            check=True,
+        )
+    elif shape == "separate_git_dir":
+        separate_git_dir = tmp_path / "explicit-separate.git"
+        subprocess.run(
+            ["git", "init", "-q", "--separate-git-dir", str(separate_git_dir), str(target)],
+            check=True,
+        )
     elif shape == "symlink_checkout":
         checkout = tmp_path / "checkout"
         subprocess.run(["git", "init", "-q", str(checkout)], check=True)
