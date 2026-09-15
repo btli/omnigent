@@ -3168,6 +3168,7 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
         "gitfile",
         "dangling_gitfile",
         "malformed_gitfile",
+        "malformed_head",
         "no_repo",
         "empty",
         "stale_tmp",
@@ -3192,6 +3193,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     ownership_marker = temporary / ".omnigent-workspace-prep"
     call_log = tmp_path / "calls.log"
     broken_gitfile = workspace_state in {"dangling_gitfile", "malformed_gitfile"}
+    malformed_head = workspace_state == "malformed_head"
     repo = (
         parse_repo_workspace("https://github.com/org/repo.git#release/test")
         if workspace_state != "no_repo"
@@ -3254,6 +3256,13 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         ownership_marker.touch()
         (temporary / "partial-clone.txt").write_text("keep staging too\n")
         before_files = {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
+    elif malformed_head:
+        (clone_dir / ".git").mkdir(parents=True)
+        (clone_dir / ".git" / "HEAD").write_text("malformed head\n")
+        (clone_dir / "untracked.txt").write_text("keep me\n")
+        temporary.mkdir()
+        (temporary / "partial-clone.txt").write_text("keep this too\n")
+        before_files = {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
     elif workspace_state in {"empty", "stale_tmp"}:
         clone_dir.mkdir(parents=True)
         if workspace_state == "stale_tmp":
@@ -3294,16 +3303,28 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             kwargs["host_id"],
         )
         git_command = (
+            'if [ "$1" = "-C" ]; then return 128; fi; '
             'test ! -e "${@: -1}"; mkdir -p "${@: -1}/.git"; '
             'printf "ref: refs/heads/release/test\\n" > "${@: -1}/.git/HEAD"; '
             'printf "cloned\\n" > "${@: -1}/tracked.txt"'
         )
-        if workspace_state in {"persistent", "gitfile"} or broken_gitfile:
+        if workspace_state in {
+            "persistent",
+            "gitfile",
+            "dangling_gitfile",
+            "malformed_head",
+            "non_repo",
+        }:
             git_command = 'command git "$@"'
+        elif workspace_state == "malformed_gitfile":
+            # Model a Git version that accepts this malformed shape so the
+            # renderer's deterministic validation, not local Git, decides.
+            git_command = 'if [ "$1" = "-C" ]; then return 0; fi; command git "$@"'
         elif workspace_state in {"clone_failure", "unowned_tmp"}:
             git_command += '; printf "clone failed\\n" >&2; return 1'
         script = (
-            'python3() { printf "credentials\\n" >> "$CALL_LOG"; }\n'
+            'python3() { if [ "$1" = "-c" ]; then printf "credentials\\n" >> "$CALL_LOG"; '
+            'else command python3 "$@"; fi; }\n'
             'git() { printf "git %s\\n" "$*" >> "$CALL_LOG"; ' + git_command + "; }\n" + command[2]
         )
         subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
@@ -3315,7 +3336,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         "clone_failure": "clone failed",
         "unowned_tmp": "is not owned by workspace prep; refusing to remove it",
     }
-    failed = workspace_state in failure_messages or broken_gitfile
+    failed = workspace_state in failure_messages or broken_gitfile or malformed_head
     if failed:
         with pytest.raises(HTTPException) as exc:
             await resume_managed_host(
@@ -3328,7 +3349,8 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         cause = exc.value.__cause__
         assert isinstance(cause, subprocess.CalledProcessError)
         assert cause.returncode != 0
-        assert failure_messages["non_repo" if broken_gitfile else workspace_state] in cause.stderr
+        failure_key = "non_repo" if broken_gitfile or malformed_head else workspace_state
+        assert failure_messages[failure_key] in cause.stderr
     else:
         await resume_managed_host(
             host.host_id,
@@ -3339,16 +3361,19 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
 
     assert fake.resumed == ["sb-workspace-wake"]
     assert host_store.is_online(host.host_id) is not failed
-    assert captured["repos"] == ([repo] if repo is not None else [])
     assert workspace.is_dir()
     calls = call_log.read_text().splitlines() if call_log.exists() else []
-    gitfile_probe = f"git -C {clone_dir} rev-parse --resolve-git-dir {clone_dir}/.git"
+    checkout_probe = f"git -C {clone_dir} rev-parse --git-dir"
+    credential_calls = [call for call in calls if call == "credentials"]
+    clone_calls = [call for call in calls if call.startswith("git clone ")]
+    probe_calls = [call for call in calls if call == checkout_probe]
     if workspace_state in {"ephemeral", "empty", "stale_tmp", "clone_failure"}:
         assert repo is not None
-        assert calls == [
-            "credentials",
+        assert credential_calls == ["credentials"]
+        assert clone_calls == [
             f"git clone --branch release/test --single-branch -- {repo.url} {staged_clone}",
         ]
+        assert probe_calls == [checkout_probe]
         if workspace_state == "clone_failure":
             assert not clone_dir.exists()
             assert (staged_clone / ".git" / "HEAD").is_file()
@@ -3359,7 +3384,9 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             assert not (clone_dir / "partial-clone.txt").exists()
             assert not temporary.exists()
     elif workspace_state in {"persistent", "gitfile"}:
-        assert calls == ([gitfile_probe] if workspace_state == "gitfile" else [])
+        assert credential_calls == []
+        assert clone_calls == []
+        assert probe_calls == [checkout_probe]
         assert _git("branch", "--show-current") == before_branch == "local-work\n"
         assert _git("rev-parse", "HEAD") == before_head
         assert _git("status", "--porcelain") == before_status
@@ -3371,17 +3398,30 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert (clone_dir / "unstaged.txt").read_text() == "unstaged change\n"
         assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
     elif broken_gitfile:
-        assert calls == [gitfile_probe]
+        assert credential_calls == []
+        assert clone_calls == []
+        assert probe_calls == ([] if workspace_state == "malformed_gitfile" else [checkout_probe])
+        assert {
+            path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()
+        } == before_files
+    elif malformed_head:
+        assert credential_calls == []
+        assert clone_calls == []
+        assert probe_calls == [checkout_probe]
         assert {
             path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()
         } == before_files
     elif workspace_state == "unowned_tmp":
-        assert calls == []
+        assert credential_calls == []
+        assert clone_calls == []
+        assert probe_calls == [checkout_probe]
         assert not clone_dir.exists()
         assert (temporary / "backup.txt").read_text() == "user backup\n"
         assert list(temporary.iterdir()) == [temporary / "backup.txt"]
     elif workspace_state == "non_repo":
-        assert calls == []
+        assert credential_calls == []
+        assert clone_calls == []
+        assert probe_calls == [checkout_probe]
         assert (clone_dir / ".git" / "config").read_text() == "incomplete repository\n"
         assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
         assert (temporary / "partial-clone.txt").read_text() == "keep this too\n"
@@ -3390,6 +3430,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     else:
         assert calls == []
         assert list(workspace.iterdir()) == []
+    assert captured["repos"] == ([repo] if repo is not None else [])
 
 
 @pytest.mark.parametrize("raw_repo", [None, "https://github.com/org/repo.git#release/test", "bad"])
@@ -3466,6 +3507,16 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     """A resumable managed host wakes in place under the same sandbox id."""
     host_store = HostStore(db_uri)
 
+    class _WorkspaceObservingIsloFake(_IsloFakeLauncher):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.started_workspaces: list[str] = []
+
+        def start_host(self, *args: Any, **kwargs: Any) -> str:
+            workspace = super().start_host(*args, **kwargs)
+            self.started_workspaces.append(workspace)
+            return workspace
+
     def _register(invocation: HostStartInvocation) -> None:
         """Simulate the sandbox host reconnecting over the tunnel."""
         host_store.upsert_on_connect(
@@ -3474,7 +3525,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
             user_id=_OWNER,
         )
 
-    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    fake = _WorkspaceObservingIsloFake(on_host_start=_register, can_resume=True)
     config = _injected_config(fake)
     first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     host = host_store.get_host(first.host_id)
@@ -3486,10 +3537,15 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     host_store.set_offline(first.host_id)
     assert host_resume_supported(host_store.get_host(first.host_id), config) is True
 
-    await resume_managed_host(first.host_id, host_store, config)
+    await resume_managed_host(
+        first.host_id,
+        host_store,
+        config,
+        repos=[parse_repo_workspace("https://github.com/org/repo.git#main")],
+    )
 
     assert fake.resumed == ["sb-fake-1"]
-    assert not any("git clone" in command for command in fake.commands)
+    assert fake.started_workspaces == ["/root/workspace", "/root/workspace"]
     assert len(fake.provisioned_names) == 1
     woke = host_store.get_host(first.host_id)
     assert woke is not None
