@@ -401,27 +401,29 @@ def test_same_day_rerun_noop_then_rerun_suffix(env):
     assert env.fork_ref("refs/heads/staging") == third["staging_sha"]
 
 
-def test_pin_push_uses_expected_absent_leases(env, pushes):
+def test_pin_push_uses_expected_absent_tag_lease(env, pushes):
     report = env.run([])
     push = pushes[-1]
 
-    assert f"--force-with-lease=refs/heads/{report['branch']}:" in push
     assert f"--force-with-lease=refs/tags/{report['tag']}:" in push
+    assert not any(f"refs/heads/{report['tag']}" in arg for arg in push)
 
 
 def test_pin_creation_race_is_atomic(env, monkeypatch):
     real_git = stage_mod.git
     raced = False
     concurrent_sha = ""
-    pin_branch = f"refs/heads/nightly-{STAMP}"
+    attempted_push: tuple[str, ...] = ()
+    pin_tag = f"refs/tags/nightly-{STAMP}"
 
     def race(cwd, *args, **kwargs):
-        nonlocal concurrent_sha, raced
+        nonlocal attempted_push, concurrent_sha, raced
         if args and args[0] == "push" and "--atomic" in args and not raced:
+            attempted_push = args
             raced = True
             concurrent_sha = git(cwd, "rev-parse", "HEAD^1").stdout.strip()
             git(env.fork, "fetch", str(cwd), concurrent_sha)
-            git(env.fork, "update-ref", pin_branch, concurrent_sha)
+            git(env.fork, "update-ref", pin_tag, concurrent_sha)
         return real_git(cwd, *args, **kwargs)
 
     monkeypatch.setattr(stage_mod, "git", race)
@@ -429,38 +431,36 @@ def test_pin_creation_race_is_atomic(env, monkeypatch):
         env.run([env.add_pr(31, "race.txt", "race\n")])
 
     assert raced is True
-    assert env.fork_ref(pin_branch) == concurrent_sha
-    assert env.fork_ref(f"refs/tags/nightly-{STAMP}") == ""
+    assert env.fork_ref(pin_tag) == concurrent_sha
+    assert env.fork_ref(f"refs/heads/nightly-{STAMP}") == ""
     assert env.fork_ref("refs/heads/staging") == ""
+    assert not any(f"refs/heads/nightly-{STAMP}" in arg for arg in attempted_push)
 
 
-def test_surviving_pin_branch_never_reuses_deleted_tag_name(env):
-    first = env.run([])
+def test_legacy_branch_does_not_block_tag_allocation(env):
     pin_branch = f"refs/heads/nightly-{STAMP}"
     pin_tag = f"refs/tags/nightly-{STAMP}"
-    git(env.fork, "update-ref", "-d", pin_tag)
-    env.advance_main("descendant.txt", "descendant\n")
+    legacy_sha = env.fork_ref("refs/heads/main")
+    git(env.fork, "update-ref", pin_branch, legacy_sha)
 
-    with pytest.raises(stage_mod.StageError, match="tag is absent"):
-        env.run([])
+    report = env.run([])
 
-    assert env.fork_ref(pin_branch) == first["staging_sha"]
-    assert env.fork_ref(pin_tag) == ""
+    assert report["tag"] == f"nightly-{STAMP}"
+    assert report["pin_created"] is True
+    assert env.fork_ref(pin_branch) == legacy_sha
+    assert env.fork_ref(pin_tag) == report["staging_sha"]
 
 
 def test_post_push_audit_records_fully_qualified_pin_refs(env):
     report = env.run([])
     pin = f"nightly-{STAMP}"
 
+    assert "branch" not in report
+    assert report["tag"] == pin
     assert report["pin_ref"] == f"refs/tags/{pin}"
     assert report["audit"] == [
         {
             "ref": f"refs/tags/{pin}",
-            "expected": report["staging_sha"],
-            "observed": report["staging_sha"],
-        },
-        {
-            "ref": f"refs/heads/{pin}",
             "expected": report["staging_sha"],
             "observed": report["staging_sha"],
         },
@@ -478,7 +478,7 @@ def test_dev_tag_mirrors_nightly_scheme(env):
 
 
 def test_only_allowed_refs_pushed(env):
-    """Allowlist: the run may only create staging, the nightly-* pin, and the
+    """Allowlist: the run may only create staging, the nightly-* tag, and the
     dev tag — any pre-existing ref (here the deploy branch) stays untouched."""
     git(env.seed, "checkout", "-q", "main")
     testing_sha = git(env.seed, "rev-parse", "HEAD").stdout.strip()
@@ -495,7 +495,7 @@ def test_only_allowed_refs_pushed(env):
     ]
     allowed = re.compile(
         r"refs/heads/staging$"
-        r"|refs/(heads|tags)/nightly-\d{8}(-rerun\d+)?$"
+        r"|refs/tags/nightly-\d{8}(-rerun\d+)?$"
         r"|refs/tags/v\d+\.\d+\.\d+\.dev\d{8}$"
     )
     assert all(
@@ -1450,15 +1450,15 @@ def test_direct_production_stage_rejects_branch_extras_before_git(env, source):
 
 
 def test_production_pin_prefix(env):
-    """The production nightly mints production-YYYYMMDD (branch + tag) at the
-    composed sha — no nightly-* ref anywhere."""
+    """The production nightly mints a production-YYYYMMDD tag at the composed
+    sha — no dated production branch or nightly-* ref anywhere."""
     pr = env.add_pr(7, "c.txt", "7\n")
     report = env.run([pr], ring=stage_mod.PRODUCTION)
     assert report["tag"] == f"production-{STAMP}"
-    assert report["branch"] == f"production-{STAMP}"
+    assert "branch" not in report
     assert report["pin_created"] is True
     assert env.fork_ref(f"refs/tags/production-{STAMP}") == report["staging_sha"]
-    assert env.fork_ref(f"refs/heads/production-{STAMP}") == report["staging_sha"]
+    assert env.fork_ref(f"refs/heads/production-{STAMP}") == ""
     assert env.fork_ref("refs/heads/production") == report["staging_sha"]
     refs = [
         line.split("\t")[1]
