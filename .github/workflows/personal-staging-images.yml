@@ -35,6 +35,9 @@ jobs:
           persist-credentials: false
           ref: ${{ format('refs/tags/{0}', inputs.ref) }}
 
+      - name: Require separate host extras support in the source pin
+        run: grep -q '^ARG OMNIGENT_HOST_EXTRAS=' deploy/docker/Dockerfile
+
       - name: Resolve source tag
         id: source
         env:
@@ -111,6 +114,8 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: runtime
+          build-args: |
+            OMNIGENT_EXTRAS=kubernetes,openshell,microsandbox,postgres,tracing,databricks,vault
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.source.outputs.server_tags }}
@@ -126,6 +131,8 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: host
+          build-args: |
+            OMNIGENT_HOST_EXTRAS=antigravity,hindsight
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.source.outputs.host_tags }}

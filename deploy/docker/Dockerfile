@@ -140,6 +140,16 @@ ENV VIRTUAL_ENV=/opt/venv \
 # .pth references stay valid.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e .
 
+# Host extras stay separate from server extras: Antigravity and Databricks
+# require incompatible protobuf versions.
+FROM builder AS host-builder
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+ARG OMNIGENT_HOST_EXTRAS=
+RUN if [ -n "${OMNIGENT_HOST_EXTRAS}" ]; then \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_HOST_EXTRAS}]"; \
+    fi
+RUN uv pip check
+
 # ── Server builder ──────────────────────────────────────
 # Server-only additions on top of the shared builder: the SPA bundle
 # and the Postgres driver.
@@ -166,6 +176,7 @@ ARG OMNIGENT_EXTRAS=
 RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
         uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
+RUN uv pip check
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
@@ -385,8 +396,8 @@ RUN set -eu; \
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
 # policy. Re-install without -e so the package bytes land in the venv's
 # site-packages and imports no longer require /build at runtime.
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /build /build
+COPY --from=host-builder /opt/venv /opt/venv
+COPY --from=host-builder /build /build
 RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
