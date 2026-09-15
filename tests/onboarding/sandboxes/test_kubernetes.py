@@ -183,30 +183,17 @@ if sys.argv[1:2] == ["-c"]:
     mutation = os.environ.get("WIRE_MUTATION")
     if not mutation:
         os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-    import omnigent.git_credential_github as g
+    prefix = "import omnigent.git_credential_github as g; "
     if mutation == "renamed_installer":
-        import subprocess
-
-        def renamed_installer(*_args):
-            helper = "!python3 --test-helper-token " + os.environ["OMNIGENT_HOST_TOKEN"]
-            subprocess.run(
-                ["git", "config", "--global", "--replace-all",
-                 "credential.https://github.com.helper", ""], check=True
-            )
-            subprocess.run(
-                ["git", "config", "--global", "--add",
-                 "credential.https://github.com.helper", helper], check=True
-            )
-
-        del g._install_broker_helper
-        g._renamed_installer = renamed_installer
-        g.configure_clone_credentials = lambda *_args: (g._renamed_installer(), True)[1]
+        prefix += (
+            "del g._install_broker_helper; "
+            "g.configure_clone_credentials=lambda *_args:True; "
+        )
     elif mutation == "missing_git_config":
-        del g._git_config
+        prefix += "del g._git_config; "
     elif mutation == "failed_config_write":
-        g._git_config = lambda *_args: None
-    exec(compile(sys.argv[2], "<workspace-credential-wire>", "exec"), {"__name__": "__main__"})
-    raise SystemExit(0)
+        prefix += "g._git_config=lambda *_args:None; "
+    os.execv(sys.executable, [sys.executable, "-c", prefix + sys.argv[2]])
 with Path(os.environ["HELPER_ARGV_LOG"]).open("a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 if sys.argv[1:2] == ["-Ic"]:
