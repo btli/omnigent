@@ -520,6 +520,11 @@ def _render_workspace_prep_command(
         # ponytail: unbounded fan-out; add `xargs -P <n>` if huge repo sets on a
         # 2-vCPU pod ever thrash.
         script += "pids=''\nwired=''\n"
+        # Define the wiring once so the script text carries a single
+        # ``python3 -c`` line for every clone; each clone branch calls it at
+        # most once overall via the ``$wired`` runtime guard, and a preserved
+        # workspace never calls it at all.
+        script += f"wire_credentials() {{ python3 -c {shlex.quote(wire)} || true; }}\n"
         # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
         # shared clone dir would fail the concurrent clones, so disambiguate.
         for repo, dirname in zip(repos, clone_dir_names(repos), strict=True):
@@ -560,9 +565,7 @@ def _render_workspace_prep_command(
             script += f"      printf '%s\\n' {staging_error} >&2\n"
             script += "      exit 1\n    fi\n  fi\n"
             script += f"  mkdir -- {temporary}\n  touch -- {marker}\n"
-            script += (
-                f'  if [ -z "$wired" ]; then python3 -c {shlex.quote(wire)} || true; wired=1; fi\n'
-            )
+            script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
             script += (
                 f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
                 f"&& mv -f -- {staged_clone} {target} "
