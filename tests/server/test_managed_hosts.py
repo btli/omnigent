@@ -3211,7 +3211,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         ).stdout
 
     if workspace_state in {"persistent", "gitfile"}:
-        initial_dir = clone_dir
+        initial_dir = tmp_path / "main checkout" if workspace_state == "gitfile" else clone_dir
         initial_dir.mkdir(parents=True)
         _git("init", "--initial-branch=main", directory=initial_dir)
         _git("config", "user.name", "Test", directory=initial_dir)
@@ -3221,14 +3221,12 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         (initial_dir / "unstaged.txt").write_text("original unstaged\n")
         _git("add", ".", directory=initial_dir)
         _git("commit", "-m", "Initial commit", directory=initial_dir)
-        _git("checkout", "-b", "local-work")
         if workspace_state == "gitfile":
-            internal_git_dir = clone_dir / ".git-data"
-            (clone_dir / ".git").rename(internal_git_dir)
-            (clone_dir / ".git").write_text(f"gitdir: {internal_git_dir}\n")
-            (internal_git_dir / "info" / "exclude").write_text(".git-data/\n")
+            _git("worktree", "add", "-b", "local-work", str(clone_dir), directory=initial_dir)
             before_gitfile = (clone_dir / ".git").read_bytes()
             assert before_gitfile.startswith(b"gitdir: ")
+        else:
+            _git("checkout", "-b", "local-work")
         (clone_dir / "staged.txt").write_text("staged change\n")
         _git("add", "staged.txt")
         (clone_dir / "unstaged.txt").write_text("unstaged change\n")

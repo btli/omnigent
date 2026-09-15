@@ -601,7 +601,13 @@ def _render_workspace_prep_command(
                 f"   ! {{ [ -e {gitfile} ] && ( unset GIT_DIR GIT_WORK_TREE; "
                 f"target_dir=$(cd -P -- {target} && pwd) || exit 1; "
                 f"git_dir=$(git -C {target} rev-parse --absolute-git-dir 2>/dev/null) || exit 1; "
-                'case "$git_dir" in "$target_dir"/*) ;; *) exit 1;; esac; '
+                'case "$git_dir" in "$target_dir"/*) ;; *) '
+                'if [ -f "$git_dir/gitdir" ]; then '
+                'awk -v target="$target_dir/.git" '
+                "'END { exit (NR == 1 && $0 == target ? 0 : 1) }' "
+                '"$git_dir/gitdir" || exit 1; '
+                f"elif git -C {target} config --local --get core.worktree >/dev/null 2>&1; "
+                'then exit 1; else [ "$?" -eq 1 ] || exit 1; fi;; esac; '
                 f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
                 '[ -z "$prefix" ] ); }; then\n'
             )
