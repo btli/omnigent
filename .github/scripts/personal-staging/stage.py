@@ -1215,7 +1215,7 @@ def stage(
                 "expected": staging_sha,
                 "observed": remote_ref(cwd, fork, ref),
             }
-            for ref in (pin_tag_ref,)
+            for ref in [pin_tag_ref]
         ],
         **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
