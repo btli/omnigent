@@ -49,9 +49,13 @@ KEEP_PER_FAMILY = 5
 MAX_DELETE = 60
 
 RING_PIN_RE = re.compile(
-    r"^(?P<family>production|nightly)-(?P<date>\d{8})(?:-rerun(?P<rerun>\d+))?$"
+    r"(?P<family>production|nightly)-(?P<date>[0-9]{8})(?:-rerun(?P<rerun>[0-9]+))?",
+    re.ASCII,
 )
-DEV_TAG_RE = re.compile(r"^v(?P<version>\d+\.\d+\.\d+)\.dev(?P<date>\d{8})$")
+DEV_TAG_RE = re.compile(
+    r"v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\.dev(?P<date>[0-9]{8})",
+    re.ASCII,
+)
 DEV_FAMILY = "dev"
 # Families that mint a compatibility branch alongside the tag.
 BRANCHED_FAMILIES = ("production", "nightly")
@@ -73,7 +77,7 @@ class Pin:
     order: tuple[object, ...]
     has_tag: bool = False
     has_branch: bool = False
-    release_id: int | None = None
+    release_ids: tuple[int, ...] = ()
 
     @property
     def is_half(self) -> bool:
@@ -85,6 +89,7 @@ class Plan:
     delete: list[Pin] = field(default_factory=list)
     keep_recent: list[Pin] = field(default_factory=list)
     keep_floor: list[Pin] = field(default_factory=list)
+    deferred: list[Pin] = field(default_factory=list)
     cutoff: dt.date = dt.date.min
 
     @property
@@ -93,7 +98,7 @@ class Plan:
 
     @property
     def release_count(self) -> int:
-        return sum(p.release_id is not None for p in self.delete)
+        return sum(len(p.release_ids) for p in self.delete)
 
 
 def _date(stamp: str) -> dt.date | None:
@@ -106,13 +111,13 @@ def _date(stamp: str) -> dt.date | None:
 def parse_pin(name: str) -> tuple[str, dt.date, tuple[object, ...]] | None:
     """Classify a ref name into (family, date, sort key), or None if it is
     not a dated pin this script is allowed to touch."""
-    m = RING_PIN_RE.match(name)
+    m = RING_PIN_RE.fullmatch(name)
     if m:
         date = _date(m.group("date"))
         if date is None:
             return None
         return m.group("family"), date, (date, int(m.group("rerun") or 0))
-    m = DEV_TAG_RE.match(name)
+    m = DEV_TAG_RE.fullmatch(name)
     if m:
         date = _date(m.group("date"))
         if date is None:
@@ -124,17 +129,22 @@ def parse_pin(name: str) -> tuple[str, dt.date, tuple[object, ...]] | None:
 
 def collect(tags: list[str], branches: list[str], releases: list[dict]) -> list[Pin]:
     """Fold the fork's tags, branches and releases into one pin per name."""
-    release_ids = {r["tag_name"]: r["id"] for r in releases}
+    release_ids: dict[str, list[int]] = {}
+    for release in releases:
+        release_ids.setdefault(release["tag_name"], []).append(release["id"])
     found: dict[str, Pin] = {}
 
-    def note(name: str, *, tag: bool) -> None:
+    def note(name: str, *, tag: bool = False, branch: bool = False) -> None:
         parsed = parse_pin(name)
         if parsed is None:
             return
         family, date, order = parsed
         # A dev tag has no branch namespace; a branch by that name is
         # someone's own work, not a pin.
-        if not tag and family not in BRANCHED_FAMILIES:
+        if branch and family not in BRANCHED_FAMILIES:
+            return
+        # Releases named after dev tags are unrelated release artifacts.
+        if not tag and not branch and family not in BRANCHED_FAMILIES:
             return
         prev = found.get(name)
         found[name] = Pin(
@@ -143,14 +153,16 @@ def collect(tags: list[str], branches: list[str], releases: list[dict]) -> list[
             date=date,
             order=order,
             has_tag=tag or bool(prev and prev.has_tag),
-            has_branch=(not tag) or bool(prev and prev.has_branch),
-            release_id=release_ids.get(name) if family in BRANCHED_FAMILIES else None,
+            has_branch=branch or bool(prev and prev.has_branch),
+            release_ids=(tuple(release_ids.get(name, ())) if family in BRANCHED_FAMILIES else ()),
         )
 
     for name in tags:
         note(name, tag=True)
     for name in branches:
-        note(name, tag=False)
+        note(name, branch=True)
+    for name in release_ids:
+        note(name)
     return sorted(found.values(), key=lambda p: (p.family, p.order))
 
 
@@ -180,6 +192,16 @@ def plan(
                 out.delete.append(pin)
     out.delete.sort(key=lambda p: (p.family, p.order))
     return out
+
+
+def limit_plan(pruned: Plan, max_delete: int) -> Plan:
+    """Select the oldest pins for one explicitly bounded drain batch."""
+    if not 1 <= max_delete <= MAX_DELETE:
+        raise PruneError(f"--max-delete must be between 1 and at most {MAX_DELETE}")
+    oldest_first = sorted(pruned.delete, key=lambda p: (p.date, p.family, p.order, p.name))
+    pruned.delete = oldest_first[:max_delete]
+    pruned.deferred = oldest_first[max_delete:]
+    return pruned
 
 
 class PinDeleter(Protocol):
@@ -244,42 +266,66 @@ class GhClient:
         self._delete(f"repos/{self.repo}/releases/{release_id}")
 
 
-def execute(pruned: Plan, client: PinDeleter, max_delete: int = MAX_DELETE) -> list[str]:
+class ExecutionError(PruneError):
+    """A deletion failed after zero or more operations completed."""
+
+    def __init__(self, cause: Exception, done: list[str]) -> None:
+        super().__init__(str(cause))
+        self.done = done
+
+
+def check_delete_ceiling(pruned: Plan) -> None:
+    """Reject an unbounded plan before any deletion can start."""
+    if len(pruned.delete) > MAX_DELETE:
+        raise PruneError(
+            f"plan would delete {len(pruned.delete)} pins, above the {MAX_DELETE} "
+            "circuit breaker; dispatch an oldest-N batch with --max-delete 1-60"
+        )
+
+
+def execute(pruned: Plan, client: PinDeleter) -> list[str]:
     """Delete the planned pins, branch -> release -> tag so a crash can only
     ever leave the half-pin state stage.py tolerates."""
-    if len(pruned.delete) > max_delete:
-        raise PruneError(
-            f"plan would delete {len(pruned.delete)} pins, above the {max_delete} "
-            "circuit breaker; re-run with --max-delete once the plan looks right"
-        )
+    check_delete_ceiling(pruned)
     done: list[str] = []
-    for pin in pruned.delete:
-        if pin.has_branch:
-            client.delete_branch(pin.name)
-            done.append(f"branch {pin.name}")
-        if pin.release_id is not None:
-            client.delete_release(pin.release_id)
-            done.append(f"release {pin.name}")
-        if pin.has_tag:
-            client.delete_tag(pin.name)
-            done.append(f"tag {pin.name}")
+    try:
+        for pin in pruned.delete:
+            if pin.has_branch:
+                client.delete_branch(pin.name)
+                done.append(f"branch {pin.name}")
+            for release_id in pin.release_ids:
+                client.delete_release(release_id)
+                done.append(f"release {pin.name} ({release_id})")
+            if pin.has_tag:
+                client.delete_tag(pin.name)
+                done.append(f"tag {pin.name}")
+    except Exception as e:
+        raise ExecutionError(e, done) from e
     return done
 
 
-def summarize(pruned: Plan, *, dry_run: bool, keep_per_family: int) -> str:
-    verb = "Would delete" if dry_run else "Deleted"
+def summarize(
+    pruned: Plan,
+    *,
+    dry_run: bool,
+    keep_per_family: int,
+    done: list[str] | None = None,
+    error: str | None = None,
+) -> str:
     lines = [
         "## Personal pin retention",
         "",
         f"Cutoff `{pruned.cutoff.isoformat()}` — pins dated before it are retired, "
         f"keeping the newest {keep_per_family} per family regardless of age.",
         "",
-        f"- {verb}: **{len(pruned.delete)}** pins "
+        f"- Planned deletion: **{len(pruned.delete)}** pins "
         f"({pruned.ref_count} refs, {pruned.release_count} releases)",
         f"- Kept (within window): {len(pruned.keep_recent)}",
         f"- Kept (floor): {len(pruned.keep_floor)}",
         "",
     ]
+    if pruned.deferred:
+        lines += [f"- Deferred to later oldest-N batches: {len(pruned.deferred)}", ""]
     if pruned.delete:
         lines += ["| pin | family | refs | release |", "| --- | --- | --- | --- |"]
         for pin in pruned.delete:
@@ -287,8 +333,7 @@ def summarize(pruned: Plan, *, dry_run: bool, keep_per_family: int) -> str:
                 part for part, on in (("tag", pin.has_tag), ("branch", pin.has_branch)) if on
             )
             lines.append(
-                f"| `{pin.name}` | {pin.family} | {refs} | "
-                f"{'yes' if pin.release_id is not None else '—'} |"
+                f"| `{pin.name}` | {pin.family} | {refs} | {len(pin.release_ids) or '—'} |"
             )
         lines.append("")
     halves = [p.name for p in pruned.delete if p.is_half]
@@ -300,6 +345,15 @@ def summarize(pruned: Plan, *, dry_run: bool, keep_per_family: int) -> str:
             + ", ".join(f"`{p.name}`" for p in pruned.keep_floor),
             "",
         ]
+    if error:
+        lines += [f"**FAILED:** {error}", ""]
+        if done:
+            lines += ["Completed before failure: " + ", ".join(f"`{item}`" for item in done), ""]
+    elif done is not None:
+        label = (
+            "Dry run; no deletions performed" if dry_run else f"Completed operations: {len(done)}"
+        )
+        lines += [label, ""]
     return "\n".join(lines)
 
 
@@ -310,12 +364,43 @@ def append_summary(text: str) -> None:
             fh.write(text if text.endswith("\n") else text + "\n")
 
 
+def write_report(
+    path: str | None,
+    pruned: Plan,
+    *,
+    dry_run: bool,
+    status: str,
+    done: list[str] | None = None,
+    error: str | None = None,
+) -> None:
+    if not path:
+        return
+    report = {
+        "cutoff": pruned.cutoff.isoformat(),
+        "dry_run": dry_run,
+        "status": status,
+        "planned": [p.name for p in pruned.delete],
+        "deferred": [p.name for p in pruned.deferred],
+        "done": done or [],
+        "kept_recent": [p.name for p in pruned.keep_recent],
+        "kept_floor": [p.name for p in pruned.keep_floor],
+        "error": error,
+    }
+    with open(path, "w") as fh:
+        json.dump(report, fh, indent=2)
+        fh.write("\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "btli/omnigent"))
     parser.add_argument("--keep-days", type=int, default=KEEP_DAYS)
     parser.add_argument("--keep-per-family", type=int, default=KEEP_PER_FAMILY)
-    parser.add_argument("--max-delete", type=int, default=MAX_DELETE)
+    parser.add_argument(
+        "--max-delete",
+        type=int,
+        help="drain only the oldest N pins (1-60); omitted means abort above 60",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -329,29 +414,59 @@ def main(argv: list[str] | None = None) -> int:
     if today is None:
         parser.error(f"--date {args.date!r} is not a YYYYMMDD calendar date")
 
-    try:
-        client = GhClient(args.repo, dry_run=args.dry_run)
-        pins = collect(client.tags(), client.branches(), client.releases())
-        pruned = plan(pins, today, args.keep_days, args.keep_per_family)
-        execute(pruned, client, args.max_delete)
-    except Exception as e:
-        append_summary(f"## Personal pin retention\n\n**FAILED:** {e}\n")
-        raise
+    client = GhClient(args.repo, dry_run=args.dry_run)
+    pins = collect(client.tags(), client.branches(), client.releases())
+    pruned = plan(pins, today, args.keep_days, args.keep_per_family)
+    if args.max_delete is not None:
+        pruned = limit_plan(pruned, args.max_delete)
 
     text = summarize(pruned, dry_run=args.dry_run, keep_per_family=args.keep_per_family)
     append_summary(text)
     sys.stdout.write(text + "\n")
-    if args.report:
-        report = {
-            "cutoff": pruned.cutoff.isoformat(),
-            "dry_run": args.dry_run,
-            "deleted": [p.name for p in pruned.delete],
-            "kept_recent": [p.name for p in pruned.keep_recent],
-            "kept_floor": [p.name for p in pruned.keep_floor],
-        }
-        with open(args.report, "w") as fh:
-            json.dump(report, fh, indent=2)
-            fh.write("\n")
+    write_report(args.report, pruned, dry_run=args.dry_run, status="planned")
+
+    done: list[str] = []
+    try:
+        check_delete_ceiling(pruned)
+        if not args.dry_run:
+            done = execute(pruned, client)
+    except Exception as e:
+        if isinstance(e, ExecutionError):
+            done = e.done
+        failure = summarize(
+            pruned,
+            dry_run=args.dry_run,
+            keep_per_family=args.keep_per_family,
+            done=done,
+            error=str(e),
+        )
+        append_summary(failure)
+        sys.stdout.write(failure + "\n")
+        write_report(
+            args.report,
+            pruned,
+            dry_run=args.dry_run,
+            status="failed",
+            done=done,
+            error=str(e),
+        )
+        raise
+
+    result = summarize(
+        pruned,
+        dry_run=args.dry_run,
+        keep_per_family=args.keep_per_family,
+        done=done,
+    )
+    append_summary(result)
+    sys.stdout.write(result + "\n")
+    write_report(
+        args.report,
+        pruned,
+        dry_run=args.dry_run,
+        status="dry_run" if args.dry_run else "complete",
+        done=done,
+    )
     return 0
 
 

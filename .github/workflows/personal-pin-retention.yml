@@ -30,7 +30,7 @@ on:
       dry_run:
         description: "Report the plan without deleting anything"
         type: boolean
-        default: false
+        default: true
       keep_days:
         description: "Retention window in days (pins dated before it retire)"
         type: string
@@ -39,6 +39,10 @@ on:
         description: "Newest pins kept per family regardless of age"
         type: string
         default: "5"
+      max_delete:
+        description: "Oldest pins to drain in this reviewed batch (1-60)"
+        type: string
+        default: "60"
 
 permissions:
   contents: read
@@ -94,18 +98,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
       - name: Retire aged pins
         env:
           GH_TOKEN: ${{ github.token }}
-          # All three are empty on schedule runs; the defaults live in
+          # Dispatch-only values are empty on schedule runs; the defaults live in
           # prune_pins.py, so the schedule is always the armed 14/5 policy.
           DRY_RUN: ${{ inputs.dry_run }}
           KEEP_DAYS: ${{ inputs.keep_days || '14' }}
           KEEP_PER_FAMILY: ${{ inputs.keep_per_family || '5' }}
+          MAX_DELETE: ${{ inputs.max_delete }}
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
             set -- --dry-run
+          fi
+          if [ -n "$MAX_DELETE" ]; then
+            set -- "$@" --max-delete "$MAX_DELETE"
           fi
           python3 .github/scripts/personal-staging/prune_pins.py \
             --repo "$GITHUB_REPOSITORY" \
