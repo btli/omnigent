@@ -3373,7 +3373,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert clone_calls == [
             f"git clone --branch release/test --single-branch -- {repo.url} {staged_clone}",
         ]
-        assert probe_calls == [checkout_probe]
+        assert probe_calls == []
         if workspace_state == "clone_failure":
             assert not clone_dir.exists()
             assert (staged_clone / ".git" / "HEAD").is_file()
@@ -3414,7 +3414,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     elif workspace_state == "unowned_tmp":
         assert credential_calls == []
         assert clone_calls == []
-        assert probe_calls == [checkout_probe]
+        assert probe_calls == []
         assert not clone_dir.exists()
         assert (temporary / "backup.txt").read_text() == "user backup\n"
         assert list(temporary.iterdir()) == [temporary / "backup.txt"]

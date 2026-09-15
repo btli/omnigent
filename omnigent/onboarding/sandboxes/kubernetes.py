@@ -508,16 +508,20 @@ def _render_workspace_prep_command(
         )
         helper = f"!python3 -Ic {shlex.quote(helper_source)}"
         helper_key = "credential.https://github.com.helper"
+        expected_helpers = ["", helper]
         wire = (
-            "import subprocess,sys; import omnigent.git_credential_github as g; "
+            "import os,subprocess,sys; import omnigent.git_credential_github as g; "
             "cfg=g._git_config; _=g._install_broker_helper; "
             "g._install_broker_helper=lambda *_:("
             f"cfg('--replace-all',{helper_key!r},''),"
             f"cfg('--add',{helper_key!r},{helper!r})); "
+            f"token=(os.environ.get({HOST_TOKEN_ENV_VAR!r}) or '').strip(); "
             f"wired=g.configure_clone_credentials({server_url!r},{host_id!r}); "
-            "verified=(not wired or "
-            f"{helper!r} in subprocess.run(['git','config','--global','--get-all',"
-            f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines()); "
+            "helpers=(subprocess.run(['git','config','--global','--get-all',"
+            f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines() "
+            "if wired is True else []); "
+            f"verified=(bool(token) and (wired is False or "
+            f"(wired is True and helpers=={expected_helpers!r}))); "
             "sys.exit(0 if verified else 1)"
         )
         # Clone every repo concurrently, then wait on each and fail the init
@@ -542,7 +546,8 @@ def _render_workspace_prep_command(
             "wire_credentials() {\n"
             "  credential_config=$(mktemp)\n"
             '  export GIT_CONFIG_GLOBAL="$credential_config"\n'
-            f"  PYTHONSAFEPATH=1 python3 -c {shlex.quote(wire)} || exit 1\n"
+            f"  PYTHONSAFEPATH=1 PYTHONNOUSERSITE=1 PYTHONPATH= "
+            f"python3 -c {shlex.quote(wire)} || exit 1\n"
             "}\n"
         )
         # Replacing an empty reserved directory is atomic; a writer that adds
@@ -593,9 +598,9 @@ def _render_workspace_prep_command(
             script += (
                 f"if ! {{ [ ! -f {gitfile} ] || "
                 f"awk 'END {{ exit (NR == 1 ? 0 : 1) }}' {gitfile}; }} ||\n"
-                f"   ! ( unset GIT_DIR GIT_WORK_TREE; "
+                f"   ! {{ [ -e {gitfile} ] && ( unset GIT_DIR GIT_WORK_TREE; "
                 f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
-                '[ -z "$prefix" ] ); then\n'
+                '[ -z "$prefix" ] ); }; then\n'
             )
             script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             script += f"    if ! rmdir -- {target}; then\n"
