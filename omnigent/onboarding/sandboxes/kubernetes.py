@@ -527,8 +527,25 @@ def _render_workspace_prep_command(
         script += f"wire_credentials() {{ python3 -c {shlex.quote(wire)} || true; }}\n"
         # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
         # shared clone dir would fail the concurrent clones, so disambiguate.
-        for repo, dirname in zip(repos, clone_dir_names(repos), strict=True):
+        dirnames = clone_dir_names(repos)
+        # A staging path must never collide with a sibling repo's clone
+        # destination: repo "foo" staging at "foo.tmp" while a sibling repo is
+        # literally named "foo.tmp" would subject that sibling's checkout to
+        # the staging-cleanup branch (refusal at best, removal if it carries a
+        # root-level ownership marker). Suffix until the staging name is unique
+        # across every destination and every other staging name.
+        taken = set(dirnames)
+        staging_names: list[str] = []
+        for dirname in dirnames:
+            staging, n = f"{dirname}.tmp", 2
+            while staging in taken:
+                staging = f"{dirname}.tmp{n}"
+                n += 1
+            taken.add(staging)
+            staging_names.append(staging)
+        for repo, dirname, staging in zip(repos, dirnames, staging_names, strict=True):
             clone_dir = f"{workspace}/{dirname}"
+            staging_dir = f"{workspace}/{staging}"
             branch = (
                 f"--branch {shlex.quote(repo.branch)} --single-branch "
                 if repo.branch is not None
@@ -536,16 +553,15 @@ def _render_workspace_prep_command(
             )
             target = shlex.quote(clone_dir)
             gitfile = shlex.quote(f"{clone_dir}/.git")
-            temporary = shlex.quote(f"{clone_dir}.tmp")
-            marker = shlex.quote(f"{clone_dir}.tmp/.omnigent-workspace-prep")
-            staged_clone = shlex.quote(f"{clone_dir}.tmp/clone")
+            temporary = shlex.quote(staging_dir)
+            marker = shlex.quote(f"{staging_dir}/.omnigent-workspace-prep")
+            staged_clone = shlex.quote(f"{staging_dir}/clone")
             error = shlex.quote(
                 f"Workspace {clone_dir} has no Git checkout and is not an empty directory; "
                 "refusing to overwrite it"
             )
             staging_error = shlex.quote(
-                f"Staging path {clone_dir}.tmp is not owned by workspace prep; "
-                "refusing to remove it"
+                f"Staging path {staging_dir} is not owned by workspace prep; refusing to remove it"
             )
             script += (
                 f"if [ ! -e {target}/.git/HEAD ] && "
