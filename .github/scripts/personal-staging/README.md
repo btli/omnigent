@@ -19,9 +19,10 @@ It:
    outcome. If upstream is already contained, staging may equal fork main.
 2. Pins an immutable, canonical `nightly-YYYYMMDD` tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
-   deprecated same-name compatibility branch slated for removal in v0.12.0
-   and a PEP 440 `vX.Y.Z.devYYYYMMDD` tag mirroring `nightly-release.yml`'s
+   PEP 440 `vX.Y.Z.devYYYYMMDD` tag mirroring `nightly-release.yml`'s
    scheme, so `scripts/update_nightly.sh` resolves it:
+
+   Same-name compatibility branches were removed in v0.15.0.
 
    ```sh
    OMNIGENT_REPO=https://github.com/btli/omnigent bash scripts/update_nightly.sh
@@ -158,13 +159,15 @@ stream: `filter_drafts()` runs before the extras union, so a numeric production
 extra bypasses it (both current pins are non-draft). The current bot-owned pins
 also resolve mutable `refs/pull/N/head` refs. Each run mints an immutable,
 canonical `production-YYYYMMDD` tag
-pin (same rerun/no-op semantics as `nightly-*`) plus a deprecated same-name
-compatibility branch slated for removal in v0.12.0, which homelab's
-`build-omnigent-production.yml` resolves at 11:10 UTC to build and
+pin (same rerun/no-op semantics as `nightly-*`). Homelab's
+`build-omnigent-production.yml` resolves immutable `refs/tags/production-*`
+at 11:10 UTC to build and
 digest-pin the prod server + host images. The workflow also builds APK and
 desktop release artifacts and dispatches image publication. Its concurrency group (`personal-production`,
 `cancel-in-progress: false`) is disjoint from the staging groups, so the
 rings can never cancel each other.
+
+Same-name compatibility branches were removed in v0.15.0.
 
 ### Migration gate
 
@@ -216,8 +219,8 @@ be gone. Nothing should track the branch tip.
 
 - **Pin instead:** for anything reproducible — homelab deploys, container
   builds, bisecting — use the canonical `nightly-YYYYMMDD` tag or the
-  `vX.Y.Z.devYYYYMMDD` tag from the nightly. The same-name dated branch is a
-  deprecated compatibility shim slated for removal in v0.12.0.
+  `vX.Y.Z.devYYYYMMDD` tag from the nightly. Same-name compatibility branches
+  were removed in v0.15.0.
 - **Existing clone:** `git pull` on `staging` will refuse or conflict
   after a rewrite. Recover with:
 
