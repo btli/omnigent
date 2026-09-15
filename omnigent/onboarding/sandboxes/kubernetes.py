@@ -504,16 +504,21 @@ def _render_workspace_prep_command(
         helper_source = (
             "import os,sys; from omnigent.git_credential_github import main; "
             f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
-            "'--host-token',os.environ['OMNIGENT_HOST_TOKEN'],*sys.argv[1:]]))"
+            f"'--host-token',os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
         )
-        helper = f"!python3 -Ec {shlex.quote(helper_source)}"
+        helper = f"!python3 -Ic {shlex.quote(helper_source)}"
         helper_key = "credential.https://github.com.helper"
         wire = (
-            "import omnigent.git_credential_github as g; "
+            "import subprocess,sys; import omnigent.git_credential_github as g; "
+            "cfg=g._git_config; _=g._install_broker_helper; "
             "g._install_broker_helper=lambda *_:("
-            f"g._git_config('--replace-all',{helper_key!r},''),"
-            f"g._git_config('--add',{helper_key!r},{helper!r})); "
-            f"g.configure_clone_credentials({server_url!r},{host_id!r})"
+            f"cfg('--replace-all',{helper_key!r},''),"
+            f"cfg('--add',{helper_key!r},{helper!r})); "
+            f"wired=g.configure_clone_credentials({server_url!r},{host_id!r}); "
+            "verified=(not wired or "
+            f"{helper!r} in subprocess.run(['git','config','--global','--get-all',"
+            f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines()); "
+            "sys.exit(0 if verified else 1)"
         )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
@@ -531,15 +536,13 @@ def _render_workspace_prep_command(
             "}\n"
             "trap cleanup_credentials EXIT\n"
         )
-        # Define the wiring once so the script text carries a single
-        # ``python3 -c`` line for every clone; each clone branch calls it at
-        # most once overall via the ``$wired`` runtime guard, and a preserved
-        # workspace never calls it at all.
+        # One guarded ``python3 -c`` wiring call serves every clone; preserved
+        # workspaces never call it.
         script += (
             "wire_credentials() {\n"
             "  credential_config=$(mktemp)\n"
             '  export GIT_CONFIG_GLOBAL="$credential_config"\n'
-            f"  python3 -c {shlex.quote(wire)} || true\n"
+            f"  PYTHONSAFEPATH=1 python3 -c {shlex.quote(wire)} || exit 1\n"
             "}\n"
         )
         # Replacing an empty reserved directory is atomic; a writer that adds
@@ -556,12 +559,8 @@ def _render_workspace_prep_command(
         # Distinct URLs can derive the same repo_name (e.g. two orgs' "api"); a
         # shared clone dir would fail the concurrent clones, so disambiguate.
         dirnames = clone_dir_names(repos)
-        # A staging path must never collide with a sibling repo's clone
-        # destination: repo "foo" staging at "foo.tmp" while a sibling repo is
-        # literally named "foo.tmp" would subject that sibling's checkout to
-        # the staging-cleanup branch (refusal at best, removal if it carries a
-        # root-level ownership marker). Suffix until the staging name is unique
-        # across every destination and every other staging name.
+        # Keep each staging name distinct from every clone destination and
+        # sibling staging path so cleanup cannot target another checkout.
         taken = set(dirnames)
         staging_names: list[str] = []
         for dirname in dirnames:
@@ -594,7 +593,9 @@ def _render_workspace_prep_command(
             script += (
                 f"if ! {{ [ ! -f {gitfile} ] || "
                 f"awk 'END {{ exit (NR == 1 ? 0 : 1) }}' {gitfile}; }} ||\n"
-                f"   ! git -C {target} rev-parse --git-dir >/dev/null 2>&1; then\n"
+                f"   ! ( unset GIT_DIR GIT_WORK_TREE; "
+                f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
+                '[ -z "$prefix" ] ); then\n'
             )
             script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"
             script += f"    if ! rmdir -- {target}; then\n"

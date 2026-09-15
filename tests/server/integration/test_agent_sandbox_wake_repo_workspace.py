@@ -1,9 +1,9 @@
-"""Regression: waking ``agent_sandbox`` must rebuild every repo workspace.
+"""Regression: waking ``agent_sandbox`` must rebuild recorded repo workspaces.
 
 User journey:
 
-1. Create a managed ``agent_sandbox`` session with two repository workspaces.
-   The sandbox clones both beneath ``/root/workspace`` and binds there.
+1. Create a managed ``agent_sandbox`` session with one or two repositories.
+   The sandbox clones them beneath ``/root/workspace`` and binds there.
 2. The sandbox suspends: its Pod is deleted (the ``emptyDir`` HOME is lost) but
    the Sandbox CR is retained (``shutdownPolicy: Retain``), so the host goes
    offline.
@@ -11,8 +11,8 @@ User journey:
    the messages route spawns the background wake (``_kick_managed_wake`` →
    ``_run_managed_wake``), which resumes the sandbox and launches a runner in
    the session's recorded workspace.
-4. On a broken wake one or more recorded repository directories are absent from
-   the fresh ephemeral HOME, so the session is incomplete.
+4. On a broken wake recorded repository directories are absent from the fresh
+   ephemeral HOME, so the session is incomplete.
 
 This drives the REAL ``_run_managed_wake`` orchestration (the exact coroutine a
 message POST spawns for a dormant resumable host) against the production
@@ -20,12 +20,12 @@ message POST spawns for a dormant resumable host) against the production
 models the agent-sandbox provider faithfully — resume wipes the ephemeral HOME,
 ``start_host`` recreates only what it is told to — and mirrors the real host's
 workspace check in ``omnigent/host/connect.py`` (refuse with
-``workspace_missing`` when the workspace dir is absent). Whether every repo is
+``workspace_missing`` when the workspace dir is absent). Whether each repo is
 reconstructed on wake therefore depends entirely on what the real wake path
 passes into ``start_host``; the fake presupposes nothing.
 
-The test asserts the correct behavior — the wake reconstructs both recorded
-repositories and the runner launch succeeds.
+The test asserts that the wake reconstructs every recorded repository and the
+runner launch succeeds for both provider capability shapes.
 """
 
 from __future__ import annotations
@@ -76,12 +76,12 @@ from tests.server.helpers import (
 
 pytestmark = pytest.mark.asyncio
 
-_REPO_WORKSPACES = [
+_SINGLE_REPO_WORKSPACES = ["https://github.com/org/myrepo.git#main"]
+_MULTI_REPO_WORKSPACES = [
     "https://github.com/org/api.git#main",
     "https://github.com/org/web.git#release",
 ]
 _WORKSPACE_DIR = "/root/workspace"
-_CLONE_DIRS = {f"{_WORKSPACE_DIR}/api", f"{_WORKSPACE_DIR}/web"}
 
 
 class _AgentSandboxFake(FakeSandboxLauncher):
@@ -108,10 +108,11 @@ class _AgentSandboxFake(FakeSandboxLauncher):
 
     @property
     def capabilities(self) -> SandboxCapabilities:
-        return replace(super().capabilities, multi_repo=True)
+        return replace(super().capabilities, multi_repo=self._multi_repo)
 
-    def __init__(self) -> None:
+    def __init__(self, *, multi_repo: bool) -> None:
         super().__init__(can_resume=True)
+        self._multi_repo = multi_repo
         self.live_dirs: set[str] = set()
         self.resume_count = 0
         # Every launch result the fake host answered, in arrival order.
@@ -226,9 +227,8 @@ async def _serve_agent_sandbox_host(
             # Runner-encoded ping frames share the socket; skip them.
             continue
         if isinstance(frame, HostLaunchRunnerFrame):
-            # Mirror the real host check (connect.py): a launch into a
-            # workspace directory that does not exist is refused with
-            # workspace_missing.
+            # Mirror the real host: a launch into a missing workspace is
+            # refused with workspace_missing.
             if frame.workspace in fake.live_dirs:
                 result = HostLaunchRunnerResultFrame(
                     request_id=frame.request_id,
@@ -270,18 +270,41 @@ async def _wait_for_binding(
     )
 
 
-async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
+@pytest.mark.parametrize(
+    ("repo_workspaces", "multi_repo", "expected_workspace", "expected_clone_dirs"),
+    [
+        pytest.param(
+            _SINGLE_REPO_WORKSPACES,
+            False,
+            f"{_WORKSPACE_DIR}/myrepo",
+            {f"{_WORKSPACE_DIR}/myrepo"},
+            id="single-repo",
+        ),
+        pytest.param(
+            _MULTI_REPO_WORKSPACES,
+            True,
+            _WORKSPACE_DIR,
+            {f"{_WORKSPACE_DIR}/api", f"{_WORKSPACE_DIR}/web"},
+            id="multiple-repos",
+        ),
+    ],
+)
+async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     runtime_init: None,
     db_uri: str,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    repo_workspaces: list[str],
+    multi_repo: bool,
+    expected_workspace: str,
+    expected_clone_dirs: set[str],
 ) -> None:
-    """Waking a resumable agent_sandbox host must rebuild every repo workspace.
+    """Waking a resumable agent_sandbox host must rebuild its repo workspaces.
 
-    Create a managed agent_sandbox session with repository workspaces, suspend
+    Create a managed agent_sandbox session with recorded repositories, suspend
     it (ephemeral HOME lost), then drive the real send-message wake
     (``_run_managed_wake``). The wake must reconstruct the recorded repository
-    directories so its runner launch succeeds and every checkout is present.
+    directories so its runner launch succeeds and each checkout is present.
     """
     # A healthy fake host registers well under a second; shrink the online-poll
     # budget so a wake/registration regression fails in seconds.
@@ -296,7 +319,7 @@ async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
 
-    fake = _AgentSandboxFake()
+    fake = _AgentSandboxFake(multi_repo=multi_repo)
     config = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://managed-test.example.com",
@@ -351,14 +374,17 @@ async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        # 1. Create a managed agent_sandbox session with two repository workspaces.
+        workspace_request = (
+            {"workspaces": repo_workspaces} if multi_repo else {"workspace": repo_workspaces[0]}
+        )
+        # Create a managed agent_sandbox session with recorded repositories.
         agent = await create_test_agent(client, name="agent-sandbox-wake-agent")
         resp = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": agent["id"],
                 "host_type": "managed",
-                "workspaces": _REPO_WORKSPACES,
+                **workspace_request,
             },
         )
         assert resp.status_code == 201, resp.text
@@ -367,18 +393,16 @@ async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
         conv = await _wait_for_binding(conv_store, session_id)
         gen1_tunnel = await host_futures[0]
 
-        # Both repos cloned into the sandbox and the session bound to their parent.
+        # Repositories are cloned and the session binds to the expected workspace.
         assert conv.host_id is not None
         assert conv.runner_id is not None
-        assert conv.workspace == _WORKSPACE_DIR
-        assert fake.live_dirs >= _CLONE_DIRS, (
-            f"initial launch did not clone every repo; live dirs={sorted(fake.live_dirs)}"
+        assert conv.workspace == expected_workspace
+        assert fake.live_dirs >= expected_clone_dirs, (
+            f"initial launch did not clone each repo; live dirs={sorted(fake.live_dirs)}"
         )
         host_id = conv.host_id
 
-        # Let the create launch fully settle (its tracker entry cleared) so the
-        # suspend below deterministically takes the offline/wake branch rather
-        # than riding the still-inflight create.
+        # Settle creation so suspension takes the offline/wake branch.
         tracker = app.state.managed_launches
         deadline = loop.time() + 10.0
         while loop.time() < deadline and tracker.get(session_id) is not None:
@@ -396,14 +420,10 @@ async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
         assert host_registry.get(host_id) is None
         assert host_store.is_online(host_id) is False
 
-        # 3. Send-message wake: drive the exact background coroutine the
-        # messages route spawns for a dormant resumable host
-        # (_kick_managed_wake -> _run_managed_wake). It resumes the SAME
-        # sandbox in place (fresh, empty ephemeral HOME) and then launches a
-        # runner in the session's recorded workspace on the woken host.
+        # Drive the message route's wake coroutine against a fresh ephemeral HOME.
         refreshed = conv_store.get_conversation(session_id)
         assert refreshed is not None
-        assert refreshed.workspace == _WORKSPACE_DIR
+        assert refreshed.workspace == expected_workspace
         tracker.begin(session_id)
         await sessions_module._run_managed_wake(
             session_id=session_id,
@@ -428,18 +448,13 @@ async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
         assert host_registry.get(host_id) is not None, "no live host tunnel after wake"
         assert tracker.get(session_id) is None, "wake never settled the launch tracker"
 
-        # 4. The wake launched a runner on the woken host in the recorded
-        # workspace — the step a woken session's next turn depends on. The
-        # fake host answered it the way the real host does.
+        # The wake must launch a runner in the recorded workspace.
         assert len(fake.launch_results) == 2, (
             f"expected the create launch and the wake launch; got {fake.launch_results!r}"
         )
         wake_launch = fake.launch_results[-1]
 
-        # EXPECTED behavior: the wake reconstructed the recorded repository
-        # workspace, so the runner launches. On a broken build the wake never
-        # re-clones, the clone dir is absent from the fresh ephemeral HOME, and
-        # the launch is refused with workspace_missing.
+        # Missing restoration is surfaced as workspace_missing.
         assert wake_launch.error_code != WORKSPACE_MISSING_ERROR_CODE, (
             "waking a resumable agent_sandbox host with an ephemeral HOME rejected "
             "the runner launch with workspace_missing: the wake never re-cloned the "
@@ -449,9 +464,8 @@ async def test_agent_sandbox_wake_reconstructs_multiple_repo_workspaces(
         assert wake_launch.status == "launched", (
             f"runner launch refused after wake: {wake_launch!r}"
         )
-        # Corroborate the root cause: both repo directories are back in the sandbox.
-        assert fake.live_dirs >= _CLONE_DIRS, (
-            "woken sandbox did not re-clone every recorded repository; "
+        assert fake.live_dirs >= expected_clone_dirs, (
+            "woken sandbox did not re-clone each recorded repository; "
             f"live dirs={sorted(fake.live_dirs)}"
         )
 

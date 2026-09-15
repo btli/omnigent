@@ -3363,7 +3363,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     assert host_store.is_online(host.host_id) is not failed
     assert workspace.is_dir()
     calls = call_log.read_text().splitlines() if call_log.exists() else []
-    checkout_probe = f"git -C {clone_dir} rev-parse --git-dir"
+    checkout_probe = f"git -C {clone_dir} rev-parse --show-prefix"
     credential_calls = [call for call in calls if call == "credentials"]
     clone_calls = [call for call in calls if call.startswith("git clone ")]
     probe_calls = [call for call in calls if call == checkout_probe]
