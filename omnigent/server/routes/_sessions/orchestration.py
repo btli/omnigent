@@ -3728,26 +3728,6 @@ async def ensure_runner_connected(
     return runner_client, conv
 
 
-def _recorded_repo_workspace(
-    session_id: str, labels: dict[str, str], *, invalid_label_fallback: str
-) -> RepoWorkspace | None:
-    raw_repo = labels.get(MANAGED_REPO_LABEL_KEY)
-    if raw_repo is None:
-        return None
-    try:
-        return parse_repo_workspace(raw_repo)
-    except ValueError:
-        _logger.warning(
-            "Session %s has an unparseable %s label (%r); %s",
-            session_id,
-            MANAGED_REPO_LABEL_KEY,
-            raw_repo,
-            invalid_label_fallback,
-            extra={"session_id": session_id},
-        )
-        return None
-
-
 def _recorded_repo_workspaces(
     session_id: str, labels: dict[str, str], *, invalid_label_fallback: str
 ) -> list[RepoWorkspace]:
