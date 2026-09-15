@@ -1,6 +1,6 @@
 import {
   HarnessPicker,
-  HarnessPickerEntry,
+  HarnessPickerConfigRow,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
 import {
@@ -42,7 +42,6 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -72,6 +71,7 @@ import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
+import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -113,7 +113,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -208,7 +208,6 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
-import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import {
   formatStatusModelLabel,
@@ -312,14 +311,12 @@ export function isSubagentRoutingEligible(
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
-// just the `/skill` and leave any args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)(\/[A-Za-z0-9][\w:-]*)/;
+// just the `/command` or `$skill` and leave args in the default color.
+const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
 
 /**
- * Split a slash-command draft into the command token and the rest, for the
- * composer highlight overlay. Returns null when the text isn't a command
- * (callers gate on `isSlashCommandText`, so a returned token is the full
- * command — never a `/etc/hosts`-style path prefix).
+ * Split a command or skill draft for the composer highlight overlay.
+ * Returns null for prose and file paths such as `/etc/hosts`.
  */
 export function splitSlashCommand(
   value: string,
@@ -522,9 +519,6 @@ export function ChatPage() {
   // handling). Overrides the liveness-derived unreachable affordances
   // below, which misread the not-yet-host-bound session as stranded.
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
-  // Terminal-first spin-up state, read here (not just in the child surfaces) so
-  // the working-indicator gate below can defer to the "Starting up…" cue.
-  const chatTerminalFirst = useTerminalFirst();
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
@@ -716,16 +710,10 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  // A spin-up in flight owns the in-progress slot with more specific copy
-  // ("Starting up…" / "Cloning repository…") than the generic shimmer, and
-  // `RunnerStartingIndicator` only renders when the shimmer is absent. So the
-  // OPTIMISTIC path must stand down here: a send that has to boot a runner is
-  // exactly when the user needs to know it's booting, not just that we asked.
-  // A server-confirmed `running`/`waiting` still wins — by then the harness is
-  // up and the spin-up cue has self-gated to null.
-  const spinUpInFlight =
-    sandboxLaunching ||
-    Boolean(chatTerminalFirst?.isTerminalFirst && chatTerminalFirst.terminalStartingUp);
+  // Managed-sandbox stages own the in-progress slot with specific pipeline
+  // copy. A normal terminal runner launch keeps the standard Working shimmer
+  // so startup does not introduce a second, special chat state.
+  const spinUpInFlight = sandboxLaunching;
   const showsWorking = computeShowsWorking(sessionStatus, {
     hasPendingElicitation,
     runnerOnline,
@@ -1009,11 +997,11 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  // Client-only conversation: no server session to POST a follow-up to yet, so
-  // the composer stays read-only until the create resolves and the id hydrates.
-  const readOnlyReason = isTempConvId(urlConvId)
-    ? "Starting the session…"
-    : readOnlyReasonForSessionLabels(activeSession, activeConv);
+  // A client-only conversation has no server session to POST to yet. Keep the
+  // composer editable so the user can draft the next message during creation,
+  // but gate submission until the temp id is promoted below.
+  const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
+  const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
@@ -1111,6 +1099,7 @@ export function ChatPage() {
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
       readOnlyReason={readOnlyReason}
+      sendDisabledReason={sendDisabledReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
       showModels={modelPickerKind !== null}
@@ -1354,6 +1343,8 @@ interface MainAgentSurfaceProps {
   permissionLevel: number | null;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
+  /** Keeps drafting enabled while temporarily blocking submission. */
+  sendDisabledReason: string | null;
   effortLevels: readonly string[];
   /** Show effort controls. */
   showEffort: boolean;
@@ -1506,6 +1497,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   loadingMoreHistory,
   permissionLevel,
   readOnlyReason,
+  sendDisabledReason,
   effortLevels,
   showEffort,
   showModels,
@@ -1781,7 +1773,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showsWorking={showsWorking}
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
-            terminalFirst={terminalFirst}
             spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
@@ -1802,6 +1793,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
+            sendDisabledReason={sendDisabledReason}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
@@ -1919,6 +1911,8 @@ interface ComposerProps {
    * leaves the existing ``permissionLevel`` gate alone.
    */
   readOnlyReason: string | null;
+  /** Keeps drafting enabled while temporarily blocking submission. */
+  sendDisabledReason?: string | null;
   /** Reasoning-effort options to render in `/effort` and the picker dropdown. */
   effortLevels: readonly string[];
   /** Show `/effort` and the Effort picker section. */
@@ -2006,7 +2000,7 @@ interface ComposerProps {
 /**
  * Build the full slash-command map for the composer: built-ins
  * first (so they top the menu), then one entry per session skill
- * keyed by ``/${skill.name}``. Insertion order matters — the
+ * keyed by the session's skill prefix and name. Insertion order matters — the
  * menu iterates ``Object.entries`` and the user sees built-ins
  * before skills.
  *
@@ -2024,6 +2018,7 @@ export function buildSlashCommandMap(
   showModel: boolean,
   showCompact = true,
   showBtw = false,
+  skillPrefix: "/" | "$" = "/",
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2035,7 +2030,7 @@ export function buildSlashCommandMap(
     m[name] = description;
   }
   for (const skill of skills) {
-    m[`/${skill.name}`] = skill.description;
+    m[`${skillPrefix}${skill.name}`] = skill.description;
   }
   return m;
 }
@@ -2053,20 +2048,21 @@ export function buildSlashCommandMap(
  * :param showEffort: Whether ``/effort`` should be selectable.
  * :param showModel: Whether ``/model`` should be selectable (same gate
  *     as :func:`buildSlashCommandMap`'s ``showModel``).
- * :returns: A ``Set`` of slash-prefixed names.
+ * :returns: A ``Set`` of prefixed command and skill names.
  */
 export function buildSlashCommandWithArgsSet(
   skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
   showBtw = false,
+  skillPrefix: "/" | "$" = "/",
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
   // Selecting /btw fills "/btw " so the user types the side question after it.
   if (showBtw) s.add("/btw");
-  for (const skill of skills) s.add(`/${skill.name}`);
+  for (const skill of skills) s.add(`${skillPrefix}${skill.name}`);
   return s;
 }
 
@@ -2200,17 +2196,17 @@ export function subAgentComposerLabel(
 }
 
 /**
- * Peeking tray tucked behind the composer's top edge while the active
+ * Peeking tray tucked behind the composer stack's top edge while the active
  * session is a sub-agent (child) — names the sub-agent the message is going
  * to, so the composer reads as "messaging the sub-agent", not the
- * orchestrator. Mirrors ``ComposerStatusLine`` (the worktree/context shelf
- * below the card) but rises above it: ``-mb-4`` slides the tray's square
- * bottom corners down behind the card (the 16px overlap exceeds the card's
- * ~14px corner radius, hiding them behind its straight sides) and ``pb-5.5``
- * re-reserves the hidden region so the label sits above the card's top edge.
- * The card is ``position:relative`` and paints on top, so its own top border
- * is the divider. Brand pink (``brand-accent``) marks this as a sub-agent
- * context cue, not a status.
+ * orchestrator. Rendered inside the composer column wrapper with the same
+ * ``mx-3`` inset as the workspace bar below it: ``-mb-4`` slides the tray's
+ * square bottom corners down behind the bar (the 16px overlap exceeds the
+ * bar's ~14px corner radius, hiding them behind its straight sides) and
+ * ``pb-5.5`` re-reserves the hidden region so the label sits above the bar's
+ * top edge. The bar is ``position:relative`` and paints on top, so its own
+ * top border is the divider. Brand pink (``brand-accent``) marks this as a
+ * sub-agent context cue, not a status.
  *
  * @param label - The sub-agent instance name, e.g.
  *   ``"check-account-eligibility"`` (from ``subAgentComposerLabel``).
@@ -2219,10 +2215,7 @@ function SubagentComposerTray({ label }: { label: string }) {
   return (
     <div
       data-testid="composer-subagent-tray"
-      className={cn(
-        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-sm text-brand-accent",
-        COMPOSER_COLUMN_WIDTH,
-      )}
+      className="mx-3 -mb-4 flex items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-sm text-brand-accent"
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
       {/* truncate so a long sub-agent name never wraps the tray to two rows */}
@@ -2268,6 +2261,7 @@ function ComposerImpl(
     selectedAgentId,
     permissionLevel,
     readOnlyReason,
+    sendDisabledReason = null,
     effortLevels,
     showEffort,
     showModels,
@@ -2313,6 +2307,7 @@ function ComposerImpl(
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -2360,6 +2355,7 @@ function ComposerImpl(
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
   const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
+  const draftConversationIdRef = useRef<string | null>(null);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -2386,7 +2382,8 @@ function ComposerImpl(
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
-  const isReadOnly = permissionLevel === 1 || readOnlyReason !== null;
+  const isReadOnly =
+    readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
   // A pending elicitation addressed to this session parks the turn
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
@@ -2469,6 +2466,14 @@ function ComposerImpl(
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
+
+  // Cmd/Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
+  // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
+  // exists and the gear isn't disabled (not read-only, unreachable, or busy).
+  useModelPickerHotkey(
+    () => setPickerOpenNonce((n) => n + 1),
+    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy,
+  );
   const composerWorkspace = composerSession?.workspace;
   // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
   // the branch comes from the host's `git worktree list`, never a PR head.
@@ -2547,7 +2552,15 @@ function ComposerImpl(
   isMobileRef.current = isMobile;
 
   useEffect(() => {
-    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
+    const previousConversationId = draftConversationIdRef.current;
+    const promoted =
+      conversationId &&
+      previousConversationId &&
+      isTempConvId(previousConversationId) &&
+      !isTempConvId(conversationId)
+        ? promoteSessionDraft(previousConversationId, conversationId)
+        : undefined;
+    const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
@@ -2557,6 +2570,7 @@ function ComposerImpl(
     // hold the OUTGOING conversation's text during this commit — it waits for
     // this to settle rather than mistaking that for "the user is typing".
     setSettledConversationId(conversationId ?? null);
+    draftConversationIdRef.current = conversationId ?? null;
     if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
@@ -2577,8 +2591,7 @@ function ComposerImpl(
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
   // Session skills (bundled + host-discovered) come from the snapshot
-  // on bind and populate the suggestions menu as ``/skill-name``
-  // entries alongside the built-ins.
+  // on bind. Codex-native invokes skills with `$`; other harnesses use `/`.
   const skills = useChatStore((s) => s.skills);
   const reportedSkillsStatus = useChatStore((s) => s.skillsStatus);
   const terminalPending = useChatStore((s) => s.terminalPending);
@@ -2602,35 +2615,37 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
+  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
-    [skills, showEffort, showModel, showCompact, showBtw],
+    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw, skillPrefix),
+    [skills, showEffort, showModel, showCompact, showBtw, skillPrefix],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
-    [skills, showEffort, showModel, showBtw],
+    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw, skillPrefix),
+    [skills, showEffort, showModel, showBtw, skillPrefix],
   );
 
-  // Suggestions menu is open while the user is still typing the command
-  // name — i.e. the value starts with "/" with no spaces yet (once a
-  // space appears the command name is done and args follow) and no second
-  // "/" (guards against file-path-like strings).
+  // Suggest names until a space starts the arguments; exclude file paths.
   const trimmedValue = value.trimStart();
+  const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
   const menuOpen =
+    inputFocused &&
     draft.quotes.length === 0 &&
-    trimmedValue.startsWith("/") &&
+    hasCommandPrefix &&
     !trimmedValue.slice(1).includes("/") &&
     !trimmedValue.includes(" ") &&
     files.length === 0;
-  // Query = what the user typed after the leading "/".
+  // Query = what the user typed after the command or skill prefix.
   const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
-  // Tint the `/skill` token blue while the draft reads as a slash command, so
-  // the command shape is signalled as the user types it.
+  // Tint only the command or skill token, leaving arguments in the default color.
   const composerIsCommand =
-    draft.quotes.length === 0 && files.length === 0 && isSlashCommandText(value);
+    draft.quotes.length === 0 &&
+    files.length === 0 &&
+    hasCommandPrefix &&
+    splitSlashCommand(value) !== null;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3048,6 +3063,7 @@ function ComposerImpl(
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
       disabled ||
+      sendDisabledReason !== null ||
       hasPendingElicitation
     )
       return;
@@ -3351,40 +3367,46 @@ function ComposerImpl(
           }
         }}
       />
-      {/* Queued messages — peeks above the card like the sub-agent tray.
-          Lists follow-ups held while the agent is busy; drains FIFO on idle.
-          Scope to this conversation so a queue held elsewhere never leaks in. */}
-      <QueuedMessagesStrip
-        messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
-        onDelete={dequeueMessage}
-        onEdit={(queueId) => {
-          // Pull the queued message back into the composer for editing:
-          // replace the composer's text + attachments with the queued
-          // message's, remove it from the queue, and focus the textarea.
-          // Re-sending re-queues it (busy) or sends it (idle).
-          const target = queuedMessages.find((m) => m.queueId === queueId);
-          if (!target) return;
-          replaceText(target.text, target.replyDraft);
-          dirtyRef.current = true;
-          resetCursor();
-          recallingRef.current = false;
-          textareaRef.current = tailTextareaRef.current;
-          setFiles(target.files ?? []);
-          dequeueMessage(queueId);
-          textareaRef.current?.focus();
-        }}
-        onSteer={(queueId) => steerMessage(queueId)}
-        onReorder={reorderQueuedMessage}
-        widthClassName={COMPOSER_COLUMN_WIDTH}
-      />
-      {/* Sub-agent context tray — peeks above the card; reserves its own
-          layout slot so the card sits below it (see SubagentComposerTray).
-          Truthy (not just non-null) so an empty label never peeks a
-          nameless tray. */}
-      {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
       {/* Drop cue, spanning the chat column this composer belongs to. */}
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
+      {/* The composer stack above the card: trays dock onto the inset
+          workspace bar, so they share its column wrapper and its mx-3
+          inset — a tray's negative-margin tuck only hides its square
+          bottom corners when the surface below is at least as wide,
+          otherwise page background shows and the tray floats detached. */}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
+        {/* Queued messages — peeks above the workspace bar like the
+            sub-agent tray. Lists follow-ups held while the agent is busy;
+            drains FIFO on idle. Scope to this conversation so a queue held
+            elsewhere never leaks in. */}
+        <QueuedMessagesStrip
+          messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+          onDelete={dequeueMessage}
+          onEdit={(queueId) => {
+            // Pull the queued message back into the composer for editing:
+            // replace the composer's text + attachments with the queued
+            // message's, remove it from the queue, and focus the textarea.
+            // Re-sending re-queues it (busy) or sends it (idle).
+            const target = queuedMessages.find((m) => m.queueId === queueId);
+            if (!target) return;
+            replaceText(target.text, target.replyDraft);
+            dirtyRef.current = true;
+            resetCursor();
+            recallingRef.current = false;
+            textareaRef.current = tailTextareaRef.current;
+            setFiles(target.files ?? []);
+            dequeueMessage(queueId);
+            textareaRef.current?.focus();
+          }}
+          onSteer={(queueId) => steerMessage(queueId)}
+          onReorder={reorderQueuedMessage}
+          widthClassName="mx-3 w-auto"
+        />
+        {/* Sub-agent context tray — peeks above the workspace bar; reserves
+            its own layout slot so the bar sits below it (see
+            SubagentComposerTray). Truthy (not just non-null) so an empty
+            label never peeks a nameless tray. */}
+        {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
         <ComposerWorkspaceBar data-testid="composer-workspace-controls">
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
@@ -3410,8 +3432,6 @@ function ComposerImpl(
                 tokensUsed={composerTokensUsed}
               />
             </div>
-            <BackgroundTaskIndicator />
-            <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
         </ComposerWorkspaceBar>
       </div>
@@ -3427,14 +3447,14 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
-          onFocus: (e) => handleTextFocus(null, e.currentTarget),
+          onFocus: (e) => {
+            setInputFocused(true);
+            handleTextFocus(null, e.currentTarget);
+          },
           onKeyDown: handleKeyDown,
           onBlur: () => {
-            // Dismiss the "@"-mention menu when focus leaves the textarea
-            // (clicking a chip's ✕, the Send button, or another field).
-            // Menu rows ``preventDefault`` on mousedown so selecting an entry
-            // keeps focus and does NOT blur — this only fires for genuine
-            // focus-out, where the lingering menu would otherwise float.
+            // Menu rows preventDefault on mousedown so selecting one keeps focus.
+            setInputFocused(false);
             dismissMention();
           },
           onPaste: handlePaste,
@@ -3449,17 +3469,20 @@ function ComposerImpl(
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
-                : unreachable
+                : unreachable && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
-                    : disabled
+                    : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : isStreaming
                         ? "Send a follow-up (queued) — Esc to stop"
                         : "Send a message…",
           rows: 1,
-          disabled: disabled || isReadOnly || unreachable || composerLockedByBtw,
+          disabled:
+            ((disabled || unreachable) && sendDisabledReason === null) ||
+            isReadOnly ||
+            composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -3556,7 +3579,7 @@ function ComposerImpl(
                 </div>
               )}
               {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the `/skill` token we hide the textarea's own glyphs
+            to tint just the command or skill token we hide the textarea's own glyphs
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
@@ -3765,9 +3788,13 @@ function ComposerImpl(
                       disabled={
                         showInterruptButton
                           ? isReadOnly
-                          : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                          : !hasDraft ||
+                            disabled ||
+                            isReadOnly ||
+                            sendDisabledReason !== null ||
+                            hasPendingElicitation
                       }
-                      title={showInterruptButton ? "Interrupt" : undefined}
+                      title={showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
                     />
                   </TooltipTrigger>
@@ -4294,7 +4321,7 @@ function SessionHarnessPicker({
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
-  const [configMenuOpen, setConfigMenuOpen] = useState(false);
+  const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
@@ -4362,12 +4389,12 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       setMenuOpen(true);
-      setConfigMenuOpen(true);
+      setConfigMenu(showModels ? "model" : "effort");
     }
-  }, [openNonce, disabled, configurable]);
+  }, [openNonce, disabled, configurable, showModels]);
   useEffect(() => {
     setMenuOpen(false);
-    setConfigMenuOpen(false);
+    setConfigMenu(null);
     setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
@@ -4409,56 +4436,78 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
-  const configContent = (
-    <ComposerConfigSections
-      models={
-        showModels
-          ? {
-              testId: "composer-agent-models",
-              header: "Models",
-              choices: [
-                ...(!modelOptions.some((model) => model.isDefault)
-                  ? [
-                      {
-                        key: "__default__",
-                        label: "Default",
-                        checked: !routingOn && pickerSelectedModel === null,
-                        disabled: busy || pendingModelChange !== null,
-                        onSelect: () => selectModel(null),
-                        testId: "composer-agent-model-default",
-                      },
-                    ]
-                  : []),
-                ...modelOptions.map((model) => ({
-                  key: model.id,
-                  label: nativeModelLabel(model),
-                  checked:
-                    !routingOn &&
-                    (model.id === pickerSelectedModel ||
-                      (pickerSelectedModel === null && model.isDefault === true)),
-                  disabled: busy || pendingModelChange !== null,
-                  onSelect: () => selectModel(model.isDefault ? null : model.id),
-                  testId: `composer-agent-model-${model.id}`,
-                  className: "whitespace-normal break-words",
-                  data: { "data-model-id": model.id },
-                })),
-                ...(pickerSelectedModel &&
-                !modelOptions.some((model) => model.id === pickerSelectedModel)
-                  ? [
-                      {
-                        key: "__current__",
-                        label: `${modelSummary ?? "Default"} (current)`,
-                        checked: !routingOn,
-                        disabled: true,
-                        className: "whitespace-normal break-words",
-                        data: { "data-model-id": pickerSelectedModel },
-                      },
-                    ]
-                  : []),
-              ],
+  const modelContent = (
+    <>
+      {costRoutingEligible && showModels && (
+        <>
+          <DropdownMenuItem
+            disabled={busy || pendingModelChange !== null}
+            onSelect={() =>
+              void apply(() => useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"))
             }
-          : undefined
-      }
+            data-active={routingOn ? "true" : undefined}
+            className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          >
+            <WandSparklesIcon className="size-4" />
+            {SMART_ROUTING_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
+      <ComposerConfigSections
+        models={
+          showModels
+            ? {
+                testId: "composer-agent-models",
+                header: "Models",
+                choices: [
+                  ...(!modelOptions.some((model) => model.isDefault)
+                    ? [
+                        {
+                          key: "__default__",
+                          label: "Default",
+                          checked: !routingOn && pickerSelectedModel === null,
+                          disabled: busy || pendingModelChange !== null,
+                          onSelect: () => selectModel(null),
+                          testId: "composer-agent-model-default",
+                        },
+                      ]
+                    : []),
+                  ...modelOptions.map((model) => ({
+                    key: model.id,
+                    label: nativeModelLabel(model),
+                    checked:
+                      !routingOn &&
+                      (model.id === pickerSelectedModel ||
+                        (pickerSelectedModel === null && model.isDefault === true)),
+                    disabled: busy || pendingModelChange !== null,
+                    onSelect: () => selectModel(model.isDefault ? null : model.id),
+                    testId: `composer-agent-model-${model.id}`,
+                    className: "whitespace-normal break-words",
+                    data: { "data-model-id": model.id },
+                  })),
+                  ...(pickerSelectedModel &&
+                  !modelOptions.some((model) => model.id === pickerSelectedModel)
+                    ? [
+                        {
+                          key: "__current__",
+                          label: `${modelSummary ?? "Default"} (current)`,
+                          checked: !routingOn,
+                          disabled: true,
+                          className: "whitespace-normal break-words",
+                          data: { "data-model-id": pickerSelectedModel },
+                        },
+                      ]
+                    : []),
+                ],
+              }
+            : undefined
+        }
+      />
+    </>
+  );
+  const effortContent = (
+    <ComposerConfigSections
       efforts={
         showEffort && availableEfforts.length > 0
           ? {
@@ -4484,7 +4533,7 @@ function SessionHarnessPicker({
         open={menuOpen}
         onOpenChange={(next) => {
           if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigMenuOpen(false);
+          if (!next) setConfigMenu(null);
         }}
         trigger={{
           label: "Configure session",
@@ -4504,60 +4553,59 @@ function SessionHarnessPicker({
         tooltip={<ComposerConfigTooltipRows rows={summary} />}
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
-        configOpen={configMenuOpen}
       >
-        {isMobile && configMenuOpen ? (
+        {isMobile && configMenu !== null ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"
-            testId="composer-agent-config-menu"
-            onBack={() => setConfigMenuOpen(false)}
+            testId={
+              configMenu === "model" ? "composer-agent-config-menu" : "composer-agent-effort-menu"
+            }
+            onBack={() => setConfigMenu(null)}
           >
-            {configContent}
+            {configMenu === "model" ? modelContent : effortContent}
           </HarnessPickerConfigPage>
         ) : (
           <>
-            <div
-              title={
-                !costRoutingEligible || !showModels
-                  ? "Smart Routing is not available for this session."
-                  : undefined
-              }
-            >
-              <DropdownMenuItem
-                disabled={
-                  busy || pendingModelChange !== null || !costRoutingEligible || !showModels
-                }
-                onSelect={() =>
-                  void apply(() =>
-                    useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
+            <PickerSectionHeader>
+              {nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+            </PickerSectionHeader>
+            {showModels && (
+              <HarnessPickerConfigRow
+                label="Model"
+                value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+                open={configMenu === "model"}
+                onOpenChange={(open) =>
+                  setConfigMenu((current) =>
+                    open ? "model" : current === "model" ? null : current,
                   )
                 }
-                data-active={routingOn ? "true" : undefined}
-                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+                isMobile={isMobile}
+                disabled={busy || pendingModelChange !== null}
+                valueTestId="composer-agent-model-summary"
+                testId="composer-agent-edit"
+                configTestId="composer-agent-config-menu"
               >
-                <WandSparklesIcon className="size-4" />
-                <span className="flex-1">{SMART_ROUTING_LABEL}</span>
-                <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
-                  Model
-                </span>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-            </div>
-            <PickerSectionHeader>{nativeAgent ? "Harnesses" : "Agents"}</PickerSectionHeader>
-            <HarnessPickerEntry
-              open={configMenuOpen}
-              onOpenChange={setConfigMenuOpen}
-              icon={<ComposerAgentIcon agent={iconAgent} />}
-              label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-              summary={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
-              active={!routingOn}
-              isMobile={isMobile}
-              disabled={busy || pendingModelChange !== null}
-              summaryTestId="composer-agent-model-summary"
-              testId="composer-agent-edit"
-              configTestId="composer-agent-config-menu"
-              configContent={configContent}
-            />
+                {modelContent}
+              </HarnessPickerConfigRow>
+            )}
+            {showEffort && availableEfforts.length > 0 && (
+              <HarnessPickerConfigRow
+                label={modelPickerKind === "pi" ? "Thinking level" : "Effort"}
+                value={routingOn ? "Automatic" : (effortLabel ?? "Default")}
+                open={configMenu === "effort"}
+                onOpenChange={(open) =>
+                  setConfigMenu((current) =>
+                    open ? "effort" : current === "effort" ? null : current,
+                  )
+                }
+                isMobile={isMobile}
+                disabled={routingOn || busy || pendingModelChange !== null}
+                testId="composer-agent-effort-select"
+                configTestId="composer-agent-effort-menu"
+              >
+                {effortContent}
+              </HarnessPickerConfigRow>
+            )}
           </>
         )}
       </HarnessPicker>
@@ -4738,6 +4786,7 @@ function useResolvedComposerModel(
     hostId !== undefined &&
       !sessionModelSeeded &&
       (!isReportedModelPicker || effectiveModel === llmModel),
+    codexModelOptions,
   );
   return {
     llmModel,
