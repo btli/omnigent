@@ -454,18 +454,15 @@ async def _run_fire_for_task(
                 )
                 return
 
-<<<<<<< HEAD
         # Check connected-host workspaces, including the resolved HOME default,
-        # against the agent's cwd boundary. A new sandbox has no workspace yet.
-=======
-        # Validate the RESOLVED host/workspace. ``effective.workspace`` is always
+        # against the agent's cwd boundary. ``effective.workspace`` is always
         # an absolute realpath by this point — a caller-supplied path or the
         # canonicalized default (HOME). Gating on ``effective.workspace`` (not the
         # stored ``task.workspace``) means the agent's ``os_env.cwd`` boundary is
         # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
         # does — an agent that pins an absolute cwd outside HOME records a failed
-        # run instead of silently launching outside its declared boundary.
->>>>>>> d0e68b9d2 (fix(scheduled): reconcile shared project resolution)
+        # run instead of silently launching outside its declared boundary. A new
+        # sandbox has no workspace yet.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
@@ -717,7 +714,6 @@ async def _resolve_owned_fire_project(
                 body=body,
                 user_id=owner,
                 project_store=project_store,
-                warn_on_mismatch=False,
             )
         except OmnigentError as exc:
             if exc.code == ErrorCode.NOT_FOUND:
