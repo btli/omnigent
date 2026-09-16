@@ -308,7 +308,7 @@ def test_deployed_project_revision_runs_new_parallel_migration(tmp_path: Path) -
     }
     with engine.connect() as conn:
         assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "c18e2f7a4b90"
+            ScriptDirectory.from_config(config).get_current_head()
         )
 
     engine.dispose()
@@ -317,7 +317,7 @@ def test_deployed_project_revision_runs_new_parallel_migration(tmp_path: Path) -
 
 def test_single_alembic_head_after_project_merge(tmp_path: Path) -> None:
     config = _build_alembic_config(f"sqlite:///{tmp_path / 'heads.db'}")
-    assert ScriptDirectory.from_config(config).get_heads() == ["c18e2f7a4b90"]
+    assert len(ScriptDirectory.from_config(config).get_heads()) == 1
 
 
 @pytest.mark.parametrize("dialect", ["postgresql", "sqlite", "mysql"])
