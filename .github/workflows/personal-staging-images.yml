@@ -115,7 +115,7 @@ jobs:
           file: deploy/docker/Dockerfile
           target: runtime
           build-args: |
-            OMNIGENT_EXTRAS=kubernetes,openshell,microsandbox,postgres,tracing,databricks,vault
+            OMNIGENT_EXTRAS=kubernetes,openshell,microsandbox,postgres,tracing,databricks,vault,hindsight
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.source.outputs.server_tags }}

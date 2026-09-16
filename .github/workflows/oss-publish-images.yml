@@ -235,9 +235,8 @@ jobs:
           provenance: false
           sbom: true
 
-      # Kubernetes server variant: the default server image plus the kubernetes
-      # client extra (OMNIGENT_EXTRAS=kubernetes), so `sandbox.provider:
-      # kubernetes` works without a self-built image. Used by the
+      # Kubernetes server variant includes the Kubernetes client, PostgreSQL
+      # driver, and Hindsight client without a separate derived image. Used by the
       # deploy/kubernetes/overlays/sandbox-runners kustomize overlay. Reuses
       # the shared builder-stage layers from the gha cache.
       - name: Build and push kubernetes server image
@@ -250,7 +249,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.kubernetes_tags }}
           build-args: |
-            OMNIGENT_EXTRAS=kubernetes
+            OMNIGENT_EXTRAS=kubernetes,postgres,hindsight
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
