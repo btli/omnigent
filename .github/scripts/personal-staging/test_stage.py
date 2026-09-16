@@ -1807,6 +1807,47 @@ def test_production_migration_gate_clean_composes(env):
     assert env.fork_ref("refs/heads/production") == second["staging_sha"]
 
 
+@pytest.mark.parametrize("remove", [False, True])
+def test_published_migration_cannot_be_rewritten_even_with_approval(env, remove):
+    path = f"{MIGRATIONS_DIR}/merge.py"
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    old = "revision = 'merge'\ndown_revision = ('project', 'gg')\n"
+    pr = env.add_pr(4, path, old)
+    blocked = env.run([pr], ring=stage_mod.PRODUCTION)
+    published = env.run([pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"])
+    refs = git(env.work, "ls-remote", str(env.fork)).stdout
+
+    if remove:
+        prs = []
+    else:
+        prs = [env.advance_pr(4, path, old.replace("'gg'", "'gh'"))]
+    with pytest.raises(stage_mod.StageError, match="published migration history changed"):
+        env.run(prs, ring=stage_mod.PRODUCTION)
+    candidate = git(env.work, "rev-parse", "HEAD").stdout.strip()
+    # Even an exact candidate approval cannot make rewritten ancestry safe.
+    with pytest.raises(stage_mod.StageError, match="published migration history changed"):
+        env.run(prs, ring=stage_mod.PRODUCTION, migration_approval=candidate)
+    assert env.fork_ref("refs/heads/production") == published["staging_sha"]
+    current = git(env.work, "ls-remote", str(env.fork)).stdout
+    assert current == refs
+
+
+def test_published_merge_can_be_extended_with_a_new_revision(env):
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(4, f"{MIGRATIONS_DIR}/merge.py", "revision = 'merge'\n")
+    blocked = env.run([pr], ring=stage_mod.PRODUCTION)
+    env.run([pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"])
+    pr = env.advance_pr(
+        4,
+        f"{MIGRATIONS_DIR}/new_merge.py",
+        "revision = 'new_merge'\ndown_revision = ('merge', 'gh')\n",
+    )
+    blocked = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert blocked["migration_gate"]["blocked"] is True
+    result = env.run([pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"])
+    assert result["migration_gate"]["blocked"] is False
+
+
 def test_staging_report_has_no_migration_gate_key(env):
     """The gate is production-only surface: staging reports (nightly and
     hourly) carry no migration_gate key — the golden enforces the bytes."""
