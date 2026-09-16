@@ -999,6 +999,31 @@ def assert_production_identity(
 MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
 
 
+def assert_migration_history(
+    cwd: str | Path, candidate_sha: str, prev_pin_sha: str | None
+) -> None:
+    """Published migrations are append-only, including no-op merge revisions."""
+    if not prev_pin_sha:
+        return
+    changes = git(
+        cwd,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "--diff-filter=DMRTUXB",
+        prev_pin_sha,
+        candidate_sha,
+        "--",
+        MIGRATIONS_PATH_PREFIX,
+    ).stdout.strip()
+    if changes:
+        raise StageError(
+            "published migration history changed; migration approval cannot override this. "
+            "Restore shipped files and add a new revision (including a new merge revision "
+            "when joining heads):\n" + changes
+        )
+
+
 def migration_touched(
     cwd: str | Path,
     candidate_sha: str,
@@ -1166,6 +1191,9 @@ def stage(
     gate: dict | None = None
     if ring.pin_prefix == "production-":
         prev_pin_sha = latest_pin_sha(cwd, fork, ring)
+        if prev_pin_sha:
+            git(cwd, "fetch", fork, prev_pin_sha)
+        assert_migration_history(cwd, staging_sha, prev_pin_sha)
         gate = {
             "blocked": False,
             "candidate": staging_sha,

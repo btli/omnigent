@@ -168,9 +168,23 @@ rings can never cancel each other.
 
 ### Migration gate
 
+Published migration files are immutable. Before considering backup approval,
+the composer rejects any edit, deletion, or rename under the migrations path
+relative to the previous production pin. This is a hard failure that approval
+cannot bypass. Keep shipped ancestry intact and add a new revision to join new
+heads; a merge revision's ID cannot be reused with different parents. For a
+previously shipped defect, add a forward repair revision instead of editing
+the old file.
+
+Fork-only migrations already shipped to production stay on fork main even if
+their originating feature PR is removed from the composition. The retained
+scheduled-project and merge revisions preserve existing databases; the forward
+repair handles databases stamped by the earlier merge graph without overwriting
+existing project-order preferences.
+
 A candidate that touches `omnigent/db/migrations/versions/**` — on either
 `base_sha..candidate` or `previous-production-pin..candidate` (the second leg
-catches a migration arriving on main or removed between compositions) —
+catches a migration arriving on main between compositions) —
 is never auto-published. `stage.py` itself refuses the atomic push, so **no
 ring refs move** (the scheduled main sync may already have advanced main): the run stays green (blocked is a success outcome), the
 step summary shows a BLOCKED row with the candidate sha, and a best-effort
