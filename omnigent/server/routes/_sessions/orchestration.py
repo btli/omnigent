@@ -232,9 +232,11 @@ from omnigent.server.routes._sessions.helpers import (
     _consume_pre_resolved_harness_elicitation,
     _create_and_publish_antigravity_child,
     _create_and_publish_codex_child,
+    _create_and_publish_devin_child,
     _create_session_worktree,
     _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec,
+    _devin_subagent_labels_from_body,
     _emit_server_routing_decision,
     _error_item_from_sse,
     _extract_claude_native_runner_failure,
@@ -242,6 +244,7 @@ from omnigent.server.routes._sessions.helpers import (
     _extract_user_text_for_routing,
     _extract_user_text_from_event,
     _find_codex_native_subagent_child,
+    _find_devin_native_subagent_child,
     _find_subagent_child_by_title,
     _flush_relay_text,
     _forward_approval_to_runner,
@@ -372,6 +375,8 @@ from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -1042,6 +1047,7 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    side_chat_sealed: bool = False,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1137,6 +1143,12 @@ def _build_session_response(
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+    # A codex /side child whose ephemeral fork's runner is gone (parent resumed
+    # onto a new runner) can never be sent to again. Surface it as closed so the
+    # composer reads-only itself instead of letting the user fire a turn at a
+    # vanished thread. Computed per-response (not persisted) — self-heals.
+    if side_chat_sealed:
+        labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2370,6 +2382,55 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+async def _persist_external_devin_subagent_start(
+    parent_id: str,
+    parent_conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> str:
+    """
+    Mint or update a child Conversation for a Devin ``run_subagent`` sub-agent.
+
+    Devin runs each delegate as a chain inside the parent session's message
+    forest, not as its own session; the forwarder reconstructs that chain from
+    Devin's SQLite store on completion and posts it here as a child.
+
+    Idempotent: the forwarder re-posts a sub-agent each time it mirrors the
+    (already finished, stable) transcript, so repeated POSTs for the same
+    ``agent_id`` return the existing child id and upsert any new labels.
+
+    :param parent_id: Parent devin-native conversation id, e.g. ``"conv_parent987"``.
+    :param parent_conv: Pre-fetched parent row.
+    :param body: POST event body with ``data.agent_id`` required; optional
+        ``title``, ``tool_use_id``.
+    :param conversation_store: Store for reading/creating child rows.
+    :returns: Child conversation id, e.g. ``"conv_child456"``.
+    :raises OmnigentError: If ``agent_id`` is missing or the parent has no bound agent.
+    """
+    agent_id = body.data.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        raise OmnigentError(
+            "external_devin_subagent_start requires non-empty data.agent_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if parent_conv.agent_id is None:
+        raise OmnigentError(
+            f"parent session {parent_id!r} has no agent_id; cannot "
+            "create a devin-native sub-agent child",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    existing = await asyncio.to_thread(
+        _find_devin_native_subagent_child, conversation_store, parent_id, agent_id
+    )
+    labels = _devin_subagent_labels_from_body(agent_id, body)
+    if existing is not None:
+        await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        return existing.id
+    return await _create_and_publish_devin_child(
+        parent_id, parent_conv, agent_id, labels, conversation_store
+    )
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -3212,6 +3273,8 @@ async def _bind_and_launch_managed_runner(
             session_id, "failed", "session was deleted while its sandbox was provisioning"
         )
         return
+    if relaunch_host is not None:
+        await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
     # for its tunnel.
     _publish_sandbox_status(session_id, "connecting")
@@ -3664,6 +3727,66 @@ async def ensure_runner_connected(
     return runner_client, conv
 
 
+def _managed_relaunch_repos(conv: Conversation, session_id: str) -> list[RepoWorkspace]:
+    """Recover a managed session's create-time repository workspaces."""
+    from omnigent.server.managed_hosts import parse_repo_workspace
+
+    raw_workspaces = read_managed_repo_workspaces(conv.labels)
+    try:
+        return [parse_repo_workspace(workspace) for workspace in raw_workspaces]
+    except ValueError:
+        _logger.warning(
+            "Session %s has an unparseable sandbox repo label (%r); "
+            "relaunching with an empty workspace",
+            session_id,
+            raw_workspaces,
+            extra={"session_id": session_id},
+        )
+        return []
+
+
+_WORKSPACE_RESET_ERROR_CODE = "managed_sandbox_workspace_reset"
+_WORKSPACE_RESET_NOTICE = (
+    "The sandbox backing this session no longer exists. A fresh sandbox is being "
+    "created. Local files that were not committed and pushed are gone. If the "
+    "session started from a repository, that repository has been cloned again."
+)
+
+
+async def _note_workspace_reset_on_recreate(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist and publish the user-facing notice that the workspace reset."""
+    response_id = f"turn_{uuid.uuid4().hex}"
+    visible_item = NewConversationItem(
+        type="error",
+        response_id=response_id,
+        data=ErrorData(
+            source="execution",
+            code=_WORKSPACE_RESET_ERROR_CODE,
+            message=_WORKSPACE_RESET_NOTICE,
+            level="info",
+        ),
+    )
+    try:
+        persisted = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [visible_item],
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist workspace-reset notice for session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if persisted:
+        _publish_external_conversation_item(session_id, persisted[0])
+
+
 def _kick_managed_relaunch(
     *,
     session_id: str,
@@ -3699,30 +3822,12 @@ def _kick_managed_relaunch(
     :param app_state: ``request.app.state`` — supplies the registries and the
         agent store the classifier is re-derived from.
     """
-    from omnigent.server.managed_hosts import (
-        parse_repo_workspace,
-        read_managed_repo_workspaces,
-    )
-
     # Re-clone the repositories the session was created with so the fresh
     # generation's workspace matches the create-time state. The per-repo labels
     # hold the raw create-time values, already validated by the create's parse —
     # a parse failure here means a label was tampered with, and the relaunch
     # proceeds with an empty workspace rather than dying.
-    repos: list[RepoWorkspace] = []
-    raw_workspaces = read_managed_repo_workspaces(conv.labels)
-    if raw_workspaces:
-        try:
-            repos = [parse_repo_workspace(w) for w in raw_workspaces]
-        except ValueError:
-            _logger.warning(
-                "Session %s has an unparseable sandbox repo label (%r); "
-                "relaunching with an empty workspace",
-                session_id,
-                raw_workspaces,
-                extra={"session_id": session_id},
-            )
-            repos = []
+    repos = _managed_relaunch_repos(conv, session_id)
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
@@ -3899,6 +4004,7 @@ async def _run_managed_wake(
         built-in gate into the woken runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
     """
+    from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
         resolve_managed_agent_label,
         resume_managed_host,
@@ -3938,14 +4044,43 @@ async def _run_managed_wake(
                 agent_id,
                 session_id=session_id,
             )
-        await resume_managed_host(
-            host_id,
-            host_store,
-            sandbox_config,
-            force=True,
-            on_stage=_on_stage,
-            agent_name=agent_name,
-        )
+        try:
+            await resume_managed_host(
+                host_id,
+                host_store,
+                sandbox_config,
+                force=True,
+                on_stage=_on_stage,
+                agent_name=agent_name,
+            )
+        except SandboxGoneError:
+            _logger.info(
+                "Managed host %s (session %s) sandbox is gone; recreating a fresh generation",
+                host_id,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+            if host is None:
+                reason = "managed host not found after sandbox loss"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            await _run_managed_launch(
+                session_id=session_id,
+                owner=host.user_id,
+                sandbox_config=sandbox_config,
+                repos=_managed_relaunch_repos(conv, session_id),
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                tunnel_registry=tunnel_registry,
+                relaunch_host=host,
+                agent_store=agent_store,
+                agent_id=agent_id,
+            )
+            return
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
@@ -5874,6 +6009,48 @@ async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
         return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
 
 
+async def _forward_codex_side_chat_turn(
+    conv: Conversation,
+    body: SessionEventInput,
+    runner_client: httpx.AsyncClient,
+) -> _SessionEventDispatchResult | None:
+    """
+    Forward a Codex ``/side`` child's user turn to the PARENT runner.
+
+    A side-chat child (``kind == "sub_agent"`` + ``_is_codex_native_subagent``) has
+    no Codex process of its own: its thread lives in the parent's app-server. Forward
+    the message to the parent runner's ``/events`` tagged with the child Codex thread
+    id (``codex_side_thread_id``) so the runner drives it via ``turn/start`` on that
+    thread. Not persisted AP-side: the transcript forwarder mirrors the child thread's
+    echo, staying the single writer (same invariant as the native message bypass).
+
+    :param conv: The side-chat child conversation row.
+    :param body: The user message event.
+    :param runner_client: The child's runner client (== the parent's runner).
+    :returns: A no-persist dispatch result, or ``None`` to fall through when the
+        child lacks a parent id or a Codex thread-id label.
+    """
+    from omnigent.harnesses.claude_native.bridge import url_component
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+    )
+
+    parent_id = conv.parent_conversation_id
+    child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
+    if not parent_id or not child_thread_id:
+        return None
+    resp = await runner_client.post(
+        f"/v1/sessions/{url_component(parent_id)}/events",
+        json={
+            "type": "message",
+            "content": body.data.get("content"),
+            "codex_side_thread_id": child_thread_id,
+        },
+    )
+    resp.raise_for_status()
+    return _SessionEventDispatchResult(item_id=None, pending_id=None)
+
+
 async def _dispatch_session_event_to_runner_impl(
     session_id: str,
     conv: Conversation,
@@ -5966,6 +6143,13 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
+        # Codex /side follow-up: drive the child on its own Codex thread via the
+        # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
+        # the child thread echo, staying the single writer).
+        side_result = await _forward_codex_side_chat_turn(conv, body, runner_client)
+        if side_result is not None:
+            return side_result
     if body.type == "message" and _is_native_terminal_session(conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
@@ -6010,6 +6194,14 @@ async def _dispatch_session_event_to_runner_impl(
             if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
             else None
         )
+        # A codex /side command never reaches the main thread — the executor
+        # forks it into a side chat — so the transcript forwarder never mirrors
+        # it back and this bubble would sit in the parent chat forever.
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+
+        opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
+            _extract_user_text_for_routing(body)
+        )
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -6018,7 +6210,7 @@ async def _dispatch_session_event_to_runner_impl(
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
             )
-            if isinstance(content, list) and content
+            if isinstance(content, list) and content and not opens_side_chat
             else None
         )
         # ── Server-side routing for native terminal sessions ────────
@@ -10024,6 +10216,37 @@ async def _fetch_model_options(
     return cached or []
 
 
+_SIDE_CHAT_NICKNAME = "Side chat"
+
+
+async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: ConversationStore) -> bool:
+    """
+    Whether a codex ``/side`` child's ephemeral fork is no longer reachable.
+
+    The fork lives only in the runner process that created it. A side-chat child
+    keeps its birth ``runner_id`` while the parent's changes on resume/relaunch,
+    so a divergence means the fork's owning runner is gone and a follow-up turn
+    would hit a vanished thread. Gated to ``/side`` children (the "Side chat"
+    nickname) so ordinary codex sub-agents are unaffected; a plain reload with
+    the same live runner does not diverge, so a still-live side chat stays
+    sendable.
+    """
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY,
+    )
+
+    if (
+        not _is_codex_native_subagent(conv)
+        or conv.parent_conversation_id is None
+        or not conv.runner_id
+        or (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY)
+        != _SIDE_CHAT_NICKNAME
+    ):
+        return False
+    parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
+    return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -10311,6 +10534,7 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
+        side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
         background_task_count=_session_background_task_count_cache.get(session_id),
         background_tasks=_session_background_tasks_cache.get(session_id),
         llm_model=llm_model,
@@ -10378,6 +10602,7 @@ __all__ = [
     "_persist_external_antigravity_subagent_start",
     "_persist_external_codex_subagent_start",
     "_persist_external_conversation_item",
+    "_persist_external_devin_subagent_start",
     "_persist_external_session_usage",
     "_persist_host_launch_failure_turn",
     "_persist_model_change_note",
