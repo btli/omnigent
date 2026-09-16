@@ -523,6 +523,20 @@ async def test_active_creates_session_grant_and_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_owned_fire_project_uses_shared_session_create_validation() -> None:
+    project_id = "a" * 32
+    project_store = FakeProjectStore([_FakeProject(project_id)])
+
+    resolved = await fire_mod._resolve_owned_fire_project(
+        project_store,
+        _task(project_id=project_id),
+    )
+
+    assert resolved == project_id
+    assert project_store.calls == [(project_id, None)]
+
+
+@pytest.mark.asyncio
 async def test_fire_sets_project_once_in_initial_insert_without_followup_write() -> None:
     project_id = "a" * 32
     events: list[str] = []
@@ -660,7 +674,7 @@ async def test_fire_missing_project_runs_unfiled_and_conditionally_self_heals_ta
 
 @pytest.mark.asyncio
 async def test_fire_stamps_labels_while_self_healing_missing_project() -> None:
-    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
 
     project_id = "a" * 32
     task = _task(project_id=project_id)

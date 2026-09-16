@@ -615,7 +615,6 @@ async def _resolve_owned_fire_project(
                 body=body,
                 user_id=owner,
                 project_store=project_store,
-                warn_on_mismatch=False,
             )
         except OmnigentError as exc:
             if exc.code == ErrorCode.NOT_FOUND:
