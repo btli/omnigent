@@ -520,9 +520,8 @@ def _render_workspace_prep_command(
             "helpers=(subprocess.run(['git','config','--global','--get-all',"
             f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines() "
             "if wired is True else []); "
-            f"verified=(bool(token) and (wired is False or "
-            f"(wired is True and helpers=={expected_helpers!r}))); "
-            "sys.exit(0 if verified else 1)"
+            f"verified=(bool(token) and wired is True and helpers=={expected_helpers!r}); "
+            "sys.exit(10 if bool(token) and wired is False else 0 if verified else 1)"
         )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
@@ -545,9 +544,17 @@ def _render_workspace_prep_command(
         script += (
             "wire_credentials() {\n"
             "  credential_config=$(mktemp)\n"
-            '  export GIT_CONFIG_GLOBAL="$credential_config"\n'
-            f"  PYTHONSAFEPATH=1 PYTHONNOUSERSITE=1 PYTHONPATH= "
-            f"python3 -c {shlex.quote(wire)} || exit 1\n"
+            "  wire_rc=0\n"
+            f'  GIT_CONFIG_GLOBAL="$credential_config" PYTHONSAFEPATH=1 '
+            f"PYTHONNOUSERSITE=1 PYTHONPATH= python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
+            '  if [ "$wire_rc" -eq 0 ]; then\n'
+            '    export GIT_CONFIG_GLOBAL="$credential_config"\n'
+            '  elif [ "$wire_rc" -eq 10 ]; then\n'
+            '    rm -f -- "$credential_config"\n'
+            "    credential_config=''\n"
+            "  else\n"
+            '    exit "$wire_rc"\n'
+            "  fi\n"
             "}\n"
         )
         # Replacing an empty reserved directory is atomic; a writer that adds
@@ -601,13 +608,7 @@ def _render_workspace_prep_command(
                 f"   ! {{ [ -e {gitfile} ] && ( unset GIT_DIR GIT_WORK_TREE; "
                 f"target_dir=$(cd -P -- {target} && pwd) || exit 1; "
                 f"git_dir=$(git -C {target} rev-parse --absolute-git-dir 2>/dev/null) || exit 1; "
-                'case "$git_dir" in "$target_dir"/*) ;; *) '
-                'if [ -f "$git_dir/gitdir" ]; then '
-                'awk -v target="$target_dir/.git" '
-                "'END { exit (NR == 1 && $0 == target ? 0 : 1) }' "
-                '"$git_dir/gitdir" || exit 1; '
-                f"elif git -C {target} config --local --get core.worktree >/dev/null 2>&1; "
-                'then exit 1; else [ "$?" -eq 1 ] || exit 1; fi;; esac; '
+                'case "$git_dir" in "$target_dir"/*) ;; *) exit 1;; esac; '
                 f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
                 '[ -z "$prefix" ] ); }; then\n'
             )

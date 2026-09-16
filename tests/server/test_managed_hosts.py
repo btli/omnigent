@@ -3332,6 +3332,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
 
     monkeypatch.setattr(fake, "start_host", _start)
     failure_messages = {
+        "gitfile": "has no Git checkout and is not an empty directory; refusing to overwrite it",
         "non_repo": "has no Git checkout and is not an empty directory; refusing to overwrite it",
         "clone_failure": "clone failed",
         "unowned_tmp": "is not owned by workspace prep; refusing to remove it",
@@ -3384,7 +3385,7 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             assert (clone_dir / "tracked.txt").read_text() == "cloned\n"
             assert not (clone_dir / "partial-clone.txt").exists()
             assert not temporary.exists()
-    elif workspace_state in {"persistent", "gitfile"}:
+    elif workspace_state == "persistent":
         assert credential_calls == []
         assert clone_calls == []
         assert probe_calls == [git_dir_probe, checkout_probe]
@@ -3393,8 +3394,19 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert _git("status", "--porcelain") == before_status
         assert index_path.read_bytes() == before_index
         assert config_path.read_bytes() == before_config
-        if workspace_state == "gitfile":
-            assert (clone_dir / ".git").read_bytes() == before_gitfile
+        assert (clone_dir / "staged.txt").read_text() == "staged change\n"
+        assert (clone_dir / "unstaged.txt").read_text() == "unstaged change\n"
+        assert (clone_dir / "untracked.txt").read_text() == "keep me\n"
+    elif workspace_state == "gitfile":
+        assert credential_calls == []
+        assert clone_calls == []
+        assert probe_calls == [git_dir_probe]
+        assert _git("branch", "--show-current") == before_branch == "local-work\n"
+        assert _git("rev-parse", "HEAD") == before_head
+        assert _git("status", "--porcelain") == before_status
+        assert index_path.read_bytes() == before_index
+        assert config_path.read_bytes() == before_config
+        assert (clone_dir / ".git").read_bytes() == before_gitfile
         assert (clone_dir / "staged.txt").read_text() == "staged change\n"
         assert (clone_dir / "unstaged.txt").read_text() == "unstaged change\n"
         assert (clone_dir / "untracked.txt").read_text() == "keep me\n"

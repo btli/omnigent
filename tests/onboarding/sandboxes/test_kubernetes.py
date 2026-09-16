@@ -206,6 +206,8 @@ if sys.argv[1:2] == ["-c"]:
             "configure=g.configure_clone_credentials; "
             "g.configure_clone_credentials=lambda *args:configure(*args) and 1; "
         )
+    elif mutation == "disconnected_broker":
+        prefix += "g.configure_clone_credentials=lambda *_args:False; "
     os.execv(sys.executable, [sys.executable, "-c", prefix + sys.argv[2]])
 with Path(os.environ["HELPER_ARGV_LOG"]).open("a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -266,6 +268,22 @@ raise SystemExit(128)
     fake_git.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
+    if wire_mutation == "disconnected_broker":
+        fallback_log = tmp_path / "fallback-used"
+        (home / ".gitconfig").write_text(
+            json.dumps(
+                [
+                    "--add",
+                    "credential.https://github.com.helper",
+                    '!f() { [ "$1" = get ] || return 0; '
+                    '[ -n "$GIT_TOKEN" ] || return 1; '
+                    'printf used > "$FALLBACK_LOG"; }; f',
+                ]
+            )
+            + "\n"
+        )
+        monkeypatch.setenv("FALLBACK_LOG", str(fallback_log))
+        monkeypatch.setenv("GIT_TOKEN", "shared-token-sentinel")
     workspace = home / "workspace"
     monkeypatch.setenv("ARGV_LOG", str(argv_log))
     monkeypatch.setenv("HELPER_ARGV_LOG", str(helper_argv_log))
@@ -392,6 +410,19 @@ def test_empty_launch_token_aborts_before_clone(
     assert not any(call and call[0] == "clone" for call in argv)
 
 
+def test_disconnected_broker_keeps_ambient_git_token_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disconnected broker leaves the image's shared Git helper active."""
+    result, argv, paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, wire_mutation="disconnected_broker"
+    )
+    assert result.returncode != 0
+    assert any(call and call[0] == "clone" for call in argv)
+    assert paths == []
+    assert (tmp_path / "fallback-used").read_text() == "used"
+
+
 def test_credential_python_ignores_workspace_package_shadow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -488,8 +519,8 @@ def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
     [
         ("git_directory", "preserve"),
         ("gitfile", "preserve"),
-        ("real_worktree", "preserve"),
-        ("separate_git_dir", "preserve"),
+        ("real_worktree", "refuse"),
+        ("separate_git_dir", "refuse"),
         ("symlink_checkout", "preserve"),
         ("missing_head", "refuse"),
         ("ancestor_checkout", "clone"),
@@ -499,6 +530,7 @@ def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
         ("plain_empty", "clone"),
         ("bare", "refuse"),
         ("ancestor_core_worktree", "clone"),
+        ("gitfile_to_ancestor_core_worktree", "refuse"),
         ("gitfile_to_ancestor", "refuse"),
         ("ambient_work_tree_malformed", "refuse"),
     ],
@@ -513,7 +545,12 @@ def test_workspace_prep_classifies_checkout_at_target(
     monkeypatch.delenv("GIT_DIR", raising=False)
     monkeypatch.delenv("GIT_WORK_TREE", raising=False)
     workspace = tmp_path / "workspace"
-    if shape in {"ancestor_checkout", "ancestor_core_worktree", "gitfile_to_ancestor"}:
+    if shape in {
+        "ancestor_checkout",
+        "ancestor_core_worktree",
+        "gitfile_to_ancestor",
+        "gitfile_to_ancestor_core_worktree",
+    }:
         ancestor = tmp_path / "ancestor"
         subprocess.run(["git", "init", "-q", str(ancestor)], check=True)
         workspace = ancestor / "workspace"
@@ -523,7 +560,7 @@ def test_workspace_prep_classifies_checkout_at_target(
         subprocess.run(["git", "init", "-q", str(target)], check=True)
     elif shape == "gitfile":
         subprocess.run(["git", "init", "-q", str(target)], check=True)
-        separate_git_dir = tmp_path / "separate.git"
+        separate_git_dir = target / ".git-data"
         (target / ".git").rename(separate_git_dir)
         (target / ".git").write_text(f"gitdir: {separate_git_dir}\n")
     elif shape == "real_worktree":
@@ -565,12 +602,20 @@ def test_workspace_prep_classifies_checkout_at_target(
         subprocess.run(["git", "init", "-q", str(target)], check=True)
         (target / ".git" / "HEAD").unlink()
         (target / "keep.txt").write_text("preserve me\n")
-    elif shape == "gitfile_to_ancestor":
+    elif shape in {"gitfile_to_ancestor", "gitfile_to_ancestor_core_worktree"}:
         target.mkdir(parents=True)
-        subprocess.run(
-            ["git", "-C", str(tmp_path / "ancestor"), "config", "core.worktree", str(target)],
-            check=True,
-        )
+        if shape == "gitfile_to_ancestor_core_worktree":
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(tmp_path / "ancestor"),
+                    "config",
+                    "core.worktree",
+                    str(target),
+                ],
+                check=True,
+            )
         (target / ".git").write_text(f"gitdir: {tmp_path / 'ancestor' / '.git'}\n")
         (target / "keep.txt").write_text("preserve me\n")
     elif shape in {"ancestor_checkout", "plain_empty", "ancestor_core_worktree"}:
