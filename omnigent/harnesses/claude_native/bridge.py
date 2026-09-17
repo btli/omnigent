@@ -78,6 +78,8 @@ from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
+CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
@@ -1958,6 +1960,19 @@ def build_hook_settings(
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
     command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
+    framework_context_parts = [
+        python,
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.hook",
+        "framework-context",
+        "--bridge-dir",
+        str(bridge_dir),
+    ]
+    framework_context_hook = {
+        "type": "command",
+        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+    }
     session_start_hook = {
         "type": "command",
         "command": command,
@@ -1985,7 +2000,7 @@ def build_hook_settings(
         # (web-UI message via tmux send-keys, or direct keystrokes
         # into the embedded terminal). The transcript forwarder
         # translates it into ``session.status: running``.
-        "UserPromptSubmit": [{"hooks": [hook]}],
+        "UserPromptSubmit": [{"hooks": [hook, framework_context_hook]}],
         # ``TaskCreated`` fires when Claude creates a new native task
         # (shown with ``□`` in the TUI). The payload carries ``task_id``
         # and ``task_subject``; the forwarder converts all current tasks
@@ -4668,6 +4683,7 @@ def post_tools_changed(
     bridge_dir: Path,
     *,
     timeout_s: float = _TOOLS_CHANGED_READY_TIMEOUT_S,
+    cancelled: threading.Event | None = None,
 ) -> None:
     """
     Notify Claude Code that the MCP tool list changed.
@@ -4679,12 +4695,13 @@ def post_tools_changed(
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait for the bridge HTTP control
         endpoint to publish itself, e.g. ``30.0``.
+    :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
         be reached, or rejects the notification.
     """
     try:
-        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s, cancelled=cancelled)
     except OSError as exc:
         # Reading the advertisement can fail for reasons other than the file
         # being absent — fd exhaustion is the one seen in the wild. Callers
@@ -8108,22 +8125,30 @@ def _summary_text_from_blocks(content: object) -> str:
     return "\n".join(parts)
 
 
-def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> _JsonObject:
+def _wait_for_server_info(
+    bridge_dir: Path, *, timeout_s: float, cancelled: threading.Event | None = None
+) -> _JsonObject:
     """
     Wait for the bridge control HTTP endpoint file.
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
+    :param cancelled: Stops polling when the caller no longer needs the endpoint.
     :returns: Parsed server-info JSON object.
     :raises RuntimeError: If the server file never appears.
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _SERVER_FILE
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
         if isinstance(payload, dict) and payload.get("url") and payload.get("token"):
             return payload
-        time.sleep(0.05)
+        if cancelled is None:
+            time.sleep(0.05)
+        else:
+            cancelled.wait(0.05)
     raise RuntimeError(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."

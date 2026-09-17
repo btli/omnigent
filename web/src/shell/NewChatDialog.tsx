@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -19,6 +20,7 @@ import {
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { buildFusionSections } from "@/components/composer/fusionSections";
 import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   codexCreateApprovalOptions,
@@ -264,9 +266,14 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import {
+  currentFusionCombo,
+  fusionModelLabel,
+  fusionOption,
+  isFusionModelUid,
+} from "@/lib/devinFusion";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
-  useConversations,
   useProjectConfig,
   useProjects,
   moveConversationToProject,
@@ -2196,13 +2203,8 @@ export function NewChatLandingScreen() {
     storedProjectConfig,
   ]);
 
-  // Pin the configured project agent into discovery so the recency-bounded
-  // session scan (or its same-name dedup) can't drop or id-swap it out of
-  // the picker — the config must seed the agent the project actually pinned.
-  // agentsArePlaceholder: catalog-only rows served while the sessions
-  // discovery scan is still in flight — render them (harnesses must not wait
-  // for a slow scan), but never resolve a stored agent id against them: a
-  // scan-discovered agent may still be on its way.
+  // Preserve a configured agent through name deduplication when it is in the
+  // catalog or first 30 Mine sessions. Templates render while Mine is loading.
   const {
     data: agents,
     isLoading: agentsLoading,
@@ -2223,7 +2225,7 @@ export function NewChatLandingScreen() {
   // Omnigent sessions can pull in their existing local CLI history. Same query
   // key ChatPage already holds, so this reuses the cache. Wait for data before
   // deciding so the button doesn't flash for returning users.
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const hasNoSessions =
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
@@ -3104,11 +3106,8 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
-  // The project's configured agent could not be resolved: the catalog, the
-  // session scan, AND the pinned direct lookup all came up empty (deleted
-  // agent, or one the caller can't read). Never substitute another agent for
-  // it — the composer surfaces this state ("Agent unavailable" chip, blocked
-  // submit) until the user explicitly picks an agent instead.
+  // A configured agent absent from templates and the first 30 Mine sessions
+  // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
     projectParam !== "" &&
     prefillConfig?.agentId != null &&
@@ -3516,6 +3515,20 @@ export function NewChatLandingScreen() {
       rememberPickerOptions(selectedNativeHarness, { routing: "on", model: "", effort: "" });
       return;
     }
+    // Picking the Fusion family lands on its default combo id, which the Lead /
+    // Effort / Sidekick selectors then refine.
+    const fusionDescriptor = fusionOption(pickerModelOptions)?.fusion;
+    if (fusionDescriptor !== undefined && model === fusionOption(pickerModelOptions)?.id) {
+      setPickedModel(fusionDescriptor.default);
+      setPickedEffort("");
+      setCostControlMode(null);
+      rememberPickerOptions(selectedNativeHarness, {
+        model: fusionDescriptor.default,
+        effort: "",
+        routing: "off",
+      });
+      return;
+    }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
     const effort =
       selectedNativeHarness === "codex-native" &&
@@ -3534,6 +3547,27 @@ export function NewChatLandingScreen() {
     if (!selectedNativeHarness) return;
     setPickedEffort(effort);
     rememberPickerOptions(selectedNativeHarness, { effort });
+  };
+  // Devin Fusion: the composed `fusion-…` variant id IS the model, so it lands
+  // in pickedModel with no separate effort (the lead effort is baked in).
+  const pickerFusion = fusionOption(pickerModelOptions)?.fusion;
+  // Fusion is active when the stored model is a fusion id, or when Fusion is the
+  // catalog default and nothing is explicitly picked yet.
+  const pickerFusionIsDefault = fusionOption(pickerModelOptions)?.isDefault === true;
+  const fusionSelected =
+    pickerFusion !== undefined &&
+    (isFusionModelUid(pickedModel) || (pickedModel === "" && pickerFusionIsDefault));
+  // The combo id the selectors edit: the stored fusion id, else the default.
+  const fusionModelUid = isFusionModelUid(pickedModel)
+    ? pickedModel
+    : (pickerFusion?.default ?? "");
+  const selectFusionModel = (modelUid: string) => {
+    if (!selectedNativeHarness) return;
+    userPickedModelRef.current = true;
+    setPickedModel(modelUid);
+    setPickedEffort("");
+    setCostControlMode(null);
+    rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
@@ -3613,10 +3647,20 @@ export function NewChatLandingScreen() {
                         label: visibleModelLabel(nativeModelLabel(option)),
                         checked:
                           !routingOn &&
-                          (pickedModel === option.id ||
-                            (pickedModel === "" && option.isDefault === true)),
-                        onSelect: () =>
-                          selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                          (option.fusion !== undefined
+                            ? isFusionModelUid(pickedModel) ||
+                              (pickedModel === "" && option.isDefault === true)
+                            : pickedModel === option.id ||
+                              (pickedModel === "" && option.isDefault === true)),
+                        // The Fusion row always opens its Lead/Sidekick selectors,
+                        // even when Fusion is the catalog default (routing it
+                        // through MODEL_SELECT_DEFAULT would hide them).
+                        onSelect: option.fusion
+                          ? () => selectFusionModel(option.fusion!.default)
+                          : () =>
+                              selectPickerModel(
+                                option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
+                              ),
                         testId: `new-chat-landing-agent-model-${option.id}`,
                         title: nativeModelLabel(option),
                         className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
@@ -3639,6 +3683,16 @@ export function NewChatLandingScreen() {
                     testId: `new-chat-landing-agent-effort-${option.value}`,
                   })),
                 }
+              : undefined
+          }
+          extra={
+            pickerFusion !== undefined && fusionSelected && !routingOn
+              ? buildFusionSections({
+                  descriptor: pickerFusion,
+                  modelUid: fusionModelUid,
+                  testIdPrefix: "new-chat-landing-agent",
+                  onChange: selectFusionModel,
+                })
               : undefined
           }
         />
@@ -3677,8 +3731,16 @@ export function NewChatLandingScreen() {
               : native.iconKind === "devin"
                 ? devinModelOptions
                 : [];
+      const savedFusion = fusionOption(catalog)?.fusion;
       const model = catalog.find((option) => option.id === saved.model);
-      const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
+      const label = visibleModelLabel(
+        savedFusion !== undefined && isFusionModelUid(saved.model)
+          ? // A fusion id isn't a catalog row id, so label it from the combo.
+            fusionModelLabel(savedFusion, saved.model ?? "")
+          : model
+            ? nativeModelLabel(model)
+            : defaultModelLabel(catalog),
+      );
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
@@ -3723,16 +3785,9 @@ export function NewChatLandingScreen() {
     else if (supportsDevinPermission) setDevinPermissionMode(mode);
     rememberPickerOptions(selectedNativeHarness, { mode });
   };
-  // Reset per-agent-instance run-config that must not carry across an agent
-  // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
-  // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
-  // is instance-scoped). Clear routing too so a non-routable agent cannot inherit it.
-  //
-  // Only reset on an ACTUAL agent change — not the initial resolution (null →
-  // first id, or a persisted/draft pick resolving on mount), which would wipe a
-  // costControlMode/bypass restored from the landing draft.
+  // Clear shared state on agent changes; the harness seed restores its own
+  // saved options. Initial agent resolution must preserve the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
-  const suppressBypassSeedRef = useRef(false);
   // Tracks an explicit model pick the user committed in this composer visit
   // (via the model picker). Once set, an async project-config arrival or
   // cache refresh must not reseed the project default over the user's choice;
@@ -3741,9 +3796,7 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
-    suppressBypassSeedRef.current =
-      prev !== undefined && prev !== null && prev !== effectiveAgentId;
-    if (!suppressBypassSeedRef.current) return;
+    if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
@@ -3857,9 +3910,7 @@ export function NewChatLandingScreen() {
       );
     } else if (supportsApprovalMode) {
       setBypassSandbox(
-        (!suppressBypassSeedRef.current ||
-          editedOptions.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) &&
-          selectedNativeHarness === "codex-native" &&
+        selectedNativeHarness === "codex-native" &&
           stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
       );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
@@ -4078,10 +4129,8 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — the narrow set
-  // the health poll needs to check for live directory conflicts. Much
-  // smaller than all 200 directorySessions (only host-matched + workspace
-  // rows), so registering them into the /health poll is cheap.
+  // Only register loaded owned sessions on the selected host with a workspace
+  // for live directory-conflict checks.
   const conflictCandidates = useMemo(
     () =>
       (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
@@ -5004,6 +5053,15 @@ export function NewChatLandingScreen() {
       // Normalized create-time model / effort — shared by the optimistic seed
       // and the POST body so the temp composer shows exactly what the create
       // request pins. Never pinned alongside routing.
+      // A stored Fusion id can go stale (host switch, or a restored draft after
+      // the combo was retired). The controls display it through
+      // `currentFusionCombo` (which falls back to a real combo), so resolve the
+      // SAME way here — otherwise Create would send a combo Devin no longer
+      // offers while the picker showed a different one.
+      const submittedModel =
+        fusionSelected && pickerFusion !== undefined
+          ? currentFusionCombo(pickerFusion, fusionModelUid).modelUid
+          : pickedModel;
       const normalizedModelOverride =
         !smartRoutingHarnessSelected &&
         !routingOwnsModel &&
@@ -5014,8 +5072,8 @@ export function NewChatLandingScreen() {
         (agentSupportsModelPicker ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native") &&
-        pickedModel
-          ? pickedModel
+        submittedModel
+          ? submittedModel
           : null;
       const normalizedReasoningEffort =
         !smartRoutingHarnessSelected &&
@@ -5387,7 +5445,6 @@ export function NewChatLandingScreen() {
       if (submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
-      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
 
       // `localConv` is set only when a real agent id was resolved up front, so
       // it's safe to POST the first message with it.
