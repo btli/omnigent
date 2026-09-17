@@ -661,7 +661,7 @@ async def test_fire_missing_project_runs_unfiled_and_conditionally_self_heals_ta
 
 @pytest.mark.asyncio
 async def test_fire_stamps_labels_while_self_healing_missing_project() -> None:
-    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
 
     project_id = "a" * 32
     task = _task(project_id=project_id)
