@@ -21,6 +21,7 @@ branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 # btli open+draft PRs — force-included so a compose never drops one (drafts are
 # not covered by the open-PR stream; ready PRs are pinned redundantly on purpose
 # so nothing is left out of a staging build). Remove each once it lands upstream.
+7671  # draft feat/hindsight-credential-file-ref (host-file memory key; refs #7670)
 7280  # draft feat/agent-spec-icon (per-agent icons; upstream #7280, refs #7277)
 6856  # draft fix/background-battery-drain-main
 6788  # open  fix/agent-sandbox-wake-workspace
