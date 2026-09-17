@@ -131,24 +131,24 @@ def test_unicode_and_non_dated_names_never_enter_the_delete_plan():
     assert gh.calls == []
 
 
-def test_collect_pairs_refs_and_attaches_releases():
+def test_collect_tag_only_new_pin_and_attaches_release():
     pins = prune.collect(
         tags=["nightly-20260810", "v0.9.0.dev20260810", "production-latest"],
-        branches=["nightly-20260810", "main", "v0.9.0.dev20260810"],
+        branches=["main", "v0.9.0.dev20260810"],
         releases=[{"id": 7, "tag_name": "nightly-20260810"}],
     )
     by_name = {p.name: p for p in pins}
     assert set(by_name) == {"nightly-20260810", "v0.9.0.dev20260810"}
 
     pin = by_name["nightly-20260810"]
-    assert (pin.has_tag, pin.has_branch, pin.release_ids) == (True, True, (7,))
+    assert (pin.has_tag, pin.has_branch, pin.release_ids) == (True, False, (7,))
 
     # A dev tag has no branch namespace: a same-named branch is not its pin.
     dev = by_name["v0.9.0.dev20260810"]
     assert (dev.has_tag, dev.has_branch, dev.release_ids) == (True, False, ())
 
 
-def test_collect_sweeps_a_half_pin_branch():
+def test_collect_sweeps_a_legacy_branch_without_tag():
     pins = prune.collect(tags=[], branches=["nightly-20260810"], releases=[])
     assert len(pins) == 1
     assert pins[0].is_half
@@ -256,8 +256,7 @@ def test_deletes_branch_then_release_then_tag():
     assert [p.name for p in pruned.delete] == ["nightly-20260810"]
     gh = FakeGh()
     prune.execute(pruned, gh)
-    # stage.py's pin_name() hard-errors on a branch without its tag but
-    # tolerates a tag without its branch, so the branch must go first.
+    # Pre-v0.15.0 same-name branches remain eligible for cleanup.
     assert gh.calls == ["branch:nightly-20260810", "release:42", "tag:nightly-20260810"]
 
 

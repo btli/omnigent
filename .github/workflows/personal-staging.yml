@@ -2,9 +2,10 @@
 #
 # Composes fork main + fresh upstream main + every open btli PR (sequential merges, conflicts
 # skipped and reported) onto fork branch `staging`, pins an immutable
-# nightly-YYYYMMDD branch + tag and a PEP 440 vX.Y.Z.devYYYYMMDD tag, builds
+# nightly-YYYYMMDD tag and a PEP 440 vX.Y.Z.devYYYYMMDD tag, builds
 # Android debug APK + unsigned release AAB from that commit, and publishes a
 # prerelease (plus a floating `nightly-latest` for a stable download URL).
+# Same-name compatibility branches were removed in v0.15.0.
 #
 # Trust boundary: jobs that execute third-party code (the test suite's dev
 # deps in test-composer, merged PR code in android-build) run secretless with

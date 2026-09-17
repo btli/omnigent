@@ -6,9 +6,9 @@ Builds branch ``staging`` = fork main + fresh upstream main + every open btli PR
 PRs are skipped and reported — but an open PR whose merge conflicts gets
 one rebase rescue onto upstream main first, and a clean rescue is pushed
 back to the PR's fork branch so the PR stays current). The nightly mode
-then pins an immutable ``nightly-YYYYMMDD`` tag, a same-name compatibility
-branch through v0.11.x,
-and a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag at the same commit;
+then pins an immutable ``nightly-YYYYMMDD`` tag and a PEP 440
+``vX.Y.Z.devYYYYMMDD`` tag at the same commit; same-name compatibility
+branches were removed in v0.15.0.
 ``--staging-only`` (the hourly mode) pushes only
 ``staging`` and skips the push entirely when the composition is unchanged.
 The refs ever pushed are ``staging``, the ``nightly-*`` pin, the dev tag,
@@ -910,30 +910,13 @@ def push_causes(
 def pin_name(
     cwd: str | Path, fork: str, datestamp: str, sha: str, ring: Ring = STAGING
 ) -> tuple[str, bool]:
-    """Allocate a dual-namespace pin, failing closed on incomplete pairs."""
+    """Allocate an immutable dated tag name."""
     n = 0
     while True:
         cand = f"{ring.pin_prefix}{datestamp}" + (f"-rerun{n}" if n else "")
-        branch_sha = remote_ref(cwd, fork, f"refs/heads/{cand}")
         tag_sha = remote_ref(cwd, fork, f"refs/tags/{cand}")
-        if not branch_sha and not tag_sha:
+        if not tag_sha:
             return cand, True
-        if branch_sha and not tag_sha:
-            raise StageError(
-                f"pin branch {cand} points at {branch_sha}, but its tag is absent; "
-                "refusing to reuse the dated name"
-            )
-        if tag_sha and not branch_sha:
-            if tag_sha != sha:
-                raise StageError(
-                    f"pin tag {cand} points at {tag_sha}, expected {sha}, "
-                    "and its compatibility branch is absent"
-                )
-            return cand, False
-        if branch_sha != tag_sha:
-            raise StageError(
-                f"pin branch {cand} points at {branch_sha}, but tag points at {tag_sha}"
-            )
         if tag_sha == sha:
             return cand, False
         n += 1
@@ -1221,7 +1204,6 @@ def stage(
 
     dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
     name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
-    pin_branch_ref = f"refs/heads/{name}"
     pin_tag_ref = f"refs/tags/{name}"
 
     # One atomic push for every ref: a partial failure can't leave the fork
@@ -1233,13 +1215,10 @@ def stage(
     if expected_staging != staging_sha:
         refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
         leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
-    # Dated compatibility branches are removed in v0.12.0.
+    # Same-name compatibility branches were removed in v0.15.0.
     if created:
-        refspecs += [f"{staging_sha}:{pin_branch_ref}", f"{staging_sha}:{pin_tag_ref}"]
-        leases += [
-            f"--force-with-lease={pin_branch_ref}:",
-            f"--force-with-lease={pin_tag_ref}:",
-        ]
+        refspecs.append(f"{staging_sha}:{pin_tag_ref}")
+        leases.append(f"--force-with-lease={pin_tag_ref}:")
     # The dev tag floats within the day: a rerun repoints it (fork-local tag,
     # nothing downstream pins to it mid-day). Rings without one push nothing.
     if dev_tag:
@@ -1256,7 +1235,6 @@ def stage(
         "date": datestamp,
         **base_fields,
         "staging_sha": staging_sha,
-        "branch": name,
         "tag": name,
         "pin_ref": pin_tag_ref,
         "audit": [
@@ -1265,7 +1243,7 @@ def stage(
                 "expected": staging_sha,
                 "observed": remote_ref(cwd, fork, ref),
             }
-            for ref in (pin_tag_ref, pin_branch_ref)
+            for ref in [pin_tag_ref]
         ],
         **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
