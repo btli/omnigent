@@ -1168,7 +1168,7 @@ def _ensure_default_acp_agents(
     # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
     # (already a valid slug), not the display label. A row a configured agent already
     # claims is skipped: both seed the same ``builtin_agent_id``.
-    for key in ACP_CLI_HARNESSES:
+    for key, harness in ACP_CLI_HARNESSES.items():
         if key in shadowed:
             continue
         _ensure_builtin_agent(
@@ -1176,9 +1176,7 @@ def _ensure_default_acp_agents(
             artifact_store,
             agent_cache,
             name=key,
-            bundle_bytes=_build_acp_bundle(
-                harness=key, name=key, icon=ACP_CLI_HARNESSES[key].icon
-            ),
+            bundle_bytes=_build_acp_bundle(harness=key, name=key, icon=harness.icon),
         )
 
 
