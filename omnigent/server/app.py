@@ -855,7 +855,7 @@ _ACP_AGENT_PROMPT = (
 )
 
 
-def _build_acp_bundle(*, harness: str, name: str) -> bytes:
+def _build_acp_bundle(*, harness: str, name: str, icon: str | None = None) -> bytes:
     """
     Materialize a one-file ACP picker agent and tar it.
 
@@ -868,6 +868,7 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
     :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
     :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
         slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
+    :param icon: Optional agent icon: an emoji grapheme or bundle-relative image path.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
     import tempfile
@@ -883,6 +884,8 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
         "executor": {"type": "omnigent", "config": {"harness": harness}},
         "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
     }
+    if icon:
+        raw["icon"] = icon
     with tempfile.TemporaryDirectory() as tmpdir:
         source = Path(tmpdir) / "src"
         source.mkdir()
@@ -949,7 +952,9 @@ def _ensure_default_acp_agents(
             artifact_store,
             agent_cache,
             name=agent.slug,
-            bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
+            bundle_bytes=_build_acp_bundle(
+                harness=f"acp:{agent.slug}", name=agent.slug, icon=agent.icon
+            ),
         )
 
     # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
@@ -964,7 +969,9 @@ def _ensure_default_acp_agents(
             artifact_store,
             agent_cache,
             name=key,
-            bundle_bytes=_build_acp_bundle(harness=key, name=key),
+            bundle_bytes=_build_acp_bundle(
+                harness=key, name=key, icon=ACP_CLI_HARNESSES[key].icon
+            ),
         )
 
 
