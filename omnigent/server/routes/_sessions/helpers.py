@@ -27,7 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 import httpx
 from fastapi import (
@@ -787,6 +787,7 @@ def _stored_file_to_resource(
             "filename": stored.filename,
             "bytes": stored.bytes,
             "created_at": stored.created_at,
+            "source_metadata": stored.source_metadata,
         },
     }
 
@@ -1881,10 +1882,9 @@ def _resolve_harness_impl(
         # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
         # brain harness when the head declares none or can't be matched.
         if conv.sub_agent_name:
-            sub = next(
-                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
-                None,
-            )
+            from omnigent.runtime.workflow import _find_spec_by_name
+
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
         harness = (
@@ -4584,6 +4584,29 @@ def _require_codex_approval_mode_forward(
         )
 
 
+# Bound fallback assistant text while preserving multiline tracebacks and
+# runner-exit diagnostics within the limit.
+_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 4500
+
+
+def _failure_log_detail(error: ErrorDetail | None) -> str:
+    """Render a turn failure's reason for the log, bounded in length.
+
+    :param error: The failure's typed detail, or ``None`` when the publisher
+        attached none.
+    :returns: The reason, truncated with a dropped-character count when it
+        exceeds :data:`_FAILURE_LOG_DETAIL_MAX_CHARS`; ``"no detail"`` when
+        ``error`` is ``None`` or carries no message.
+    """
+    if error is None or not error.message.strip():
+        return "no detail"
+    message = error.message
+    if len(message) <= _FAILURE_LOG_DETAIL_MAX_CHARS:
+        return message
+    dropped = len(message) - _FAILURE_LOG_DETAIL_MAX_CHARS
+    return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4693,7 +4716,7 @@ def _publish_status(
             origin,
             failure_code,
             previous_status or "unknown",
-            error.message if error is not None else "no detail",
+            _failure_log_detail(error),
             extra=debug_event(
                 "session_turn_failed",
                 session_id=session_id,
@@ -6592,10 +6615,16 @@ async def _forward_session_change_to_runner_impl(
             timeout=timeout_s,
         )
     except (httpx.HTTPError, ConnectionError):
-        _logger.exception(
-            "Session-change forward failed for session=%r type=%r",
+        # Transport-level miss (runner asleep, tunnel still reconnecting). The
+        # persisted AP-side value stays authoritative and the runner re-reads it,
+        # so this is a recovered condition — WARNING, matching the non-2xx branch
+        # below rather than out-ranking it.
+        _logger.warning(
+            "Session-change forward did not reach the runner for session=%r type=%r; "
+            "the persisted value remains authoritative",
             session_id,
             event.get("type"),
+            exc_info=True,
             extra={"session_id": session_id},
         )
         return None

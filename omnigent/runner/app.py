@@ -46,7 +46,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import phase_scope, runner_primary_session_id
+from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -68,7 +68,11 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+from omnigent.inner.native_attachments import (
+    framework_notice_block,
+    has_unresolved_file_id,
+    resolve_file_id_block,
+)
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -535,6 +539,15 @@ _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 # the Databricks Apps ingress) can drop the long-lived HTTP connection.
 # Matches the AP-side ``_SESSION_STREAM_HEARTBEAT_INTERVAL_S``.
 _SESSION_STREAM_HEARTBEAT_S = 15.0
+
+# How long a required-terminal exit waits for the session's in-flight turn
+# stream to converge before releasing the harness subprocess. The harness
+# usually reports the failure that killed its pane (e.g. a prompt-readiness
+# timeout) on that very stream; releasing at once would close the client the
+# runner is reading and turn the report into a bare transport error. A pane
+# that died on its own leaves the harness parked on a readiness wait, so the
+# wait is bounded and the stream failure is then attributed to the exit.
+_TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
@@ -1363,6 +1376,20 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
+def _response_failed_payload(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> _JsonObject:
+    """Build a failure envelope with required error fields and a legacy mirror."""
+    failure_error = {**_normalize_turn_error(error), **error}
+    return {
+        "type": "response.failed",
+        "source": source,
+        "response": {"status": "failed", "error": failure_error},
+        "error": failure_error,
+    }
+
+
 def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
@@ -1382,10 +1409,7 @@ def _response_failed_event(
         so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
-    response = {"status": "failed", "error": error}
-    payload = json.dumps(
-        {"type": "response.failed", "source": source, "response": response, "error": error}
-    )
+    payload = json.dumps(_response_failed_payload(error, source=source))
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -1409,15 +1433,18 @@ async def _resolve_forwarded_message_content(
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
-        new_block = None
+        result = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            new_block = await resolve_file_id_block(
+            result = await resolve_file_id_block(
                 block, session_id=session_id, client=server_client
             )
-        if new_block is None:
+        if result is None:
             resolved.append(block)
         else:
+            new_block, notice = result
             resolved.append(new_block)
+            if notice is not None:
+                resolved.append(framework_notice_block(notice))
             changed = True
 
     return resolved if changed else content
@@ -1764,7 +1791,7 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return None
-    if entry.status == "launching":
+    if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
 
@@ -2005,31 +2032,48 @@ async def _recover_subagent_results_from_server(
         status = child.get("current_task_status")
         if not isinstance(child_id, str) or not isinstance(status, str):
             continue
-        if status not in _SUBAGENT_TERMINAL_STATUSES:
+        error = child.get("last_task_error")
+        interrupted = status == "in_progress" or (
+            status == "failed"
+            and isinstance(error, dict)
+            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+        )
+        if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
-        if (
-            get_subagent_work(child_id) is not None
-            or child_id in _drained_delivered_subagent_children
+        existing = get_subagent_work(child_id)
+        if (existing is not None and existing.status != "waiting") or (
+            child_id in _drained_delivered_subagent_children
         ):
             continue
         labels = child.get("labels")
         dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
-        if dispatch_id is None:
+        if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
         if status == "failed":
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
-        else:
+        elif not interrupted:
             output = await _fetch_latest_assistant_text(server_client, child_id)
-        entry = register_subagent_work(
+        # A forwarded completion or newer dispatch may arrive during the history read.
+        if (
+            get_subagent_work(child_id) is not existing
+            or (existing is not None and existing.status != "waiting")
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        entry = existing or register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
             work_id=dispatch_id,
         )
+        if interrupted:
+            # This dispatch already existed; a local launch timeout cannot judge it.
+            entry.status = "waiting"
+            continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
             schedule_wake(entry)
@@ -2226,6 +2270,7 @@ async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -2237,12 +2282,15 @@ async def run_subagent_launch_reaper(
     :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
+    :param reconcile_pending: Refresh recovered work awaiting remote completion.
     :returns: None.
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            if reconcile_pending is not None:
+                await reconcile_pending()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
@@ -2876,7 +2924,10 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
-    _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
+    _session_init_tasks: dict[
+        tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
+    ] = {}
+    _recovery_turn_ids: dict[str, set[str]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -3016,6 +3067,11 @@ def create_runner_app(
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
+    # Required-terminal exits whose handler released the session's harness
+    # subprocess. The release closes the httpx client an in-flight
+    # ``proxy_stream`` is reading, which surfaces there as a transport error;
+    # the stream's failure handler consumes the record to report the exit.
+    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -3026,6 +3082,7 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
@@ -3356,12 +3413,12 @@ def create_runner_app(
         runner log) and attaches the live pane snapshot as a ``Last captured
         terminal output:`` block, which the web UI renders as diagnostics.
         """
-        cause = str(exc).strip()
-        message = (
-            f"Harness stream connection error: {cause}"
-            if cause
-            else "Harness stream connection error."
-        )
+        # httpx raises several transport errors with no message at all
+        # (``ReadError()``), which left the whole diagnostic as the bare
+        # sentence. Fall back to the exception type so the message always names
+        # which transport failure ended the stream.
+        cause = str(exc).strip() or type(exc).__name__
+        message = f"Harness stream connection error: {cause}"
         pane = _live_terminal_pane_snapshot(conv_id)
         if pane:
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
@@ -3372,6 +3429,12 @@ def create_runner_app(
             return
 
         async def _release() -> None:
+            # Let a live turn stream converge first (bounded): the harness's own
+            # failure event may already be on the wire, and releasing now would
+            # sever the stream carrying it.
+            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            while session_id in _live_response_id and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
             try:
                 await process_manager.release(session_id)
             except Exception:
@@ -3413,6 +3476,12 @@ def create_runner_app(
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
+        # Record the exit before releasing the harness: the release severs any
+        # in-flight turn stream, whose failure handler then reports this exit
+        # instead of the transport error the severed socket raises.
+        error = _build_required_terminal_error(event)
+        _required_terminal_exit_errors[event.session_id] = error
+
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
@@ -3422,7 +3491,6 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        error = _build_required_terminal_error(event)
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
@@ -3847,6 +3915,11 @@ def create_runner_app(
             )
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
+        initial_turn_epoch = _turn_bind_epoch.get(session_id)
+        initial_native_activity = resource_registry.session_activity_epoch(session_id)
+        initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
+            session_id
+        )
 
         # Captured before init's first await: the legacy (no-envelope) context
         # load below probes the server's version over the network, so a reset
@@ -4039,8 +4112,11 @@ def create_runner_app(
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
         # A fresh queue can mean a fresh runner process rather than a fresh
-        # session: re-queue results the previous process never drained.
-        await _recover_undrained_subagent_results(session_id)
+        # session: re-queue results the previous process never drained. Start
+        # the durable server scan now, but overlap it with terminal creation;
+        # sys_read_inbox uses the same locked helper if a turn races the scan.
+        _deliver_retained_subagent_results(session_id)
+        _subagent_recovery_task = _start_subagent_recovery(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -4181,12 +4257,16 @@ def create_runner_app(
             elif harness_name == "codex-native":
 
                 async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
-                    needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    needs = (
+                        init_context.envelope is not None
+                        or await _codex_session_needs_runner_terminal(server_client, session_id)
+                    )
                     if not has_terminal:
                         inbound = await _codex_native_terminal_arrives_via_transfer(
                             server_client=server_client,
                             session_id=session_id,
                             resource_registry=resource_registry,
+                            session_labels=init_context.labels,
                         )
                         _logger.info(
                             "Codex terminal transfer-inbound check: session=%s "
@@ -4347,6 +4427,11 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        # Preserve the initialization contract: undrained child results are
+        # recovered before POST /sessions returns. The scan no longer delays
+        # native terminal registration because it ran concurrently above.
+        await asyncio.shield(_subagent_recovery_task)
+
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
         # indicates an incomplete turn that needs restarting.
@@ -4367,13 +4452,25 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        recovery_id = (
+            init_context.envelope.recovery_id
+            if init_context.envelope is not None
+            and init_context.envelope.resume_interrupted_turn
+            and not _suppress_recovery
+            else None
+        )
         history: list[_JsonObject]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
         else:
             history = await _load_history_as_input(session_id)
-        if history:
+        execution_seen = (
+            initially_active
+            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+        )
+        if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -4383,7 +4480,12 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and not _suppress_recovery and session_id not in _active_turns:
+            if (
+                needs_turn
+                and recovery_id is None
+                and not _suppress_recovery
+                and session_id not in _active_turns
+            ):
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4401,6 +4503,47 @@ def create_runner_app(
                     _background_tasks.discard,
                 )
                 _background_tasks.add(_turn_task)
+
+        if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
+            session_id, set()
+        ):
+            # Active execution, including a newer message, takes precedence over
+            # automatic continuation. Initialization alone cannot consume it.
+            if (
+                not execution_seen
+                and session_id not in _active_turns
+                and not resource_registry.session_turn_is_active(session_id)
+            ):
+                if is_native_harness(harness_name):
+                    _session_histories[session_id] = []
+                _begin_turn_slot(session_id)
+                _publish_turn_status(session_id, "running")
+                recovery_body: _JsonObject = {
+                    "agent_id": agent_id,
+                    "model": body.get("model", agent_id),
+                    "browser_renderer_available": False,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Your runner was interrupted while this task was active. "
+                                "Continue the existing task from its current state. "
+                                "Check any interrupted operation's outcome before repeating it."
+                            ),
+                        }
+                    ],
+                }
+                if not is_native_harness(harness_name):
+                    _session_histories.setdefault(session_id, []).append(
+                        {"type": "message", "role": "user", "content": recovery_body["content"]}
+                    )
+                recovery_task = asyncio.create_task(
+                    _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
+                )
+                _active_turns[session_id] = recovery_task
+                recovery_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(recovery_task)
+            _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
         return JSONResponse(
@@ -4441,10 +4584,15 @@ def create_runner_app(
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
             return await _initialize_session(body)
         sub_agent_name = body.get("sub_agent_name")
+        try:
+            envelope = parse_runner_session_init_envelope(body)
+        except ValueError:
+            return await _initialize_session(body)
         key = (
             session_id,
             agent_id,
             sub_agent_name if isinstance(sub_agent_name, str) else None,
+            envelope.recovery_id if envelope is not None else None,
         )
         task = _session_init_tasks.get(key)
         if task is None:
@@ -4604,6 +4752,7 @@ def create_runner_app(
                         session_id,
                         done_task.exception(),
                     )
+        await _cancel_subagent_recovery(session_id)
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -4614,8 +4763,10 @@ def create_runner_app(
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
+        _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
+        _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -5208,16 +5359,17 @@ def create_runner_app(
             if _deliver_subagent_completion(entry).delivered_now:
                 _schedule_subagent_wake(entry)
 
-    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+    async def _run_subagent_recovery(parent_id: str) -> None:
         """
         Re-queue terminal child results lost with a runner process restart.
 
         The parent inbox is a process-local queue, so a result queued before
         a restart but not yet drained would otherwise vanish. Runs once per
-        parent per process; a scan that fails on a server read is retried
-        before the next ``sys_read_inbox`` drain. The inbox is created here
-        when missing: after a reconnect the server can dispatch a pending
-        message before it re-initializes the session, and that turn's drain
+        parent per process; pending recovered work is refreshed by the periodic
+        sweep. A failed server read is retried before the next ``sys_read_inbox``
+        drain. The inbox is created here when missing: after a reconnect the
+        server can dispatch a pending message before it re-initializes the session,
+        and that turn's drain
         must still see the recovered results. Results acknowledged while this
         parent had no inbox here are handed over first, on every call.
 
@@ -5249,7 +5401,65 @@ def create_runner_app(
                 return
             _subagent_recovery_done.add(parent_id)
 
+    def _start_subagent_recovery(parent_id: str) -> asyncio.Task[None]:
+        """Return the session-owned single-flight restart recovery task."""
+        task = _subagent_recovery_tasks.get(parent_id)
+        if task is not None and not task.done():
+            return task
+        _subagent_recovery_tasks.pop(parent_id, None)
+        task = asyncio.create_task(
+            _run_subagent_recovery(parent_id),
+            name=f"subagent-recovery:{parent_id}",
+        )
+        _subagent_recovery_tasks[parent_id] = task
+        _background_tasks.add(task)
+
+        def _drop_completed_recovery(done: asyncio.Task[None]) -> None:
+            _background_tasks.discard(done)
+            if _subagent_recovery_tasks.get(parent_id) is done:
+                _subagent_recovery_tasks.pop(parent_id, None)
+
+        task.add_done_callback(_drop_completed_recovery)
+        return task
+
+    async def _cancel_subagent_recovery(parent_id: str) -> None:
+        """Stop recovery before deleting its session-local inbox and markers."""
+        task = _subagent_recovery_tasks.pop(parent_id, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - recovery failure must not block session deletion
+            _logger.warning(
+                "Sub-agent recovery failed while deleting session %s",
+                parent_id,
+                exc_info=True,
+                extra={"session_id": parent_id},
+            )
+
+    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+        """Await the session-owned single-flight restart recovery task."""
+        await asyncio.shield(_start_subagent_recovery(parent_id))
+
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
+
+    async def _reconcile_pending_subagent_results() -> None:
+        """Refresh only recovered work with no local execution or completion edge."""
+        parents = {
+            entry.parent_session_id
+            for entry in list(_subagent_work_by_child.values())
+            if entry.status == "waiting"
+        }
+        for parent_id in parents:
+            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+                continue
+            _subagent_recovery_done.discard(parent_id)
+            await _recover_undrained_subagent_results(parent_id)
+
+    app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
@@ -5287,6 +5497,8 @@ def create_runner_app(
         conv_id: str,
         status: str,
         error: Mapping[str, object] | None = None,
+        *,
+        source_error: Mapping[str, object] | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5310,6 +5522,14 @@ def create_runner_app(
         if error is not None:
             event["error"] = error
         if status == "failed":
+            source = source_error if source_error is not None else (error or {})
+            dimensions: dict[str, str] = {}
+            for key in ("code", "type", "status"):
+                value = source.get(key)
+                if (isinstance(value, int) and not isinstance(value, bool)) or (
+                    isinstance(value, str) and re.fullmatch(r"[\w.:-]{1,128}", value)
+                ):
+                    dimensions[f"source_{key}"] = str(value)
             # Canonical broken-turn signal: every failed turn shown in the UI
             # funnels through here, so log once at ERROR for the dashboard.
             _logger.error(
@@ -5317,7 +5537,12 @@ def create_runner_app(
                 conv_id,
                 harness,
                 error,
-                extra={"session_id": conv_id},
+                extra=debug_event(
+                    "runner_turn_failed",
+                    session_id=conv_id,
+                    harness=harness,
+                    **dimensions,
+                ),
             )
         _publish_event(conv_id, event)
 
@@ -6024,11 +6249,17 @@ def create_runner_app(
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
+            read_model_picker_values,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
+            stored_claude_catalog_rows,
+            stored_claude_picker_values,
         )
-        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+        from omnigent.models.claude_model_vocabulary import (
+            claude_model_command_arg,
+            picker_command_values,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -6043,19 +6274,32 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        # ``/model`` takes only this session's own picker vocabulary — its
-        # family aliases and its one custom slot. Typing a bare catalog id
-        # outside it leaves the pane on its old model while this handler
-        # reports success, so fail loud instead. Same translation the routed
-        # turn path and the executor apply.
+        # Translate through the pane's picker values, aliases, and custom slot.
+        # An unknown spelling must fail before any command reaches the terminal.
         env = read_model_env(bridge_dir) or None
-        model_arg = claude_model_command_arg(resolved_model, env)
+        cached_options = _claude_model_options_rows.get(conv_id)
+        if cached_options is not None:
+            picker_values = picker_command_values(cached_options[1])
+        else:
+            stored_rows = stored_claude_catalog_rows(claude_config)
+            if stored_rows is not None and not stored_rows:
+                # Discovery stored an authoritative empty catalog (every
+                # picker entry disabled): launch-recorded bridge values are
+                # stale vocabulary, so nothing is switchable.
+                picker_values: list[str] = []
+            else:
+                picker_values = read_model_picker_values(bridge_dir)
+                if not picker_values:
+                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
+        model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         if model_arg is None:
             _logger.warning(
-                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                "claude-native model change: %r has no spelling session=%s accepts "
+                "(pins=%s, picker=%s)",
                 resolved_model,
                 conv_id,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": conv_id},
             )
             return JSONResponse(
@@ -7105,7 +7349,9 @@ def create_runner_app(
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
             if not _suppress_status:
-                _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
+                _publish_turn_status(
+                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                )
         else:
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
@@ -7847,10 +8093,11 @@ def create_runner_app(
             superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
+            from threading import Event
+
+            cancelled = Event()
             try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, post_tools_changed, bridge_dir
-                )
+                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -7862,11 +8109,16 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+            finally:
+                # Cancelling an executor future does not stop its worker thread.
+                cancelled.set()
 
         if await_notify:
             await _notify_tools_changed()
         else:
-            _notify_task = asyncio.create_task(_notify_tools_changed())
+            _notify_task = asyncio.create_task(
+                _notify_tools_changed(), name=f"tools-changed:{session_id}"
+            )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
@@ -8494,6 +8746,9 @@ def create_runner_app(
                     },
                 )
 
+        # A required-terminal exit recorded before this turn belongs to an
+        # earlier stream; only exits observed from here on can end this one.
+        _required_terminal_exit_errors.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -8530,7 +8785,11 @@ def create_runner_app(
                         conv_id,
                         exc,
                         exc_info=True,
-                        extra={"session_id": conv_id},
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "runner_turn_spec_resolution_failed",
+                            "attributes": {"phase": "eager", "exception_type": type(exc).__name__},
+                        },
                     )
                     _eager_spec_error = (
                         type(exc).__name__,
@@ -8588,7 +8847,11 @@ def create_runner_app(
                     conv_id,
                     exc,
                     exc_info=True,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "runner_turn_spec_resolution_failed",
+                        "attributes": {"phase": "lazy", "exception_type": type(exc).__name__},
+                    },
                 )
                 return None, (
                     type(exc).__name__,
@@ -8616,13 +8879,7 @@ def create_runner_app(
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
-                _fail = {
-                    "type": "response.failed",
-                    "error": {
-                        "message": _err_msg,
-                        "type": _err_type,
-                    },
-                }
+                _fail = _response_failed_payload({"message": _err_msg, "type": _err_type})
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
                     conv_id,
@@ -8706,15 +8963,18 @@ def create_runner_app(
                             "harness rejected turn delivery for %s with status %d",
                             conv_id,
                             harness_resp.status_code,
-                            extra={"session_id": conv_id},
-                        )
-                        _fail_status = {
-                            "type": "response.failed",
-                            "source": "harness",
-                            "error": {
-                                "status": harness_resp.status_code,
+                            extra={
+                                "session_id": conv_id,
+                                "event_name": "harness_turn_rejected",
+                                "attributes": {
+                                    "harness": harness_name,
+                                    "http_status": harness_resp.status_code,
+                                },
                             },
-                        }
+                        )
+                        _fail_status = _response_failed_payload(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         _publish_event(
                             conv_id,
                             _fail_status,
@@ -8905,13 +9165,9 @@ def create_runner_app(
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
-                                            _fail = {
-                                                "type": "response.failed",
-                                                "error": {
-                                                    "message": _err_msg,
-                                                    "type": _err_type,
-                                                },
-                                            }
+                                            _fail = _response_failed_payload(
+                                                {"message": _err_msg, "type": _err_type}
+                                            )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
                                                 conv_id,
@@ -8971,6 +9227,9 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    effective_harness=_session_harness_name(
+                                                        conv_id
+                                                    ),
                                                 )
                                             )
                                         )
@@ -9116,41 +9375,60 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
-                _overflow_fail = {
-                    "type": "response.failed",
-                    "source": "llm",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                _overflow_fail = _response_failed_payload(_error, source="llm")
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.exception(
-                    "proxy stream connection error for %s: %s",
-                    conv_id,
-                    exc,
-                    extra={
-                        "session_id": conv_id,
-                        "event_name": "harness_stream_failed",
-                        "attributes": {
-                            "harness": harness_name,
-                            "response_id": _response_id,
+                _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
+                if _exit_error is not None:
+                    # The runner ended this stream itself: the session's required
+                    # terminal exited and its handler released the harness
+                    # subprocess, closing this client mid-read. Report the exit
+                    # and its pane diagnostics, not the transport symptom.
+                    _logger.warning(
+                        "harness stream for %s ended by required terminal exit: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_ended_by_terminal_exit",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
                         },
-                    },
-                )
-                _error = {
-                    "code": "connection_error",
-                    "message": _harness_stream_failure_message(conv_id, exc),
-                    "type": type(exc).__name__,
-                }
-                _http_fail = {
-                    "type": "response.failed",
-                    "source": "harness",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                    )
+                    # The status event's code is derived from ``type``.
+                    _error = {**_exit_error, "type": _exit_error["code"]}
+                else:
+                    # Name the type as well as the text: the messageless httpx
+                    # errors otherwise log a trailing colon and nothing, so one
+                    # signature covered every transport cause.
+                    _logger.exception(
+                        "proxy stream connection error for %s: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_failed",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
+                    )
+                    _error = {
+                        "code": "connection_error",
+                        "message": _harness_stream_failure_message(conv_id, exc),
+                        "type": type(exc).__name__,
+                    }
+                _http_fail = _response_failed_payload(_error, source="harness")
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="harness")
@@ -11464,7 +11742,7 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        if not rows:
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -11477,6 +11755,37 @@ def create_runner_app(
             time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
             rows,
         )
+        # Executor parity: a cold launch may have recorded no picker
+        # vocabulary (the store had no catalog yet), while routing decisions
+        # accept picks against THIS listing. Refresh the bridge snapshot so
+        # a routed turn's executor translates exactly the vocabulary served
+        # here — including an authoritative empty catalog, which clears
+        # stale launch values. Best-effort: the terminal may not exist yet.
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                bridge_dir_for_bridge_id,
+                record_model_vocabulary,
+            )
+            from omnigent.models.claude_model_vocabulary import picker_command_values
+
+            bridge_id = await _claude_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=session_id,
+            )
+            await asyncio.to_thread(
+                record_model_vocabulary,
+                bridge_dir_for_bridge_id(bridge_id),
+                launch_env=None,
+                launch_model=None,
+                picker_values=picker_command_values(rows),
+            )
+        except Exception:  # noqa: BLE001 — vocabulary refresh is advisory
+            _logger.debug(
+                "claude-native model options: bridge vocabulary refresh skipped for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")
@@ -11798,6 +12107,7 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -11825,6 +12135,7 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -12118,6 +12429,7 @@ def create_runner_app(
                         harness_client=None,
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
+                        effective_harness=_session_harness_name(session_id),
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -12775,10 +13087,25 @@ def _build_spawn_env_from_spec(
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
     harness = canonicalize_harness(harness) or harness
+    acp_default_model: str | None = None
+    if harness == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        acp_default_model = _acp_launch_model(spec)
+        validate_acp_model(spec, acp_default_model)
+        validate_acp_model(spec, model_override)
     effective_spec = spec
     if model_override is not None:
         executor = getattr(spec, "executor", None)
-        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+        if (
+            harness == "acp"
+            and dataclasses.is_dataclass(spec)
+            and dataclasses.is_dataclass(executor)
+        ):
+            effective_spec = dataclasses.replace(
+                spec, executor=dataclasses.replace(spec.executor, model=model_override)
+            )
+        elif hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
             copied_executor = cast(_ModelCopyValue, executor).model_copy(
                 update={"model": model_override}
             )
@@ -12825,6 +13152,9 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            # Reset uses the original default even when the process launched
+            # with a session override. Empty defers to the vendor's first model.
+            env["HARNESS_ACP_DEFAULT_MODEL"] = acp_default_model or ""
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness in ACP_CLI_HARNESSES:
