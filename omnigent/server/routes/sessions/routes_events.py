@@ -238,10 +238,17 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+from omnigent.telemetry.request_headers import (
+    INSTALLATION_ID_HEADER as _TEL_INSTALLATION_ID_HEADER,
+)
+from omnigent.telemetry.request_headers import (
+    parse_installation_id_header as _tel_parse_installation_id,
+)
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 from omnigent.util.session_lifecycle import (
     is_session_closed,
@@ -342,6 +349,7 @@ async def _recover_retry_session(
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
+    was_connected = runner_client is not None
     runner_relaunched = False
     terminal_ready_from_init = False
     if runner_client is None:
@@ -359,18 +367,19 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
-        terminal_ready_from_init = await _ensure_runner_session_initialized(
-            session_id,
-            conv,
-            runner_client,
-            conversation_store,
-            initializer=getattr(request.app.state, "runner_session_initializer", None),
-            suppress_recovery_turn=False,
-            require_success=True,
-        )
+    terminal_ready_from_init = await _ensure_runner_session_initialized(
+        session_id,
+        conv,
+        runner_client,
+        conversation_store,
+        initializer=getattr(request.app.state, "runner_session_initializer", None),
+        suppress_recovery_turn=was_connected,
+        require_success=True,
+    )
 
     if _is_native_terminal_session(conv):
-        if not terminal_ready_from_init:
+        # A cached init response cannot prove that a connected runner's pane still exists.
+        if was_connected or not terminal_ready_from_init:
             terminal_outcome = await _ensure_native_terminal_ready(
                 runner_client,
                 session_id,
@@ -1141,13 +1150,8 @@ def register_events_routes(
             # its (still-online) host via the normal message-dispatch
             # relaunch path below.
             try:
-                import hashlib as _hashlib
-
                 _srv_id = _get_installation_id()
-                _anon: str | None = None
-                if user_id is not None:
-                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+                _anon = _tel_anon_user_id(user_id, _srv_id)
                 _tel_emit(
                     _TelSessionStoppedEvent(
                         session_id=session_id,
@@ -1493,6 +1497,10 @@ def register_events_routes(
                     _TelTurnEndEvent(
                         installation_id=_get_installation_id(),
                         session_id=session_id,
+                        anon_user_id=_tel_anon_user_id(user_id, _get_installation_id()),
+                        host_installation_id=_tel_parse_installation_id(
+                            request.headers.get(_TEL_INSTALLATION_ID_HEADER)
+                        ),
                         status="completed" if status == "idle" else "failed",
                         latency_ms=None,
                         model=None,
@@ -1614,6 +1622,8 @@ def register_events_routes(
                 body,
                 conversation_store,
                 conv,
+                user_id,
+                _tel_parse_installation_id(request.headers.get(_TEL_INSTALLATION_ID_HEADER)),
             )
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:
@@ -2498,13 +2508,15 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
-        # Session file cleanup.
+        # Session file cleanup. delete_all_for_session returns only the blob
+        # keys that became orphaned — a blob still shared by a fork in another
+        # session is not returned, so the fork's attachment survives.
         if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await asyncio.to_thread(
+            orphaned_blob_keys = await asyncio.to_thread(
                 file_store.delete_all_for_session, session_id
             )
-            for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
+            for blob_key in orphaned_blob_keys:
+                await asyncio.to_thread(artifact_store.delete, blob_key)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)
@@ -2558,14 +2570,10 @@ def register_events_routes(
                     getattr(request.app.state, "sandbox_config", None),
                 )
         try:
-            import hashlib as _hashlib
             import time as _time
 
             _srv_id = _get_installation_id()
-            _anon_d: str | None = None
-            if user_id is not None:
-                _salt_d = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                _anon_d = _hashlib.sha256(_salt_d.encode()).hexdigest()[:16]
+            _anon_d = _tel_anon_user_id(user_id, _srv_id)
             _usage = conv.session_usage or {}
             _duration: float | None = None
             with contextlib.suppress(Exception):
