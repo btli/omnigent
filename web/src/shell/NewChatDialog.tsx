@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -273,7 +274,6 @@ import {
 } from "@/lib/devinFusion";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
-  useConversations,
   useProjectConfig,
   useProjects,
   moveConversationToProject,
@@ -2203,13 +2203,8 @@ export function NewChatLandingScreen() {
     storedProjectConfig,
   ]);
 
-  // Pin the configured project agent into discovery so the recency-bounded
-  // session scan (or its same-name dedup) can't drop or id-swap it out of
-  // the picker — the config must seed the agent the project actually pinned.
-  // agentsArePlaceholder: catalog-only rows served while the sessions
-  // discovery scan is still in flight — render them (harnesses must not wait
-  // for a slow scan), but never resolve a stored agent id against them: a
-  // scan-discovered agent may still be on its way.
+  // Preserve a configured agent through name deduplication when it is in the
+  // catalog or first 30 Mine sessions. Templates render while Mine is loading.
   const {
     data: agents,
     isLoading: agentsLoading,
@@ -2230,7 +2225,7 @@ export function NewChatLandingScreen() {
   // Omnigent sessions can pull in their existing local CLI history. Same query
   // key ChatPage already holds, so this reuses the cache. Wait for data before
   // deciding so the button doesn't flash for returning users.
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const hasNoSessions =
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
@@ -3111,11 +3106,8 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
-  // The project's configured agent could not be resolved: the catalog, the
-  // session scan, AND the pinned direct lookup all came up empty (deleted
-  // agent, or one the caller can't read). Never substitute another agent for
-  // it — the composer surfaces this state ("Agent unavailable" chip, blocked
-  // submit) until the user explicitly picks an agent instead.
+  // A configured agent absent from templates and the first 30 Mine sessions
+  // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
     projectParam !== "" &&
     prefillConfig?.agentId != null &&
@@ -4137,10 +4129,8 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — the narrow set
-  // the health poll needs to check for live directory conflicts. Much
-  // smaller than all 200 directorySessions (only host-matched + workspace
-  // rows), so registering them into the /health poll is cheap.
+  // Only register loaded owned sessions on the selected host with a workspace
+  // for live directory-conflict checks.
   const conflictCandidates = useMemo(
     () =>
       (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
@@ -5455,7 +5445,6 @@ export function NewChatLandingScreen() {
       if (submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
-      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
 
       // `localConv` is set only when a real agent id was resolved up front, so
       // it's safe to POST the first message with it.
