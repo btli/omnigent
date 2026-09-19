@@ -42,9 +42,7 @@ class MainActivityTest {
         val request = request("https://example.com/app")
         val response = httpError(503)
         val activityShadow = shadowOf(activity)
-        while (activityShadow.nextStartedActivity != null) {
-            // Discard startup permission intents before observing recovery.
-        }
+        activityShadow.clearNextStartedActivities()
 
         webView.webViewClient.onReceivedHttpError(webView, request, response)
 
