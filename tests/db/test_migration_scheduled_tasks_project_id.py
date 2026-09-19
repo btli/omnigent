@@ -258,16 +258,16 @@ def test_project_assignment_migration_downgrade_round_trip(tmp_path: Path) -> No
         index["name"] for index in inspector.get_indexes("scheduled_tasks")
     }
     _assert_distinct_payload_survives(engine)
-    assert _column_defaults(engine, "scheduled_tasks") == {
-        name: default for name, default in head_task_defaults.items() if name != "project_id"
-    }
-    assert _column_defaults(engine, "scheduled_task_runs") == head_run_defaults
-    assert _indexes(engine, "scheduled_tasks") == {
-        name: signature
-        for name, signature in head_task_indexes.items()
-        if name != "ix_scheduled_tasks_project_id"
-    }
-    assert _indexes(engine, "scheduled_task_runs") == head_run_indexes
+    # The historical target can predate immutable successors; compare the
+    # shared schema here, then require exact head restoration below.
+    task_defaults = _column_defaults(engine, "scheduled_tasks")
+    run_defaults = _column_defaults(engine, "scheduled_task_runs")
+    task_indexes = _indexes(engine, "scheduled_tasks")
+    run_indexes = _indexes(engine, "scheduled_task_runs")
+    assert task_defaults == {name: head_task_defaults[name] for name in task_defaults}
+    assert run_defaults == {name: head_run_defaults[name] for name in run_defaults}
+    assert task_indexes == {name: head_task_indexes[name] for name in task_indexes}
+    assert run_indexes == {name: head_run_indexes[name] for name in run_indexes}
 
     with engine.begin() as conn:
         config.attributes["connection"] = conn
