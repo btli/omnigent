@@ -30,6 +30,8 @@ from omnigent.harness_plugins import (
     install_specs,
     valid_harnesses,
 )
+from omnigent.inner.acp_executor import AcpExecutor
+from omnigent.inner.acp_harness import _build_acp_executor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.onboarding.harness_install import ui_setup_steps
 from omnigent.runtime.workflow import _build_acp_cli_spawn_env
@@ -108,6 +110,74 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
     assert json.loads(env["HARNESS_ACP_OS_ENV"]) == dataclasses.asdict(os_env)
     # Rows own their model selection: no model var may ride along.
     assert "HARNESS_ACP_MODEL" not in env
+
+
+def test_grok_spawn_env_forwards_xai_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"
+    monkeypatch.setattr("os.environ", {"XAI_API_KEY": "xai-test-key", **env})
+
+    executor = _build_acp_executor()
+    assert isinstance(executor, AcpExecutor)
+    assert executor._build_spawn_env()["XAI_API_KEY"] == "xai-test-key"
+
+
+def test_undeclared_row_does_not_forward_xai_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+    monkeypatch.setattr("os.environ", {"XAI_API_KEY": "xai-test-key", **env})
+
+    executor = _build_acp_executor()
+    assert isinstance(executor, AcpExecutor)
+    assert "XAI_API_KEY" not in executor._build_spawn_env()
+
+
+@pytest.mark.parametrize(
+    "secret", ["AWS_SECRET_ACCESS_KEY", "XAI_OTHER_SECRET", "XAI_API_KEY_EXTRA"]
+)
+def test_grok_spawn_env_does_not_forward_undeclared_secrets(
+    monkeypatch: pytest.MonkeyPatch, secret: str
+) -> None:
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    monkeypatch.setattr("os.environ", {"XAI_API_KEY": "xai-test-key", secret: "secret", **env})
+
+    executor = _build_acp_executor()
+    assert isinstance(executor, AcpExecutor)
+    assert secret not in executor._build_spawn_env()
+
+
+def test_jcode_connect_merges_row_and_gateway_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        ACP_CLI_HARNESSES,
+        "jcode",
+        dataclasses.replace(
+            ACP_CLI_HARNESSES["jcode"],
+            env_passthrough=("ROW_TOKEN", "JCODE_HOME", "ROW_TOKEN"),
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.api_key_auth_precludes_broker", lambda spec: False
+    )
+    gateway_env = {
+        "JCODE_DBX_TOKEN": "fresh-bearer",
+        "JCODE_HOME": "/tmp/jc-home",
+        "JCODE_RUNTIME_DIR": "/tmp/jc-home/run",
+    }
+    monkeypatch.setattr(
+        "omnigent.host.jcode_databricks.connect_jcode_gateway_env", lambda **_kw: gateway_env
+    )
+    env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"].split(",") == [
+        "JCODE_DBX_TOKEN",
+        "JCODE_HOME",
+        "JCODE_RUNTIME_DIR",
+        "ROW_TOKEN",
+    ]
+    monkeypatch.setattr("os.environ", {"ROW_TOKEN": "row-token", **env})
+    executor = _build_acp_executor()
+    assert isinstance(executor, AcpExecutor)
+    assert executor._build_spawn_env() == {"ROW_TOKEN": "row-token", **gateway_env}
 
 
 def test_jcode_connect_injects_gateway_env_and_passthrough(

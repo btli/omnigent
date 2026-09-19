@@ -321,12 +321,13 @@ login it wrote to disk. That also means `--model` is refused rather than
 silently dropped: both run their account-default model. To pin one, configure an
 `acp:` agent whose command passes the vendor's own model flag.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
-`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
-credential allowlist, so exporting it in your shell does not reach the agent.
-If you need the key route, pass it explicitly with
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+Builtin ACP rows may declare exact-name `env_passthrough` allowances; Grok
+forwards `XAI_API_KEY` for API-key authentication. The key must already be
+present in the runner environment: set it in the runner container's environment,
+or export it on the host and set `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`.
+The host-to-runner hop (`connect.py`) remains a separate, unchanged gate:
+`XAI_API_KEY` is not in its credential allowlist, so exporting the key alone on
+the host is insufficient. Other variables still require an explicit declaration.
 
 </details>
 
