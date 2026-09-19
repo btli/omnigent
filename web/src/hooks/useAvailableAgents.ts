@@ -60,9 +60,10 @@ const DISPLAY_NAMES: Record<string, string> = {
 };
 
 function displayNameForAgent(name: string, harness?: string | null): string {
+  const nativeAgent = nativeCodingAgentForAgentName(agentRootName(name));
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
-    nativeCodingAgentForAgentName(name)?.displayName ??
+    (nativeAgent ? nativeCodingAgentForHarness(harness)?.displayName : undefined) ??
+    nativeAgent?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );

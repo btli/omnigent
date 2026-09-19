@@ -457,16 +457,15 @@ describe("useAvailableAgents", () => {
           { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
           { id: "ag_stale_kiro", name: "kiro-native-ui (fork ag_old)", harness: "kiro-native" },
           { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
+          // Variant names on native harnesses intentionally survive, like Pollux.
+          { id: "ag_variant_kiro", name: "kiro-naitive", harness: "kiro-native" },
         ],
         has_more: false,
       }),
       [SCAN_URL]: mockResponse({
         object: "list",
         data: [
-          // Session-bound id with a non-canonical kiro name (server typo).
-          // On initial load harness is null (lazy enrichment), so it appears
-          // in the list; prefetchAvailableAgentDetails removes it once enriched
-          // to harness: "kiro-native" and a kiro built-in already exists.
+          // A session-bound duplicate of the catalog variant is shadowed by name.
           { id: "conv_kiro", agent_id: "ag_session_kiro", agent_name: "kiro-naitive" },
           // Legacy failed Kiro attempts used a plain "kiro" agent name and
           // no harness; that row must not surface as a custom Kiro picker row.
@@ -479,9 +478,6 @@ describe("useAvailableAgents", () => {
     const { result } = renderHook(() => useAvailableAgents(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // ag_session_kiro appears on initial load with harness: null because
-    // enrichment is deferred. prefetchAvailableAgentDetails (called on picker
-    // open) would later detect harness: "kiro-native" and remove the duplicate.
     // ag_legacy_kiro is filtered by kiroLegacyNames (name: "kiro").
     expect(result.current.data).toEqual([
       {
@@ -495,7 +491,7 @@ describe("useAvailableAgents", () => {
       {
         id: "ag_pollux",
         name: "pollux",
-        display_name: "Codex",
+        display_name: "Pollux",
         description: null,
         harness: "codex-native",
         skills: [],
@@ -518,12 +514,11 @@ describe("useAvailableAgents", () => {
         skills: [],
       },
       {
-        id: "ag_session_kiro",
+        id: "ag_variant_kiro",
         name: "kiro-naitive",
         display_name: "Kiro-naitive",
         description: null,
-        harness: null,
-        sessionId: "conv_kiro",
+        harness: "kiro-native",
         skills: [],
       },
     ]);
