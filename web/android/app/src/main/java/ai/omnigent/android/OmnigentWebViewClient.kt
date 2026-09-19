@@ -193,7 +193,6 @@ class OmnigentWebViewClient(
         super.onReceivedHttpError(view, request, errorResponse)
         if (!request.isForMainFrame) return
         if (originOf(request.url.toString()) != pinnedOrigin()) return
-        if (errorResponse.statusCode in 200..299) return
         onMainFrameHttpError(errorResponse.statusCode)
     }
 
