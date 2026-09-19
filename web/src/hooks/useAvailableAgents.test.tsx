@@ -439,22 +439,23 @@ describe("useAvailableAgents", () => {
     expect(enrichCalls).toEqual([]);
   });
 
-  it("dedupes native built-ins and hides session-discovered native shadows", async () => {
+  it("dedupes native built-ins without hiding custom agents on native harnesses", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
         object: "list",
         data: [
           // Stale/non-canonical native rows from older local state; they
-          // resolve by harness but must not compete with the seeded rows.
+          // are forks of canonical rows and must not compete with the seeded rows.
           { id: "ag_stale_codex", name: "codex-native-ui (fork ag_old)", harness: "codex-native" },
           { id: "ag_codex", name: "codex-native-ui", harness: "codex-native" },
+          { id: "ag_pollux", name: "pollux", harness: "codex-native", builtin: true },
           {
             id: "ag_stale_claude",
             name: "claude-native-ui (fork ag_old)",
             harness: "claude-native",
           },
           { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
-          { id: "ag_stale_kiro", name: "kiro-naitive", harness: "kiro-native" },
+          { id: "ag_stale_kiro", name: "kiro-native-ui (fork ag_old)", harness: "kiro-native" },
           { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
         ],
         has_more: false,
@@ -490,6 +491,15 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: "codex-native",
         skills: [],
+      },
+      {
+        id: "ag_pollux",
+        name: "pollux",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+        builtin: true,
       },
       {
         id: "ag_claude",

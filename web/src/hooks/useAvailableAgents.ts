@@ -72,7 +72,7 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
-    const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
+    const nativeAgent = nativeCodingAgentForAgentName(agentRootName(agent.name));
     if (nativeAgent === undefined) {
       result.push(agent);
       continue;
