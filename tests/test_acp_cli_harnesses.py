@@ -114,7 +114,7 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
 
 def test_grok_spawn_env_forwards_xai_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
-    assert env.get("HARNESS_ACP_ENV_PASSTHROUGH", "").split(",") == ["XAI_API_KEY"]
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"
     monkeypatch.setattr("os.environ", {"XAI_API_KEY": "xai-test-key", **env})
 
     executor = _build_acp_executor()
