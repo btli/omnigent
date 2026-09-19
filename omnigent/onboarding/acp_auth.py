@@ -51,9 +51,8 @@ class AcpAgentEntry:
     :param command: The command to launch, e.g. ``"gemini --experimental-acp"``.
     :param model: Optional model id (only honored by agents that accept a model
         in ``session/new``; see :class:`omnigent.inner.acp_executor.AcpAgentConfig`).
-    :param icon: Optional agent icon: an emoji grapheme, or a path relative to
-        the agent's config directory naming a bundled
-        ``.svg``/``.png``/``.jpg``/``.jpeg``/``.webp`` image.
+    :param icon: Optional ACP icon. Emoji works directly; image paths are passed
+        through, but generated ACP bundles do not contain image assets.
     :param session_id_mode: ``"server"`` (default) or ``"client"``.
     :param send_model: Send the model in ``session/new`` (Qwen-shaped agents).
     :param omnigent_mcp: Lend Omnigent's builtin MCP relay in ``session/new``.
