@@ -1075,7 +1075,8 @@ def _build_acp_bundle(*, harness: str, name: str, icon: str | None = None) -> by
     :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
     :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
         slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
-    :param icon: Optional agent icon: an emoji grapheme or bundle-relative image path.
+    :param icon: Optional ACP icon. Emoji works directly; image paths are passed
+        through, but this generated bundle contains no image asset.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
     import tempfile
@@ -1126,8 +1127,9 @@ def _ensure_default_acp_agents(
     :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
-    A malformed ``acp:`` block is logged and skipped, never fatal to startup
-    (mirrors the dynamic ``acp:*`` catalog rows in ``harness_plugins``).
+    A malformed ``acp:`` block or invalid generated spec is logged and skipped,
+    never fatal to startup (mirrors the dynamic ``acp:*`` catalog rows in
+    ``harness_plugins``).
 
     Note: a seeded row is keyed by the agent's display name, so renaming a
     configured ACP agent leaves the old picker row behind until the store is
@@ -1138,6 +1140,18 @@ def _ensure_default_acp_agents(
     :param agent_cache: Cache for loaded agent specs.
     """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    def seed(name: str, harness: str, icon: str | None) -> None:
+        try:
+            _ensure_builtin_agent(
+                agent_store,
+                artifact_store,
+                agent_cache,
+                name=name,
+                bundle_bytes=_build_acp_bundle(harness=harness, name=name, icon=icon),
+            )
+        except OmnigentError as exc:
+            _logger.warning("Skipping invalid ACP agent %s: %s", name, exc)
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
     try:
@@ -1154,15 +1168,7 @@ def _ensure_default_acp_agents(
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
         # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
         # for display (e.g. ``devin`` -> "Devin").
-        _ensure_builtin_agent(
-            agent_store,
-            artifact_store,
-            agent_cache,
-            name=agent.slug,
-            bundle_bytes=_build_acp_bundle(
-                harness=f"acp:{agent.slug}", name=agent.slug, icon=agent.icon
-            ),
-        )
+        seed(agent.slug, f"acp:{agent.slug}", agent.icon)
 
     # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
     # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
@@ -1171,13 +1177,7 @@ def _ensure_default_acp_agents(
     for key, harness in ACP_CLI_HARNESSES.items():
         if key in shadowed:
             continue
-        _ensure_builtin_agent(
-            agent_store,
-            artifact_store,
-            agent_cache,
-            name=key,
-            bundle_bytes=_build_acp_bundle(harness=key, name=key, icon=harness.icon),
-        )
+        seed(key, key, harness.icon)
 
 
 def _build_debby_bundle() -> bytes:

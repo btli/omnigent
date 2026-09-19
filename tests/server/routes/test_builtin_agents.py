@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -19,7 +20,7 @@ import yaml
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.errors import OmnigentError
-from omnigent.onboarding.acp_auth import AcpAgentEntry
+from omnigent.onboarding.acp_auth import AcpAgentEntry, acp_agents
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
 from omnigent.server.routes.builtin_agents import _resolve_icon_file
@@ -215,7 +216,7 @@ async def test_builtin_acp_agent_payload_keeps_icon_unset(
     """Builtin ACP rows keep their existing iconless payload by default."""
     key, harness = next(iter(ACP_CLI_HARNESSES.items()))
     assert harness.icon is None
-    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", list)
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     server_app._ensure_default_acp_agents(
         SqlAlchemyAgentStore(db_uri),
@@ -229,13 +230,85 @@ async def test_builtin_acp_agent_payload_keeps_icon_unset(
     assert by_id[builtin_agent_id(key)]["icon"] is None
 
 
+async def test_builtin_acp_agent_payload_includes_catalog_icon(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A builtin ACP catalog icon reaches its seeded picker payload."""
+    key, harness = next(iter(ACP_CLI_HARNESSES.items()))
+    monkeypatch.setattr(
+        "omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES",
+        {key: replace(harness, icon="🦊")},
+    )
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    server_app._ensure_default_acp_agents(
+        SqlAlchemyAgentStore(db_uri),
+        artifact_store,
+        AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {agent["id"]: agent for agent in resp.json()["data"]}
+    assert by_id[builtin_agent_id(key)]["icon"] == "🦊"
+
+
+def test_configured_acp_agent_invalid_refresh_does_not_stop_seeding(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An invalid configured refresh leaves cached agents running and continues."""
+    configured = [
+        AcpAgentEntry(slug="escape", name="Escape", command="escape acp", icon="🦊"),
+        AcpAgentEntry(slug="healthy", name="Healthy", command="healthy acp", icon="🔥"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: configured)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+    server_app._ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
+
+    escape = agent_store.get_by_name("escape")
+    healthy = agent_store.get_by_name("healthy")
+    assert escape is not None
+    assert healthy is not None
+    assert agent_cache.load(escape.id, escape.bundle_location).spec.icon == "🦊"
+    assert agent_cache.load(healthy.id, healthy.bundle_location).spec.icon == "🔥"
+
+    configured[:] = [
+        replace(configured[0], icon="../secret.png"),
+        replace(configured[1], icon="🪿"),
+    ]
+    server_app._ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
+
+    refreshed_escape = agent_store.get_by_name("escape")
+    refreshed_healthy = agent_store.get_by_name("healthy")
+    assert refreshed_escape is not None
+    assert refreshed_healthy is not None
+    assert (
+        agent_cache.load(refreshed_escape.id, refreshed_escape.bundle_location).spec.icon == "🦊"
+    )
+    assert (
+        agent_cache.load(refreshed_healthy.id, refreshed_healthy.bundle_location).spec.icon == "🪿"
+    )
+    assert "Skipping invalid ACP agent escape: invalid agent spec: icon:" in caplog.text
+
+
 def test_configured_acp_agent_invalid_icon_uses_spec_validation(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ACP defers invalid icon paths to the shared agent-spec validator."""
-    entry = AcpAgentEntry(slug="escape", name="Escape", command="escape acp", icon="../secret.png")
+    entry = acp_agents(
+        {"acp": {"agents": [{"name": "Escape", "command": "escape acp", "icon": "../secret.png"}]}}
+    )[0]
+    assert entry.icon == "../secret.png"
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda: [entry])
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_store = SqlAlchemyAgentStore(db_uri)
