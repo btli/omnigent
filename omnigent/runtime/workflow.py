@@ -1615,6 +1615,9 @@ def _build_acp_cli_spawn_env(
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
 
+    if row.env_passthrough:
+        env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(row.env_passthrough)
+
     # Managed-connect support for jcode: point it at a session-private JCODE_HOME
     # (with a config.toml pinning the gateway provider) + a fresh broker bearer. A
     # no-op when not connected (connect_jcode_gateway_env returns None), and — like the
