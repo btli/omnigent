@@ -19,7 +19,6 @@ import yaml
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
-from omnigent.errors import OmnigentError
 from omnigent.onboarding.acp_auth import AcpAgentEntry, acp_agents
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
@@ -262,12 +261,13 @@ def test_configured_acp_agent_invalid_refresh_does_not_stop_seeding(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An invalid configured refresh leaves cached agents running and continues."""
+    """An invalid refresh leaves the stored bundle intact and continues."""
     configured = [
         AcpAgentEntry(slug="escape", name="Escape", command="escape acp", icon="🦊"),
         AcpAgentEntry(slug="healthy", name="Healthy", command="healthy acp", icon="🔥"),
     ]
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: configured)
+    monkeypatch.setattr("omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES", {})
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_store = SqlAlchemyAgentStore(db_uri)
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
@@ -279,6 +279,12 @@ def test_configured_acp_agent_invalid_refresh_does_not_stop_seeding(
     assert healthy is not None
     assert agent_cache.load(escape.id, escape.bundle_location).spec.icon == "🦊"
     assert agent_cache.load(healthy.id, healthy.bundle_location).spec.icon == "🔥"
+    escape_bundle_location = escape.bundle_location
+    escape_version = escape.version
+    escape_artifact_dir = tmp_path / "artifacts" / escape.id
+    escape_artifacts = {
+        path.name: path.read_bytes() for path in escape_artifact_dir.iterdir() if path.is_file()
+    }
 
     configured[:] = [
         replace(configured[0], icon="../secret.png"),
@@ -290,12 +296,22 @@ def test_configured_acp_agent_invalid_refresh_does_not_stop_seeding(
     refreshed_healthy = agent_store.get_by_name("healthy")
     assert refreshed_escape is not None
     assert refreshed_healthy is not None
+    assert refreshed_escape.bundle_location == escape_bundle_location
+    assert refreshed_escape.version == escape_version
+    assert {
+        path.name: path.read_bytes() for path in escape_artifact_dir.iterdir() if path.is_file()
+    } == escape_artifacts
+    fresh_cache = AgentCache(
+        artifact_store=artifact_store,
+        cache_dir=tmp_path / "fresh-cache",
+    )
     assert (
-        agent_cache.load(refreshed_escape.id, refreshed_escape.bundle_location).spec.icon == "🦊"
+        fresh_cache.load(refreshed_escape.id, refreshed_escape.bundle_location).spec.icon == "🦊"
     )
     assert (
         agent_cache.load(refreshed_healthy.id, refreshed_healthy.bundle_location).spec.icon == "🪿"
     )
+    assert not (tmp_path / "cache" / f"{escape.id}_staging").exists()
     assert "Skipping invalid ACP agent escape: invalid agent spec: icon:" in caplog.text
 
 
@@ -303,22 +319,47 @@ def test_configured_acp_agent_invalid_icon_uses_spec_validation(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """ACP defers invalid icon paths to the shared agent-spec validator."""
+    """The shared spec validator rejects a new invalid ACP row before storage."""
     entry = acp_agents(
         {"acp": {"agents": [{"name": "Escape", "command": "escape acp", "icon": "../secret.png"}]}}
     )[0]
     assert entry.icon == "../secret.png"
-    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda: [entry])
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    monkeypatch.setattr("omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES", {})
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_store = SqlAlchemyAgentStore(db_uri)
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
     server_app._ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
 
-    seeded = agent_store.get_by_name("escape")
-    assert seeded is not None
-    with pytest.raises(OmnigentError, match=r"icon: path must not contain '\.\.'"):
-        agent_cache.load(seeded.id, seeded.bundle_location)
+    assert agent_store.get_by_name("escape") is None
+    assert not any((tmp_path / "artifacts").rglob("*"))
+    assert not (tmp_path / "cache").exists()
+    assert "Skipping invalid ACP agent escape: invalid agent spec: icon:" in caplog.text
+
+
+def test_configured_acp_agent_unexpected_store_error_propagates(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected persistence failures remain fatal during ACP seeding."""
+    entry = AcpAgentEntry(slug="fox", name="Fox", command="fox acp", icon="🦊")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    monkeypatch.setattr("omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES", {})
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    def fail_put(_key: str, _data: bytes) -> None:
+        raise RuntimeError("artifact store unavailable")
+
+    monkeypatch.setattr(artifact_store, "put", fail_put)
+    with pytest.raises(RuntimeError, match="artifact store unavailable"):
+        server_app._ensure_default_acp_agents(
+            SqlAlchemyAgentStore(db_uri),
+            artifact_store,
+            AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        )
 
 
 async def test_icon_endpoint_serves_svg(

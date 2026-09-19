@@ -1075,8 +1075,8 @@ def _build_acp_bundle(*, harness: str, name: str, icon: str | None = None) -> by
     :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
     :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
         slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
-    :param icon: Optional ACP icon. Emoji works directly; image paths are passed
-        through, but this generated bundle contains no image asset.
+    :param icon: Optional ACP icon. Emoji works directly; a relative image path
+        resolves to no icon because generated ACP bundles contain no image assets.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
     import tempfile
@@ -1139,16 +1139,27 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
+    import tempfile
+
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.spec import load
 
     def seed(name: str, harness: str, icon: str | None) -> None:
         try:
+            bundle_bytes = _build_acp_bundle(harness=harness, name=name, icon=icon)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                load(
+                    bundle_bytes,
+                    dest=Path(tmpdir) / "agent",
+                    expand_env=True,
+                    prune_invalid_sub_agents=True,
+                )
             _ensure_builtin_agent(
                 agent_store,
                 artifact_store,
                 agent_cache,
                 name=name,
-                bundle_bytes=_build_acp_bundle(harness=harness, name=name, icon=icon),
+                bundle_bytes=bundle_bytes,
             )
         except OmnigentError as exc:
             _logger.warning("Skipping invalid ACP agent %s: %s", name, exc)
