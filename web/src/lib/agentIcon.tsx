@@ -65,9 +65,7 @@ export interface DeclaredIconAgent {
  * precedence lives in one place while each surface keeps its own fallback.
  */
 export type AgentIconResolution<F> =
-  | { kind: "emoji"; value: string }
-  | { kind: "url"; value: string }
-  | { kind: "harness"; value: F };
+  { kind: "emoji"; value: string } | { kind: "url"; value: string } | { kind: "harness"; value: F };
 
 /**
  * Resolve which icon to render for an agent, declared-icon first.

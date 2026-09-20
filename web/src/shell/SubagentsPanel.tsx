@@ -458,7 +458,10 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         )}
       >
         <div className="flex w-full items-center gap-1">
-          <AgentIcon resolution={iconResolution} className="size-3.5 shrink-0 text-muted-foreground" />
+          <AgentIcon
+            resolution={iconResolution}
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
           <span className="shrink-0 truncate text-sm font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
