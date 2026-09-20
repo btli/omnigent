@@ -10,6 +10,8 @@ const { joinServerUrl, workspaceIdentityKey } = require("../src/url");
 
 function loadMainHarness({
   settings = {},
+  serverUrl = "https://server.example/app",
+  sessionCookies = [],
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
   serverShutdown = () => Promise.resolve(),
@@ -34,16 +36,25 @@ function loadMainHarness({
     showMessageBox: [],
     setApplicationMenu: [],
     aboutOpens: [],
+    expiredAccess: [],
+    removedRefresh: [],
+    authRequests: [],
+    cookieReads: [],
+    cookieRemovals: [],
+    reloads: 0,
   };
 
   const sender = {
-    getURL: () => "https://server.example/app",
+    getURL: () => serverUrl,
   };
   const win = {
     isDestroyed: () => false,
     webContents: {
-      getURL: () => "https://server.example/app",
+      getURL: () => serverUrl,
       send: (channel, payload) => calls.sent.push({ channel, payload }),
+      reload: () => {
+        calls.reloads++;
+      },
     },
     isMinimized: () => false,
     restore: () => {},
@@ -123,7 +134,19 @@ function loadMainHarness({
     },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
     screen: {},
-    session: { defaultSession: {} },
+    session: {
+      defaultSession: {
+        cookies: {
+          get: async (filter) => {
+            calls.cookieReads.push(filter);
+            return sessionCookies;
+          },
+          remove: async (url, name) => {
+            calls.cookieRemovals.push([url, name]);
+          },
+        },
+      },
+    },
     shell: {},
     systemPreferences: {
       getUserDefault: (key, type) =>
@@ -151,8 +174,20 @@ function loadMainHarness({
     // databricks-session (transitively) requires electron's `net`, unresolvable
     // under the sandbox's real require; behavior is covered in databricks-*.test.js.
     "./databricks-session": {
-      ensureDatabricksSession: async (_ses, origin) => origin,
-      databricksOAuthConfigured: () => false,
+      ensureDatabricksSession: async (_ses, origin) => {
+        calls.authRequests.push(origin);
+        return origin;
+      },
+    },
+    "./databricks-oauth": {
+      expireStoredAccessToken: (origin) => {
+        calls.expiredAccess.push(origin);
+        return true;
+      },
+      removeStoredRefreshToken: (origin) => {
+        calls.removedRefresh.push(origin);
+        return true;
+      },
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -221,9 +256,9 @@ function loadMainHarness({
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   module.exports.testApi.windows.set(win, {
-    origin: "https://server.example",
-    identity: workspaceIdentityKey("https://server.example/app"),
-    serverUrl: "https://server.example/app",
+    origin: new URL(serverUrl).origin,
+    identity: workspaceIdentityKey(serverUrl),
+    serverUrl,
     badgeCount: 0,
   });
 
@@ -234,7 +269,7 @@ function loadMainHarness({
     calls,
     cleanup: () => fs.rmSync(userData, { recursive: true, force: true }),
     events: {
-      pinned: { sender, senderFrame: { url: "https://server.example/app" } },
+      pinned: { sender, senderFrame: { url: serverUrl } },
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
@@ -259,8 +294,8 @@ function plain(value) {
 
 function findMenuItem(menu, id) {
   for (const item of menu.template) {
-    const submenu = item.submenu ?? [];
-    const found = submenu.find((entry) => entry.id === id);
+    if (item.id === id) return item;
+    const found = findMenuItem({ template: item.submenu ?? [] }, id);
     if (found) return found;
   }
   return null;
@@ -336,13 +371,65 @@ describe("About menu wiring", () => {
 });
 
 describe("developer-mode menu wiring", () => {
-  it("keeps the Debug menu in development builds", (t) => {
+  it("places expiry simulations under Debug, not Server, in development builds", (t) => {
     const harness = loadMainHarness({ isPackaged: false, platform: "linux" });
     t.after(harness.cleanup);
 
     harness.api.buildMenu();
 
-    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const debug = menu.template.find((item) => item.label === "Debug");
+    const server = menu.template.find((item) => item.label === "Server");
+    const authentication = debug.submenu.find((item) => item.id === "debug_authentication");
+    assert.equal(authentication.label, "Authentication");
+    for (const id of [
+      "simulate_session_expiry",
+      "simulate_oauth_token_expiry",
+      "invalidate_oauth_refresh_token",
+    ]) {
+      assert.equal(typeof authentication.submenu.find((item) => item.id === id)?.click, "function");
+      assert.equal(findMenuItem({ template: [server] }, id), null);
+    }
+  });
+
+  it("clears the focused workspace cookie without forcing a reload or renewal", async (t) => {
+    const origin = "https://workspace.cloud.databricks.com";
+    const harness = loadMainHarness({
+      isPackaged: false,
+      platform: "linux",
+      serverUrl: `${origin}/omnigent`,
+      sessionCookies: [
+        { name: "DBAUTH", domain: ".workspace.cloud.databricks.com", path: "/", secure: true },
+      ],
+    });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "simulate_session_expiry").click();
+    await flushPromises();
+    assert.deepEqual(plain(harness.calls.cookieReads), [{ url: origin, name: "DBAUTH" }]);
+    assert.deepEqual(harness.calls.cookieRemovals, [[`${origin}/`, "DBAUTH"]]);
+    assert.equal(harness.calls.reloads, 0);
+    assert.deepEqual(harness.calls.authRequests, []);
+  });
+
+  it("changes cached tokens without starting a refresh or reload", async (t) => {
+    const origin = "https://workspace.cloud.databricks.com";
+    const harness = loadMainHarness({
+      isPackaged: false,
+      platform: "linux",
+      serverUrl: `${origin}/omnigent`,
+    });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    findMenuItem(menu, "simulate_oauth_token_expiry").click();
+    findMenuItem(menu, "invalidate_oauth_refresh_token").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.expiredAccess, [origin]);
+    assert.deepEqual(harness.calls.removedRefresh, [origin]);
+    assert.deepEqual(harness.calls.authRequests, []);
+    assert.equal(harness.calls.reloads, 0);
+    assert.deepEqual(harness.calls.showMessageBox, []);
   });
 
   it("hides the Debug menu in packaged builds by default", (t) => {
