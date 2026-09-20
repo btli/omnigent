@@ -7233,20 +7233,12 @@ async def _relay_runner_stream(
                         "Session stream lost unexpectedly.",
                     )
                     origin = "session_stream_lost_mid_turn"
-                    log_msg = "Relay: session stream lost for session=%s"
                 else:
                     code, message = (
                         "runner_disconnected",
                         "Runner disconnected unexpectedly.",
                     )
                     origin = "runner_disconnected_mid_turn"
-                    log_msg = "Relay: runner transport lost for session=%s"
-                _logger.warning(
-                    log_msg,
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
                 disconnect_error = ErrorDetail(code=code, message=message)
                 _publish_status(
                     session_id,
