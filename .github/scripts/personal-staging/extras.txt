@@ -24,7 +24,6 @@ branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 7671  # draft feat/hindsight-credential-file-ref (host-file memory key; refs #7670)
 7280  # draft feat/agent-spec-icon (per-agent icons; upstream #7280, refs #7277)
 6856  # draft fix/background-battery-drain-main
-6788  # open  fix/agent-sandbox-wake-workspace
 6776  # draft fix/agent-sandbox-display-name
 6656  # draft feat/3d-preview-large-models
 6449  # draft fix/kimi-trust-preseed

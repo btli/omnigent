@@ -14,7 +14,6 @@
 # each once it lands upstream. #6439 (fix/kimi-steer-ctrl-s) removed — merged.
 7671  # draft feat/hindsight-credential-file-ref (host-file memory key; refs #7670)
 6856  # draft fix/background-battery-drain-main (supersedes bot #5825 on v0.13.0)
-6788  # open  fix/agent-sandbox-wake-workspace
 6776  # draft fix/agent-sandbox-display-name
 6656  # draft feat/3d-preview-large-models
 6449  # draft fix/kimi-trust-preseed
