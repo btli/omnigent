@@ -180,6 +180,11 @@ jobs:
             const fs = require('fs');
             const result = JSON.parse(fs.readFileSync('staleness.json', 'utf8'));
             const { owner, repo } = context.repo;
+            const repository = await github.rest.repos.get({ owner, repo });
+            if (!repository.data.has_issues) {
+              core.notice('repository Issues are disabled; skipping staging regression tracking issue');
+              return;
+            }
             const LABEL = 'staging-seed-stale-hourly';
             const title = 'Personal staging composition regression (hourly)';
             const existing = (await github.rest.issues.listForRepo({

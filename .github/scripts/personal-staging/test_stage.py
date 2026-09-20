@@ -2537,6 +2537,25 @@ def test_failed_composition_uploads_saved_report():
         assert upload["if"] == "always() && hashFiles('merge-report.json') != ''"
 
 
+def test_staging_regression_monitor_skips_when_issues_are_disabled():
+    import yaml
+
+    workflows = Path(__file__).resolve().parents[2] / "workflows"
+    for filename in ("personal-staging-hourly.yml", "personal-staging.yml"):
+        workflow = yaml.safe_load((workflows / filename).read_text())
+        [update_issue] = [
+            step
+            for step in workflow["jobs"]["seed-staleness-monitor"]["steps"]
+            if step.get("name") == "Update tracking issue"
+        ]
+        script = update_issue["with"]["script"]
+        assert "github.rest.repos.get({ owner, repo })" in script
+        assert "if (!repository.data.has_issues)" in script
+        assert script.index("if (!repository.data.has_issues)") < script.index(
+            "github.rest.issues.listForRepo"
+        )
+
+
 def test_android_build_requires_successful_integration():
     import yaml
 
