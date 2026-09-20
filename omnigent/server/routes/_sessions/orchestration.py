@@ -6888,13 +6888,20 @@ async def _relay_runner_stream(
                 await asyncio.sleep(retry_delay)
                 retry_number += 1
                 continue
+            _logger.warning(
+                "Relay: runner transport lost for session=%s",
+                session_id,
+                exc_info=True,
+                extra={
+                    "session_id": session_id,
+                    "event_name": "runner_stream_disconnected",
+                    "attributes": {
+                        "intentional_stop": lost.intentional,
+                        "cached_session_status": _session_status_cache.get(session_id),
+                    },
+                },
+            )
             if lost.intentional:
-                _logger.warning(
-                    "Relay: runner transport lost for session=%s",
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
                 # User clicked Stop: the Stop handler brought this runner's
                 # tunnel down on purpose (see _stop_session_host_runner), so
                 # the drop is expected — not a failure. Publish a quiet idle
@@ -6946,20 +6953,12 @@ async def _relay_runner_stream(
                         "Session stream lost unexpectedly.",
                     )
                     origin = "session_stream_lost_mid_turn"
-                    log_msg = "Relay: session stream lost for session=%s"
                 else:
                     code, message = (
                         "runner_disconnected",
                         "Runner disconnected unexpectedly.",
                     )
                     origin = "runner_disconnected_mid_turn"
-                    log_msg = "Relay: runner transport lost for session=%s"
-                _logger.warning(
-                    log_msg,
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
                 disconnect_error = ErrorDetail(code=code, message=message)
                 _publish_status(
                     session_id,
