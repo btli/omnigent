@@ -16,7 +16,7 @@ import {
   type AgentNodeData,
 } from "./subagentGraphLayout";
 import { activityDotClassName, sessionStatus } from "./subagentStatus";
-import { resolveAgentIcon } from "./subagentIcons";
+import { resolveSubagentIcon } from "./subagentIcons";
 
 import "@xyflow/react/dist/style.css";
 
@@ -51,24 +51,12 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
-  const {
-    label,
-    activity,
-    statusLabel,
-    isActive,
-    preview,
-    nodeKind,
-    wrapper,
-    tool,
-    harness,
-    agentName,
-  } = data;
+  const { label, activity, statusLabel, isActive, preview, identity } = data;
   const tint = ACTIVITY_TINT[activity];
-  const Icon = resolveAgentIcon(
-    nodeKind === "root"
-      ? { kind: "root", wrapper, harness, agentName }
-      : { kind: "child", wrapper, tool },
-  );
+  const Icon = resolveSubagentIcon(identity);
+  const accessibleIdentity =
+    nativeCodingAgentForWrapper(identity.wrapper)?.displayName ??
+    (identity.kind === "root" ? identity.agentName : identity.tool);
 
   return (
     <>
@@ -87,7 +75,14 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
-          <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+          {accessibleIdentity && (
+            <span className="sr-only">Agent identity: {accessibleIdentity}</span>
+          )}
+          <Icon
+            aria-hidden="true"
+            data-testid="agent-node-icon"
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
           <span className="truncate text-sm font-medium leading-tight">{label}</span>
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
@@ -225,7 +220,12 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         null,
         childrenMap,
         conversationId,
-        { wrapper: wrapper ?? null, harness: rootHarness, agentName: rootAgentName },
+        {
+          kind: "root",
+          wrapper: wrapper ?? null,
+          harness: rootHarness,
+          agentName: rootAgentName,
+        },
       ),
     [
       rootSessionId,

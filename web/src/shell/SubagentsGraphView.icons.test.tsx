@@ -49,9 +49,7 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   useChildSessions: vi.fn(),
 }));
 
-vi.mock("@/hooks/useSession", () => ({
-  useSession: vi.fn(),
-}));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ search: "" }),
@@ -60,6 +58,9 @@ vi.mock("@/lib/routing", () => ({
 
 vi.mock("@/components/icons/CodexIcon", () => ({
   CodexIcon: (props: Record<string, unknown>) => <svg data-icon="codex" {...props} />,
+}));
+vi.mock("@/components/icons/OttoIcon", () => ({
+  OttoIcon: (props: Record<string, unknown>) => <svg data-icon="otto" {...props} />,
 }));
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
@@ -87,14 +88,22 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SubagentsGraphView agent icons", () => {
-  it("renders decorative icons before the root and child node labels", async () => {
-    const child = childInfo({
-      id: "conv_child",
-      session_name: "find-auth",
-      tool: "Explore",
-      labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
-    });
-    const rootChildren = [child];
+  it("renders hidden icons immediately before root, branded, role, and fallback labels", async () => {
+    const rootChildren = [
+      childInfo({
+        id: "conv_brand",
+        session_name: "brand-child",
+        tool: "reviewer",
+        labels: { "omnigent.wrapper": "codex-native-ui" },
+      }),
+      childInfo({
+        id: "conv_role",
+        session_name: "role-child",
+        tool: "Explore",
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      }),
+      childInfo({ id: "conv_unknown", session_name: "unknown-child", tool: "general-purpose" }),
+    ];
     const noChildren: ChildSessionInfo[] = [];
     useChildSessionsMock.mockImplementation((sessionId) => ({
       children: sessionId === "conv_root" ? rootChildren : noChildren,
@@ -125,18 +134,24 @@ describe("SubagentsGraphView agent icons", () => {
 
     render(<SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" />);
 
-    const rootNode = await screen.findByTestId("graph-node-conv_root");
-    const childNode = await screen.findByTestId("graph-node-conv_child");
-    const rootIcon = rootNode.querySelector('[data-icon="codex"]');
-    const childIcon = childNode.querySelector(".lucide-search");
-    const rootLabel = screen.getByText("Codex");
-    const childLabel = screen.getByText("Explore");
-
-    expect(rootIcon).not.toBeNull();
-    expect(childIcon).not.toBeNull();
-    expect(rootIcon).toHaveAttribute("aria-hidden", "true");
-    expect(childIcon).toHaveAttribute("aria-hidden", "true");
-    expect(rootLabel.previousElementSibling).toBe(rootIcon);
-    expect(childLabel.previousElementSibling).toBe(childIcon);
+    const cases = [
+      ["conv_root", "Codex", '[data-icon="codex"]', "Codex"],
+      ["conv_brand", "brand-child", '[data-icon="codex"]', "Codex"],
+      ["conv_role", "Explore", ".lucide-search", "Explore"],
+      ["conv_unknown", "unknown-child", '[data-icon="otto"]', "general-purpose"],
+    ] as const;
+    await Promise.all(
+      cases.map(async ([id, label, selector, accessibleIdentity]) => {
+        const node = await screen.findByTestId(`graph-node-${id}`);
+        const icon = node.querySelector(selector);
+        const labelElement = screen.getByText(label);
+        const identityElement = node.querySelector(".sr-only");
+        expect(icon).not.toBeNull();
+        expect(icon).toHaveAttribute("aria-hidden", "true");
+        expect(icon).toHaveAttribute("data-testid", "agent-node-icon");
+        expect(labelElement.previousElementSibling).toBe(icon);
+        expect(identityElement).toHaveTextContent(`Agent identity: ${accessibleIdentity}`);
+      }),
+    );
   });
 });

@@ -1,11 +1,22 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  BookOpenIcon,
+  Code2Icon,
+  CompassIcon,
+  FileTextIcon,
+  FlaskConicalIcon,
+  ScanSearchIcon,
+  SearchIcon,
+} from "lucide-react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import { SubagentsPanel } from "./SubagentsPanel";
+import { useSessionAgent } from "@/hooks/useAgents";
+import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
@@ -16,6 +27,13 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+// The main row resolves its agent's declared spec icon (if any) from the
+// bound agent object. Default to "no bound agent loaded" so rows fall back to
+// the wrapper/harness glyph; the declared-icon case overrides it per test.
+vi.mock("@/hooks/useAgents", () => ({
+  useSessionAgent: vi.fn(),
 }));
 
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
@@ -44,6 +62,7 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
+const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 interface RenderOptions {
   /** The conversation in main — used only for active-row highlighting. */
@@ -108,9 +127,33 @@ function mockChildTree(tree: Record<string, ChildSessionInfo[]>) {
   }));
 }
 
+/** Agent-type → category-icon expectations. Order-sensitive cases (review
+ *  before code, test before code) guard the substring precedence. */
+const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
+  ["Explore", SearchIcon],
+  ["deep-researcher", BookOpenIcon],
+  ["planner", CompassIcon],
+  ["architect", CompassIcon],
+  ["code-reviewer", ScanSearchIcon],
+  ["pr-test-analyzer", FlaskConicalIcon],
+  ["frontend_engineer", Code2Icon],
+  // Both halves of the doc/writ branch, so neither sub-condition can be
+  // dropped without a test failing.
+  ["documentation", FileTextIcon],
+  ["technical-writer", FileTextIcon],
+  ["general-purpose", OttoIcon],
+  [null, OttoIcon],
+];
+
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  useSessionAgentMock.mockReset();
+  // Default: no bound-agent object loaded, so the main row uses its
+  // wrapper/harness glyph. Tests that assert a declared spec icon override this.
+  useSessionAgentMock.mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useSessionAgent>);
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
     session: {
@@ -208,7 +251,6 @@ describe("SubagentsPanel", () => {
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveTextContent("Claude Code");
     expect(main).not.toHaveTextContent("claude-native-ui");
-    expect(main.querySelector('[data-icon="claude"]')).toHaveAttribute("aria-hidden", "true");
   });
 
   it("labels Pi native-wrapper main rows with the product name", () => {
@@ -238,6 +280,33 @@ describe("SubagentsPanel", () => {
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveTextContent("Pi");
     expect(main).not.toHaveTextContent("pi-native-ui");
+  });
+
+  it("renders the bound agent's declared emoji icon on the main row", () => {
+    // A custom agent whose spec declares an emoji icon shows that grapheme
+    // instead of the generic bot glyph — the same declared-icon precedence
+    // the picker card uses, so the two surfaces stay in lockstep.
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_root", name: "sparkle-agent", icon: "🦊" },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(screen.getByTestId("subagent-main-row")).toHaveTextContent("🦊");
+  });
+
+  it("renders the bound agent's declared path icon as an <img> to the icon endpoint", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_root", name: "branded-agent", icon: "brand/logo.svg" },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    const img = screen.getByTestId("subagent-main-row").querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img).toHaveAttribute("src", "/v1/agents/ag_root/icon");
   });
 
   it("shows the root's latest message as the main-row preview", () => {
@@ -574,7 +643,7 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const codexRow = childRow(container, "conv_codex");
-    expect(codexRow.querySelector('[data-icon="codex"]')).toHaveAttribute("aria-hidden", "true");
+    expect(codexRow.querySelector('[data-icon="codex"]')).not.toBeNull();
     expect(codexRow.querySelector(".lucide-code-2")).toBeNull();
 
     const opencodeRow = childRow(container, "conv_opencode");
@@ -1338,6 +1407,12 @@ describe("SubagentsPanel", () => {
 
     const child = screen.getByTestId("subagent-row");
     expect(child.getAttribute("href")).toBe("/c/conv_child_a?debug=1");
+  });
+
+  it.each(ICON_CASES)("maps agent type %s to its category icon", (tool, expected) => {
+    // Substring precedence matters: "code-reviewer" must hit review before
+    // code, "pr-test-analyzer" must hit test — a wrong branch order regresses.
+    expect(iconForAgentType(tool)).toBe(expected);
   });
 
   it("shows instance names for user-added and normal spawned sub-agents", () => {
