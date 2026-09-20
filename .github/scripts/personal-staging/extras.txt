@@ -33,7 +33,6 @@ branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 6136  # open  feat/terminal-extra-keys
 5554  # open  pollux/terminal-backpressure-v2
 5381  # open  automation-project-assignment (alembic merge-head re-parented on rebase)
-branch:fix/terminal-scrollbar-bleed-5225  # closed PR #5264; keep the rebased fork branch live
 4650  # open  fix/oidc-browser-handoff
 4438  # open  pollux/server-disconnect-attribution
 4058  # open  feat/graph-view-agent-icons-v2
