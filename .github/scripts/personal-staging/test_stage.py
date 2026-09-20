@@ -1440,6 +1440,14 @@ def test_production_extras_reject_branch_pins(tmp_path):
         stage_mod.parse_extras(manifest, stage_mod.PRODUCTION)
 
 
+def test_checked_in_extras_manifests_parse_for_their_rings():
+    stage_mod.parse_extras(stage_mod.EXTRAS_FILE, stage_mod.STAGING)
+    _, production_branches = stage_mod.parse_extras(
+        stage_mod.PRODUCTION_EXTRAS_FILE, stage_mod.PRODUCTION
+    )
+    assert production_branches == []
+
+
 @pytest.mark.parametrize("source", ["extra-branch"])
 def test_direct_production_stage_rejects_branch_extras_before_git(env, source):
     with pytest.raises(stage_mod.StageError, match=r"production.*extras"):
