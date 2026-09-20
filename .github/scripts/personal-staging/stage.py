@@ -444,6 +444,7 @@ def sync_main(cwd: str | Path, upstream: str = "upstream", fork: str = "origin")
         base_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
         git(cwd, "checkout", "--detach", base_sha)
         git(cwd, "fetch", upstream, "main")
+        upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
         merge = git(
             cwd,
             "merge",
@@ -454,8 +455,13 @@ def sync_main(cwd: str | Path, upstream: str = "upstream", fork: str = "origin")
             check=False,
         )
         if merge.returncode:
+            paths = conflict_paths(cwd)
             git(cwd, "merge", "--abort", check=False)
-            raise StageError(f"sync-main: merge failed: {merge.stderr.strip()}")
+            raise StageError(
+                f"sync-main: merge failed: fork main {base_sha}, upstream main {upstream_sha}\n"
+                f"Conflicted paths: {', '.join(paths) or '(none)'}\n"
+                f"{merge.stdout.strip()}\n{merge.stderr.strip()}"
+            )
         candidate = git(cwd, "rev-parse", "HEAD").stdout.strip()
         if candidate == base_sha:
             return candidate

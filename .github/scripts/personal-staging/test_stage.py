@@ -2434,6 +2434,23 @@ def test_sync_main_failure_leaves_main_untouched(env, pushes, failure):
     assert git(env.work, "ls-files", "-u").stdout == ""
 
 
+def test_sync_main_conflict_reports_inputs_and_git_diagnostics(env):
+    base = env.add_fork_branch("fork-main", "a.txt", "fork\n")
+    git(env.seed, "push", str(env.fork), "fork-main:main")
+    upstream = env.advance_main("a.txt", "upstream\n")
+
+    with pytest.raises(stage_mod.StageError) as error:
+        stage_mod.sync_main(env.work)
+
+    message = str(error.value)
+    assert "a.txt" in message
+    assert "CONFLICT" in message
+    assert base in message
+    assert upstream in message
+    assert env.fork_ref("refs/heads/main") == base
+    assert git(env.work, "ls-files", "-u").stdout == ""
+
+
 def test_sync_main_does_not_use_composition_rerere_seeds(env):
     base = env.add_fork_branch("fork-main", "a.txt", "fork\n")
     git(env.seed, "push", str(env.fork), "fork-main:main")
