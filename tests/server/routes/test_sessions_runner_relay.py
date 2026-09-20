@@ -142,6 +142,9 @@ class _NoBannerStreamResponse:
     ) -> None:
         del exc_type, exc, traceback
 
+    def raise_for_status(self) -> None:
+        return None
+
     async def aiter_text(self) -> AsyncIterator[str]:
         await self._release.wait()
         yield "data: [DONE]\n\n"
@@ -163,6 +166,9 @@ class _DropAfterBannerStreamResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        return None
 
     async def aiter_text(self) -> AsyncIterator[str]:
         yield 'data: {"type": "session.heartbeat"}\n\n'
@@ -998,6 +1004,9 @@ class _NeverReadyStreamResponse:
     ) -> None:
         del exc_type, exc, traceback
 
+    def raise_for_status(self) -> None:
+        return None
+
     async def aiter_text(self) -> AsyncIterator[str]:
         await asyncio.Event().wait()
         yield ""
@@ -1040,6 +1049,9 @@ class _TwoIncidentStreamResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        return None
 
     async def aiter_text(self) -> AsyncIterator[str]:
         yield 'data: {"type": "session.heartbeat"}\n\n'
@@ -1098,6 +1110,9 @@ class _EarlyProgressThenStallResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        return None
 
     async def aiter_text(self) -> AsyncIterator[str]:
         yield 'data: {"type": "session.heartbeat"}\n\n'
@@ -1318,6 +1333,9 @@ class _FlappingStreamResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        return None
 
     async def aiter_text(self) -> AsyncIterator[str]:
         yield 'data: {"type": "session.heartbeat"}\n\n'
@@ -1625,6 +1643,9 @@ class _BannerThenReadTimeoutResponse:
         :returns: None.
         """
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        return None
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield the subscription banner, then stall into a read timeout.
