@@ -12,7 +12,13 @@
 # never drops one. Drafts override the draft gate; ready PRs are pinned
 # redundantly on purpose (belt-and-suspenders over the open-PR stream). Remove
 # each once it lands upstream. #6439 (fix/kimi-steer-ctrl-s) removed — merged.
-7671  # draft feat/hindsight-credential-file-ref (host-file memory key; refs #7670)
+7876  # draft feat/claude-native-gateway-live-models
+7842  # draft fix/android-503-webview-http-error
+7671  # open  feat/hindsight-credential-file-ref (host-file memory key; refs #7670)
+7412  # draft pollux/pr-4058-icons (stacked on #7393)
+7393  # draft feat/grok-acp-agent-icon (stacked on #7280)
+7280  # draft feat/agent-spec-icon (stacked on #4058)
+7274  # draft fix/android-webapp-update-notify
 6856  # draft fix/background-battery-drain-main (supersedes bot #5825 on v0.13.0)
 6776  # draft fix/agent-sandbox-display-name
 6656  # draft feat/3d-preview-large-models
