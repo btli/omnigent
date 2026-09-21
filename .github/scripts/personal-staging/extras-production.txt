@@ -19,6 +19,7 @@
 7393  # draft feat/grok-acp-agent-icon (stacked on #7280)
 7280  # draft feat/agent-spec-icon (stacked on #4058)
 7274  # draft fix/android-webapp-update-notify
+7976  # draft fix/multi-host-git-credentials (per-host GIT_TOKEN_<HOST>; Forgejo clones in sandboxes)
 6856  # draft fix/background-battery-drain-main (supersedes bot #5825 on v0.13.0)
 6776  # draft fix/agent-sandbox-display-name
 6656  # draft feat/3d-preview-large-models
