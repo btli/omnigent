@@ -1,0 +1,15 @@
+# Branches composed into the `staging` build, merged in order (oldest first).
+# Format: <upstream-pr-number> <pinned-sha> <label>
+#
+# The pinned sha is the reviewed head of the upstream PR — the exact commits
+# maintainers approved. staging is rebuilt by merging these tips as-is, so a
+# rebuild never rewrites a PR branch and never invalidates approvals.
+#
+# - Update a line only when you deliberately push a new revision to that PR.
+# - Remove a pin when its PR closes or merges; only open PRs belong here.
+# - The homelab overlay branch is not listed here; sync-staging.sh always
+#   merges it last.
+2923 f8b150d8947a742f046d14bc0337d5045884c1e2 polly/font-loader-catalog
+4058 3dd198261a2efd43eca129abdcecb2f71637531a feat/graph-view-agent-icons-v2
+4438 5d41e3742dfaeafb5a25878177e5ff45df555485 pollux/server-disconnect-attribution
+5381 56040cf754ad776648971faca5a9e5937f172897 automation-project-assignment
