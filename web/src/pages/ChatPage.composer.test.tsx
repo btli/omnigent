@@ -8,10 +8,13 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
@@ -52,29 +55,66 @@ vi.mock("@/hooks/useGithub", () => ({
 // composer renders in isolation (no QueryClient) with a neutral empty status.
 // The hoisted spy records the args so a test can assert the page passes the
 // real session id / host / workspace / creation branch (not fixtures).
-const { composerGitStatusArgsSpy } = vi.hoisted(() => ({ composerGitStatusArgsSpy: vi.fn() }));
+const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() => ({
+  composerGitStatusArgsSpy: vi.fn(),
+  composerGitStatusSnapshot: {
+    branch: null as string | null,
+    branchState: "unknown" as "loading" | "branch" | "detached" | "not-git" | "unknown",
+    isWorktree: null as boolean | null,
+    worktreePath: null as string | null,
+    creationBranch: null as string | null,
+    repoNameWithOwner: "omnigent-ai/omnigent" as string | null,
+    githubState: "ready" as "loading" | "ready" | "unknown",
+    prCount: 0,
+    prNumber: null as number | null,
+    refresh: vi.fn(),
+    refreshing: false,
+  },
+}));
+const { openGithubTabMock } = vi.hoisted(() => ({ openGithubTabMock: vi.fn() }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: (args: unknown) => {
     composerGitStatusArgsSpy(args);
-    return {
+    return composerGitStatusSnapshot;
+  },
+}));
+vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileViewerContextModule>()),
+  useOpenGithubTab: () => openGithubTabMock,
+}));
+
+function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
+  Object.assign(
+    composerGitStatusSnapshot,
+    {
       branch: null,
       branchState: "unknown",
       isWorktree: null,
       worktreePath: null,
       creationBranch: null,
-      repoNameWithOwner: null,
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      githubState: "ready",
       prCount: 0,
       prNumber: null,
-      refresh: () => {},
       refreshing: false,
-    };
-  },
-}));
+    },
+    overrides,
+  );
+}
+
+afterEach(() => setComposerGitStatus());
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
+const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
+  childSessionsArgsSpy: vi.fn(),
+  composerChildSessions: { children: [] as ChildSessionInfo[] },
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: () => ({ children: [] }),
+  useChildSessions: (conversationId: string | null) => {
+    childSessionsArgsSpy(conversationId);
+    return { children: composerChildSessions.children, isLoading: false, error: null };
+  },
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
@@ -1947,9 +1987,9 @@ describe("Composer model/effort label", () => {
     );
 
     openSessionConfig();
-
     fireEvent.click(screen.getByTestId("composer-agent-edit"));
     expect(await screen.findByTestId("composer-agent-config-menu")).toBeTruthy();
+    expect(screen.getByTestId("composer-agent-model-opus")).toBeInTheDocument();
   });
 
   it("keeps the label click inert when the session is read-only", () => {
@@ -2005,6 +2045,14 @@ describe("Composer shared visible controls", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    childSessionsArgsSpy.mockClear();
+    composerChildSessions.children = [];
+    useChatStore.setState({
+      contextWindow: null,
+      tokensUsed: null,
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+    });
   });
 
   // The workspace/worktree popover markup moved into the shared
@@ -2040,6 +2088,7 @@ describe("Composer shared visible controls", () => {
     expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
     expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
+    expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
     // The branch text now flows through the shared ComposerWorkspaceStatus +
     // useComposerGitStatus (covered by their own tests); here assert the shared
     // branch control renders in the bar.
@@ -2052,6 +2101,115 @@ describe("Composer shared visible controls", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("transitions PR and worktree visibility across ready, empty, loading, and unknown GitHub states", () => {
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 1,
+      prNumber: 42,
+    });
+    const view = renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("#42");
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature/shared-composer");
+
+    setComposerGitStatus({ prCount: 0, prNumber: null });
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...composerProps()} />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("composer-pr-link")).toBeNull();
+    expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
+
+    setComposerGitStatus({ githubState: "loading", repoNameWithOwner: null });
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...composerProps()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
+    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+
+    setComposerGitStatus({ githubState: "unknown" });
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...composerProps()} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
+    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("keeps the PR to the left of the confirmed worktree status", () => {
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 1,
+      prNumber: 42,
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    const pr = screen.getByTestId("composer-pr-link");
+    const worktree = screen.getByTestId("composer-git-branch");
+    expect(pr.compareDocumentPosition(worktree) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("mounts sub-agent work after context and background indicators with navigation", () => {
+    useChatStore.setState({
+      conversationId: "conv_parent",
+      contextWindow: 100_000,
+      tokensUsed: 25_000,
+      backgroundTaskCount: 1,
+      backgroundTasks: [],
+    });
+    composerChildSessions.children = [
+      {
+        id: "conv_child",
+        title: "developer:queue-tests",
+        task_summary: "Verify queue behavior",
+        tool: "developer",
+        session_name: "queue-tests",
+        labels: {},
+        current_task_status: "in_progress",
+        last_task_error: null,
+        busy: true,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+        routed_model: null,
+      },
+    ];
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_parent?file=README.md&debug=1"]}>
+        <TooltipProvider>
+          <Composer {...composerProps()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    const workspace = screen.getByTestId("composer-workspace-controls");
+    const context = within(workspace).getByTestId("composer-context-ring");
+    const background = within(workspace).getByTestId("background-task-pill");
+    const subagent = within(workspace).getByTestId("subagent-task-pill");
+    expect(context.compareDocumentPosition(background) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
+    expect(
+      background.compareDocumentPosition(subagent) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
+
+    fireEvent.click(subagent);
+    expect(
+      screen.getByRole("link", { name: /Verify queue behavior.*Working.*developer/ }),
+    ).toHaveAttribute("href", "/c/conv_child?debug=1");
   });
 
   it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
@@ -4510,7 +4668,35 @@ describe("Composer config gear", () => {
     await openSessionEfforts();
     fireEvent.click(screen.getByTestId("composer-agent-effort-low"));
     await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
+    expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(calls).toEqual(["model", "effort"]);
+  });
+
+  it("shows a titled actionable tooltip when a session config update fails", async () => {
+    const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
+    const options = [
+      { id: "opus", model: "opus", displayName: "Opus" },
+      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+    ] as never;
+    useChatStore.setState({ setModel, codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+    const error = await screen.findByTestId("composer-config-error");
+    fireEvent.focus(error);
+    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
+    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
+    expect(tooltip).toHaveTextContent("Host stopped responding");
+    expect(tooltip).toHaveTextContent("Try again");
   });
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
