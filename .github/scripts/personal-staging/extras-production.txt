@@ -29,7 +29,7 @@
 6319  # open  fix/unified-touch-input
 6136  # open  feat/terminal-extra-keys
 5554  # open  pollux/terminal-backpressure-v2
-5381  # open  automation-project-assignment (alembic merge-head re-parented on rebase)
+5381  # open  automation-project-assignment (carries b7e41c0d92af, the composition merge head)
 4650  # open  fix/oidc-browser-handoff
 4438  # open  pollux/server-disconnect-attribution
 4058  # open  feat/graph-view-agent-icons-v2

@@ -17,7 +17,6 @@
 # 1234              # keep the composer hotfix until upstream merges it
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
-branch:fix/staging-alembic-merge-heads  # merges the alembic heads the pins below compose to
 #
 # btli open+draft PRs — force-included so a compose never drops one (drafts are
 # not covered by the open-PR stream; ready PRs are pinned redundantly on purpose
@@ -34,7 +33,7 @@ branch:fix/staging-alembic-merge-heads  # merges the alembic heads the pins belo
 6319  # open  fix/unified-touch-input
 6136  # open  feat/terminal-extra-keys
 5554  # open  pollux/terminal-backpressure-v2
-5381  # open  automation-project-assignment (alembic merge-head re-parented on rebase)
+5381  # open  automation-project-assignment (carries b7e41c0d92af, the composition merge head)
 4650  # open  fix/oidc-browser-handoff
 4438  # open  pollux/server-disconnect-attribution
 4058  # open  feat/graph-view-agent-icons-v2
