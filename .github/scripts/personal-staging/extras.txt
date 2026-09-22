@@ -24,7 +24,9 @@ branch:fix/staging-alembic-merge-heads  # merges the alembic heads the pins belo
 # so nothing is left out of a staging build). Remove each once it lands upstream.
 7671  # draft feat/hindsight-credential-file-ref (host-file memory key; refs #7670)
 7976  # draft fix/multi-host-git-credentials (per-host GIT_TOKEN_<HOST>; Forgejo clones in sandboxes)
-7280  # draft feat/agent-spec-icon (per-agent icons; upstream #7280, refs #7277)
+7280  # draft feat/agent-spec-icon (agent-spec icon field; refs #7277)
+7393  # draft feat/grok-acp-agent-icon (Grok icon in the agent picker)
+7412  # draft pollux/pr-4058-icons (icons in the subagent graph)
 6856  # draft fix/background-battery-drain-main
 6776  # draft fix/agent-sandbox-display-name
 6656  # draft feat/3d-preview-large-models
@@ -37,5 +39,4 @@ branch:fix/staging-alembic-merge-heads  # merges the alembic heads the pins belo
 5381  # open  automation-project-assignment (alembic merge-head re-parented on rebase)
 4650  # open  fix/oidc-browser-handoff
 4438  # open  pollux/server-disconnect-attribution
-4058  # open  feat/graph-view-agent-icons-v2
 2923  # draft polly/font-loader-catalog
