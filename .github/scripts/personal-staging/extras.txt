@@ -17,6 +17,7 @@
 # 1234              # keep the composer hotfix until upstream merges it
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
+branch:fix/staging-alembic-merge-heads  # merges the 3 alembic heads the pins compose to (see below)
 #
 # btli open+draft PRs — force-included so a compose never drops one (drafts are
 # not covered by the open-PR stream; ready PRs are pinned redundantly on purpose
