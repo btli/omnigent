@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { useSessionAgent } from "@/hooks/useAgents";
 import {
   buildTree,
   childActivity,
@@ -42,6 +43,10 @@ vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
 
+vi.mock("@/hooks/useAgents", () => ({
+  useSessionAgent: vi.fn(),
+}));
+
 vi.mock("@/components/icons/ClaudeIcon", () => ({
   ClaudeIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="claude" />,
 }));
@@ -60,6 +65,7 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
+const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -152,6 +158,10 @@ function treeRoot(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  useSessionAgentMock.mockReset();
+  useSessionAgentMock.mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useSessionAgent>);
   useSessionMock.mockReturnValue(defaultSession());
 });
 
