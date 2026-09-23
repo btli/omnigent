@@ -239,13 +239,11 @@ export { isMobileViewport };
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
-// archive + kebab take its place; on mobile those controls are gone, so the
-// badge simply holds the right edge. Without fine hover at md+ (touch tablets)
-// the controls are persistently visible instead, so the badge shifts left of
-// them (right-20 clears the control column) and never fades — a tap's sticky
-// :hover or a keyboard focus must not drop the state there.
+// archive + kebab take its place; without fine hover (phones, unfolded
+// foldables, touch tablets) those controls are gone, so the badge simply holds
+// the right edge and never fades.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0 no-fine-hover:md:right-20";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -257,22 +255,21 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
-// A session row's quick controls (pin, archive, kebab): hidden on mobile (the
-// chat header and the kebab's items cover those actions), shown from `md` up.
-// On a fine-hover display they fade until the row is hovered, a control is
-// keyboard-focused or the kebab menu is open; without fine hover (touch
-// tablets) they stay painted, matching the section headers' gating.
-// `md:inline-flex` (not `md:block`) keeps the Button base's flex centering.
-// Row title padding by trailing-badge kind: [rest, persistent touch-tablet].
+// A session row's quick controls (pin, archive, kebab) exist only on a
+// fine-hover display from `md` up, fading until the row is hovered, a control
+// is keyboard-focused or the kebab menu is open. Touch devices of any width
+// act on rows through swipes and the long-press menu instead.
+// `inline-flex` (not `block`) keeps the Button base's flex centering.
+// Row title padding by trailing-badge kind.
 const ROW_TITLE_RESERVE = {
-  none: "pr-2 no-fine-hover:md:pr-20",
-  dot: "pr-8 no-fine-hover:md:pr-27",
-  awaiting: "pr-29 no-fine-hover:md:pr-48",
-  dotShared: "pr-14 no-fine-hover:md:pr-33",
-  awaitingShared: "pr-36 no-fine-hover:md:pr-55",
+  none: "pr-2",
+  dot: "pr-8",
+  awaiting: "pr-29",
+  dotShared: "pr-14",
+  awaitingShared: "pr-36",
 } as const;
 const ROW_CONTROL_CLASS =
-  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
+  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset fine-hover:md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
 const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
@@ -3453,14 +3450,13 @@ function ConversationMenuItems({
 
   return (
     <>
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
+      {/* Pin/Unpin — wherever the quick-pin button is absent (everything but
+          fine-hover desktop). Archived rows omit it (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
           disabled={!isPinned && atPinCap}
-          className="md:hidden"
+          className="fine-hover:md:hidden"
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -4182,12 +4178,9 @@ function ConversationRowImpl({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full focus-visible:outline-offset-[-2px]",
-        // Rest reserve: mobile drops the controls, so the row reserves only
-        // what the badge needs — the same width a fine-hover desktop uses
-        // before hover reveals the controls. Without fine hover at md+ (touch
-        // tablets) the controls stay painted with the badge shifted left of
-        // them, so that reserve is persistent: the control column (pr-20)
-        // plus the badge's own width when one is present.
+        // Rest reserve: without fine hover the controls are gone, so the row
+        // reserves only what the badge needs — the same width a fine-hover
+        // desktop uses before hover reveals the controls.
         !selectionMode &&
           ROW_TITLE_RESERVE[
             sessionState?.kind === "awaiting"
@@ -4496,9 +4489,7 @@ function ConversationRowImpl({
             title="Shared with you"
             className={cn(
               "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0",
-              hasSessionIndicator
-                ? "right-8 no-fine-hover:md:right-27"
-                : "right-1 no-fine-hover:md:right-20",
+              hasSessionIndicator ? "right-8" : "right-1",
             )}
           >
             <UsersIcon className="size-3.5" aria-hidden="true" />
