@@ -606,6 +606,16 @@ function beginConnectionAttempt(win, requestId) {
   return attempt;
 }
 
+/** A cancelled sign-in on the still-current attempt, as opposed to a superseding load. */
+function isCancelledAttempt(win, attempt, error) {
+  return (
+    error?.name === "AbortError" &&
+    !attempt.controller.signal.aborted &&
+    !win.isDestroyed() &&
+    connectionAttempts.get(win) === attempt
+  );
+}
+
 function reportConnectionProgress(win, attempt, phase) {
   if (!attempt.requestId || win.isDestroyed() || connectionAttempts.get(win) !== attempt) return;
   win.webContents.send("omnigent:connection-progress", { requestId: attempt.requestId, phase });
@@ -1620,9 +1630,15 @@ async function loadServerUrl(
   try {
     assertCurrent();
     let serverUrl = requestedServerUrl;
-    databricksAuth?.reset(win);
-    pinWindow(win, serverUrl, attempt);
-    setWindowServerUrl(win, serverUrl);
+    // A window already on a server keeps it until OIDC sign-in succeeds, so a
+    // cancelled switch leaves that server's trust, auth, views and page intact.
+    const keepCurrentUntilSignedIn =
+      !usesBrowserAuth(serverUrl) && windows.get(win)?.origin != null;
+    if (!keepCurrentUntilSignedIn) {
+      databricksAuth?.reset(win);
+      pinWindow(win, serverUrl, attempt);
+      setWindowServerUrl(win, serverUrl);
+    }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     if (usesBrowserAuth(serverUrl)) {
       reportConnectionProgress(win, attempt, "authenticating");
@@ -1670,8 +1686,14 @@ async function loadServerUrl(
       });
       assertCurrent();
       if (!authenticated) {
+        // Nothing was loaded for the pre-pinned server, so drop its trust.
+        if (!keepCurrentUntilSignedIn) {
+          pinWindow(win, null, attempt);
+          setWindowServerUrl(win, null);
+        }
         throw Object.assign(new Error("Sign-in was cancelled"), { name: "AbortError" });
       }
+      if (keepCurrentUntilSignedIn) databricksAuth?.reset(win);
       pinWindow(win, serverUrl, attempt);
       setWindowServerUrl(win, serverUrl);
     }
@@ -1960,7 +1982,8 @@ function createWindow(targetUrl, opts = {}) {
   );
   if (destination) {
     // All server entry points share auth preparation and resolved-origin manifest lookup.
-    void loadServerUrl(win, serverUrl, undefined, { loadUrl: destination })
+    const attempt = beginConnectionAttempt(win);
+    void loadServerUrl(win, serverUrl, undefined, { loadUrl: destination, attempt })
       .then(() => {
         // A saved server can predate the recents list. Backfill it only after
         // a successful cold load; explicit targets may be conversation URLs.
@@ -1974,10 +1997,12 @@ function createWindow(targetUrl, opts = {}) {
           }
         }
       })
-      .catch(() => {
+      .catch((error) => {
         // Load failure falls back via did-fail-load → setup page with the
         // error and server URL shown; loading setup here too would supersede
-        // that parameterized page with a blank form.
+        // that parameterized page with a blank form. A cancelled sign-in
+        // never navigates, so it returns to setup here instead.
+        if (isCancelledAttempt(win, attempt, error)) void loadSetupPage(win, { url: serverUrl });
       });
   } else {
     if (serverUrlError) {
