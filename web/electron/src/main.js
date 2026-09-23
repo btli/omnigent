@@ -1459,6 +1459,7 @@ async function showWebAuthnTimeout(win) {
   if (response !== 0 || win.isDestroyed()) return;
   let probe;
   try {
+    await releaseSameHostSessionCookies(serverUrl);
     probe = await probeServerAuth(session.defaultSession, serverUrl);
   } catch {
     return;
@@ -1615,6 +1616,59 @@ async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUr
   await win.loadURL(destination);
 }
 
+const SESSION_COOKIE_NAMES = new Set(["ap_session", "__Host-ap_session"]);
+let sessionCookieReleases = Promise.resolve();
+
+/**
+ * Cookies are host-scoped, not port-scoped, so a same-host server on another
+ * port would receive this host's session. Drop it unless `serverUrl` owns it.
+ * Owners persist in settings; releases run one at a time.
+ */
+function releaseSameHostSessionCookies(serverUrl) {
+  const run = sessionCookieReleases.then(() => releaseSessionCookiesFor(serverUrl));
+  sessionCookieReleases = run.catch(() => {});
+  return run;
+}
+
+async function releaseSessionCookiesFor(serverUrl) {
+  const { hostname, origin } = new URL(serverUrl);
+  const recorded = loadSettings();
+  const owner =
+    recorded.session_cookie_origins?.[hostname] ?? unrecordedSessionOwner(recorded, origin);
+  if (owner !== origin) {
+    // Exactly the cookies a request to this server would carry.
+    const cookies = await session.defaultSession.cookies.get({ url: `${origin}/` });
+    await Promise.all(
+      cookies
+        .filter((cookie) => SESSION_COOKIE_NAMES.has(cookie.name))
+        .map((cookie) => {
+          const host = cookie.domain.replace(/^\./, "");
+          const url = `${cookie.secure ? "https" : "http"}://${host}${cookie.path ?? "/"}`;
+          return session.defaultSession.cookies.remove(url, cookie.name);
+        }),
+    );
+  }
+  // Re-read just before writing so settings saved meanwhile aren't lost.
+  const settings = loadSettings();
+  if (settings.session_cookie_origins?.[hostname] === origin) return;
+  settings.session_cookie_origins = { ...settings.session_cookie_origins, [hostname]: origin };
+  saveSettings(settings);
+}
+
+/** An unrecorded host adopts `origin` unless another saved server shares that host. */
+function unrecordedSessionOwner(settings, origin) {
+  const { hostname } = new URL(origin);
+  const saved = [
+    settings.server_url,
+    ...(Array.isArray(settings.recent_servers) ? settings.recent_servers : []),
+  ];
+  const shared = saved.some((url) => {
+    const other = typeof url === "string" ? originOf(url) : null;
+    return other !== null && other !== origin && new URL(other).hostname === hostname;
+  });
+  return shared ? null : origin;
+}
+
 function resolveServerPath(serverUrl, routePath) {
   return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : `/${routePath}`);
 }
@@ -1690,6 +1744,16 @@ async function loadServerUrl(
       }
     } else {
       reportConnectionProgress(win, attempt, "authenticating");
+      // The auth probe already sends cookies, so release before it.
+      try {
+        await releaseSameHostSessionCookies(serverUrl);
+      } catch (cause) {
+        throw Object.assign(new Error("Could not clear another server's session for this host."), {
+          name: "SessionReleaseError",
+          cause,
+        });
+      }
+      assertCurrent();
       const authenticated = await ensureWindowOidcSession(win, serverUrl, {
         forceInteractive: interactive,
       });
@@ -2010,8 +2074,12 @@ function createWindow(targetUrl, opts = {}) {
         // Load failure falls back via did-fail-load → setup page with the
         // error and server URL shown; loading setup here too would supersede
         // that parameterized page with a blank form. A cancelled sign-in
-        // never navigates, so it returns to setup here instead.
+        // never navigates, so it returns to setup here instead, as does a
+        // session release that failed closed before navigating.
         if (isCancelledAttempt(win, attempt, error)) void loadSetupPage(win, { url: serverUrl });
+        else if (error?.name === "SessionReleaseError" && !win.isDestroyed()) {
+          void loadSetupPage(win, { url: serverUrl, error: error.message });
+        }
       });
   } else {
     if (serverUrlError) {
