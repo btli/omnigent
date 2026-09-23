@@ -56,6 +56,9 @@ class MainActivity : AppCompatActivity() {
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
 
+    // Bumped on every server load so a late cookie callback can't load a stale one.
+    private var loadGeneration = 0
+
     // CookieManager.setCookie's completion is async; substitutable so a test
     // can hold the callback across a server switch (SessionTokenBindingTest).
     @VisibleForTesting
@@ -67,6 +70,11 @@ class MainActivity : AppCompatActivity() {
             ->
             CookieManager.getInstance().setCookie(url, value) { callback(it) }
         }
+
+    // Reads the Cookie header a request to the URL would carry; a test seam like
+    // [installSessionCookie].
+    @VisibleForTesting
+    internal var readCookies: (String) -> String? = { CookieManager.getInstance().getCookie(it) }
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -240,7 +248,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
-        webView.loadUrl(serverUrl)
+        loadReleasingSessionCookies(serverUrl, pinnedOrigin)
     }
 
     /**
@@ -453,9 +461,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Reload the user's route; a blank or foreign URL falls back to the root.
+        // Recovery can interrupt a same-host switch, so it releases cookies too.
         val reloadUrl =
             if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
-        webView.loadUrl(reloadUrl)
+        loadReleasingSessionCookies(reloadUrl, pinnedOrigin)
     }
 
     /**
@@ -767,8 +776,82 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0
         switchButton.text = hostLabelOf(serverUrl)
         installBridge()
-        webView.loadUrl(serverUrl)
+        loadReleasingSessionCookies(serverUrl, newOrigin)
     }
+
+    /**
+     * Load [serverUrl] once no other origin's session is left for its host:
+     * cookies are host-scoped, not port-scoped. The owner per host is recorded;
+     * an unrecorded host is ambiguous only if another saved server shares it.
+     */
+    private fun loadReleasingSessionCookies(
+        serverUrl: String,
+        origin: String?,
+    ) {
+        val generation = ++loadGeneration
+        val host = origin?.let { Uri.parse(it).host }
+        if (origin == null || host == null) {
+            webView.loadUrl(serverUrl)
+            return
+        }
+        val store = ServerStore(this)
+        val owner = store.sessionCookieOwner(host) ?: unrecordedSessionOwner(store, host, origin)
+        val load = {
+            store.recordSessionCookieOwner(host, origin)
+            webView.loadUrl(serverUrl)
+        }
+        if (owner == origin) return load()
+        expireSessionCookies(origin, generation) { cleared ->
+            if (isDestroyed || generation != loadGeneration) return@expireSessionCookies
+            if (cleared) {
+                load()
+            } else {
+                // Never hand the old session to this server; let the user retry.
+                startActivity(Intent(this, ConnectActivity::class.java))
+                finish()
+            }
+        }
+    }
+
+    private fun unrecordedSessionOwner(
+        store: ServerStore,
+        host: String,
+        origin: String,
+    ): String? {
+        val shared =
+            store.recentServers().any { url ->
+                val other = originOf(url)
+                other != null && other != origin && Uri.parse(other).host == host
+            }
+        return if (shared) null else origin
+    }
+
+    private fun expireSessionCookies(
+        origin: String,
+        generation: Int,
+        done: (Boolean) -> Unit,
+    ) {
+        val expiry = "; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"
+        val expired = mutableListOf("ap_session=$expiry")
+        if (origin.startsWith("https://")) expired += "__Host-ap_session=$expiry; Secure"
+
+        fun expireFrom(index: Int) {
+            // A newer load owns the cookie store now; stop writing.
+            if (generation != loadGeneration) return
+            if (index == expired.size) return done(!hasSessionCookie(origin))
+            installSessionCookie(origin, expired[index]) { accepted ->
+                if (accepted) expireFrom(index + 1) else done(false)
+            }
+        }
+        expireFrom(0)
+    }
+
+    // A cookie the expiry couldn't reach (e.g. a parent-domain one) still counts.
+    private fun hasSessionCookie(origin: String): Boolean =
+        readCookies(origin)
+            ?.split(';')
+            ?.map { it.trim().substringBefore('=') }
+            ?.any { it == "ap_session" || it == "__Host-ap_session" } == true
 
     private fun updateServerSwitcherWidth(containerWidthPx: Int) {
         if (containerWidthPx <= 0) return
