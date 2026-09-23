@@ -438,6 +438,7 @@ describe("Databricks auth mode wiring", () => {
       url: `${new URL(workspace).origin}/api/test`,
       statusCode: 303,
       redirectURL: `${new URL(workspace).origin}/login.html`,
+      webContentsId: h.webContents.id,
     });
     h.setUrl("https://identity.example/login");
     h.emit("did-navigate", "https://identity.example/login");
