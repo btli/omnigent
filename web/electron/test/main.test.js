@@ -23,6 +23,7 @@ const os = require("node:os");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
+const { workspaceIdentityKey } = require("../src/url");
 const { EventEmitter } = require("node:events");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
@@ -321,6 +322,7 @@ function loadNavigationHarness({
   const api = module.exports.testApi;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
+    identity: workspaceIdentityKey(serverUrl),
     serverUrl,
     ephemeral: false,
     badgeCount: 0,
@@ -519,6 +521,7 @@ describe("Databricks auth mode wiring", () => {
       url: `${workspace}/api/test`,
       statusCode: 303,
       redirectURL: `${new URL(workspace).origin}/login.html`,
+      webContentsId: h.webContents.id,
     });
     assert.equal(h.calls.reloads, 1);
     assert.deepEqual(h.calls.auth, []);
@@ -1023,7 +1026,7 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("navigation fallback wiring (src/main.js)", () => {
-  it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
+  it("boots a saved Databricks API URL on the UI mount without losing URL state", async () => {
     const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
     const harness = loadNavigationHarness({
       savedServerUrl: saved,
@@ -1031,6 +1034,9 @@ describe("navigation fallback wiring (src/main.js)", () => {
     });
 
     harness.api.createWindow();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
 
     assert.equal(
       harness.calls.loadURL[0][0],
@@ -1231,7 +1237,7 @@ describe("deep-link path join wiring (src/main.js)", () => {
   it("joins opts.path onto opts.serverUrl via resolveServerPath as live code", () => {
     assert.match(
       liveCode,
-      /resolveServerPath\(serverUrl, opts\.path\)/,
+      /(resolveServerPath|joinServerUrl)\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
         "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
@@ -1370,7 +1376,7 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     // consent-unknown branch, and does NOT appear before chooseDeepLinkStrategy.
     assert.match(
       liveCode,
-      /confirmOpenDeepLink\(parent, targetOrigin\)[\s\S]{0,300}expandDatabricksWorkspaceUrl\(targetOrigin\)/,
+      /confirmOpenDeepLink\(parent, parsed\.origin, workspaceCandidates\)[\s\S]{0,500}expandDatabricksWorkspaceUrl\(targetIdentity\)/,
       [
         "handleDeepLink no longer defers expandDatabricksWorkspaceUrl until AFTER",
         "confirmOpenDeepLink. A deep link to an unknown (attacker-chosen) server would",
@@ -1488,7 +1494,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   it("closes the window's browserRegistry when pinWindow changes origin", () => {
     assert.match(
       liveCode,
-      /function pinWindow\(win,\s*origin,\s*attemptToKeep\)\s*\{[\s\S]{0,700}browserRegistry\?\.closeAll\(/,
+      /function pinWindow\(win,\s*serverUrl,\s*attemptToKeep\)\s*\{[\s\S]{0,700}browserRegistry\?\.closeAll\(/,
       [
         "pinWindow no longer closes the window's embedded-browser views when the",
         "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
@@ -1502,12 +1508,35 @@ describe("browser-view teardown on server change (src/main.js)", () => {
   it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
     assert.match(
       liveCode,
-      /function pinWindow\(win,\s*origin,\s*attemptToKeep\)\s*\{[\s\S]{0,700}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
+      /function pinWindow\(win,\s*serverUrl,\s*attemptToKeep\)\s*\{[\s\S]{0,700}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
       [
         "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
         "state.origin != null guard the initial pin (setup→first connect) would try to",
         "close a registry with nothing open. Keep the guard.",
       ].join(" "),
+    );
+  });
+});
+
+describe("generic OIDC system-browser integration", () => {
+  it("keeps generic OIDC authentication in the shared server loader", () => {
+    assert.match(
+      liveCode,
+      /async function loadServerUrl[\s\S]{0,5000}else \{[\s\S]{0,500}ensureWindowOidcSession\(win, serverUrl/,
+    );
+  });
+
+  it("keeps workspace identity when pinning a server URL", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win, serverUrl, attemptToKeep\)[\s\S]{0,300}workspaceIdentityKey\(serverUrl\)/,
+    );
+  });
+
+  it("attributes legacy expiry redirects to the issuing webContents", () => {
+    assert.match(
+      liveCode,
+      /registerSessionExpiryReload\([\s\S]{0,900}webContentsId == null[\s\S]{0,300}expiredRequestMatchesIdentity/,
     );
   });
 });
