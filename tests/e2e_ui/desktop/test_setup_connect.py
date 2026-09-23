@@ -106,6 +106,11 @@ def test_explicit_http_remote_surfaces_main_process_rejection(page: Page) -> Non
     _open_setup_page(page)
 
     page.fill("#url", "http://example.databricks.com")
+    # The page warns once about plain http to a remote host; the second click
+    # proceeds and reaches the main process.
+    page.click("#connect")
+    expect(page.locator("#err")).to_contain_text("unencrypted http://")
+    assert page.evaluate("() => window.__connectCalls") == []
     page.click("#connect")
 
     page.wait_for_function("() => window.__connectCalls.length === 1")
