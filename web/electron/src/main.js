@@ -663,7 +663,7 @@ function getDatabricksAuth() {
 function registerSessionExpiryAccess() {
   registerSessionExpiryReload(
     session.defaultSession,
-    isPinnedWorkspaceUrl,
+    (identity) => !usesBrowserAuth(identity) && isPinnedWorkspaceUrl(identity),
     (identity, webContentsId) => {
       const now = globalThis.performance?.now?.() ?? Date.now();
       for (const [win, state] of windows) {
