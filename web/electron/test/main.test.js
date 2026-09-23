@@ -42,6 +42,7 @@ function loadNavigationHarness({
   ensureSession = async (_ses, origin) => origin,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  oidc,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -289,6 +290,40 @@ function loadNavigationHarness({
     },
   };
 
+  // Capture each window's OIDC expiry callback so tests can fire it directly.
+  const expiryHandoffs = [];
+  const sessionExpiry = localRequires["./session-expiry"];
+  localRequires["./session-expiry"] = {
+    ...sessionExpiry,
+    registerOidcSessionExpiryHandoff: (contents, serverUrlFor, onExpired) => {
+      expiryHandoffs.push(onExpired);
+      return sessionExpiry.registerOidcSessionExpiryHandoff(contents, serverUrlFor, onExpired);
+    },
+  };
+  // `oidc` scripts the generic OIDC seams: probe result, browser-dialog
+  // outcome and a cached CLI token.
+  const oidcCalls = { dialogs: [], installs: [] };
+  if (oidc) {
+    localRequires["./oidc_auth"] = {
+      ...require("../src/oidc_auth"),
+      probeServerAuth: async () => oidc.probe ?? { kind: "oidc" },
+      installAndVerifySessionCookie: async (_ses, url, token) => {
+        oidcCalls.installs.push([url, token]);
+      },
+    };
+    localRequires["./oidc_login_dialog"] = {
+      runOidcLoginDialog: async ({ serverUrl: url }) => {
+        oidcCalls.dialogs.push(url);
+        const result = oidc.dialogResult ?? false;
+        return typeof result === "function" ? result(url) : result;
+      },
+    };
+    localRequires["./omnigent_cli"] = {
+      ...localRequires["./omnigent_cli"],
+      serverAuthEntry: () => (oidc.cachedToken ? { token: oidc.cachedToken } : null),
+    };
+  }
+
   const mainPath = path.join(__dirname, "../src/main.js");
   const mainRequire = createRequire(mainPath);
   const source =
@@ -336,6 +371,8 @@ function loadNavigationHarness({
     bannerCalls,
     browserRegistryCalls,
     permissionPromptCalls,
+    expiryHandoffs,
+    oidcCalls,
     electron,
     ipc,
     webRequest,
@@ -1209,7 +1246,7 @@ describe("recent-server startup wiring (src/main.js)", () => {
   it("backfills a saved server only after its cold load succeeds", () => {
     assert.match(
       liveCode,
-      /loadServerUrl\(win,\s*serverUrl,\s*undefined,\s*\{\s*loadUrl:\s*destination\s*\}\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      /loadServerUrl\(win,\s*serverUrl,\s*undefined,\s*\{\s*loadUrl:\s*destination(?:,\s*attempt)?\s*\}\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
       [
         "createWindow no longer backfills a successfully loaded saved server into",
         "recent_servers. Existing installs can have server_url without recent_servers,",
@@ -1539,5 +1576,84 @@ describe("generic OIDC system-browser integration", () => {
       liveCode,
       /registerSessionExpiryReload\([\s\S]{0,900}webContentsId == null[\s\S]{0,300}expiredRequestMatchesIdentity/,
     );
+  });
+});
+
+describe("generic OIDC connection state", () => {
+  const serverA = "https://a.example";
+  const serverB = "https://b.example";
+  const tick = () =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+  const setupParams = (h) => new URLSearchParams(h.calls.loadFile.at(-1)?.[1]?.search ?? "");
+
+  it("keeps the current server when sign-in to a new one is cancelled", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: serverA, oidc: { dialogResult: false } });
+    t.after(h.cleanup);
+    const closed = [];
+    h.api.windows.get(h.win).browserRegistry = { closeAll: (reason) => closed.push(reason) };
+
+    await assert.rejects(h.api.loadServerUrl(h.win, serverB), { name: "AbortError" });
+
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.origin, serverA);
+    assert.equal(state.serverUrl, serverA);
+    assert.deepEqual(closed, [], "the current server's browser views must survive");
+    assert.deepEqual(h.oidcCalls.dialogs, [serverB]);
+    assert.deepEqual(h.calls.loadURL, []);
+  });
+
+  it("pins the new server once sign-in succeeds", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: serverA, oidc: { dialogResult: true } });
+    t.after(h.cleanup);
+
+    await h.api.loadServerUrl(h.win, serverB);
+
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.origin, serverB);
+    assert.equal(state.serverUrl, serverB);
+    assert.deepEqual(h.calls.loadURL, [[serverB]]);
+  });
+
+  it("returns a cold-start window to setup when sign-in is cancelled", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: serverB, oidc: { dialogResult: false } });
+    t.after(h.cleanup);
+
+    h.api.createWindow(serverB);
+    await tick();
+
+    assert.deepEqual(h.calls.loadURL, []);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupParams(h).get("url"), serverB);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+});
+
+describe("generic OIDC switches from a live server", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const serverA = "https://a.example";
+  const serverB = "https://b.example";
+  const tick = () =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+
+  it("keeps a Databricks workspace's auth lifecycle when a generic switch is cancelled", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      oidc: { dialogResult: false },
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace);
+
+    await assert.rejects(h.api.loadServerUrl(h.win, serverB), { name: "AbortError" });
+
+    // The still-attached workspace lifecycle routes its login page back to setup.
+    h.emit("did-navigate-in-page", `${new URL(workspace).origin}/login/sso`, true);
+    await tick();
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    assert.equal(h.calls.loadFile.length, 1);
   });
 });
