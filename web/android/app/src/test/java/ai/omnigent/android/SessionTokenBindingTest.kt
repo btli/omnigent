@@ -75,6 +75,18 @@ class SessionTokenBindingTest {
         assertTrue(lastLoaded.startsWith(switched))
     }
 
+    @Test
+    fun `session cookie includes HttpOnly flag`() {
+        val activity = launch()
+        var capturedCookie = ""
+        activity.installSessionCookie = { _, cookie, callback ->
+            capturedCookie = cookie
+            callback(true)
+        }
+        activity.onSessionToken(pinned, token)
+        assertTrue("Cookie should contain HttpOnly flag", capturedCookie.contains("; HttpOnly"))
+    }
+
     private fun webViewOf(activity: MainActivity): WebView {
         fun find(view: View): WebView? =
             when (view) {
