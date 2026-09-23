@@ -71,6 +71,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const {
@@ -3742,6 +3743,9 @@ function registerIpc() {
     return {
       ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
       customizationDisabled: databricksInternalFeaturesEnabled(),
+      // In-app install is macOS-only; the renderer must not route connect/local
+      // through an install step on platforms where it can't run.
+      installSupported: process.platform === "darwin",
     };
   });
 
