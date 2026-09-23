@@ -591,17 +591,26 @@ let databricksAuthMode;
 let databricksAuth;
 const connectionAttempts = new WeakMap();
 
+function finishConnectionAttempt(attempt) {
+  attempt.pending = false;
+  attempt.settle?.();
+}
+
 function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
   if (!attempt) return;
   connectionAttempts.delete(win);
-  attempt.pending = false;
+  finishConnectionAttempt(attempt);
   attempt.controller.abort(Object.assign(new Error(message), { name: "AbortError" }));
 }
 
 function beginConnectionAttempt(win, requestId) {
   abortConnectionAttempt(win);
-  const attempt = { controller: new AbortController(), requestId, pending: true };
+  let settle;
+  const settled = new Promise((resolve) => {
+    settle = resolve;
+  });
+  const attempt = { controller: new AbortController(), requestId, pending: true, settled, settle };
   connectionAttempts.set(win, attempt);
   return attempt;
 }
@@ -1707,7 +1716,7 @@ async function loadServerUrl(
     assertCurrent();
     return serverUrl;
   } finally {
-    attempt.pending = false;
+    finishConnectionAttempt(attempt);
   }
 }
 /**
@@ -2087,13 +2096,27 @@ function createWindow(targetUrl, opts = {}) {
       // gap after the awaited pending load settles — that load owns the
       // window now; recovering (or showing the expired setup page when
       // withServerLoad refuses) would clobber it.
-      if (windows.get(win)?.pendingServerLoads) return;
+      // A plain switch (setup Connect, server picker) is tracked by its
+      // connection attempt; wait out every such attempt and recover only if
+      // none moved the window off the expired server.
+      for (let switching; (switching = connectionAttempts.get(win))?.pending;) {
+        // eslint-disable-next-line no-await-in-loop -- each attempt must settle before the next is read
+        await switching.settled;
+        if (win.isDestroyed?.()) return;
+        if (windows.get(win)?.serverUrl !== expiredServerUrl) return;
+      }
+      if (windows.get(win)?.pendingServerLoads || connectionAttempts.get(win)?.pending) return;
       // The renderer's own /auth/login is explicit unauthenticated intent;
       // bypass cached CLI credentials and retain the modal's Cancel path.
-      const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl, {
-        forceInteractiveAuth: true,
-      });
-      if (!loaded) {
+      const attempt = beginConnectionAttempt(win);
+      try {
+        await loadServerUrl(win, expiredServerUrl, undefined, {
+          loadUrl: returnUrl,
+          interactive: true,
+          attempt,
+        });
+      } catch (error) {
+        if (!isCancelledAttempt(win, attempt, error)) throw error;
         await loadSetupPage(win, {
           error: "Your session expired and sign-in did not complete.",
           url: expiredServerUrl,
@@ -3333,7 +3356,7 @@ function registerIpc() {
       if (error.name === "AbortError") return { cancelled: true };
       throw error;
     } finally {
-      attempt.pending = false;
+      finishConnectionAttempt(attempt);
     }
   });
 
