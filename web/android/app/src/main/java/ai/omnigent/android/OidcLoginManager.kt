@@ -226,6 +226,8 @@ class OidcLoginManager {
             conn.setRequestProperty("Content-Length", "0")
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
+            // A redirect must fail, not follow: the ticket flow stays on the pinned origin.
+            conn.instanceFollowRedirects = false
             if (!publishConnection(conn, generation)) return null
             try {
                 val status = conn.responseCode
@@ -289,6 +291,8 @@ class OidcLoginManager {
             conn.requestMethod = "GET"
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
+            // Following a redirect would hand the one-time ticket to another server.
+            conn.instanceFollowRedirects = false
             if (!publishConnection(conn, generation)) return null
             try {
                 when (conn.responseCode) {

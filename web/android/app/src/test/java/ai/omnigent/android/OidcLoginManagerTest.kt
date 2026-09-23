@@ -572,4 +572,57 @@ class OidcLoginManagerTest {
             server.stop(0)
         }
     }
+
+    // An origin that redirects every request to a second local server (the
+    // stand-in for another host), whose hit count proves nothing followed.
+    private fun redirectingServer(status: Int): Triple<HttpServer, HttpServer, AtomicInteger> {
+        val target = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val targetHits = AtomicInteger(0)
+        target.createContext("/") { exchange ->
+            targetHits.incrementAndGet()
+            val bytes = """{"ticket":"t","login_url":"/l","token":"leaked"}""".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        target.start()
+        val origin = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        origin.createContext("/") { exchange ->
+            val location = "http://127.0.0.1:${target.address.port}${exchange.requestURI}"
+            exchange.responseHeaders.add("Location", location)
+            exchange.sendResponseHeaders(status, -1)
+            exchange.close()
+        }
+        origin.start()
+        return Triple(origin, target, targetHits)
+    }
+
+    @Test
+    fun `ticket creation fails on a redirect instead of following it`() {
+        val (server, target, targetHits) = redirectingServer(302)
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            assertNull(manager.requestTicket(origin, clock() + 30_000))
+            assertEquals(0, targetHits.get())
+        } finally {
+            server.stop(0)
+            target.stop(0)
+        }
+    }
+
+    @Test
+    fun `polling fails on a redirect instead of sending the ticket elsewhere`() {
+        val (server, target, targetHits) = redirectingServer(302)
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            assertNull(manager.pollForToken(origin, "t-1", clock() + 30_000))
+            assertEquals(0, targetHits.get())
+        } finally {
+            server.stop(0)
+            target.stop(0)
+        }
+    }
 }
