@@ -1628,6 +1628,39 @@ describe("generic OIDC connection state", () => {
     assert.equal(setupParams(h).get("url"), serverB);
     assert.equal(h.api.windows.get(h.win).origin, null);
   });
+
+  it("forces the browser flow and restores the route when a session expires", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: serverA,
+      oidc: { dialogResult: true, cachedToken: "cached.cli.token" },
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(serverA);
+    await tick();
+    h.calls.loadURL.length = 0;
+    h.oidcCalls.installs.length = 0;
+
+    await h.expiryHandoffs.at(-1)({ serverUrl: serverA, returnUrl: `${serverA}/c/abc` });
+
+    assert.deepEqual(h.oidcCalls.dialogs, [serverA], "expiry must not reuse the cached token");
+    assert.deepEqual(h.oidcCalls.installs, []);
+    assert.deepEqual(h.calls.loadURL, [[`${serverA}/c/abc`]]);
+  });
+
+  it("shows the expired-session setup page when expiry sign-in is cancelled", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: serverA, oidc: { dialogResult: false } });
+    t.after(h.cleanup);
+    h.api.createWindow(serverA);
+    await tick();
+    h.calls.loadFile.length = 0;
+
+    await h.expiryHandoffs.at(-1)({ serverUrl: serverA, returnUrl: `${serverA}/c/abc` });
+    await tick();
+
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.match(setupParams(h).get("error") ?? "", /session expired/);
+    assert.equal(setupParams(h).get("url"), serverA);
+  });
 });
 
 describe("generic OIDC switches from a live server", () => {
@@ -1655,5 +1688,113 @@ describe("generic OIDC switches from a live server", () => {
     await tick();
     assert.equal(h.api.windows.get(h.win).origin, null);
     assert.equal(h.calls.loadFile.length, 1);
+  });
+
+  it("does not let a session expiry on the current server abort a pending switch", async (t) => {
+    let finishB;
+    const h = loadNavigationHarness({
+      serverUrl: serverA,
+      oidc: {
+        dialogResult: (url) =>
+          url === serverB
+            ? new Promise((resolve) => {
+                finishB = resolve;
+              })
+            : true,
+      },
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(serverA);
+    await tick();
+    h.calls.loadURL.length = 0;
+    h.oidcCalls.dialogs.length = 0;
+
+    const switching = h.api.loadServerUrl(h.win, serverB);
+    await tick();
+    const recovering = h.expiryHandoffs.at(-1)({
+      serverUrl: serverA,
+      returnUrl: `${serverA}/c/abc`,
+    });
+    finishB(true);
+    await switching;
+    await recovering;
+
+    assert.deepEqual(h.oidcCalls.dialogs, [serverB], "expiry must not start its own sign-in");
+    assert.equal(h.api.windows.get(h.win).origin, serverB);
+    assert.deepEqual(h.calls.loadURL, [[serverB]]);
+  });
+
+  it("keeps waiting when a pending switch is superseded by another that cancels", async (t) => {
+    const serverC = "https://c.example";
+    const finish = {};
+    const h = loadNavigationHarness({
+      serverUrl: serverA,
+      oidc: {
+        dialogResult: (url) =>
+          url === serverA
+            ? true
+            : new Promise((resolve) => {
+                finish[url] = resolve;
+              }),
+      },
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(serverA);
+    await tick();
+    h.calls.loadURL.length = 0;
+    h.oidcCalls.dialogs.length = 0;
+
+    const toB = h.api.loadServerUrl(h.win, serverB);
+    await tick();
+    const recovering = h.expiryHandoffs.at(-1)({
+      serverUrl: serverA,
+      returnUrl: `${serverA}/c/abc`,
+    });
+    const toC = h.api.loadServerUrl(h.win, serverC);
+    await tick();
+    // The stale B sign-in still completes later; it must not commit anything.
+    finish[serverB](true);
+    await assert.rejects(toB, /superseded/);
+    finish[serverC](false);
+    await assert.rejects(toC, { name: "AbortError" });
+    await recovering;
+
+    assert.deepEqual(h.oidcCalls.dialogs, [serverB, serverC, serverA]);
+    assert.equal(h.api.windows.get(h.win).origin, serverA);
+    assert.deepEqual(h.calls.loadURL, [[`${serverA}/c/abc`]]);
+  });
+
+  it("recovers the current server once a pending switch away from it is cancelled", async (t) => {
+    let finishB;
+    const h = loadNavigationHarness({
+      serverUrl: serverA,
+      oidc: {
+        dialogResult: (url) =>
+          url === serverB
+            ? new Promise((resolve) => {
+                finishB = resolve;
+              })
+            : true,
+      },
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(serverA);
+    await tick();
+    h.calls.loadURL.length = 0;
+    h.oidcCalls.dialogs.length = 0;
+
+    const switching = h.api.loadServerUrl(h.win, serverB);
+    await tick();
+    const recovering = h.expiryHandoffs.at(-1)({
+      serverUrl: serverA,
+      returnUrl: `${serverA}/c/abc`,
+    });
+    finishB(false);
+    await assert.rejects(switching, { name: "AbortError" });
+    await recovering;
+
+    assert.deepEqual(h.oidcCalls.dialogs, [serverB, serverA]);
+    assert.equal(h.api.windows.get(h.win).origin, serverA);
+    assert.deepEqual(h.calls.loadURL, [[`${serverA}/c/abc`]]);
   });
 });
