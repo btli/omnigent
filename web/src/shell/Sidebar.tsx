@@ -49,6 +49,7 @@ import {
   MailIcon,
   MailOpenIcon,
   MessageCircleDashedIcon,
+  MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -62,7 +63,6 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
-  SquarePenIcon,
   Trash2Icon,
   UsersIcon,
   WalletIcon,
@@ -1076,7 +1076,7 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1108,7 +1108,7 @@ function SidebarImpl({
                     onNavClick(e);
                   }}
                 >
-                  <SquarePenIcon
+                  <MessageCirclePlusIcon
                     className={cn(
                       "ui-icon",
                       isNewChatPage
@@ -2272,7 +2272,7 @@ function ConversationList({
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex flex-col gap-4"
+            className="flex flex-col gap-6"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -2799,7 +2799,7 @@ function SectionHeader({
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
             )
-          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+          : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
     >
       {icon ? (
@@ -2889,22 +2889,28 @@ function SessionFilterMenu({
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
   return (
     <DropdownMenu>
-      <Tooltip>
+      <Tooltip disableHoverableContent>
         <TooltipTrigger asChild>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Filter sessions"
-              data-testid="session-filter"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <ListFilterIcon className="size-3.5" />
-            </Button>
-          </DropdownMenuTrigger>
+          {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+          <span className="inline-flex shrink-0">
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Filter sessions"
+                data-testid="session-filter"
+                className="text-muted-foreground"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <ListFilterIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+          </span>
         </TooltipTrigger>
-        <TooltipContent side="bottom">Filter sessions</TooltipContent>
+        <TooltipContent side="bottom" data-noninteractive-tooltip>
+          Filter sessions
+        </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
         <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
@@ -3079,7 +3085,7 @@ function SectionGroup({
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
     </section>
   );
 }
@@ -3212,7 +3218,7 @@ function ConversationSection({
                 // control itself still reveals it.
                 <div
                   className={cn(
-                    "flex items-center transition-opacity",
+                    "flex items-center rounded transition-opacity",
                     actionHoverOnly
                       ? "fine-hover:opacity-0 fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:group-hover/header:opacity-100 fine-hover:group-has-[[data-state=open]]/header:opacity-100 fine-hover:has-[[aria-expanded=true]]:opacity-100"
                       : "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
@@ -3232,7 +3238,7 @@ function ConversationSection({
       )}
       {afterHeader}
       {!isCollapsed && (
-        <>
+        <div className="pt-1">
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
@@ -3250,7 +3256,7 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
+            <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -3268,7 +3274,7 @@ function ConversationSection({
             </ul>
           )}
           {footer}
-        </>
+        </div>
       )}
     </section>
   );
@@ -4101,7 +4107,7 @@ function ConversationRowImpl({
     // unmounts. A failed archive reconciles the row back with its own error
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
-    if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
+    if (nextArchived) showArchiveUndoToast(queryClient, [conversation], navigate);
   }
 
   function confirmLeave() {
@@ -4506,109 +4512,127 @@ function ConversationRowImpl({
             gap to its left. Hidden entirely while selecting (bulk mode owns the
             row controls). */}
         {!selectionMode && (
-          <div
-            data-testid="conversation-row-controls"
-            className={cn(
-              "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
-              // While hover-faded on a fine-pointer display the controls must
-              // not hit-test either (opacity alone leaves them tappable on a
-              // touchscreen laptop, ahead of the row's tap/swipe), so they go
-              // inert until the same hover/focus/open state that reveals them —
-              // the section headers' controls use the identical gate.
-              "fine-hover:md:pointer-events-none",
-              "fine-hover:md:group-hover:pointer-events-auto fine-hover:md:group-has-[:focus-visible]:pointer-events-auto fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
-            )}
-          >
-            {/* Archived rows omit the pin entirely: pinning is meaningless there
-                (archive outranks pin), so there's no pin action even on hover. */}
-            {!isArchived && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                data-testid="quick-pin-conversation"
-                aria-disabled={!isPinned && atPinCap}
-                title={!isPinned && atPinCap ? "Unpin a session first" : undefined}
-                // Pinned rows keep no persistent marker: the "Pinned" section
-                // header already conveys the state, so the glyph is unpin when
-                // pinned, pin otherwise.
-                className={ROW_CONTROL_CLASS}
-                onClick={(e) => {
-                  // Keep the toggle click off the surrounding Link (no navigation).
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onTogglePinned(conversation.id);
-                }}
-              >
-                {isPinned ? (
-                  <PinOffIcon className="size-3.5" data-icon-size="14" />
-                ) : (
-                  <PinIcon className="size-3.5" data-icon-size="14" />
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <div
+                data-testid="conversation-row-controls"
+                className={cn(
+                  "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+                  // While hover-faded on a fine-pointer display the controls must
+                  // not hit-test either (opacity alone leaves them tappable on a
+                  // touchscreen laptop, ahead of the row's tap/swipe), so they go
+                  // inert until the same hover/focus/open state that reveals them —
+                  // the section headers' controls use the identical gate.
+                  "fine-hover:md:pointer-events-none",
+                  "fine-hover:md:group-hover:pointer-events-auto fine-hover:md:group-has-[:focus-visible]:pointer-events-auto fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
                 )}
-              </Button>
-            )}
-            {/* Archive is owner-only, same as the kebab's Archive item; non-owners
-                don't get the quick affordance and instead see that item disabled
-                with an explanation. */}
-            {isOwner && (
-              <Tooltip disableHoverableContent>
-                <TooltipContent>
-                  <TooltipArrow />
-                  {isArchived ? "Unarchive conversation" : "Archive conversation"}
-                </TooltipContent>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                    data-testid="quick-archive-conversation"
-                    className={ROW_CONTROL_CLASS}
-                    onClick={(e) => {
-                      // Keep the toggle click off the surrounding Link (no navigation).
-                      e.preventDefault();
-                      e.stopPropagation();
-                      runArchive();
-                    }}
-                  >
-                    {isArchived ? (
-                      <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                    ) : (
-                      <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                    )}
-                  </Button>
-                </TooltipTrigger>
-              </Tooltip>
-            )}
+              >
+                {/* Archived rows omit the pin entirely: pinning is meaningless there
+                    (archive outranks pin), so there's no pin action even on hover. */}
+                {!isArchived && (
+                  <Tooltip disableHoverableContent>
+                    <TooltipContent>
+                      <TooltipArrow />
+                      {!isPinned && atPinCap ? "Unpin a session first" : isPinned ? "Unpin" : "Pin"}
+                    </TooltipContent>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                        data-testid="quick-pin-conversation"
+                        aria-disabled={!isPinned && atPinCap}
+                        // Pinned rows keep no persistent marker: the "Pinned" section
+                        // header already conveys the state, so the glyph is unpin when
+                        // pinned, pin otherwise.
+                        className={ROW_CONTROL_CLASS}
+                        onClick={(e) => {
+                          // Keep the toggle click off the surrounding Link (no navigation).
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onTogglePinned(conversation.id);
+                        }}
+                      >
+                        {isPinned ? (
+                          <PinOffIcon className="size-3.5" data-icon-size="14" />
+                        ) : (
+                          <PinIcon className="size-3.5" data-icon-size="14" />
+                        )}
+                      </Button>
+                    </TooltipTrigger>
+                  </Tooltip>
+                )}
+                {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+                    don't get the quick affordance and instead see that item disabled
+                    with an explanation. */}
+                {isOwner && (
+                  <Tooltip disableHoverableContent>
+                    <TooltipContent>
+                      <TooltipArrow />
+                      {isArchived ? "Unarchive" : "Archive"}
+                    </TooltipContent>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                        data-testid="quick-archive-conversation"
+                        className={ROW_CONTROL_CLASS}
+                        onClick={(e) => {
+                          // Keep the toggle click off the surrounding Link (no navigation).
+                          e.preventDefault();
+                          e.stopPropagation();
+                          runArchive();
+                        }}
+                      >
+                        {isArchived ? (
+                          <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                        ) : (
+                          <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                        )}
+                      </Button>
+                    </TooltipTrigger>
+                  </Tooltip>
+                )}
 
-            <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label="Conversation actions"
-                  data-testid="conversation-actions"
-                  className={ROW_CONTROL_CLASS}
-                  onClick={(e) => {
-                    // Keep the trigger click from bubbling into the Link.
-                    e.preventDefault();
-                    e.stopPropagation();
-                  }}
-                >
-                  <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="min-w-44">
-                <ConversationMenuItems
-                  components={dropdownBundle}
-                  setMenuOpen={setMenuOpen}
-                  {...menuItemProps}
-                />
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+                <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Conversation actions"
+                      data-testid="conversation-actions"
+                      className={ROW_CONTROL_CLASS}
+                      onClick={(e) => {
+                        // Keep the trigger click from bubbling into the Link.
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }}
+                    >
+                      <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-44">
+                    <ConversationMenuItems
+                      components={dropdownBundle}
+                      setMenuOpen={setMenuOpen}
+                      {...menuItemProps}
+                    />
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44">
+              <ConversationMenuItems
+                components={contextBundle}
+                setMenuOpen={() => {}}
+                {...menuItemProps}
+              />
+            </ContextMenuContent>
+          </ContextMenu>
         )}
       </div>
       {/* Mount only while open — one per row, its hook tree + JSX would
@@ -4936,7 +4960,7 @@ function ProjectFolderActions({
                 onNavigate(e);
               }}
             >
-              <SquarePenIcon className="size-3.5" data-icon-size="14" />
+              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -4977,7 +5001,7 @@ function ProjectFolderMenuItems({
             onNavigate(e);
           }}
         >
-          <SquarePenIcon className="size-3.5" />
+          <MessageCirclePlusIcon className="size-3.5" />
           New session
         </Link>
       </C.Item>
@@ -5361,7 +5385,12 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="sr-only text-muted-foreground focus-visible:not-sr-only fine-hover:not-sr-only fine-hover:flex"
+          // sr-only keeps a focusable/announced trigger where no fine hover can
+          // reveal it (touch/AT). On reveal, not-sr-only zeroes width/height/
+          // padding, so restore the icon-xs box (size-6) — otherwise the ghost
+          // hover highlight collapses to the glyph and mismatches the session /
+          // project-list kebabs.
+          className="sr-only text-muted-foreground focus-visible:not-sr-only focus-visible:size-6 fine-hover:not-sr-only fine-hover:flex fine-hover:size-6"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -5731,7 +5760,7 @@ function BulkActionBar({
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, nonArchivedSelected);
+    showArchiveUndoToast(queryClient, nonArchivedSelected, navigate);
   }
 
   function handleUnarchive() {
@@ -5867,27 +5896,31 @@ function BulkActionBar({
                 if (!open) setMoveSearch("");
               }}
             >
-              <Tooltip>
+              <Tooltip disableHoverableContent>
                 <TooltipTrigger asChild>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      className="shrink-0"
-                      disabled={isBusy || ownedSelected.length === 0}
-                      aria-label="Move to project"
-                      data-testid="bulk-move-to-project"
-                    >
-                      {bulkMove.isPending ? (
-                        <Loader2Icon className="size-3.5 animate-spin" />
-                      ) : (
-                        <FolderInputIcon className="size-3.5" />
-                      )}
-                    </Button>
-                  </DropdownMenuTrigger>
+                  {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+                  <span className="inline-flex shrink-0">
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        disabled={isBusy || ownedSelected.length === 0}
+                        aria-label="Move to project"
+                        data-testid="bulk-move-to-project"
+                      >
+                        {bulkMove.isPending ? (
+                          <Loader2Icon className="size-3.5 animate-spin" />
+                        ) : (
+                          <FolderInputIcon className="size-3.5" />
+                        )}
+                      </Button>
+                    </DropdownMenuTrigger>
+                  </span>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Move to project</TooltipContent>
+                <TooltipContent side="bottom" data-noninteractive-tooltip>
+                  Move to project
+                </TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end" className="w-52">
                 <div className="flex items-center gap-2 border-b px-2 py-1.5">
