@@ -302,11 +302,14 @@ function loadNavigationHarness({
   };
   // `oidc` scripts the generic OIDC seams: probe result, browser-dialog
   // outcome and a cached CLI token.
-  const oidcCalls = { dialogs: [], installs: [] };
+  const oidcCalls = { dialogs: [], installs: [], order: [] };
   if (oidc) {
     localRequires["./oidc_auth"] = {
       ...require("../src/oidc_auth"),
-      probeServerAuth: async () => oidc.probe ?? { kind: "oidc" },
+      probeServerAuth: async (_ses, url) => {
+        oidcCalls.order.push(`probe:${url}`);
+        return oidc.probe ?? { kind: "oidc" };
+      },
       installAndVerifySessionCookie: async (_ses, url, token) => {
         oidcCalls.installs.push([url, token]);
       },
@@ -726,16 +729,23 @@ describe("Databricks auth mode wiring", () => {
 
   it("ignores completion of an authentication attempt after switching servers", async (t) => {
     let finish;
+    let signalStarted;
+    const started = new Promise((resolve) => {
+      signalStarted = resolve;
+    });
     const h = loadNavigationHarness({
       serverUrl: workspace,
       databricksMode: "browser",
       ensureSession: () =>
         new Promise((resolve) => {
           finish = resolve;
+          signalStarted();
         }),
     });
     t.after(h.cleanup);
     const pending = h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    // Switch only once the workspace sign-in is actually in flight.
+    await started;
     await h.api.loadServerUrl(h.win, "https://server.example");
     const rejected = assert.rejects(pending, /superseded/);
     finish(new URL(workspace).origin);
@@ -1796,5 +1806,119 @@ describe("generic OIDC switches from a live server", () => {
     assert.deepEqual(h.oidcCalls.dialogs, [serverB, serverA]);
     assert.equal(h.api.windows.get(h.win).origin, serverA);
     assert.deepEqual(h.calls.loadURL, [[`${serverA}/c/abc`]]);
+  });
+});
+
+describe("same-host session cookies across ports", () => {
+  const serverA = "https://h.example:8443";
+  const serverB = "https://h.example:9443";
+  const sessionCookie = { name: "__Host-ap_session", domain: "h.example", path: "/", secure: true };
+
+  function harnessWith(t, owners, { recents, serverUrl = serverA, databricksMode } = {}) {
+    const h = loadNavigationHarness({ serverUrl, databricksMode, oidc: { dialogResult: true } });
+    t.after(h.cleanup);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        ...(owners && { session_cookie_origins: owners }),
+        ...(recents && { recent_servers: recents }),
+      }),
+    );
+    const removed = [];
+    const lookups = [];
+    Object.assign(h.electron.session.defaultSession.cookies, {
+      get: async (filter) => {
+        lookups.push(filter);
+        return [
+          sessionCookie,
+          { name: "DBAUTH", domain: ".h.example", path: "/", secure: true },
+          { name: "other", domain: "h.example", path: "/" },
+        ];
+      },
+      remove: async (url, name) => {
+        removed.push([url, name]);
+        h.oidcCalls.order.push(`remove:${name}`);
+      },
+    });
+    const owner = (host = "h.example") =>
+      JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).session_cookie_origins?.[host];
+    return { h, removed, lookups, owner };
+  }
+
+  it("drops another port's session before the new server is probed", async (t) => {
+    const { h, removed, lookups, owner } = harnessWith(t, { "h.example": serverA });
+
+    await h.api.loadServerUrl(h.win, serverB);
+
+    assert.deepEqual(
+      lookups.map((filter) => filter.url),
+      [`${serverB}/`],
+    );
+    assert.deepEqual(removed, [["https://h.example/", "__Host-ap_session"]]);
+    assert.deepEqual(h.oidcCalls.order, ["remove:__Host-ap_session", `probe:${serverB}`]);
+    assert.equal(owner(), serverB);
+  });
+
+  it("keeps the session when reconnecting to the origin that owns it", async (t) => {
+    const { h, removed, owner } = harnessWith(t, { "h.example": serverA });
+
+    await h.api.loadServerUrl(h.win, serverA);
+
+    assert.deepEqual(removed, []);
+    assert.equal(owner(), serverA);
+  });
+
+  it("clears an unrecorded host when another saved server shares it", async (t) => {
+    const { h, removed, owner } = harnessWith(t, undefined, { recents: [`${serverA}/`] });
+
+    await h.api.loadServerUrl(h.win, serverB);
+
+    assert.equal(removed.length, 1);
+    assert.equal(owner(), serverB);
+  });
+
+  // Databricks operates its workspace hosts, so no other-port server can share
+  // them; its own auth lifecycle owns DBAUTH.
+  it("leaves Databricks workspace sign-in to Databricks auth", async (t) => {
+    const host = "w.cloud.databricks.com";
+    const workspace = `https://${host}/omnigent`;
+    const { h, removed, owner } = harnessWith(
+      t,
+      { [host]: `https://${host}:8443` },
+      { serverUrl: workspace, databricksMode: "browser" },
+    );
+
+    await h.api.loadServerUrl(h.win, workspace);
+
+    assert.deepEqual(removed, []);
+    assert.equal(owner(host), `https://${host}:8443`);
+    assert.equal(h.calls.auth.length, 1);
+  });
+
+  it("returns a cold-start window to setup when the session release fails", async (t) => {
+    const { h } = harnessWith(t, { "h.example": serverA }, { serverUrl: serverB });
+    h.electron.session.defaultSession.cookies.get = async () => {
+      throw new Error("cookie store unavailable");
+    };
+
+    h.api.createWindow(serverB);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+
+    assert.deepEqual(h.oidcCalls.order, [], "the new server must not be probed");
+    assert.deepEqual(h.calls.loadURL, []);
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)?.[1]?.search ?? "");
+    assert.match(params.get("error") ?? "", /Could not clear/);
+    assert.equal(params.get("url"), serverB);
+  });
+
+  it("adopts a host with no recorded owner without dropping its session", async (t) => {
+    const { h, removed, owner } = harnessWith(t, undefined);
+
+    await h.api.loadServerUrl(h.win, serverB);
+
+    assert.deepEqual(removed, []);
+    assert.equal(owner(), serverB);
   });
 });
