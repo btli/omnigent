@@ -372,6 +372,23 @@ describe("Composer session drafts", () => {
     expect(getSessionDraft("temp:draft")).toBeUndefined();
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
   });
+
+  it("restores attached files when switching back to a conversation", async () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    await waitFor(() => expect(getSessionDraft("conv_draft")?.files).toHaveLength(1));
+
+    // The other conversation has no draft, so its composer is empty...
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(screen.queryByText("notes.txt")).toBeNull();
+
+    // ...and switching back re-arms the saved attachment as a chip.
+    act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+    await waitFor(() => expect(screen.getByText("notes.txt")).toBeTruthy());
+  });
 });
 
 describe("Composer starting-session cancellation", () => {
@@ -4014,6 +4031,83 @@ describe("Composer paste", () => {
   });
 });
 
+// A send that fails before the server takes ownership hands its text and
+// files back to the composer for retry. The files re-enter through the same
+// up-front validation as a fresh attach — when the upload itself was what
+// failed (a 415 on an unsupported type), re-arming that file would only
+// fail again, so it is dropped with the same inline reason.
+describe("Composer failed-send attachment restore", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    clearSessionDrafts();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("restores the retriable files and flags the ones current limits reject", () => {
+    render(<Composer {...composerProps()} />);
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
+      }),
+    );
+
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    // The store entry drained on restore, so the draft can't come back twice.
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("skips the restore when the user attached a file while the send was in flight", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["mine"], "mine.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "message that failed",
+          files: [new File(["hello"], "notes.txt", { type: "text/plain" })],
+        },
+      }),
+    );
+
+    // The in-progress attachment wins over the restore: the failed message's
+    // text and files stay out, and the drained store entry does not return.
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("clears the failed-send rejection notice once the user types", () => {
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "",
+          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
+        },
+      }),
+    );
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
+});
+
 // The "Chatting with sub-agent …" tray peeks above the composer only when a
 // sub-agent label is passed (the active session is a child). It must name the
 // sub-agent so the composer reads as messaging the child, not the orchestrator.
@@ -4079,7 +4173,6 @@ describe("Composer sub-agent tray", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
       "rounded-t-none",
-      "pl-2.5",
       "border-t-0",
       "border-border/50",
       "before:inset-x-4",

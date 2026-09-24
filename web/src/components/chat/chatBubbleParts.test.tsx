@@ -329,3 +329,80 @@ describe("AssistantBubble error retry", () => {
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
   });
 });
+
+describe("UserBubble long-prompt collapse", () => {
+  const COLLAPSE_THRESHOLD = 12000;
+  const TAIL = "UNIQUE_TAIL";
+
+  // Overflowing ASCII characters followed by the tail
+  const LONG_TEXT = "a".repeat(COLLAPSE_THRESHOLD) + TAIL;
+  const EMOJI_AT_BOUNDARY = "a".repeat(COLLAPSE_THRESHOLD - 1) + "🔥" + "b".repeat(100);
+  const SHORT_TEXT = "Hello, world!";
+
+  function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
+    return {
+      kind: "user",
+      itemId: "user_collapse_test",
+      content: [{ type: "input_text", text }],
+    };
+  }
+
+  it("renders a short prompt fully without a collapse button", () => {
+    render(<BubbleView bubble={userBubble(SHORT_TEXT)} isLastAssistant={false} />);
+
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(SHORT_TEXT);
+    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
+  });
+
+  it("hides the tail when collapsed, shows it when expanded, hides it again when re-collapsed", () => {
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+
+    // Initially collapsed
+    expect(bubble).not.toHaveTextContent(TAIL);
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+
+    // After expanding
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    expect(bubble).toHaveTextContent(TAIL);
+
+    // After collapsing again
+    fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
+    expect(bubble).not.toHaveTextContent(TAIL);
+  });
+
+  it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
+    const writtenTexts: string[] = [];
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText: vi.fn((text: string) => {
+          writtenTexts.push(text);
+          return Promise.resolve();
+        }),
+      },
+    });
+
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const copyButton = screen.getByRole("button", { name: /^copy$/i });
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(writtenTexts).toHaveLength(1));
+    expect(writtenTexts[0]).toBe(LONG_TEXT);
+    expect(writtenTexts[0]).toContain(TAIL);
+  });
+
+  it("does not corrupt an emoji at slice boundary", () => {
+    render(<BubbleView bubble={userBubble(EMOJI_AT_BOUNDARY)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+
+    expect(bubble).not.toHaveTextContent("🔥");
+    expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
+    expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
+  });
+});

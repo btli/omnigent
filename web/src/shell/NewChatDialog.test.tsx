@@ -3237,7 +3237,7 @@ describe("NewChatLandingScreen", () => {
     const landingContent = screen.getByTestId("new-chat-landing").firstElementChild;
 
     expect(screen.getByTestId("new-chat-landing")).toHaveClass("pb-24");
-    expect(landingContent).toHaveClass("max-w-[800px]", "md:px-10");
+    expect(landingContent).toHaveClass("max-w-[800px]", "px-4");
     expect(composerSurface.firstElementChild).toBe(workspaceControls);
     expect(workspaceControls).toContainElement(workspace);
     expect(workspaceControls.nextElementSibling).toBe(composer.closest("form"));
@@ -3254,22 +3254,14 @@ describe("NewChatLandingScreen", () => {
       "border",
       "border-b-0",
       "composer-workspace-surface",
-      "px-2",
+      "px-3",
       "py-1.5",
     );
-    expect(workspace).toHaveClass(
-      "h-6",
-      "gap-1",
-      "rounded-md",
-      "px-0.5",
-      "md:px-1",
-      "text-xs",
-      "leading-4",
-    );
+    expect(workspace).toHaveClass("h-6", "gap-1", "rounded-md", "px-1", "text-xs", "leading-4");
     expect(composer).not.toHaveClass("min-h-[105px]");
     expect(composer).toHaveClass("md:min-h-[105px]");
     expect(composer).toContainElement(actions);
-    expect(actions).toHaveClass("justify-between", "gap-2", "px-2", "pt-1", "pb-2");
+    expect(actions).toHaveClass("justify-between", "gap-2", "px-3", "pt-1", "pb-2");
     expect(actions).not.toHaveClass("mt-2");
     const attach = screen.getByTestId("new-chat-landing-attach");
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
@@ -3311,8 +3303,7 @@ describe("NewChatLandingScreen", () => {
       "gap-1",
       "rounded-md",
       "bg-transparent",
-      "px-0.5",
-      "md:px-1",
+      "px-1",
       "text-xs",
       "leading-4",
     );
@@ -5802,8 +5793,7 @@ describe("NewChatLandingScreen", () => {
       "h-6",
       "max-w-[calc(50%-0.25rem)]",
       "gap-1",
-      "px-0.5",
-      "md:px-1",
+      "px-1",
       "text-xs",
       "leading-4",
     );
@@ -7314,6 +7304,48 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
   });
 
+  it("keeps Create disabled with the loading reason when the composer blurs mid-discovery", async () => {
+    // A lone partial token typed while skills are still loading keeps
+    // Create blocked even after the textarea loses focus — the pending
+    // completion is a property of the draft, not of the open menu.
+    mockSkills({ skillsStatus: "loading" });
+    renderLanding();
+    typeMessage("/review");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    fireEvent.blur(screen.getByTestId("new-chat-landing-input"));
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+    expect(tooltip).toHaveTextContent("Loading skills…");
+  });
+
+  it("keeps Start disabled for a restored slash draft that never takes focus", async () => {
+    // The stashed draft rides back onto a remounted landing; with discovery
+    // still in flight its partial command token must keep Start blocked even
+    // though this mount never focused the textarea (no autofocus on touch).
+    const restoreViewport = forceMobileViewport();
+    try {
+      mockSkills({ skillsStatus: "loading" });
+      const first = renderLanding();
+      typeMessage("/rev");
+      first.unmount();
+
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("/rev");
+      expect(screen.getByTestId("new-chat-landing-input")).not.toHaveFocus();
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      expect(submit).toBeDisabled();
+      fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+      const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+      expect(tooltip).toHaveTextContent("Loading skills…");
+    } finally {
+      restoreViewport();
+    }
+  });
+
   it("hides the cached host catalog when the host disconnects", () => {
     mockAgents([skilledAgent()]);
     mockSkills({ skills: [{ name: "host-only", description: "Host-only skill" }] });
@@ -7723,6 +7755,102 @@ describe("NewChatLandingScreen attachments", () => {
     });
 
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+
+  it("hands the attachments back when a create the user walked away from is rejected", async () => {
+    // A submitted draft is dropped on unmount — it belongs to the session
+    // being created. But a rejected create makes no session, so the files
+    // are the user's again and must ride the stashed draft back onto the
+    // remounted landing instead of vanishing with the failed attempt.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    const first = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    const file = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user gives up waiting and opens another session, then the create
+    // comes back rejected.
+    first.unmount();
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    renderLanding();
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "rebuild the parser",
+    );
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+  });
+
+  it("keeps the rejection notice verbatim when a create is rejected on screen", async () => {
+    // A mixed batch leaves a valid chip plus a rejection notice. A wholesale
+    // re-validating restore of the returned draft would clear the notice
+    // (every restored file is valid); the verbatim restore keeps both
+    // exactly as the user left them.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [ok] },
+    });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [clip] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user is still on the landing when the create comes back rejected.
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-error")).toBeTruthy());
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+    expect(screen.queryByText("clip.mp4")).toBeNull();
   });
 });
 
