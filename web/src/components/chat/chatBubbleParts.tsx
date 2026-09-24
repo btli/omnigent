@@ -18,10 +18,10 @@ import {
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  GitForkIcon,
   ImageIcon,
   Link2Icon,
   Loader2Icon,
+  SplitIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -90,6 +90,13 @@ import {
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+
+const COLLAPSE_THRESHOLD = 12000;
+
+// Slice a string by threshold and remove corrupted symbols
+function sliceByCodePoint(str: string, limit: number): string {
+  return str.slice(0, limit).replace(/[\uD800-\uDBFF]$/, "");
+}
 
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
@@ -692,6 +699,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
+  // Collapse long prompts by default to avoid expensive Markdown parsing and
+  // a large DOM for text the user hasn't asked to read yet.
+  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -821,15 +832,37 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
+              nothing rather than an empty markdown block.
+              For long prompts, only the visible slice is passed to the renderer
+              so the Markdown parser never processes hidden text. */}
             {text && (
-              <FilePathAwareMessageResponse
-                breaks
-                mode="static"
-                remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-              >
-                {text}
-              </FilePathAwareMessageResponse>
+              <>
+                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                  <FilePathAwareMessageResponse
+                    breaks
+                    mode="static"
+                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                  >
+                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
+                  </FilePathAwareMessageResponse>
+                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                      there is more content below. */}
+                  {isCollapsed && isLong && (
+                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                  )}
+                </div>
+                {isLong && (
+                  <button
+                    type="button"
+                    onClick={() => setIsCollapsed((c) => !c)}
+                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {isCollapsed
+                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                      : "Collapse prompt"}
+                  </button>
+                )}
+              </>
             )}
           </MessageContent>
         </div>
@@ -1022,8 +1055,10 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (
           <div
             className={cn(
-              "flex items-center gap-3 py-1 opacity-40 transition-opacity md:group-hover:opacity-100 md:group-focus-within:opacity-100",
-              !actionsPersistent && "md:opacity-0",
+              "flex items-center gap-3 py-1",
+              actionsPersistent
+                ? "opacity-100"
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
             )}
           >
             <MessageActions>
@@ -1048,7 +1083,7 @@ function AssistantBubble({
                   onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
                   componentId="chat.message.fork"
                 >
-                  <GitForkIcon size={14} />
+                  <SplitIcon size={14} />
                 </MessageAction>
               )}
               <MessageAction

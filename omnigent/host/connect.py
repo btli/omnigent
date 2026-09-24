@@ -18,11 +18,13 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
 import click
 import httpx
@@ -175,6 +177,12 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
 from omnigent.version import VERSION
+
+if TYPE_CHECKING:
+    from omnigent.workspace_fs import WorkspaceReader
+
+# Workspaces whose fs reader (and change registry) stay warm between requests.
+_FS_READER_CACHE_SIZE = 8
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -1058,6 +1066,11 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        # One reader per workspace, so its registry keeps state between
+        # requests (the changed-files snapshot search reuses for untracked
+        # files). Each entry remembers the repository root it was built for.
+        self._fs_readers: OrderedDict[str, tuple[Path | None, WorkspaceReader]] = OrderedDict()
+        self._fs_readers_lock = threading.Lock()
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
             if interactive_shells is not None
@@ -2925,6 +2938,7 @@ class HostProcess:
         """
         from pathlib import Path
 
+        from omnigent.runtime.filesystem_registry import detect_git_root
         from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
@@ -2946,7 +2960,18 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
-        reader = WorkspaceReader(Path(expanded))
+        # Re-detect the repository every time: a workspace that gains or loses
+        # a .git after its first request needs a reader of the matching kind.
+        repo_root = detect_git_root(Path(expanded))
+        with self._fs_readers_lock:
+            cached = self._fs_readers.get(expanded)
+            if cached is None or cached[0] != repo_root:
+                cached = (repo_root, WorkspaceReader(Path(expanded)))
+                self._fs_readers[expanded] = cached
+                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                    self._fs_readers.popitem(last=False)
+            self._fs_readers.move_to_end(expanded)
+            reader = cached[1]
         params = frame.params or {}
         try:
             payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
@@ -3271,8 +3296,6 @@ class HostProcess:
         :raises ValueError: On an unknown op.
         """
         from typing import cast
-
-        from omnigent.workspace_fs import WorkspaceReader
 
         r = cast("WorkspaceReader", reader)
         if op == "list_or_read":

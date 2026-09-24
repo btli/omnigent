@@ -435,14 +435,19 @@ before Step 1.
 ## Step 1 — Look for an existing fix PR (this decides your path)
 
 Before writing any code, find out whether someone is **already fixing this bug**.
-When `bug_url` is a GitHub issue, search for an open PR that fixes it:
+For GitHub issues and Linear tickets (with or without a GitHub mirror), search
+linked PRs and use `gh pr list --repo <repo> --state open --search "<query>"`
+with the issue/ticket identifier, symptom keywords, and affected component.
+Use `target_repo` when supplied; otherwise use `omnigent-ai/omnigent`.
 
-- `gh issue view <bug_url> --json ...` to see linked/closing PRs, and
-  `gh pr list --search "<issue-number>"` (and a keyword search on the bug title)
-  to catch PRs that reference the issue without a formal link.
-- Consider a PR a **candidate fix** only if it is **open** and actually targets
-  this bug's behavior. Ignore merged/closed PRs (if a merged PR were the fix,
-  repro-agent would have returned `already_fixed`) and unrelated PRs.
+- Before dismissing a plausible match, read its **full description and relevant
+  diff**, not just its title or a truncated summary. Broader fixes may cover the
+  reported symptoms even when linked to a different issue.
+- Compare its coverage with each reported symptom. If it may fix the bug, use
+  Step 2A to validate it; prefer reviewing or extending a sound existing fix.
+  If you still author a separate PR, name the candidate and explain what it
+  misses or why its approach is unsuitable in `fix_summary` and the PR body.
+- An open PR does not mean the bug is already fixed; validate its behavior.
 
 Branch on what you find:
 
@@ -805,6 +810,15 @@ retry with those variables removed before reporting an environment blocker.
 This step applies **only when you authored a fix in Step 2B** — it's about
 *opening* a PR. (The review path 2A adopts the existing PR instead of opening one,
 then goes straight to Step 4 to land it.) Once the set is genuinely green:
+
+**Check again before publishing.** Once the fix and PR body are ready, repeat
+Step 1's search immediately before creating a new PR, or before the final
+handoff to a CI publisher. Inspect only new or changed candidates, using Step 2A
+if one may cover the bug; preserve your work while evaluating it. Recheck the
+state of earlier candidates too: if one merged, use the shared repro audit on
+updated main before deciding whether your fix is still needed. Record the check
+and decision in `fix_summary`. Skip this refresh for `skip_push` and updates to
+an existing PR.
 
 ### Choose the publication mode before proceeding
 
@@ -1585,7 +1599,8 @@ Field meanings:
   reviewed PR doesn't fix it), `nothing_to_fix` (recovered verdict was
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
-  `needs_more_info` (couldn't recover the reproduction).
+  `needs_more_info` (couldn't recover a reliable reproduction, evidence is unsafe,
+  intended behavior is ambiguous, or setup/environment blocks verification).
 - `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
   prominently in the Linear update under **What's the problem?** and **How is it
   fixed?** Write plain, natural English for someone who uses the product but has
