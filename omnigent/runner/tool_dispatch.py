@@ -49,7 +49,11 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    is_native_harness,
+    native_terminal_name,
+)
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -1806,7 +1810,13 @@ async def _inherited_parent_model(
       worker's author chose that model deliberately;
     - a child harness without model-override plumbing runs its default;
     - a parent model outside the child harness's family (e.g. a Claude
-      selection dispatched to a codex worker) is not forced across vendors.
+      selection dispatched to a codex worker) is not forced across vendors;
+    - a child on a *different harness vendor* than the parent runs its own
+      default unless an inference binding validates the id (see
+      :func:`_child_is_foreign_harness` and
+      :func:`_harness_has_inference_binding`). The parent's model belongs to the
+      parent harness's provider vocabulary, so a foreign harness resolves it
+      against its own provider where it may not be servable.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
@@ -1841,12 +1851,28 @@ async def _inherited_parent_model(
     except ValueError:
         return None
     if child_harness is not None and _dispatch_model_mismatch(child_harness, parent_model):
-        _logger.debug(
+        _logger.info(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
             "(family mismatch with harness %s); child runs its default",
             parent_model,
             sub_agent_name,
             child_harness,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None
+    if (
+        child_harness is not None
+        and not _harness_has_inference_binding(child_harness)
+        and _child_is_foreign_harness(child_harness, snap.get("harness"))
+    ):
+        _logger.info(
+            "sys_session_send: not inheriting parent model %r for sub-agent %r "
+            "(child harness %s differs from the parent harness %r); child runs "
+            "its default",
+            parent_model,
+            sub_agent_name,
+            child_harness,
+            snap.get("harness"),
             extra={"session_id": runner_primary_session_id()},
         )
         return None
@@ -2294,6 +2320,77 @@ def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
             return str(exc)
         return None
     return model_family_mismatch(harness, model)
+
+
+def _harness_has_inference_binding(harness: str) -> bool:
+    """Whether an inference binding owns *harness*'s model namespace.
+
+    A bound harness resolves ids through ``resolve_bound_model`` at launch
+    (see the opencode/claude launch paths in :mod:`omnigent.runner.app`), so a
+    binding-validated bare id needs no ``provider/`` prefix or Databricks
+    profile; ``_dispatch_model_mismatch`` has already vetted the id against
+    the binding's allowlist by the time inheritance consults this.
+
+    :param harness: The child's resolved harness, e.g. ``"opencode-native"``.
+    :returns: ``True`` when a binding is configured for the harness.
+    """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    return binding_for_harness(load_runtime_inference_config(), harness) is not None
+
+
+def _harness_vendor_key(canon: str) -> str:
+    """Return a vendor key that unifies a harness's native/SDK spellings.
+
+    Single-vendor harnesses key on their ``ModelFamily`` (claude / gpt / gemini),
+    so ``claude-native``, ``claude-sdk`` and ``claude_sdk`` all collapse to
+    ``"claude"`` and ``codex`` / ``codex-native`` to ``"gpt"``. Multi-model
+    harnesses have no single family, so they key on the base name with
+    ``-native`` dropped (``pi`` ↔ ``pi-native``, ``opencode`` ↔
+    ``opencode-native``). The ``_``→``-`` fold lets the executor-type spelling
+    ``claude_sdk`` resolve to the ``claude-sdk`` capability row.
+
+    :param canon: A canonical harness id, e.g. ``"claude-sdk"``.
+    :returns: The vendor key, e.g. ``"claude"``.
+    """
+    from omnigent.harness_capabilities import ModelFamily
+    from omnigent.harness_plugins import harness_capabilities
+
+    caps = harness_capabilities()
+    cap = caps.get(canon) or caps.get(canon.replace("_", "-"))
+    if cap is not None and cap.model_family is not ModelFamily.MULTI:
+        return cap.model_family.value
+    return native_terminal_name(canon) or canon
+
+
+def _child_is_foreign_harness(child_harness: str, parent_harness: object) -> bool:
+    """
+    Report whether *child_harness* is a different harness vendor than the parent.
+
+    The parent's model belongs to the parent harness's provider vocabulary, so a
+    child on a different harness resolves it against its own provider where it
+    may not be servable — inheritance should skip and let the child use its own
+    default. Vendor identity is :func:`_harness_vendor_key`, which folds a
+    vendor's native/SDK spellings together (``claude-native`` ↔ ``claude-sdk``,
+    ``pi`` ↔ ``pi-native``) so same-vendor children inherit while genuinely
+    different vendors (claude vs gpt vs pi vs opencode) skip. A child whose
+    inference binding validated the id is exempted upstream by
+    :func:`_harness_has_inference_binding`.
+
+    :param child_harness: The child's resolved harness, alias or canonical.
+    :param parent_harness: The parent session's ``harness`` field from its
+        snapshot; a non-string (missing) is treated as "differs".
+    :returns: ``True`` when inheritance should be skipped for this child.
+    """
+    child_canon = canonicalize_harness(child_harness)
+    if child_canon is None:
+        return False
+    parent_canon = (
+        canonicalize_harness(parent_harness) if isinstance(parent_harness, str) else None
+    )
+    if parent_canon is None:
+        return True
+    return _harness_vendor_key(parent_canon) != _harness_vendor_key(child_canon)
 
 
 def _normalize_subagent_model(
