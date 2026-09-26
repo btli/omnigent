@@ -1,8 +1,11 @@
-"""merge staging composition heads
+"""merge composition heads after ll1
 
-Revision ID: b7e41c0d92af
-Revises: 370db4f834a4, d29f3a8b5c01, ii1a2b3c4d5e
-Create Date: 2026-09-22 08:30:00.000000
+b7e41c0d92af shipped to production joining ii1a2b3c4d5e; it is immutable, so
+the jj/kk/ll chain that later grew from ii1a2b3c4d5e is joined here instead.
+
+Revision ID: ce67dc4f3baa
+Revises: b7e41c0d92af, ll1a2b3c4d5e
+Create Date: 2026-09-26 00:30:00.000000
 """
 
 from __future__ import annotations
@@ -10,11 +13,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 # revision identifiers, used by Alembic.
-revision: str = "b7e41c0d92af"
+revision: str = "ce67dc4f3baa"
 down_revision: str | Sequence[str] | None = (
-    "370db4f834a4",
-    "d29f3a8b5c01",
-    "ii1a2b3c4d5e",
+    "b7e41c0d92af",
+    "ll1a2b3c4d5e",
 )
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
