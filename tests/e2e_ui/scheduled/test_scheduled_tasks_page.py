@@ -1119,7 +1119,7 @@ def test_automation_project_emoji_rendering_demo_paced(
     def _fired_session() -> dict | None:
         listed = httpx.get(
             f"{live_server}/v1/sessions",
-            params={"project": "Growth Metrics"},
+            params={"project": "Growth Metrics", "visibility": "all"},
             timeout=5.0,
         ).json()
         rows = listed.get("data", [])
