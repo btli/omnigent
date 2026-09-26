@@ -3,8 +3,9 @@
 # Composes fork branch `production` = published fork main + every open NON-draft
 # btli PR plus the extras-production.txt pins (its own manifest — a listed
 # draft is force-promoted past the draft gate; no dev tag) and
-# pins an immutable production-YYYYMMDD branch + tag, the pin homelab's
-# build-omnigent-production.yml resolves at 11:10 UTC. After the pin it
+# pins an immutable production-YYYYMMDD tag. Homelab resolves the immutable
+# `refs/tags/production-*` ref at 11:10 UTC. Same-name compatibility branches
+# were removed in v0.15.0. After the pin it
 # builds a debug APK and an unsigned macOS desktop app from the pinned
 # commit and publishes both on the dated prerelease plus a floating
 # `production-latest` release (stable download URLs for device testing).

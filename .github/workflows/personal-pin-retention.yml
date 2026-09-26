@@ -1,8 +1,9 @@
 # Retires aged personal-ring pins on the btli fork.
 #
 # The staging and production nightlies each mint an immutable dated pin —
-# a `<ring>-YYYYMMDD[-rerunN]` tag, a same-name compatibility branch, and a
-# dated prerelease — plus a PEP 440 `vX.Y.Z.devYYYYMMDD` tag on staging.
+# a `<ring>-YYYYMMDD[-rerunN]` tag and dated prerelease — plus a PEP 440
+# `vX.Y.Z.devYYYYMMDD` tag on staging. Same-name compatibility branches were
+# removed in v0.15.0; historical branches remain eligible for pruning.
 # Nothing resolves a pin after the homelab has built it, so they accumulate
 # forever: this prunes every pin dated more than `keep_days` back, keeping a
 # floor of the newest few per family so a stalled ring can never be stripped
