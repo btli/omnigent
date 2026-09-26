@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
@@ -449,7 +450,6 @@ export function AppShell() {
   const [forkOpen, setForkOpen] = useState(false);
   const [forkSourceSessionId, setForkSourceSessionId] = useState<string | null>(null);
   const [forkHostSessionId, setForkHostSessionId] = useState<string | null>(null);
-  const [forkSourceLoadSettled, setForkSourceLoadSettled] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
   // actions (ChatPage, via ForkDialogContext). `null` = full clone —
   // the mobile menu Clone entry's behavior. Cleared whenever the dialog
@@ -512,26 +512,17 @@ export function AppShell() {
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(serverConversationId);
-  const {
-    session: scopedForkSourceSession,
-    isLoading: scopedForkSourceLoading,
-    error: scopedForkSourceError,
-  } = useSession(forkSourceSessionId);
+  const { session: scopedForkSourceSession, error: scopedForkSourceError } =
+    useSession(forkSourceSessionId);
   const { session: forkHostSession } = useSession(forkHostSessionId);
   const forkSourceSession = forkSourceSessionId ? scopedForkSourceSession : activeSession;
   const effectiveForkSourceSessionId = forkSourceSessionId ?? serverConversationId;
-  const forkSourcePending = Boolean(
-    forkSourceSessionId &&
-    !forkSourceLoadSettled &&
-    scopedForkSourceSession === null &&
-    scopedForkSourceError === null &&
-    scopedForkSourceLoading,
-  );
+  const forkSourceReady = !forkSourceSessionId || scopedForkSourceSession !== null;
   useEffect(() => {
-    if (scopedForkSourceSession !== null || scopedForkSourceError !== null) {
-      setForkSourceLoadSettled(true);
-    }
-  }, [scopedForkSourceSession, scopedForkSourceError]);
+    if (!forkSourceSessionId || scopedForkSourceError === null || !forkOpen) return;
+    setForkOpen(false);
+    toast.error("Couldn't load the session to fork. Try again.");
+  }, [forkOpen, forkSourceSessionId, scopedForkSourceError]);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -2048,14 +2039,19 @@ export function AppShell() {
       canFork: canClone,
       openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => {
         const sourceSessionId = opts?.sourceSessionId ?? null;
+        if (
+          sourceSessionId &&
+          queryClient.getQueryState(["session", sourceSessionId])?.status === "error"
+        ) {
+          void queryClient.resetQueries({ queryKey: ["session", sourceSessionId], exact: true });
+        }
         setForkSourceSessionId(sourceSessionId);
         setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
-        setForkSourceLoadSettled(false);
         setForkUpToResponseId(opts?.upToResponseId ?? null);
         setForkOpen(true);
       },
     }),
-    [canClone, serverConversationId],
+    [canClone, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2439,7 +2435,7 @@ export function AppShell() {
               onOpenChange={setShareOpen}
             />
           )}
-          {effectiveForkSourceSessionId && !forkSourcePending && (
+          {effectiveForkSourceSessionId && forkSourceReady && (
             <ForkSessionDialog
               // Remount per source so source-derived form defaults reset when
               // a side-chat bubble opens the app-wide dialog.
