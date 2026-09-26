@@ -1107,9 +1107,7 @@ function AssistantBubble({
                   data-testid="fork-from-response"
                   onClick={() =>
                     forkDialog.openForkDialog({
-                      ...(scopedConversationId
-                        ? { sourceSessionId: scopedConversationId }
-                        : undefined),
+                      sourceSessionId: scopedConversationId ?? undefined,
                       upToResponseId: bubble.responseId,
                     })
                   }
