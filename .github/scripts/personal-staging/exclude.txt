@@ -2,3 +2,7 @@
 #
 # PR numbers only. Blank lines and `#` comments are ignored. A listed PR is
 # held out of every ring's composition until removed.
+#
+# Superseded by the #7280/#7393/#7412 agent-spec-icon series, which conflicts
+# with it across 33 files. The rings carry the series instead.
+4058  # feat/graph-view-agent-icons-v2 — superseded by #7280 + #7393 + #7412
