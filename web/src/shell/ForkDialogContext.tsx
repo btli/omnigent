@@ -19,7 +19,7 @@ export interface ForkDialogContextValue {
    * submits a truncated fork ("fork from this response"); without it,
    * a full clone (the session-menu behavior).
    */
-  openForkDialog: (opts?: { upToResponseId?: string }) => void;
+  openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => void;
 }
 
 const ForkDialogContext = createContext<ForkDialogContextValue | null>(null);
