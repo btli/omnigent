@@ -33,6 +33,12 @@ import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
 }));
+const realUseSession = vi.hoisted(() => ({
+  hook: null as unknown as typeof UseSessionModule.useSession,
+}));
+const realSessionsApi = vi.hoisted(() => ({
+  getSessionSlim: null as unknown as typeof SessionsApiModule.getSessionSlim,
+}));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   // Keep the real provider component — only the per-session readers are
@@ -80,22 +86,31 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 
-vi.mock("@/hooks/useSession", async (importOriginal) => ({
+vi.mock("@/hooks/useSession", async (importOriginal) => {
   // useRootSessionId stays real — with useSession mocked to a null /
   // top-level session it resolves synchronously without fetching.
-  ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
-}));
+  const actual = await importOriginal<typeof UseSessionModule>();
+  realUseSession.hook = actual.useSession;
+  return {
+    ...actual,
+    useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
+  };
+});
 
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: vi.fn(() => ({ data: undefined })),
 }));
 
-vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof SessionsApiModule>()),
-  forkSession: vi.fn(),
-}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  realSessionsApi.getSessionSlim = actual.getSessionSlim;
+  return {
+    ...actual,
+    forkSession: vi.fn(),
+    getSessionSlim: vi.fn(actual.getSessionSlim),
+  };
+});
 
 // The header's AgentInfoButton (desktop) and the mobile menu's "Agent info"
 // entry gate on the bound agent's tools/policies. Default: no agent data, so
@@ -273,11 +288,13 @@ const useHostsMock = vi.mocked(useHosts);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
-import { forkSession } from "@/lib/sessionsApi";
+import { forkSession, getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import { toast } from "sonner";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 const forkSessionMock = vi.mocked(forkSession);
+const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
@@ -579,6 +596,16 @@ function sessionSnapshot(overrides: Partial<Session> = {}): Session {
   } as Session;
 }
 
+function deferredRequest<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
 function withWindowOrigin(origin: string, run: () => void) {
   const originalLocation = window.location;
   Object.defineProperty(window, "location", {
@@ -620,6 +647,8 @@ beforeEach(() => {
   });
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+  getSessionSlimMock.mockReset();
+  getSessionSlimMock.mockImplementation(realSessionsApi.getSessionSlim);
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: undefined } as ReturnType<typeof useHosts>);
   forkSessionMock.mockReset();
@@ -656,6 +685,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  toast.dismiss();
   cleanup();
   vi.useRealTimers();
 });
@@ -4155,52 +4185,132 @@ describe("AppShell clone/fork action", () => {
     expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
   });
 
-  it.each([
-    ["success", null],
-    ["error", new Error("source unavailable")],
-  ])(
-    "mounts once after scoped source pending -> %s and stays mounted during refetch",
-    async (_outcome, settledError) => {
-      let phase: "pending" | "settled" | "refetch" = "pending";
-      const parent = sessionSnapshot({
-        id: "conv_parent",
-        workspace: "/repo",
-        hostId: "host_a",
-      });
-      const child = sessionSnapshot({ id: "conv_side_child", workspace: null, hostId: null });
-      mockConversations([
-        { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/repo" },
-      ]);
-      useSessionMock.mockImplementation((sessionId) => {
-        if (sessionId !== "conv_side_child") {
-          return {
-            session: sessionId === "conv_parent" ? parent : null,
-            isLoading: false,
-            error: null,
-          };
-        }
-        if (phase === "pending") return { session: null, isLoading: true, error: null };
-        if (phase === "refetch") return { session: null, isLoading: true, error: null };
-        return {
-          session: settledError === null ? child : null,
-          isLoading: false,
-          error: settledError,
-        };
-      });
+  it("mounts once after the scoped source query succeeds with source defaults", async () => {
+    const sourceRequest = deferredRequest<Session>();
+    const parent = sessionSnapshot({ id: "conv_parent", workspace: "/parent", hostId: "host_a" });
+    const child = sessionSnapshot({
+      id: "conv_side_child",
+      title: "Side source",
+      workspace: "/side-source",
+      hostId: "host_a",
+    });
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/parent" },
+    ]);
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+    } as ReturnType<typeof useHosts>);
+    useSessionMock.mockImplementation(realUseSession.hook);
+    getSessionSlimMock.mockImplementation((sessionId) => {
+      if (sessionId === "conv_parent") return Promise.resolve(parent);
+      if (sessionId === "conv_side_child") return sourceRequest.promise;
+      return Promise.reject(new Error(`unexpected session ${sessionId}`));
+    });
 
-      renderShell("/c/conv_parent", undefined, { rerenderable: true });
-      fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
-      expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
+    renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    await waitFor(() =>
+      expect(getSessionSlimMock).toHaveBeenCalledWith("conv_side_child", { refreshState: true }),
+    );
+    expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
 
-      phase = "settled";
-      fireEvent.click(screen.getByTestId("rerender-shell"));
-      const mountedDialog = await screen.findByTestId("fork-session-dialog");
+    await act(async () => sourceRequest.resolve(child));
+    const mountedDialog = await screen.findByTestId("fork-session-dialog");
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
 
-      phase = "refetch";
-      fireEvent.click(screen.getByTestId("rerender-shell"));
-      expect(screen.getByTestId("fork-session-dialog")).toBe(mountedDialog);
-    },
-  );
+    expect(screen.getByTestId("fork-session-title-input")).toHaveAttribute(
+      "placeholder",
+      "Fork of Side source",
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/side-source"),
+    );
+    expect(screen.getByTestId("fork-session-dialog")).toBe(mountedDialog);
+    expect(getSessionSlimMock.mock.calls.filter(([id]) => id === "conv_side_child")).toHaveLength(
+      1,
+    );
+  });
+
+  it("shows an error without mounting an actionable form when the source query fails", async () => {
+    const sourceRequest = deferredRequest<Session>();
+    const parent = sessionSnapshot({ id: "conv_parent", workspace: "/parent", hostId: "host_a" });
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/parent" },
+    ]);
+    useSessionMock.mockImplementation(realUseSession.hook);
+    getSessionSlimMock.mockImplementation((sessionId) => {
+      if (sessionId === "conv_parent") return Promise.resolve(parent);
+      if (sessionId === "conv_side_child") return sourceRequest.promise;
+      return Promise.reject(new Error(`unexpected session ${sessionId}`));
+    });
+
+    renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    await waitFor(() =>
+      expect(getSessionSlimMock).toHaveBeenCalledWith("conv_side_child", { refreshState: true }),
+    );
+
+    await act(async () => sourceRequest.reject(new Error("source unavailable")));
+
+    await waitFor(() => expect(screen.queryByTestId("fork-session-dialog")).toBeNull());
+    expect(await screen.findByText("Couldn't load the session to fork. Try again.")).toBeVisible();
+    expect(getSessionSlimMock.mock.calls.filter(([id]) => id === "conv_side_child")).toHaveLength(
+      1,
+    );
+  });
+
+  it("retries an errored scoped source only when the same fork is reopened", async () => {
+    const firstRequest = deferredRequest<Session>();
+    const retryRequest = deferredRequest<Session>();
+    const parent = sessionSnapshot({ id: "conv_parent", workspace: "/parent", hostId: "host_a" });
+    const child = sessionSnapshot({
+      id: "conv_side_child",
+      title: "Recovered side source",
+      workspace: "/side-recovered",
+      hostId: "host_a",
+    });
+    let sourceAttempts = 0;
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/parent" },
+    ]);
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+    } as ReturnType<typeof useHosts>);
+    useSessionMock.mockImplementation(realUseSession.hook);
+    getSessionSlimMock.mockImplementation((sessionId) => {
+      if (sessionId === "conv_parent") return Promise.resolve(parent);
+      if (sessionId === "conv_side_child") {
+        sourceAttempts += 1;
+        return sourceAttempts === 1 ? firstRequest.promise : retryRequest.promise;
+      }
+      return Promise.reject(new Error(`unexpected session ${sessionId}`));
+    });
+
+    renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    await waitFor(() => expect(sourceAttempts).toBe(1));
+    await act(async () => firstRequest.reject(new Error("source unavailable")));
+
+    expect(await screen.findByText("Couldn't load the session to fork. Try again.")).toBeVisible();
+    expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
+    expect(sourceAttempts).toBe(1);
+
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    await waitFor(() => expect(sourceAttempts).toBe(2));
+    expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
+
+    await act(async () => retryRequest.resolve(child));
+    await screen.findByTestId("fork-session-dialog");
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+    expect(screen.getByTestId("fork-session-title-input")).toHaveAttribute(
+      "placeholder",
+      "Fork of Recovered side source",
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/side-recovered"),
+    );
+    expect(sourceAttempts).toBe(2);
+  });
 
   it("keeps the scoped source stable while closing, then resets it for session Clone", async () => {
     const parent = sessionSnapshot({ id: "conv_parent", title: "Parent title" });
