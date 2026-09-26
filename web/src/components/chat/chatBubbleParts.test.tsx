@@ -113,7 +113,7 @@ describe("AssistantBubble fork source", () => {
     {
       name: "main chat",
       scope: null,
-      expected: { upToResponseId: "resp_side_reply" },
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
     },
   ])("opens from the $name session", ({ scope, expected }) => {
     const openForkDialog = vi.fn();

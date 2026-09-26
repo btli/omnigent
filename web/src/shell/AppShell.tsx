@@ -573,6 +573,7 @@ export function AppShell() {
     () => allConversations?.find((c) => c.id === activeSession?.parentSessionId) ?? null,
     [allConversations, activeSession?.parentSessionId],
   );
+  const forkSourceFallbackConv = forkSourceSessionId ? null : parentConv;
   // ── Header breadcrumb ─────────────────────────────────────────────────
   // The chat header shows the conversation's title, prefixed by a folder icon
   // when the session is filed under a project, and with the sub-agent identity
@@ -2420,16 +2421,8 @@ export function AppShell() {
               key={`fork-session-dialog-${effectiveForkSourceSessionId}`}
               sourceSessionId={effectiveForkSourceSessionId}
               sourceTitle={forkSourceSession?.title}
-              sourceWorkspace={
-                forkSourceSessionId
-                  ? forkSourceSession?.workspace
-                  : (activeSession?.workspace ?? parentConv?.workspace)
-              }
-              sourceHostId={
-                forkSourceSessionId
-                  ? forkSourceSession?.hostId
-                  : (activeSession?.hostId ?? parentConv?.host_id)
-              }
+              sourceWorkspace={forkSourceSession?.workspace ?? forkSourceFallbackConv?.workspace}
+              sourceHostId={forkSourceSession?.hostId ?? forkSourceFallbackConv?.host_id}
               sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
               open={forkOpen}
