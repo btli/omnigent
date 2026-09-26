@@ -519,10 +519,16 @@ export function AppShell() {
   const effectiveForkSourceSessionId = forkSourceSessionId ?? serverConversationId;
   const forkSourceReady = !forkSourceSessionId || scopedForkSourceSession !== null;
   useEffect(() => {
-    if (!forkSourceSessionId || scopedForkSourceError === null || !forkOpen) return;
+    if (
+      !forkSourceSessionId ||
+      scopedForkSourceSession !== null ||
+      scopedForkSourceError === null ||
+      !forkOpen
+    )
+      return;
     setForkOpen(false);
     toast.error("Couldn't load the session to fork. Try again.");
-  }, [forkOpen, forkSourceSessionId, scopedForkSourceError]);
+  }, [forkOpen, forkSourceSessionId, scopedForkSourceError, scopedForkSourceSession]);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -2039,10 +2045,10 @@ export function AppShell() {
       canFork: canClone,
       openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => {
         const sourceSessionId = opts?.sourceSessionId ?? null;
-        if (
-          sourceSessionId &&
-          queryClient.getQueryState(["session", sourceSessionId])?.status === "error"
-        ) {
+        const sourceState = sourceSessionId
+          ? queryClient.getQueryState(["session", sourceSessionId])
+          : undefined;
+        if (sourceSessionId && sourceState?.status === "error" && sourceState.data === undefined) {
           void queryClient.resetQueries({ queryKey: ["session", sourceSessionId], exact: true });
         }
         setForkSourceSessionId(sourceSessionId);
