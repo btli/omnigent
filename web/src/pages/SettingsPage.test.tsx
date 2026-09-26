@@ -16,7 +16,6 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
-import { UI_FONT_FAMILY_FALLBACK } from "@/lib/uiFontPreferences";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -659,43 +658,6 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
 
-  it("shows the empty font family default and applies + persists a typed name", () => {
-    localStorage.clear();
-    document.documentElement.style.removeProperty("--ui-font-family");
-    renderPage("/settings/appearance");
-    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
-    // No stored preference → empty input, System-default placeholder, no override.
-    expect(input.value).toBe("");
-    expect(input.placeholder).toBe("System default");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
-    // Reset has nothing to do at the default.
-    expect(screen.getByTestId("ui-font-family-reset")).toBeDisabled();
-
-    fireEvent.change(input, { target: { value: "Inter" } });
-    expect(input.value).toBe("Inter");
-    // The choice is persisted so it survives a refresh...
-    expect(localStorage.getItem("omnigent:ui-font-family")).toBe(JSON.stringify("Inter"));
-    // ...and applied live to the document root, with the system stack appended
-    // so an uninstalled/partial name degrades to the default sans, not serif.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
-      `Inter, ${UI_FONT_FAMILY_FALLBACK}`,
-    );
-    expect(screen.getByTestId("ui-font-family-reset")).not.toBeDisabled();
-  });
-
-  it("reset restores the system default font family", () => {
-    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Georgia"));
-    renderPage("/settings/appearance");
-    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
-    // The control reflects the stored preference on mount.
-    expect(input.value).toBe("Georgia");
-
-    fireEvent.click(screen.getByTestId("ui-font-family-reset"));
-    // Reset clears the field, the applied property, and the stored key.
-    expect(input.value).toBe("");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
-    expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
-  });
 
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
@@ -714,14 +676,8 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
-      target: { value: "Inter" },
-    });
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
-    fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
-      target: { value: "Fira Code" },
-    });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
@@ -743,10 +699,7 @@ describe("SettingsPage", () => {
 
     // Fonts are back to their defaults.
     expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
-    expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
-    expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
-    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
@@ -876,35 +829,6 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("10");
   });
 
-  it("shows the empty code font family default and applies + persists a typed name", () => {
-    localStorage.clear();
-    renderPage("/settings/appearance");
-    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
-    // No stored preference → empty input, editor-default placeholder.
-    expect(input.value).toBe("");
-    expect(input.placeholder).toBe("Editor default");
-    // Reset has nothing to do at the default.
-    expect(screen.getByTestId("code-font-family-reset")).toBeDisabled();
-
-    fireEvent.change(input, { target: { value: "Fira Code" } });
-    expect(input.value).toBe("Fira Code");
-    // The choice is persisted under the code-font family key so it survives a refresh.
-    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
-    expect(screen.getByTestId("code-font-family-reset")).not.toBeDisabled();
-  });
-
-  it("reset restores the default code font family", () => {
-    localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
-    renderPage("/settings/appearance");
-    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
-    // The control reflects the stored preference on mount.
-    expect(input.value).toBe("JetBrains Mono");
-
-    fireEvent.click(screen.getByTestId("code-font-family-reset"));
-    // Reset clears the field and the stored key.
-    expect(input.value).toBe("");
-    expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
-  });
 
   it("shows and persists the code font weight", () => {
     localStorage.clear();
