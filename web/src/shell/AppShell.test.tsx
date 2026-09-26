@@ -526,6 +526,26 @@ function mockConversations(
   } as ReturnType<typeof useConversations>);
 }
 
+function sessionSnapshot(overrides: Partial<Session> = {}): Session {
+  return {
+    id: "conv_session",
+    agentId: "ag_x",
+    agentName: null,
+    runnerId: null,
+    status: "idle",
+    createdAt: 0,
+    title: null,
+    labels: {},
+    items: [],
+    pendingElicitations: [],
+    permissionLevel: 4,
+    parentSessionId: null,
+    subAgentName: null,
+    kind: "default",
+    ...overrides,
+  } as Session;
+}
+
 function withWindowOrigin(origin: string, run: () => void) {
   const originalLocation = window.location;
   Object.defineProperty(window, "location", {
@@ -3946,29 +3966,17 @@ describe("AppShell clone/fork action", () => {
   });
 
   it("forks the passed side-chat source and derives dialog defaults from it", async () => {
-    const parent = {
+    const parent = sessionSnapshot({
       id: "conv_parent",
-      agentId: "ag_x",
-      agentName: null,
-      runnerId: null,
-      status: "idle",
-      createdAt: 0,
       title: "Parent title",
-      labels: {},
-      items: [],
-      pendingElicitations: [],
-      permissionLevel: 4,
-      parentSessionId: null,
-      subAgentName: null,
-      kind: "default",
-    } as Session;
-    const child = {
+    });
+    const child = sessionSnapshot({
       ...parent,
       id: "conv_side_child",
       title: "Side chat source",
       labels: { "omnigent.side_chat": "1" },
       parentSessionId: "conv_parent",
-    } as Session;
+    });
     mockConversations([{ id: "conv_parent", permission_level: 4 }]);
     useSessionMock.mockImplementation((sessionId) => ({
       session:
@@ -3994,6 +4002,60 @@ describe("AppShell clone/fork action", () => {
       "conv_side_child",
       expect.objectContaining({ upToResponseId: "resp_side_reply" }),
     );
+  });
+
+  it("uses the parent host and workspace for a scoped side-chat source", () => {
+    const parent = sessionSnapshot({
+      id: "conv_parent",
+      runnerId: "runner_parent",
+      title: "Parent title",
+      workspace: "/repo",
+      hostId: "host_a",
+    });
+    const child = sessionSnapshot({
+      ...parent,
+      id: "conv_side_child",
+      title: "Side chat source",
+      labels: { "omnigent.side_chat": "1" },
+      parentSessionId: "conv_parent",
+      workspace: null,
+      hostId: null,
+    });
+    mockConversations([{ id: "conv_parent", permission_level: 4 }]);
+    useSessionMock.mockImplementation((sessionId) => ({
+      session:
+        sessionId === "conv_side_child" ? child : sessionId === "conv_parent" ? parent : null,
+      isLoading: false,
+      error: null,
+    }));
+
+    renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+
+    const dialog = screen.getByTestId("fork-session-dialog");
+    expect(within(dialog).getByText("Host")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Clone & start" })).toBeInTheDocument();
+  });
+
+  it("waits for a scoped side-chat source before mounting the fork dialog", () => {
+    const parent = sessionSnapshot({
+      id: "conv_parent",
+      runnerId: "runner_parent",
+      title: "Parent title",
+      workspace: "/repo",
+      hostId: "host_a",
+    });
+    mockConversations([{ id: "conv_parent", permission_level: 4 }]);
+    useSessionMock.mockImplementation((sessionId) => ({
+      session: sessionId === "conv_parent" ? parent : null,
+      isLoading: sessionId === "conv_side_child",
+      error: null,
+    }));
+
+    renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+
+    expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
   });
 
   it("offers host + directory when forking a child, taken from its parent", () => {
