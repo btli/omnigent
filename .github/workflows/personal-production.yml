@@ -10,6 +10,12 @@
 # `production-latest` release (stable download URLs for device testing).
 # Publishes native-verified amd64/arm64 server and host images for the same pin.
 #
+# Two-phase pin: compose parks the candidate on a scratch ref without moving
+# any published ref, a secretless verify job builds the web bundle from it,
+# and only then does the pin job mint production-YYYYMMDD. A pin therefore
+# always names a tree that compiles — the composer's merge resolutions can
+# produce source that does not, and a pin is immutable once published.
+#
 # Migration gate (schema safety, spec decision 11): stage.py itself refuses
 # the atomic push when the candidate touches omnigent/db/migrations/versions/
 # — versus upstream main OR the previous production pin — unless this run was
@@ -18,8 +24,9 @@
 # operator to re-dispatch after the CNPG backup checkpoint (homelab runbook).
 #
 # Trust boundary: same shape as personal-staging.yml — the test gate runs
-# third-party dev deps secretless; the compose job is privileged (pushes
-# refs) but runs only the stdlib composer. The android/desktop build jobs
+# third-party dev deps secretless; the verify job builds merged-PR code
+# secretless; the compose and pin jobs are privileged (they push refs) but
+# run only the stdlib composer. The android/desktop build jobs
 # execute merged-PR code secretless; android-sign is a clean-room re-sign
 # that never checks out merged code. ha-notify POSTs are HMAC-signed
 # and always best-effort: CI never holds an HA API token (the in-cluster
@@ -99,9 +106,9 @@ jobs:
     outputs:
       date: ${{ steps.report.outputs.date }}
       production_sha: ${{ steps.report.outputs.production_sha }}
-      # Empty when the migration gate blocked the pin — downstream build
-      # and publish jobs key off this to skip.
-      tag: ${{ steps.report.outputs.tag }}
+      # Empty when the migration gate blocked the candidate — verify and pin
+      # key off this to skip. No tag exists yet: this phase publishes nothing.
+      candidate_ref: ${{ steps.report.outputs.candidate_ref }}
     steps:
       - name: Checkout fork with full history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -130,6 +137,7 @@ jobs:
               --upstream-remote upstream --fork-remote origin
           fi
           python3 .github/scripts/personal-staging/stage.py stage --ring production \
+            --no-publish \
             --migration-approval "$APPROVE_MIGRATION" \
             --upstream-remote upstream --fork-remote origin \
             --report merge-report.json
@@ -141,7 +149,7 @@ jobs:
           {
             echo "date=$(jq -r '.date // ""' merge-report.json)"
             echo "production_sha=$(jq -r '.staging_sha // ""' merge-report.json)"
-            echo "tag=$(jq -r '.tag // ""' merge-report.json)"
+            echo "candidate_ref=$(jq -r '.candidate_ref // ""' merge-report.json)"
           } >> "$GITHUB_OUTPUT"
 
       # Blocked is a SUCCESS outcome: the composer already refused the push
@@ -175,16 +183,117 @@ jobs:
         if: always() && hashFiles('merge-report.json') != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: merge-report
+          name: merge-report-candidate
           path: merge-report.json
 
       - name: Report failure
         if: failure()
         run: echo "## Personal production nightly — compose job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
 
-  publish-images:
+  # Secretless build gate — the reason this workflow is two-phase. A composed
+  # candidate can carry source that does not compile (a bad merge resolution
+  # in a PR head), and a pin is immutable, so the bundle is built BEFORE any
+  # ref moves. This job executes third-party npm lifecycle scripts from the
+  # merged PRs, so like android-build it gets no secrets and no persisted git
+  # credentials.
+  verify:
     needs: compose
-    if: needs.compose.outputs.tag != ''
+    if: needs.compose.outputs.candidate_ref != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the composed candidate
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.compose.outputs.production_sha }}
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.15.1
+          standalone: true
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the web bundle
+        run: pnpm --filter web run build
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal production nightly — verify job FAILED — the candidate does not build, so no pin was minted (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Phase two: the candidate built, so mint the pin. Privileged (it pushes
+  # refs) and runs only the stdlib composer — it never executes merged-PR
+  # code. The candidate is named by sha, so nothing can substitute a
+  # different tree between verify and here; fork main can still have moved,
+  # which the composer rechecks before its atomic push.
+  pin:
+    concurrency:
+      group: personal-production-compose
+      cancel-in-progress: false
+    needs: [compose, verify]
+    if: github.ref == 'refs/heads/main' && needs.compose.outputs.candidate_ref != ''
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      date: ${{ steps.report.outputs.date }}
+      production_sha: ${{ steps.report.outputs.production_sha }}
+      tag: ${{ steps.report.outputs.tag }}
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Download the pending merge report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: merge-report-candidate
+
+      - name: Publish the verified candidate
+        run: |
+          python3 .github/scripts/personal-staging/stage.py publish-candidate \
+            --ring production --fork-remote origin --report merge-report.json
+
+      - name: Export report fields
+        id: report
+        run: |
+          set -euo pipefail
+          {
+            echo "date=$(jq -r '.date // ""' merge-report.json)"
+            echo "production_sha=$(jq -r '.staging_sha // ""' merge-report.json)"
+            echo "tag=$(jq -r '.tag // ""' merge-report.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The published report is what the release notes are rendered from.
+      - name: Upload published merge report
+        if: always() && hashFiles('merge-report.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: merge-report
+          path: merge-report.json
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal production nightly — pin job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-images:
+    needs: pin
+    if: needs.pin.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -192,7 +301,7 @@ jobs:
       - name: Dispatch image publication for the immutable production pin
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_TAG: ${{ needs.compose.outputs.tag }}
+          SOURCE_TAG: ${{ needs.pin.outputs.tag }}
         run: |
           gh workflow run personal-staging-images.yml -R btli/omnigent \
             --ref main -f ref="$SOURCE_TAG"
@@ -202,8 +311,8 @@ jobs:
   # read-only access to the shared gradle cache (a poisoned cache write
   # would be restored by future runs).
   android-build:
-    needs: compose
-    if: needs.compose.outputs.tag != ''
+    needs: pin
+    if: needs.pin.outputs.tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -213,7 +322,7 @@ jobs:
       - name: Checkout the production commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.compose.outputs.production_sha }}
+          ref: ${{ needs.pin.outputs.production_sha }}
           persist-credentials: false
 
       - name: Set up JDK 17
@@ -233,8 +342,8 @@ jobs:
       # store-signed app; versionName carries the pin for provenance.
       - name: Build debug APK
         env:
-          VERSION_CODE: ${{ needs.compose.outputs.date }}
-          VERSION_NAME: ${{ needs.compose.outputs.tag }}
+          VERSION_CODE: ${{ needs.pin.outputs.date }}
+          VERSION_NAME: ${{ needs.pin.outputs.tag }}
         run: |
           ./gradlew assembleDebug --no-daemon --console=plain \
             -PversionCode="$VERSION_CODE" \
@@ -378,15 +487,15 @@ jobs:
   # macOS artifacts ship unsigned (identity nulled): first launch needs
   # right-click-Open or an xattr quarantine strip; fine for self-testing.
   desktop-build:
-    needs: compose
-    if: needs.compose.outputs.tag != ''
+    needs: pin
+    if: needs.pin.outputs.tag != ''
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - name: Checkout the production commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.compose.outputs.production_sha }}
+          ref: ${{ needs.pin.outputs.production_sha }}
           persist-credentials: false
 
       - name: Install pnpm
@@ -451,7 +560,7 @@ jobs:
         run: echo "## Personal production nightly — desktop-build job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    needs: [compose, android-sign, desktop-build]
+    needs: [pin, android-sign, desktop-build]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: staging-push
@@ -460,8 +569,8 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ needs.compose.outputs.tag }}
-      PRODUCTION_SHA: ${{ needs.compose.outputs.production_sha }}
+      TAG: ${{ needs.pin.outputs.tag }}
+      PRODUCTION_SHA: ${{ needs.pin.outputs.production_sha }}
     steps:
       - name: Checkout (for the release script)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -559,7 +668,8 @@ jobs:
   # yet, and alerting must never make a red run harder to read — the curl
   # can only warn, never fail.
   alert-failure:
-    needs: [test-composer, compose, android-build, android-sign, desktop-build, publish]
+    needs:
+      [test-composer, compose, verify, pin, android-build, android-sign, desktop-build, publish]
     if: failure() && github.repository == 'btli/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 5

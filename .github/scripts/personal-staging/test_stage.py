@@ -2572,3 +2572,175 @@ def test_android_build_requires_successful_integration():
     android_build = workflow["jobs"]["android-build"]
     assert android_build["needs"] == "integrate"
     assert "if" not in android_build
+
+
+# --- two-phase publish: compose, verify elsewhere, then pin ------------------
+
+
+def test_no_publish_parks_the_candidate_without_moving_any_ref(env):
+    """A pin names a tree nothing has built yet, so the nightly composes first
+    and publishes later. Phase one must leave every published ref alone."""
+    pr = env.add_pr(1, "one.txt", "one\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
+
+    assert report["publish_pending"] is True
+    assert report["pushed"] is False
+    assert "tag" not in report and "pin_ref" not in report
+    assert env.fork_ref("refs/heads/production") == ""
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == ""
+    # The candidate is reachable for the verifying and publishing jobs, in a
+    # namespace no release consumes.
+    assert report["candidate_ref"] == "refs/personal-staging/candidates/production"
+    assert env.fork_ref(report["candidate_ref"]) == report["staging_sha"]
+
+
+def test_publish_candidate_pins_the_parked_candidate(env):
+    pr = env.add_pr(1, "one.txt", "one\n")
+    pending = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
+
+    published = stage_mod.publish_candidate(env.work, pending, ring=stage_mod.PRODUCTION)
+
+    assert published["staging_sha"] == pending["staging_sha"]
+    assert published["tag"] == f"production-{STAMP}"
+    assert published["pin_created"] is True
+    assert env.fork_ref("refs/heads/production") == pending["staging_sha"]
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == pending["staging_sha"]
+    # The composition record survives the handoff intact.
+    assert published["applied"] == pending["applied"]
+    assert published["base_sha"] == pending["base_sha"]
+
+
+def test_publish_candidate_refuses_a_migration_blocked_candidate(env):
+    """The gate runs before anything is parked, so a blocked run hands phase
+    two nothing to publish — and a report that claims otherwise is refused on
+    the recorded gate decision."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(1, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    blocked = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
+    assert blocked["migration_gate"]["blocked"] is True
+
+    assert "publish_pending" not in blocked
+    with pytest.raises(stage_mod.StageError, match="no pending candidate"):
+        stage_mod.publish_candidate(env.work, blocked, ring=stage_mod.PRODUCTION)
+    with pytest.raises(stage_mod.StageError, match="migration gate blocked this candidate"):
+        stage_mod.publish_candidate(
+            env.work, {**blocked, "publish_pending": True}, ring=stage_mod.PRODUCTION
+        )
+    assert env.fork_ref("refs/heads/production") == ""
+
+
+def test_publish_candidate_refuses_a_report_with_no_candidate(env):
+    pr = env.add_pr(1, "one.txt", "one\n")
+    published = env.run([pr], ring=stage_mod.PRODUCTION)
+    with pytest.raises(stage_mod.StageError, match="no pending candidate"):
+        stage_mod.publish_candidate(env.work, published, ring=stage_mod.PRODUCTION)
+
+
+def test_publish_candidate_refuses_when_the_candidate_ref_drifted(env):
+    """The verified sha is the contract. If something else repointed the
+    candidate ref, publishing would pin an unverified tree."""
+    pr = env.add_pr(1, "one.txt", "one\n")
+    pending = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
+    other = env.add_pr(2, "two.txt", "two\n")
+    git(env.seed, "push", "-f", str(env.fork), f"{other['headRefOid']}:{pending['candidate_ref']}")
+
+    with pytest.raises(stage_mod.StageError, match="not the verified candidate"):
+        stage_mod.publish_candidate(env.work, pending, ring=stage_mod.PRODUCTION)
+    assert env.fork_ref("refs/heads/production") == ""
+
+
+def test_publish_candidate_refuses_when_fork_main_moved(env):
+    """Fork main can advance while the verifying job builds. Phase two keeps
+    stage's base check, so a stale composition cannot be pinned."""
+    pr = env.add_pr(1, "one.txt", "one\n")
+    pending = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
+    moved = env.add_pr(2, "two.txt", "two\n")
+    git(env.seed, "push", "-f", str(env.fork), f"{moved['headRefOid']}:refs/heads/main")
+
+    with pytest.raises(stage_mod.StageError):
+        stage_mod.publish_candidate(env.work, pending, ring=stage_mod.PRODUCTION)
+    assert env.fork_ref("refs/heads/production") == ""
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == ""
+
+
+def test_pending_summary_reports_no_pin(env):
+    pr = env.add_pr(1, "one.txt", "one\n")
+    pending = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
+    summary = stage_mod.summarize(pending, stage_mod.PRODUCTION)
+    assert "awaiting verification" in summary
+    assert "no refs pushed" in summary
+    assert "| Pin |" not in summary
+
+
+def test_no_publish_rejects_the_hourly_mode(env, tmp_path, capsys):
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    with pytest.raises(SystemExit) as exc:
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--staging-only",
+                "--no-publish",
+                "--prs-json",
+                str(prs_json),
+                "--report",
+                str(tmp_path / "r.json"),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "--no-publish is not valid with --staging-only" in capsys.readouterr().err
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
+
+
+def yaml_text(obj) -> str:
+    import yaml
+
+    return yaml.safe_dump(obj)
+
+
+def _production_workflow():
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "workflows/personal-production.yml"
+    return yaml.safe_load(path.read_text())
+
+
+def test_production_composes_without_publishing():
+    """Phase one must not move a ref: the pin is minted by a later job."""
+    compose = _production_workflow()["jobs"]["compose"]
+    scripts = "\n".join(step.get("run", "") for step in compose["steps"])
+    assert "--no-publish" in scripts
+    assert "publish-candidate" not in scripts
+    assert compose["outputs"].keys() == {"date", "production_sha", "candidate_ref"}
+
+
+def test_production_verifies_the_candidate_builds_before_pinning():
+    """A pin is immutable, so the tree it names must compile first. The build
+    runs merged-PR code, so it holds no secrets and no git credentials."""
+    jobs = _production_workflow()["jobs"]
+    verify = jobs["verify"]
+    assert verify["needs"] == "compose"
+    assert "secrets" not in yaml_text(verify)
+    [checkout] = [
+        s for s in verify["steps"] if str(s.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert checkout["with"]["persist-credentials"] is False
+    assert checkout["with"]["ref"] == "${{ needs.compose.outputs.production_sha }}"
+    scripts = "\n".join(step.get("run", "") for step in verify["steps"])
+    assert "pnpm install --frozen-lockfile" in scripts
+    assert "pnpm --filter web run build" in scripts
+
+    pin = jobs["pin"]
+    assert pin["needs"] == ["compose", "verify"]
+    assert pin["environment"] == "staging-push"
+    assert "publish-candidate" in "\n".join(step.get("run", "") for step in pin["steps"])
+    # Everything that consumes a pin waits for the job that mints it, so no
+    # release artifact can exist for an unverified composition.
+    for job in ("publish-images", "android-build", "desktop-build"):
+        assert jobs[job]["needs"] == "pin"
+        assert jobs[job]["if"] == "needs.pin.outputs.tag != ''"
+    assert jobs["publish"]["needs"] == ["pin", "android-sign", "desktop-build"]

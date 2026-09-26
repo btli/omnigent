@@ -1004,6 +1004,11 @@ def assert_production_identity(
 # under this prefix must not auto-promote to production (locked decision 11).
 MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
 
+# A composed-but-unverified candidate parks here while a job that holds no
+# secrets builds it. Outside refs/heads and refs/tags so nothing consumes it
+# as a release and no workflow triggers on it.
+CANDIDATE_REF_PREFIX = "refs/personal-staging/candidates/"
+
 
 def assert_migration_history(
     cwd: str | Path, candidate_sha: str, prev_pin_sha: str | None
@@ -1069,6 +1074,127 @@ def latest_pin_sha(cwd: str | Path, fork: str, ring: Ring) -> str | None:
     return latest[1] if latest else None
 
 
+def publish_pin(
+    cwd: str | Path,
+    fork: str,
+    ring: Ring,
+    *,
+    datestamp: str,
+    staging_sha: str,
+    base_sha: str,
+    upstream_sha: str,
+    applied: list[dict],
+    skipped: list[dict],
+    base_fields: dict,
+    gate: dict | None = None,
+) -> dict:
+    """Move the ring branch and mint the pin for an already-composed candidate.
+
+    Split out of ``stage`` so a candidate can be published from a later job:
+    a pin must not exist until something has verified the tree it names.
+    """
+    dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
+    name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
+    pin_branch_ref = f"refs/heads/{name}"
+    pin_tag_ref = f"refs/tags/{name}"
+
+    # One atomic push for every ref: a partial failure can't leave the fork
+    # with mixed staging/pin/dev-tag state. Leases pin the values we just
+    # observed so a concurrent push loses loudly instead of being clobbered.
+    refspecs: list[str] = []
+    leases: list[str] = []
+    expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
+    if expected_staging != staging_sha:
+        refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
+        leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
+    # Dated compatibility branches are removed in v0.12.0.
+    if created:
+        refspecs += [f"{staging_sha}:{pin_branch_ref}", f"{staging_sha}:{pin_tag_ref}"]
+        leases += [
+            f"--force-with-lease={pin_branch_ref}:",
+            f"--force-with-lease={pin_tag_ref}:",
+        ]
+    # The dev tag floats within the day: a rerun repoints it (fork-local tag,
+    # nothing downstream pins to it mid-day). Rings without one push nothing.
+    if dev_tag:
+        expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
+        if expected_dev != staging_sha:
+            refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
+            leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
+    if refspecs:
+        assert_publish_base(cwd, fork, base_sha, staging_sha)
+        main_lease, main_refspec = _main_lease(base_sha)
+        git(cwd, "push", "--atomic", main_lease, *leases, fork, main_refspec, *refspecs)
+
+    report = {
+        "date": datestamp,
+        **base_fields,
+        "staging_sha": staging_sha,
+        "branch": name,
+        "tag": name,
+        "pin_ref": pin_tag_ref,
+        "audit": [
+            {
+                "ref": ref,
+                "expected": staging_sha,
+                "observed": remote_ref(cwd, fork, ref),
+            }
+            for ref in (pin_tag_ref, pin_branch_ref)
+        ],
+        **({"dev_tag": dev_tag} if dev_tag else {}),
+        "pin_created": created,
+        **({"migration_gate": gate} if gate else {}),
+        "applied": applied,
+        "skipped": skipped,
+    }
+    return audit_published_base(cwd, fork, report)
+
+
+def publish_candidate(
+    cwd: str | Path,
+    report: dict,
+    fork: str = "origin",
+    ring: Ring = PRODUCTION,
+) -> dict:
+    """Publish the candidate a ``--no-publish`` compose recorded.
+
+    Phase two of the two-phase nightly. The candidate is named by sha, so the
+    tree cannot drift between the verifying job and this push; fork main can,
+    which ``publish_pin`` still rechecks before any ref moves.
+    """
+    if not report.get("publish_pending"):
+        raise StageError("report holds no pending candidate; nothing to publish")
+    gate = report.get("migration_gate") or None
+    if gate and gate.get("blocked"):
+        raise StageError("migration gate blocked this candidate; refusing to publish")
+    staging_sha = report["staging_sha"]
+    candidate_ref = report.get("candidate_ref") or f"{CANDIDATE_REF_PREFIX}{ring.branch}"
+    local = f"refs/candidates/{ring.branch}"
+    git(cwd, "fetch", fork, f"+{candidate_ref}:{local}")
+    observed = git(cwd, "rev-parse", "--verify", f"{local}^{{commit}}").stdout.strip()
+    if observed != staging_sha:
+        raise StageError(
+            f"{candidate_ref} holds {observed}, not the verified candidate {staging_sha}; "
+            "refusing to publish"
+        )
+    base_fields = {
+        key: report[key] for key in ("base_sha", "upstream_sha", "entry_zero") if key in report
+    }
+    return publish_pin(
+        cwd,
+        fork,
+        ring,
+        datestamp=report["date"],
+        staging_sha=staging_sha,
+        base_sha=report["base_sha"],
+        upstream_sha=report["upstream_sha"],
+        applied=report["applied"],
+        skipped=report["skipped"],
+        base_fields=base_fields,
+        gate=gate,
+    )
+
+
 def stage(
     cwd: str | Path,
     prs: list[dict],
@@ -1080,6 +1206,7 @@ def stage(
     migration_approval: str = "",
     rr_cache_dir: Path | None = None,
     base_ref: str | None = None,
+    publish: bool = True,
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
@@ -1225,61 +1352,41 @@ def stage(
                 },
             )
 
-    dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
-    name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
-    pin_branch_ref = f"refs/heads/{name}"
-    pin_tag_ref = f"refs/tags/{name}"
-
-    # One atomic push for every ref: a partial failure can't leave the fork
-    # with mixed staging/pin/dev-tag state. Leases pin the values we just
-    # observed so a concurrent push loses loudly instead of being clobbered.
-    refspecs: list[str] = []
-    leases: list[str] = []
-    expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
-    if expected_staging != staging_sha:
-        refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
-        leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
-    # Dated compatibility branches are removed in v0.12.0.
-    if created:
-        refspecs += [f"{staging_sha}:{pin_branch_ref}", f"{staging_sha}:{pin_tag_ref}"]
-        leases += [
-            f"--force-with-lease={pin_branch_ref}:",
-            f"--force-with-lease={pin_tag_ref}:",
-        ]
-    # The dev tag floats within the day: a rerun repoints it (fork-local tag,
-    # nothing downstream pins to it mid-day). Rings without one push nothing.
-    if dev_tag:
-        expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
-        if expected_dev != staging_sha:
-            refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
-            leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
-    if refspecs:
-        assert_publish_base(cwd, fork, base_sha, staging_sha)
-        main_lease, main_refspec = _main_lease(base_sha)
-        git(cwd, "push", "--atomic", main_lease, *leases, fork, main_refspec, *refspecs)
-
-    report = {
-        "date": datestamp,
-        **base_fields,
-        "staging_sha": staging_sha,
-        "branch": name,
-        "tag": name,
-        "pin_ref": pin_tag_ref,
-        "audit": [
+    if not publish:
+        # Two-phase mode: park the candidate and leave every published ref
+        # alone. A job that holds no secrets builds this sha, and
+        # ``publish-candidate`` mints the pin only when that build passed.
+        candidate_ref = f"{CANDIDATE_REF_PREFIX}{ring.branch}"
+        git(cwd, "push", "--force", fork, f"{staging_sha}:{candidate_ref}")
+        return audit_published_base(
+            cwd,
+            fork,
             {
-                "ref": ref,
-                "expected": staging_sha,
-                "observed": remote_ref(cwd, fork, ref),
-            }
-            for ref in (pin_tag_ref, pin_branch_ref)
-        ],
-        **({"dev_tag": dev_tag} if dev_tag else {}),
-        "pin_created": created,
-        **({"migration_gate": gate} if gate else {}),
-        "applied": applied,
-        "skipped": skipped,
-    }
-    return audit_published_base(cwd, fork, report)
+                "date": datestamp,
+                **base_fields,
+                "staging_sha": staging_sha,
+                "pushed": False,
+                "publish_pending": True,
+                "candidate_ref": candidate_ref,
+                **({"migration_gate": gate} if gate else {}),
+                "applied": applied,
+                "skipped": skipped,
+            },
+        )
+
+    return publish_pin(
+        cwd,
+        fork,
+        ring,
+        datestamp=datestamp,
+        staging_sha=staging_sha,
+        base_sha=base_sha,
+        upstream_sha=upstream_sha,
+        applied=applied,
+        skipped=skipped,
+        base_fields=base_fields,
+        gate=gate,
+    )
 
 
 def _skip_reason(p: dict) -> str:
@@ -1419,6 +1526,22 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
         rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
         return "\n".join(rows) + "\n"
 
+    # Phase one of a two-phase nightly: composed, parked, nothing published.
+    if report.get("publish_pending"):
+        rows = [
+            f"## Personal {ring.name} nightly",
+            "",
+            "| | |",
+            "| --- | --- |",
+            *_summary_base_rows(report),
+            f"| candidate (awaiting verification) | `{report['staging_sha']}` |",
+            "| Result | composed; no refs pushed — the pin is minted only after the "
+            "verification job builds this sha |",
+            f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
+        ]
+        rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
+        return "\n".join(rows) + "\n"
+
     pin_note = "" if report["pin_created"] else " (already pinned — rerun no-op)"
     rows = [
         f"## Personal {ring.name} nightly",
@@ -1476,11 +1599,35 @@ def main(argv: list[str] | None = None) -> int:
         help="committed rr-cache seed directory (missing dir == no resolutions)",
     )
     p_stage.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="compose and park the candidate without moving any published ref; "
+        "publish it later with the publish-candidate subcommand",
+    )
+    p_stage.add_argument(
         "--migration-approval",
         default="",
         metavar="SHA",
         help="full candidate sha approving a migration-touching production "
         "composition (only meaningful with --ring production)",
+    )
+
+    p_publish = sub.add_parser(
+        "publish-candidate",
+        help="publish a candidate parked by a --no-publish compose",
+    )
+    p_publish.add_argument("--workdir", default=".")
+    p_publish.add_argument(
+        "--ring",
+        choices=list(RINGS),
+        default=PRODUCTION.name,
+        help="ring whose candidate to publish (default: production)",
+    )
+    p_publish.add_argument("--fork-remote", default="origin")
+    p_publish.add_argument(
+        "--report",
+        default="merge-report.json",
+        help="pending report to publish from; rewritten with the published report",
     )
 
     p_notes = sub.add_parser("notes", help="render release notes from a merge report")
@@ -1522,6 +1669,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "is-stale-ref-rejection":
         return 0 if is_stale_ref_push_rejection(sys.stdin.read(), ref=args.ref) else 1
 
+    if args.cmd == "publish-candidate":
+        ring = RINGS[args.ring]
+        pending = json.loads(Path(args.report).read_text())
+        title = f"Personal {ring.name} publish"
+        try:
+            report = publish_candidate(args.workdir, pending, fork=args.fork_remote, ring=ring)
+        except Exception as e:
+            if isinstance(e, PublicationDriftError):
+                Path(args.report).write_text(json.dumps(e.report, indent=2) + "\n")
+            append_summary(f"## {title}\n\n**FAILED:** {e}\n")
+            raise
+        if "excluded" in pending:
+            report["excluded"] = pending["excluded"]
+        Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
+        append_summary(summarize(report, ring))
+        print(json.dumps(report, indent=2))
+        return 0
+
     if args.cmd == "notes":
         report = json.loads(Path(args.report).read_text())
         sys.stdout.write(notes(report, signed=args.signed == "true", ring=RINGS[args.ring]))
@@ -1537,6 +1702,8 @@ def main(argv: list[str] | None = None) -> int:
     # only. Rejected here, before any fetch or push can move a ref.
     if args.staging_only and ring is not STAGING:
         parser.error("--staging-only is only valid for --ring staging")
+    if args.no_publish and args.staging_only:
+        parser.error("--no-publish is not valid with --staging-only")
     title = f"Personal {ring.name} " + ("hourly" if args.staging_only else "nightly")
     try:
         # Fail the stage path before any fetch/merge if the parser is absent.
@@ -1570,6 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
             migration_approval=args.migration_approval,
             rr_cache_dir=Path(args.rr_cache),
             base_ref=args.base_ref,
+            publish=not args.no_publish,
         )
         report["excluded"] = excluded
     except Exception as e:
