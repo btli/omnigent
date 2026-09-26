@@ -18,6 +18,7 @@ export interface ForkDialogContextValue {
    * Open the fork/clone dialog. With `upToResponseId` set, the dialog
    * submits a truncated fork ("fork from this response"); without it,
    * a full clone (the session-menu behavior).
+   * `sourceSessionId` overrides the URL session as the fork source.
    */
   openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => void;
 }

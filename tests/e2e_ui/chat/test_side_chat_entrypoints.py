@@ -32,9 +32,7 @@ def side_chat_forks(page: Page, seeded_session: tuple[str, str]) -> Iterator[lis
     pattern = f"**/v1/sessions/{session_id}/fork"
 
     def track_fork(route: Route) -> None:
-        if route.request.post_data_json.get("side_chat") is not True:
-            route.continue_()
-            return
+        assert route.request.post_data_json["side_chat"] is True
         response = route.fetch()
         if response.ok:
             child_ids.append(response.json()["id"])
