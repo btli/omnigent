@@ -699,13 +699,11 @@ def _get_current_db_revision(engine: Engine) -> str | None:
     ``None`` means the database has no ``alembic_version`` table at
     all — i.e. nothing has ever been migrated against this database.
     A database that exists at some revision (even if not head) returns
-    that revision string. If there are multiple heads (e.g., after
-    downgrading below a merge point), returns ``None`` to indicate
-    the database needs migration.
+    that revision string.
 
     :param engine: SQLAlchemy engine bound to the target database.
     :returns: The current revision hash (e.g. ``"c9d3a1f2e4b5"``) or
-        ``None`` if the ``alembic_version`` table is absent or has multiple heads.
+        ``None`` if the ``alembic_version`` table is absent.
     """
     from alembic.runtime.migration import MigrationContext
 
@@ -715,12 +713,7 @@ def _get_current_db_revision(engine: Engine) -> str | None:
             return None
         with engine.connect() as connection:
             ctx = MigrationContext.configure(connection)
-            heads = ctx.get_current_heads()
-            if len(heads) != 1:
-                # Multiple heads (e.g., after downgrading below a merge point) or no heads.
-                # Return None to indicate the database needs migration.
-                return None
-            return heads[0]
+            return ctx.get_current_revision()
 
 
 def _get_head_db_revision(db_uri: str) -> str:
