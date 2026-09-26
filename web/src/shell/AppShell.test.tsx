@@ -5,11 +5,12 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -84,6 +85,11 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // top-level session it resolves synchronously without fetching.
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
+}));
+
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHostsModule>()),
+  useHosts: vi.fn(() => ({ data: undefined })),
 }));
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -260,8 +266,10 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 const useChildSessionsMock = vi.mocked(useChildSessions);
 
 import { useSession } from "@/hooks/useSession";
+import { useHosts, type Host } from "@/hooks/useHosts";
 
 const useSessionMock = vi.mocked(useSession);
+const useHostsMock = vi.mocked(useHosts);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
@@ -403,6 +411,24 @@ function SessionNavButton({ to }: { to: string }) {
   );
 }
 
+function AppShellWithRerenderProbe({ enabled }: { enabled: boolean }) {
+  const [, setRenderCount] = useState(0);
+  return (
+    <>
+      {enabled && (
+        <button
+          type="button"
+          data-testid="rerender-shell"
+          onClick={() => setRenderCount((count) => count + 1)}
+        >
+          rerender shell
+        </button>
+      )}
+      <AppShell />
+    </>
+  );
+}
+
 /** Full ServerInfo with permissive defaults; override per test. */
 function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   return {
@@ -427,7 +453,11 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-function renderShell(path: string, info?: ServerInfo) {
+function renderShell(
+  path: string,
+  info?: ServerInfo,
+  options: { rerenderable?: boolean; sessionNavTo?: string } = {},
+) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -437,7 +467,9 @@ function renderShell(path: string, info?: ServerInfo) {
         <TooltipProvider>
           <MemoryRouter initialEntries={[path]}>
             <Routes>
-              <Route element={<AppShell />}>
+              <Route
+                element={<AppShellWithRerenderProbe enabled={options.rerenderable === true} />}
+              >
                 <Route
                   index
                   element={
@@ -454,6 +486,7 @@ function renderShell(path: string, info?: ServerInfo) {
                       <TerminalFirstViewProbe />
                       <ForkDialogProbe />
                       <NavProbe />
+                      {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
                       <LocationDisplay />
                     </>
                   }
@@ -587,6 +620,8 @@ beforeEach(() => {
   });
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+  useHostsMock.mockReset();
+  useHostsMock.mockReturnValue({ data: undefined } as ReturnType<typeof useHosts>);
   forkSessionMock.mockReset();
   // Default: no agent tools/policies → agent-info affordances hidden.
   useSessionAgentMock.mockReset();
@@ -4004,23 +4039,172 @@ describe("AppShell clone/fork action", () => {
     );
   });
 
-  it("uses the parent host and workspace for a scoped side-chat source", () => {
-    const parent = sessionSnapshot({
+  it.each([
+    ["web side chat", null, { "omnigent.side_chat": "1" }],
+    ["codex /side child", "conv_parent", {}],
+  ])(
+    "uses the host session environment for a scoped %s without its own",
+    async (_kind, parentSessionId, labels) => {
+      const parent = sessionSnapshot({
+        id: "conv_parent",
+        runnerId: "runner_parent",
+        title: "Parent title",
+        workspace: "/repo",
+        hostId: "host_a",
+      });
+      const child = sessionSnapshot({
+        id: "conv_side_child",
+        title: "Side chat source",
+        labels,
+        parentSessionId,
+        workspace: null,
+        hostId: null,
+      });
+      const hosts: Host[] = [
+        { host_id: "host_a", name: "Host A", owner: "owner", status: "online" },
+      ];
+      useHostsMock.mockReturnValue({ data: hosts } as ReturnType<typeof useHosts>);
+      mockConversations([
+        {
+          id: "conv_parent",
+          permission_level: 4,
+          host_id: "host_a",
+          workspace: "/repo",
+        },
+      ]);
+      useSessionMock.mockImplementation((sessionId) => ({
+        session:
+          sessionId === "conv_side_child" ? child : sessionId === "conv_parent" ? parent : null,
+        isLoading: false,
+        error: null,
+      }));
+
+      renderShell("/c/conv_parent");
+      fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+      fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+
+      await waitFor(() => expect(screen.getByTestId("workspace-path-input")).toHaveValue("/repo"));
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
+    },
+  );
+
+  it("keeps the opening host environment when navigation happens during source loading", async () => {
+    let sourceLoading = true;
+    const originalHost = sessionSnapshot({
       id: "conv_parent",
-      runnerId: "runner_parent",
-      title: "Parent title",
-      workspace: "/repo",
+      workspace: "/repo/original",
       hostId: "host_a",
     });
+    const newHost = sessionSnapshot({
+      id: "conv_new",
+      workspace: "/repo/new",
+      hostId: "host_b",
+    });
     const child = sessionSnapshot({
-      ...parent,
       id: "conv_side_child",
-      title: "Side chat source",
       labels: { "omnigent.side_chat": "1" },
-      parentSessionId: "conv_parent",
+      parentSessionId: null,
       workspace: null,
       hostId: null,
     });
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_a", name: "Host A", owner: "owner", status: "online" },
+        { host_id: "host_b", name: "Host B", owner: "owner", status: "online" },
+      ],
+    } as ReturnType<typeof useHosts>);
+    mockConversations([
+      {
+        id: "conv_parent",
+        permission_level: 4,
+        host_id: "host_a",
+        workspace: "/repo/original",
+      },
+      { id: "conv_new", permission_level: 4, host_id: "host_b", workspace: "/repo/new" },
+    ]);
+    useSessionMock.mockImplementation((sessionId) => ({
+      session:
+        sessionId === "conv_side_child"
+          ? sourceLoading
+            ? null
+            : child
+          : sessionId === "conv_parent"
+            ? originalHost
+            : sessionId === "conv_new"
+              ? newHost
+              : null,
+      isLoading: sessionId === "conv_side_child" && sourceLoading,
+      error: null,
+    }));
+
+    renderShell("/c/conv_parent", undefined, {
+      rerenderable: true,
+      sessionNavTo: "/c/conv_new",
+    });
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+    sourceLoading = false;
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/repo/original"),
+    );
+    expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
+  });
+
+  it.each([
+    ["success", null],
+    ["error", new Error("source unavailable")],
+  ])(
+    "mounts once after scoped source pending -> %s and stays mounted during refetch",
+    async (_outcome, settledError) => {
+      let phase: "pending" | "settled" | "refetch" = "pending";
+      const parent = sessionSnapshot({
+        id: "conv_parent",
+        workspace: "/repo",
+        hostId: "host_a",
+      });
+      const child = sessionSnapshot({ id: "conv_side_child", workspace: null, hostId: null });
+      mockConversations([
+        { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/repo" },
+      ]);
+      useSessionMock.mockImplementation((sessionId) => {
+        if (sessionId !== "conv_side_child") {
+          return {
+            session: sessionId === "conv_parent" ? parent : null,
+            isLoading: false,
+            error: null,
+          };
+        }
+        if (phase === "pending") return { session: null, isLoading: true, error: null };
+        if (phase === "refetch") return { session: null, isLoading: true, error: null };
+        return {
+          session: settledError === null ? child : null,
+          isLoading: false,
+          error: settledError,
+        };
+      });
+
+      renderShell("/c/conv_parent", undefined, { rerenderable: true });
+      fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+      expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
+
+      phase = "settled";
+      fireEvent.click(screen.getByTestId("rerender-shell"));
+      const mountedDialog = await screen.findByTestId("fork-session-dialog");
+
+      phase = "refetch";
+      fireEvent.click(screen.getByTestId("rerender-shell"));
+      expect(screen.getByTestId("fork-session-dialog")).toBe(mountedDialog);
+    },
+  );
+
+  it("keeps the scoped source stable while closing, then resets it for session Clone", async () => {
+    const parent = sessionSnapshot({ id: "conv_parent", title: "Parent title" });
+    const child = sessionSnapshot({ id: "conv_side_child", title: "Side chat source" });
     mockConversations([{ id: "conv_parent", permission_level: 4 }]);
     useSessionMock.mockImplementation((sessionId) => ({
       session:
@@ -4028,34 +4212,26 @@ describe("AppShell clone/fork action", () => {
       isLoading: false,
       error: null,
     }));
+    forkSessionMock.mockResolvedValue({ ...parent, id: "conv_fork" });
 
     renderShell("/c/conv_parent");
     fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    useSessionMock.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
-    const dialog = screen.getByTestId("fork-session-dialog");
-    expect(within(dialog).getByText("Host")).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "Clone & start" })).toBeInTheDocument();
-  });
-
-  it("waits for a scoped side-chat source before mounting the fork dialog", () => {
-    const parent = sessionSnapshot({
-      id: "conv_parent",
-      runnerId: "runner_parent",
-      title: "Parent title",
-      workspace: "/repo",
-      hostId: "host_a",
+    expect(useSessionMock).toHaveBeenCalledWith("conv_side_child");
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), {
+      button: 0,
+      ctrlKey: false,
     });
-    mockConversations([{ id: "conv_parent", permission_level: 4 }]);
-    useSessionMock.mockImplementation((sessionId) => ({
-      session: sessionId === "conv_parent" ? parent : null,
-      isLoading: sessionId === "conv_side_child",
-      error: null,
-    }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-    renderShell("/c/conv_parent");
-    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
-
-    expect(screen.queryByTestId("fork-session-dialog")).toBeNull();
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock).toHaveBeenCalledWith(
+      "conv_parent",
+      expect.objectContaining({ upToResponseId: undefined }),
+    );
   });
 
   it("offers host + directory when forking a child, taken from its parent", () => {

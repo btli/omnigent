@@ -448,6 +448,8 @@ export function AppShell() {
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
   const [forkSourceSessionId, setForkSourceSessionId] = useState<string | null>(null);
+  const [forkHostSessionId, setForkHostSessionId] = useState<string | null>(null);
+  const [forkSourceLoadSettled, setForkSourceLoadSettled] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
   // actions (ChatPage, via ForkDialogContext). `null` = full clone —
   // the mobile menu Clone entry's behavior. Cleared whenever the dialog
@@ -510,11 +512,26 @@ export function AppShell() {
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(serverConversationId);
-  const { session: scopedForkSourceSession, isLoading: scopedForkSourceLoading } =
-    useSession(forkSourceSessionId);
+  const {
+    session: scopedForkSourceSession,
+    isLoading: scopedForkSourceLoading,
+    error: scopedForkSourceError,
+  } = useSession(forkSourceSessionId);
+  const { session: forkHostSession } = useSession(forkHostSessionId);
   const forkSourceSession = forkSourceSessionId ? scopedForkSourceSession : activeSession;
   const effectiveForkSourceSessionId = forkSourceSessionId ?? serverConversationId;
-  const forkSourceReady = !forkSourceSessionId || !scopedForkSourceLoading;
+  const forkSourcePending = Boolean(
+    forkSourceSessionId &&
+    !forkSourceLoadSettled &&
+    scopedForkSourceSession === null &&
+    scopedForkSourceError === null &&
+    scopedForkSourceLoading,
+  );
+  useEffect(() => {
+    if (scopedForkSourceSession !== null || scopedForkSourceError !== null) {
+      setForkSourceLoadSettled(true);
+    }
+  }, [scopedForkSourceSession, scopedForkSourceError]);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -575,10 +592,10 @@ export function AppShell() {
     () => allConversations?.find((c) => c.id === activeSession?.parentSessionId) ?? null,
     [allConversations, activeSession?.parentSessionId],
   );
-  const scopedForkSourceParent =
-    forkSourceSessionId && scopedForkSourceSession?.parentSessionId === activeSession?.id
-      ? activeSession
-      : null;
+  const forkHostConv = useMemo(
+    () => allConversations?.find((c) => c.id === forkHostSessionId) ?? null,
+    [allConversations, forkHostSessionId],
+  );
   // ── Header breadcrumb ─────────────────────────────────────────────────
   // The chat header shows the conversation's title, prefixed by a folder icon
   // when the session is filed under a project, and with the sub-agent identity
@@ -2030,12 +2047,15 @@ export function AppShell() {
     () => ({
       canFork: canClone,
       openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => {
-        setForkSourceSessionId(opts?.sourceSessionId ?? null);
+        const sourceSessionId = opts?.sourceSessionId ?? null;
+        setForkSourceSessionId(sourceSessionId);
+        setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
+        setForkSourceLoadSettled(false);
         setForkUpToResponseId(opts?.upToResponseId ?? null);
         setForkOpen(true);
       },
     }),
-    [canClone],
+    [canClone, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2419,7 +2439,7 @@ export function AppShell() {
               onOpenChange={setShareOpen}
             />
           )}
-          {effectiveForkSourceSessionId && forkSourceReady && (
+          {effectiveForkSourceSessionId && !forkSourcePending && (
             <ForkSessionDialog
               // Remount per source so source-derived form defaults reset when
               // a side-chat bubble opens the app-wide dialog.
@@ -2428,21 +2448,24 @@ export function AppShell() {
               sourceTitle={forkSourceSession?.title}
               sourceWorkspace={
                 forkSourceSession?.workspace ??
-                scopedForkSourceParent?.workspace ??
-                parentConv?.workspace
+                (forkSourceSessionId
+                  ? (forkHostSession?.workspace ?? forkHostConv?.workspace)
+                  : parentConv?.workspace)
               }
               sourceHostId={
-                forkSourceSession?.hostId ?? scopedForkSourceParent?.hostId ?? parentConv?.host_id
+                forkSourceSession?.hostId ??
+                (forkSourceSessionId
+                  ? (forkHostSession?.hostId ?? forkHostConv?.host_id)
+                  : parentConv?.host_id)
               }
               sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
               open={forkOpen}
               onOpenChange={(open) => {
                 setForkOpen(open);
-                // Closing clears source-specific state so a later Clone uses
-                // the URL session and never silently forks partial history.
+                // A later opener replaces the source; only truncation must
+                // clear immediately so Clone never forks partial history.
                 if (!open) {
-                  setForkSourceSessionId(null);
                   setForkUpToResponseId(null);
                 }
               }}
