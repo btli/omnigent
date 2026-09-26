@@ -14,7 +14,12 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
+from tests.e2e_ui.conftest import (
+    configure_mock_llm,
+    fetch_with_retry,
+    open_right_rail,
+    seed_committed_turn,
+)
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
@@ -27,7 +32,9 @@ def side_chat_forks(page: Page, seeded_session: tuple[str, str]) -> Iterator[lis
     pattern = f"**/v1/sessions/{session_id}/fork"
 
     def track_fork(route: Route) -> None:
-        assert route.request.post_data_json["side_chat"] is True
+        if route.request.post_data_json.get("side_chat") is not True:
+            route.continue_()
+            return
         response = route.fetch()
         if response.ok:
             child_ids.append(response.json()["id"])
@@ -254,3 +261,62 @@ def test_runner_bound_side_chat_closes_without_stopping_parent(
     parent_items = str(_items(base_url, session_id))
     assert parent_question in parent_items
     assert question not in parent_items
+
+
+def test_fork_from_side_chat_uses_child_and_creates_visible_session(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+) -> None:
+    """Fork a side-chat reply from the child and surface the promoted session."""
+    base_url, parent_id = seeded_session
+    question = f"fork-side-{parent_id}: answer in the side chat"
+    reply = "This reply belongs only to the side chat."
+    response_id = "resp_side_fork"
+
+    page.goto(f"{base_url}/c/{parent_id}")
+    with page.expect_response(f"**/v1/sessions/{parent_id}/fork") as side_chat_response:
+        _start_side_chat(page, "panel", question)
+    assert side_chat_response.value.ok
+    child_id = str(side_chat_response.value.json()["id"])
+    pane = page.locator(".side-chat-backdrop")
+    expect(pane.get_by_text(question, exact=True)).to_be_visible(timeout=30_000)
+    assert side_chat_forks == [child_id]
+    seed_committed_turn(
+        child_id,
+        prompt="Seeded side-chat turn",
+        reply=reply,
+        response_id=response_id,
+    )
+    page.reload()
+
+    pane = page.locator(".side-chat-backdrop")
+    assistant = pane.locator(_ASSISTANT).filter(has_text=reply)
+    expect(assistant).to_be_visible(timeout=30_000)
+
+    assistant.hover()
+    assistant.get_by_test_id("fork-from-response").click()
+    dialog = page.get_by_test_id("fork-session-dialog")
+    expect(dialog).to_be_visible()
+
+    fork_id: str | None = None
+    try:
+        fork_pattern = re.compile(r"/v1/sessions/[^/]+/fork$")
+        with page.expect_request(fork_pattern) as fork_request:
+            with page.expect_response(fork_pattern) as fork_response:
+                page.get_by_test_id("fork-session-submit").click()
+        request = fork_request.value
+        assert request.post_data_json["up_to_response_id"] == response_id
+        assert request.url == f"{base_url}/v1/sessions/{child_id}/fork"
+        assert fork_response.value.status == 201
+
+        expect(page).to_have_url(
+            re.compile(rf"/c/(?!{re.escape(parent_id)}|{re.escape(child_id)})[0-9a-f]{{32}}"),
+            timeout=30_000,
+        )
+        fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+        expect(page.locator(f'a[href="/c/{fork_id}"]')).to_be_visible(timeout=20_000)
+        expect(page.locator(_ASSISTANT).filter(has_text=reply)).to_be_visible(timeout=30_000)
+    finally:
+        if fork_id is not None:
+            httpx.delete(f"{base_url}/v1/sessions/{fork_id}", timeout=10.0).raise_for_status()
