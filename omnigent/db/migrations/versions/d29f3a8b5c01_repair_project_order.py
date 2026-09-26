@@ -1,7 +1,12 @@
 """Ensure project ordering exists on databases stamped by an older merge graph.
 
 Revision ID: d29f3a8b5c01
-Revises: c18e2f7a4b90
+Revises: ll1a2b3c4d5e, b7e41c0d92af
+
+Repair migration that runs after both the project-reassignment and ll compression
+branches merge. For schemas stamped at b7e41c0d92af alone, this adds the
+project_order column if it's missing due to downgrade or schema divergence.
+For schemas that continued through the ll chain, it's a no-op.
 """
 
 from collections.abc import Sequence
@@ -11,7 +16,7 @@ from alembic import op
 from sqlalchemy.dialects.mysql import MEDIUMBLOB
 
 revision: str = "d29f3a8b5c01"
-down_revision: str | None = "c18e2f7a4b90"
+down_revision: str | Sequence[str] | None = ("ll1a2b3c4d5e", "b7e41c0d92af")
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
