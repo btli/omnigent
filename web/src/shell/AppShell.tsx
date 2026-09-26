@@ -510,9 +510,11 @@ export function AppShell() {
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(serverConversationId);
-  const { session: scopedForkSourceSession } = useSession(forkSourceSessionId);
+  const { session: scopedForkSourceSession, isLoading: scopedForkSourceLoading } =
+    useSession(forkSourceSessionId);
   const forkSourceSession = forkSourceSessionId ? scopedForkSourceSession : activeSession;
   const effectiveForkSourceSessionId = forkSourceSessionId ?? serverConversationId;
+  const forkSourceReady = !forkSourceSessionId || !scopedForkSourceLoading;
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -573,7 +575,10 @@ export function AppShell() {
     () => allConversations?.find((c) => c.id === activeSession?.parentSessionId) ?? null,
     [allConversations, activeSession?.parentSessionId],
   );
-  const forkSourceFallbackConv = forkSourceSessionId ? null : parentConv;
+  const scopedForkSourceParent =
+    forkSourceSessionId && scopedForkSourceSession?.parentSessionId === activeSession?.id
+      ? activeSession
+      : null;
   // ── Header breadcrumb ─────────────────────────────────────────────────
   // The chat header shows the conversation's title, prefixed by a folder icon
   // when the session is filed under a project, and with the sub-agent identity
@@ -2414,15 +2419,21 @@ export function AppShell() {
               onOpenChange={setShareOpen}
             />
           )}
-          {effectiveForkSourceSessionId && (
+          {effectiveForkSourceSessionId && forkSourceReady && (
             <ForkSessionDialog
               // Remount per source so source-derived form defaults reset when
               // a side-chat bubble opens the app-wide dialog.
               key={`fork-session-dialog-${effectiveForkSourceSessionId}`}
               sourceSessionId={effectiveForkSourceSessionId}
               sourceTitle={forkSourceSession?.title}
-              sourceWorkspace={forkSourceSession?.workspace ?? forkSourceFallbackConv?.workspace}
-              sourceHostId={forkSourceSession?.hostId ?? forkSourceFallbackConv?.host_id}
+              sourceWorkspace={
+                forkSourceSession?.workspace ??
+                scopedForkSourceParent?.workspace ??
+                parentConv?.workspace
+              }
+              sourceHostId={
+                forkSourceSession?.hostId ?? scopedForkSourceParent?.hostId ?? parentConv?.host_id
+              }
               sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
               open={forkOpen}
