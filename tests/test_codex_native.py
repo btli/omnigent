@@ -6582,7 +6582,10 @@ def _capture_handler(posted: list[dict[str, Any]]) -> Callable[[httpx.Request], 
 
 
 async def _replay_completed_item(
-    item: dict[str, Any], handler: Callable[..., httpx.Response]
+    item: dict[str, Any],
+    handler: Callable[..., httpx.Response],
+    *,
+    bridge_dir: Path = Path("/tmp"),
 ) -> None:
     """
     Drive one Codex ``item/completed`` notification through the forwarder.
@@ -6598,7 +6601,7 @@ async def _replay_completed_item(
         await codex_native_forwarder._handle_event(
             client,
             session_id="conv_123",
-            bridge_dir=Path("/tmp"),
+            bridge_dir=bridge_dir,
             usage_coalescer=_usage_coalescer(client),
             elicitation_tracker=_elicitation_tracker(),
             event={
@@ -6863,6 +6866,99 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
     }
     # Output summarizes each change as "<kind> <path>" from real fields.
     assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
+
+
+def test_forwarder_sends_file_change_to_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed fileChange reaches the non-git workspace registry relay."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    observed: list[dict[str, Any]] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(request: Any, *, timeout: float) -> Response:
+        assert request.full_url == "http://relay.local/hook/observe-tool"
+        assert request.headers["Authorization"] == "Bearer relay-secret"
+        assert timeout == 2
+        observed.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(codex_native_forwarder.urllib.request, "urlopen", urlopen)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path != "/hook/observe-tool"
+        return httpx.Response(202, json={"queued": False})
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": "call_patch",
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
+                ],
+                "status": "completed",
+            },
+            handler,
+            bridge_dir=tmp_path,
+        )
+    )
+
+    assert observed == [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                ]
+            },
+            "tool_response": {"type": "success"},
+        }
+    ]
+
+
+@pytest.mark.parametrize("status", ["failed", "declined"])
+def test_forwarder_does_not_observe_unsuccessful_file_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Failed or declined patches must not create phantom change records."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_native_forwarder.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail("unsuccessful patch reached file observer"),
+    )
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": f"call_patch_{status}",
+                "changes": [{"path": "/repo/not-applied.py", "kind": {"type": "add"}}],
+                "status": status,
+            },
+            lambda _request: httpx.Response(202, json={"queued": False}),
+            bridge_dir=tmp_path,
+        )
+    )
 
 
 def test_forwarder_posts_codex_web_search_tool_call() -> None:

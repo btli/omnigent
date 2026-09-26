@@ -75,6 +75,7 @@ from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
+    OS_ENV_TOOL_TYPES,
     SysOsEditTool,
     SysOsReadTool,
     SysOsShellTool,
@@ -238,14 +239,7 @@ class _SubagentInboxEvaluation:
 # Use class .name() methods where available for single-source-of-truth.
 
 # Priority 5a: OS env tools — runner-local OSEnvironment-backed execution.
-_OS_ENV_TOOLS = frozenset(
-    {
-        SysOsReadTool.name(),
-        SysOsWriteTool.name(),
-        SysOsEditTool.name(),
-        SysOsShellTool.name(),
-    }
-)
+_OS_ENV_TOOLS = frozenset(tool_cls.name() for tool_cls in OS_ENV_TOOL_TYPES)
 
 # Priority 5b: REST-backed tools — runner calls server REST APIs.
 # (sys_call_async / sys_cancel_async moved to _ASYNC_INBOX_TOOLS)
@@ -541,12 +535,6 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         SysAgentListTool,
     )
     from omnigent.tools.builtins.list_comments import ListCommentsTool
-    from omnigent.tools.builtins.os_env import (
-        SysOsEditTool,
-        SysOsReadTool,
-        SysOsShellTool,
-        SysOsWriteTool,
-    )
     from omnigent.tools.builtins.spawn import (
         SysSessionGetHistoryTool,
         SysSessionGetInfoTool,
@@ -576,7 +564,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec).get_tool_schemas():
+        for schema in ToolManager(spec, os_env_schema_only=True).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
                 _append(function)
@@ -603,42 +591,13 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             if function is not None:
                 _append(function)
 
-    # OS tools (sys_os_*), relayed unconditionally to override any harness-static
-    # versions and centralize policy enforcement. Create a minimal OSEnvironment
-    # purely for schema extraction.
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.os_env import create_os_environment
-
-    _os_spec = OSEnvSpec(
-        type="caller_process",
-        cwd=str(Path.cwd()),
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
-    )
-    try:
-        _os_env = create_os_environment(_os_spec)
-        if _os_env is None:
-            raise RuntimeError("OSEnvironment factory returned None")
-        try:
-            for tool in (
-                SysOsReadTool(_os_env),
-                SysOsWriteTool(_os_env),
-                SysOsEditTool(_os_env),
-                SysOsShellTool(_os_env),
-            ):
-                tool_schema = _string_object_dict(tool.get_schema())
-                function = (
-                    _string_object_dict(tool_schema.get("function")) if tool_schema else None
-                )
-                if function is not None:
-                    _append(function)
-        finally:
-            _os_env.close()
-    except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
-        _logger.debug(
-            "Could not create OSEnvironment for native relay OS tool schemas",
-            extra={"session_id": runner_primary_session_id()},
-        )
+    # Relay OS tools unconditionally for centralized policy enforcement.
+    # Their schemas are static and need no OS environment or working directory.
+    for tool_cls in OS_ENV_TOOL_TYPES:
+        tool_schema = _string_object_dict(tool_cls.get_schema())
+        function = _string_object_dict(tool_schema.get("function")) if tool_schema else None
+        if function is not None:
+            _append(function)
 
     return schemas
 
@@ -983,23 +942,6 @@ def _effective_harness_name(agent_spec: AgentSpec, effective_harness: str | None
     return canonicalize_harness(raw) or raw
 
 
-def _surface_only_spec(agent_spec: AgentSpec) -> AgentSpec:
-    """Return *agent_spec* with the OS-env options that only cost work stripped.
-
-    Only the *presence* of ``os_env`` decides whether ``sys_os_*`` is
-    registered, but building one honours ``fork`` (mkdtemp + full working-tree
-    copy) and ``start_in_scratch`` (raises without an active sandbox). Neither
-    changes the tool names, so the surface probe drops both.
-    """
-    os_env = agent_spec.os_env
-    if os_env is None or not (os_env.fork or os_env.start_in_scratch):
-        return agent_spec
-    return dataclasses.replace(
-        agent_spec,
-        os_env=dataclasses.replace(os_env, fork=False, start_in_scratch=False),
-    )
-
-
 def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
 
@@ -1020,10 +962,7 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
-    # Shut the probe manager down so a manager-created OS environment doesn't
-    # outlive the check; with fork/scratch stripped above there is nothing
-    # expensive to tear down.
-    manager = ToolManager(_surface_only_spec(agent_spec))
+    manager = ToolManager(agent_spec, os_env_schema_only=True)
     try:
         names = set(manager.get_tool_names())
     finally:
@@ -6477,6 +6416,24 @@ async def execute_tool(
         refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
         if refusal is not None:
             return json.dumps({"error": refusal})
+    from omnigent.sandbox.copy_on_write import has_copy_on_write
+
+    disposable = has_copy_on_write(getattr(agent_spec, "os_env", None)) or bool(
+        resource_registry is not None
+        and conversation_id is not None
+        and resource_registry.uses_copy_on_write(conversation_id)
+    )
+    if disposable and (
+        tool_name in _SKILL_TOOLS
+        or tool_name in {UploadFileTool.name(), "sys_agent_download", "sys_agent_list"}
+        or (tool_name == "sys_session_create" and args.get("config_path"))
+    ):
+        return json.dumps(
+            {
+                "error": f"{tool_name} does not yet support copy_on_write environments; "
+                "use sys_os_* tools and an inherited terminal for filesystem operations"
+            }
+        )
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -6490,6 +6447,7 @@ async def execute_tool(
             output = await _execute_os_env_tool(
                 tool_name,
                 args,
+                resource_registry=resource_registry,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
@@ -7051,6 +7009,7 @@ async def _execute_os_env_tool(
     conversation_id: str | None = None,
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> str:
     """
     Execute sys_os_* through a runner-local OSEnvironment.
@@ -7074,10 +7033,25 @@ async def _execute_os_env_tool(
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None
+    owns_environment = True
     try:
-        os_env = create_os_environment(
-            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+        effective_spec = _effective_runner_os_env_spec(
+            agent_spec, conversation_id, runner_workspace
         )
+        needs_shared_environment = effective_spec.sandbox is not None and any(
+            p.copy_on_write for p in effective_spec.sandbox.write_path_specs
+        )
+        if needs_shared_environment:
+            if resource_registry is None or conversation_id is None:
+                raise ValueError("copy_on_write tools require a session resource registry")
+            from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+
+            os_env = resource_registry.resolve_environment(
+                conversation_id, DEFAULT_ENVIRONMENT_ID, agent_spec
+            )
+            owns_environment = False
+        else:
+            os_env = create_os_environment(effective_spec)
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
@@ -7136,7 +7110,7 @@ async def _execute_os_env_tool(
         )
         return json.dumps({"error": str(exc)})
     finally:
-        if os_env is not None:
+        if os_env is not None and owns_environment:
             os_env.close()
 
     return json.dumps(result)
