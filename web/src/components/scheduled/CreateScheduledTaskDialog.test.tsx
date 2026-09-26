@@ -464,12 +464,12 @@ describe("CreateScheduledTaskDialog Project picker", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />);
     expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
-    expect(screen.getByText("/home/me/repo")).toBeInTheDocument();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
     fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Project B" }));
     expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
-    expect(screen.getByText("/home/me/repo")).toBeInTheDocument();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const input = updateMutateAsync.mock.calls[0][0].input;
