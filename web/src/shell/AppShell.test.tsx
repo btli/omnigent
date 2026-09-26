@@ -7,6 +7,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { useCallback } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -83,6 +84,11 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // top-level session it resolves synchronously without fetching.
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
+}));
+
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  forkSession: vi.fn(),
 }));
 
 // The header's AgentInfoButton (desktop) and the mobile menu's "Agent info"
@@ -259,8 +265,11 @@ const useSessionMock = vi.mocked(useSession);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
+import { forkSession } from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
+const forkSessionMock = vi.mocked(forkSession);
 
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
@@ -324,6 +333,18 @@ function ForkDialogProbe() {
         onClick={() => fork.openForkDialog({ upToResponseId: "resp_probe" })}
       >
         fork-from-here
+      </button>
+      <button
+        type="button"
+        data-testid="fork-probe-open-scoped"
+        onClick={() =>
+          fork.openForkDialog({
+            sourceSessionId: "conv_side_child",
+            upToResponseId: "resp_side_reply",
+          })
+        }
+      >
+        fork-side-chat
       </button>
     </div>
   );
@@ -546,6 +567,7 @@ beforeEach(() => {
   });
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+  forkSessionMock.mockReset();
   // Default: no agent tools/policies → agent-info affordances hidden.
   useSessionAgentMock.mockReset();
   useSessionAgentMock.mockReturnValue({ data: undefined } as ReturnType<typeof useSessionAgent>);
@@ -3921,6 +3943,57 @@ describe("AppShell clone/fork action", () => {
     const nameInput = screen.getByTestId("fork-session-title-input");
     expect(nameInput).toHaveValue("");
     expect(nameInput).toHaveAttribute("placeholder", "Fork of Auth refactor");
+  });
+
+  it("forks the passed side-chat source and derives dialog defaults from it", async () => {
+    const parent = {
+      id: "conv_parent",
+      agentId: "ag_x",
+      agentName: null,
+      runnerId: null,
+      status: "idle",
+      createdAt: 0,
+      title: "Parent title",
+      labels: {},
+      items: [],
+      pendingElicitations: [],
+      permissionLevel: 4,
+      parentSessionId: null,
+      subAgentName: null,
+      kind: "default",
+    } as Session;
+    const child = {
+      ...parent,
+      id: "conv_side_child",
+      title: "Side chat source",
+      labels: { "omnigent.side_chat": "1" },
+      parentSessionId: "conv_parent",
+    } as Session;
+    mockConversations([{ id: "conv_parent", permission_level: 4 }]);
+    useSessionMock.mockImplementation((sessionId) => ({
+      session:
+        sessionId === "conv_side_child" ? child : sessionId === "conv_parent" ? parent : null,
+      isLoading: false,
+      error: null,
+    }));
+    forkSessionMock.mockResolvedValue({ ...child, id: "conv_fork" });
+
+    renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+    expect(screen.getByTestId("fork-session-title-input")).toHaveAttribute(
+      "placeholder",
+      "Fork of Side chat source",
+    );
+
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock).toHaveBeenCalledWith(
+      "conv_side_child",
+      expect.objectContaining({ upToResponseId: "resp_side_reply" }),
+    );
   });
 
   it("offers host + directory when forking a child, taken from its parent", () => {
