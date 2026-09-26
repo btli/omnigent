@@ -534,7 +534,10 @@ function renderShell(
   );
   // Without an explicit info the CapabilitiesContext default ("loading")
   // applies, matching production first paint and every pre-existing test.
-  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
+  return {
+    ...render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree),
+    queryClient: qc,
+  };
 }
 
 function mockConversations(
@@ -4310,6 +4313,111 @@ describe("AppShell clone/fork action", () => {
       expect(screen.getByTestId("workspace-path-input")).toHaveValue("/side-recovered"),
     );
     expect(sourceAttempts).toBe(2);
+  });
+
+  it("preserves an edited fork dialog when a source background refetch fails", async () => {
+    const backgroundRequest = deferredRequest<Session>();
+    const parent = sessionSnapshot({ id: "conv_parent", workspace: "/parent", hostId: "host_a" });
+    const child = sessionSnapshot({
+      id: "conv_side_child",
+      title: "Side source",
+      workspace: "/side-source",
+      hostId: "host_a",
+    });
+    let sourceAttempts = 0;
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/parent" },
+    ]);
+    useSessionMock.mockImplementation(realUseSession.hook);
+    getSessionSlimMock.mockImplementation((sessionId) => {
+      if (sessionId === "conv_parent") return Promise.resolve(parent);
+      if (sessionId === "conv_side_child") {
+        sourceAttempts += 1;
+        return sourceAttempts === 1 ? Promise.resolve(child) : backgroundRequest.promise;
+      }
+      return Promise.reject(new Error(`unexpected session ${sessionId}`));
+    });
+
+    const { queryClient } = renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    const mountedDialog = await screen.findByTestId("fork-session-dialog");
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+    fireEvent.change(screen.getByTestId("fork-session-title-input"), {
+      target: { value: "Keep this title" },
+    });
+
+    const refetch = queryClient.refetchQueries({
+      queryKey: ["session", "conv_side_child"],
+      exact: true,
+    });
+    await waitFor(() => expect(sourceAttempts).toBe(2));
+    await act(async () => {
+      backgroundRequest.reject(new Error("background unavailable"));
+      await refetch;
+    });
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(screen.getByTestId("fork-session-dialog")).toBe(mountedDialog);
+    expect(screen.getByTestId("fork-session-title-input")).toHaveValue("Keep this title");
+    expect(screen.queryByText("Couldn't load the session to fork. Try again.")).toBeNull();
+    expect(queryClient.getQueryData(["session", "conv_side_child"])).toBe(child);
+  });
+
+  it("reopens from source data retained after a failed background refetch", async () => {
+    const backgroundRequest = deferredRequest<Session>();
+    const parent = sessionSnapshot({ id: "conv_parent", workspace: "/parent", hostId: "host_a" });
+    const child = sessionSnapshot({
+      id: "conv_side_child",
+      title: "Cached side source",
+      workspace: "/cached-side-source",
+      hostId: "host_a",
+    });
+    let sourceAttempts = 0;
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/parent" },
+    ]);
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+    } as ReturnType<typeof useHosts>);
+    useSessionMock.mockImplementation(realUseSession.hook);
+    getSessionSlimMock.mockImplementation((sessionId) => {
+      if (sessionId === "conv_parent") return Promise.resolve(parent);
+      if (sessionId === "conv_side_child") {
+        sourceAttempts += 1;
+        return sourceAttempts === 1 ? Promise.resolve(child) : backgroundRequest.promise;
+      }
+      return Promise.reject(new Error(`unexpected session ${sessionId}`));
+    });
+
+    const { queryClient } = renderShell("/c/conv_parent");
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+    await screen.findByTestId("fork-session-dialog");
+
+    const refetch = queryClient.refetchQueries({
+      queryKey: ["session", "conv_side_child"],
+      exact: true,
+    });
+    await waitFor(() => expect(sourceAttempts).toBe(2));
+    await act(async () => {
+      backgroundRequest.reject(new Error("background unavailable"));
+      await refetch;
+    });
+    fireEvent.click(screen.getByTestId("fork-probe-open-scoped"));
+
+    expect(queryClient.getQueryData(["session", "conv_side_child"])).toBe(child);
+    expect(screen.getByTestId("fork-session-dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+    expect(screen.getByTestId("fork-session-title-input")).toHaveAttribute(
+      "placeholder",
+      "Fork of Cached side source",
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/cached-side-source"),
+    );
   });
 
   it("keeps the scoped source stable while closing, then resets it for session Clone", async () => {
