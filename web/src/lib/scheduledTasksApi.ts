@@ -20,8 +20,6 @@ export type ScheduledTaskState = "active" | "paused";
  * firing (no host/workspace), using the server's normal sandbox lifecycle.
  */
 export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
-export type ScheduledTaskProjectFilter =
-  { kind: "all" } | { kind: "unfiled" } | { kind: "project"; projectId: string };
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
@@ -59,8 +57,6 @@ export interface ScheduledTask {
   hostId: string | null;
   /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
   executionTarget: ScheduledTaskExecutionTarget;
-  /** First-class Project assignment, or `null` when unfiled. */
-  projectId: string | null;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -115,8 +111,6 @@ export interface CreateScheduledTaskInput {
    * NOT be combined with `hostId` / `workspace`.
    */
   executionTarget?: ScheduledTaskExecutionTarget;
-  /** Optional first-class Project id. Omit or pass `""` for unfiled. */
-  projectId?: string;
 }
 
 /**
@@ -146,8 +140,6 @@ export interface UpdateScheduledTaskInput {
    * also set `hostId` / `workspace` in the same update.
    */
   executionTarget?: ScheduledTaskExecutionTarget;
-  /** Omit to preserve membership; pass `""` to unfile. */
-  projectId?: string;
   state?: ScheduledTaskState;
 }
 
@@ -168,7 +160,6 @@ interface ScheduledTaskWire {
   workspace: string | null;
   host_id: string | null;
   execution_target: ScheduledTaskExecutionTarget;
-  project_id: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -245,7 +236,6 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     workspace: wire.workspace,
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
-    projectId: wire.project_id,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -268,14 +258,8 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
 }
 
 /** List the caller's scheduled tasks (owner-scoped server-side). */
-export async function listScheduledTasks(
-  filter: ScheduledTaskProjectFilter = { kind: "all" },
-): Promise<ScheduledTask[]> {
-  const params = new URLSearchParams();
-  if (filter.kind === "unfiled") params.set("unfiled", "true");
-  if (filter.kind === "project") params.set("project_id", filter.projectId);
-  const query = params.toString();
-  const res = await authenticatedFetch(`/v1/scheduled-tasks${query ? `?${query}` : ""}`);
+export async function listScheduledTasks(): Promise<ScheduledTask[]> {
+  const res = await authenticatedFetch("/v1/scheduled-tasks");
   const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }
@@ -313,7 +297,6 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
-  if (input.projectId) body.project_id = input.projectId;
   const res = await authenticatedFetch("/v1/scheduled-tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -343,7 +326,6 @@ export async function updateScheduledTask(
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
-  if (input.projectId !== undefined) body.project_id = input.projectId;
   if (input.state !== undefined) body.state = input.state;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",

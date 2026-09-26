@@ -3054,7 +3054,6 @@ describe("useDeleteProject", () => {
 
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["scheduled-tasks"] });
   });
 
   it("throws with succeeded/failed split when some archives fail", async () => {
