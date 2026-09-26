@@ -82,6 +82,9 @@ import {
   useDroppable,
   useSensor,
   useSensors,
+  type KeyboardSensorOptions,
+  type MeasuringConfiguration,
+  type MouseSensorOptions,
 } from "@dnd-kit/core";
 import {
   arrayMove,
@@ -1597,6 +1600,19 @@ interface ConversationListProps {
   getVisibleIdsRef: RefObject<() => string[]>;
 }
 
+// Module-level so dnd-kit's useSensor/DndContext memoization holds: fresh
+// option objects rebuild the activators and re-render every draggable row.
+const KEYBOARD_SENSOR_OPTIONS: KeyboardSensorOptions = {
+  coordinateGetter: sortableKeyboardCoordinates,
+  keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
+};
+const MOUSE_SENSOR_OPTIONS: MouseSensorOptions = { activationConstraint: { distance: 5 } };
+// Always-measure so the transient "remove from project" zone (mounted at drag
+// start) is registered as a drop target without a stale layout cache.
+const DND_MEASURING: MeasuringConfiguration = {
+  droppable: { strategy: MeasuringStrategy.Always },
+};
+
 function ConversationList({
   conversationsQuery,
   scrollContainerRef,
@@ -1945,11 +1961,8 @@ function ConversationList({
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
   // into a drag. Project headers also support keyboard sorting.
   const sensors = useSensors(
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
-    }),
-    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, KEYBOARD_SENSOR_OPTIONS),
+    useSensor(MouseSensor, MOUSE_SENSOR_OPTIONS),
     useSensor(RowGesturePointerSensor),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
@@ -2248,9 +2261,7 @@ function ConversationList({
           }
           return closestCenter({ ...args, droppableContainers });
         }}
-        // Always-measure so the transient "remove from project" zone (mounted at
-        // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+        measuring={DND_MEASURING}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragOver={(event) =>
