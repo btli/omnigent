@@ -206,6 +206,7 @@ class ServerInfoResponse(BaseModel):
     # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
     agent_detail: bool = False
     branding: BrandingInfo
+    filesystem_attachment_policy: dict[str, Any]
 
 
 def _resolve_extension_state(
@@ -3068,6 +3069,7 @@ def create_app(
         # config presence only (extra installed + models on disk) — no
         # model is loaded here.
         from omnigent.server.dictation import engine_availability
+        from omnigent.server.server_config import filesystem_attachment_policy
 
         dictation_available, _ = engine_availability()
         return ServerInfoResponse.model_validate(
@@ -3096,6 +3098,7 @@ def create_app(
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "branding": branding_snapshot.config(),
+                "filesystem_attachment_policy": filesystem_attachment_policy().public_dict(),
             }
         )
 

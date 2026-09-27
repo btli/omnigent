@@ -262,3 +262,17 @@ describe("custom agents settings capability", () => {
     },
   );
 });
+
+it.each([[".mp4"], [], "*"])("preserves published attachment policy %j", async (allowed) => {
+  const policy = {
+    allowed_extensions: allowed,
+    denied_extensions: [".exe"],
+    max_bytes: 100,
+    max_files: 2,
+    max_total_bytes: 200,
+    harnesses: ["claude-native"],
+  };
+  expect(
+    (await probe({ filesystem_attachment_policy: policy })).filesystem_attachment_policy,
+  ).toEqual(policy);
+});
