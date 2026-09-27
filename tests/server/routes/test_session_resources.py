@@ -2401,8 +2401,8 @@ async def test_copy_spends_the_child_workspace_quota(
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit",
-        lambda: 1,
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_files": 1},
     )
     file_conv_store._conversations["405bfe154d5c0e795a2b87021bc897bf"].labels.update(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
@@ -2448,7 +2448,7 @@ async def test_native_forward_leaves_a_workspace_file_for_the_runner(
     forwarded = next(
         body for path, body in fake_runner.post_json_calls if path.endswith("/events")
     )
-    assert forwarded["content"] == [zip_block]
+    assert forwarded["content"] == [{**zip_block, "delivery": "filesystem"}]
     assert "File reference resolution failed" not in caplog.text
 
 
@@ -2934,8 +2934,13 @@ async def test_copy_files_then_download_returns_bytes(
     file_client: httpx.AsyncClient,
 ) -> None:
     """After copy, the child can download the copied content."""
+    rejected = await file_client.post(
+        "/v1/sessions/b460374fc8e697b296708f52dc9d8179/resources/files",
+        files={"file": ("payload.bin", b"\x00\xff", "text/plain")},
+    )
+    assert rejected.status_code == 415, rejected.text
     parent_file = await _upload_file(
-        file_client, "b460374fc8e697b296708f52dc9d8179", "payload.bin", b"\x00\x01\x02data"
+        file_client, "b460374fc8e697b296708f52dc9d8179", "payload.txt", b"\x00\x01\x02data"
     )
 
     copy_resp = await file_client.post(
@@ -8623,3 +8628,51 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.parametrize(
+    "case,status", [("copy", 200), ("removed", 415), ("sdk", 415), ("legacy_runtime", 409)]
+)
+async def test_copy_generalized_file_rechecks_admission_and_runtime(
+    file_client, file_app, file_conv_store, file_store, artifact_store, monkeypatch, case, status
+) -> None:
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    destination = "405bfe154d5c0e795a2b87021bc897bf"
+    source_session = "b460374fc8e697b296708f52dc9d8179"
+    config = {"filesystem_attachment_allowed_extensions": [".zip", ".mp4"]}
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: config)
+    if case != "sdk":
+        file_conv_store._conversations[destination].labels.update(
+            CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+        )
+    zip_id = _seed_parent_zip(file_store, artifact_store, "legacy.zip")
+    video = file_store.create(
+        session_id=source_session,
+        filename="clip.mp4",
+        bytes=4,
+        content_type="text/plain",
+        source_metadata={"delivery": "filesystem"},
+    )
+    artifact_store.put(video.id, b"\x00\xff\x80v")
+    if case == "removed":
+        config["filesystem_attachment_allowed_extensions"] = [".zip"]
+    if case == "legacy_runtime":
+        file_app.state.host_registry.get("host_files").hello.capabilities = [
+            "filesystem_attachments"
+        ]
+    response = await file_client.post(
+        f"/v1/sessions/{destination}/resources/files:copy",
+        json={
+            "source_session_id": source_session,
+            "file_ids": [video.id] if case == "sdk" else [zip_id, video.id],
+        },
+    )
+    assert response.status_code == status, response.text
+    if status == 200:
+        copied = file_store.get(response.json()["mapping"][video.id]["new_id"])
+        assert copied.source_metadata == {"delivery": "filesystem"}
+        assert copied.content_type == "application/octet-stream"
+        assert artifact_store.get(copied.id) == b"\x00\xff\x80v"
+    else:
+        assert file_store.list(session_id=destination, limit=10).data == []

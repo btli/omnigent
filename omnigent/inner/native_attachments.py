@@ -105,6 +105,69 @@ FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "c
 
 # Advertised by builds that can deliver and restore these attachments.
 CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
+CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS = "generalized_filesystem_attachments"
+
+
+def normalized_attachment_filename(filename: str) -> str:
+    """Return a portable basename, rejecting controls and alternate data streams."""
+    if re.search(r"[\x00-\x1f\x7f-\x9f:]", urllib.parse.unquote(filename)):
+        raise ValueError(
+            f"Invalid attachment filename {filename!r}: controls and ':' are forbidden"
+        )
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].rstrip(" .")
+    if not name:
+        raise ValueError(f"Invalid attachment filename {filename!r}")
+    return name
+
+
+def attachment_suffixes(filename: str) -> frozenset[str]:
+    """Include compound suffixes and their components for denylist matching."""
+    parts = [
+        part.rstrip(" ") for part in normalized_attachment_filename(filename).lower().split(".")
+    ]
+    return frozenset(
+        "." + ".".join(parts[start:end])
+        for start in range(1, len(parts))
+        for end in range(start + 1, len(parts) + 1)
+    )
+
+
+def stored_file_requires_filesystem(filename: str | None, source_metadata: object) -> bool:
+    """Keep persisted delivery stable; legacy rows use the original extension rule."""
+    if isinstance(source_metadata, Mapping) and "delivery" in source_metadata:
+        return source_metadata["delivery"] == "filesystem"
+    return requires_filesystem(filename)
+
+
+def stored_file_reference(
+    file_id: str,
+    filename: str,
+    content_type: str | None,
+    source_metadata: object,
+    *,
+    detail: object = None,
+) -> dict[str, Any]:
+    """Rebuild a reference exclusively from server-owned file metadata."""
+    from omnigent.runtime.content_resolver import _resolve_content_type
+
+    filesystem = stored_file_requires_filesystem(filename, source_metadata)
+    content_type = _resolve_content_type(content_type, filename)
+    block: dict[str, Any] = {
+        "type": "input_image"
+        if not filesystem and (content_type or "").startswith("image/")
+        else "input_file",
+        "file_id": file_id,
+        "filename": filename,
+    }
+    if filesystem:
+        block["delivery"] = "filesystem"
+    elif (
+        block["type"] == "input_image"
+        and isinstance(detail, str)
+        and detail in {"auto", "low", "high"}
+    ):
+        block["detail"] = detail
+    return block
 
 
 def requires_filesystem(filename: str | None) -> bool:
@@ -406,8 +469,7 @@ def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
     file_id = block.get("file_id")
     if not isinstance(file_id, str) or not file_id:
         return False
-    data_uri = block.get("image_url") or block.get("file_data")
-    return not (isinstance(data_uri, str) and data_uri.startswith("data:"))
+    return True
 
 
 def resize_notice(source_metadata: object) -> str | None:
@@ -589,22 +651,31 @@ async def resolve_file_id_block(
     content_type = meta.get("content_type")
     if not isinstance(content_type, str) or not content_type:
         content_type = content_resp.headers.get("content-type") or "application/octet-stream"
-    # Strip any charset suffix: data URIs need the media type hint.
-    content_type = content_type.split(";", 1)[0]
     encoded = base64.b64encode(content_resp.content).decode("ascii")
-    new_block = {k: v for k, v in block.items() if k != "file_id"}
-    stored_name = meta.get("name")
-    if isinstance(stored_name, str) and stored_name:
-        # The stored name decides delivery. The block's own filename comes from
-        # the client and could steer an upload past the upload checks.
-        new_block["filename"] = stored_name
+    stored_name = meta.get("name") or meta.get("filename") or block.get("filename") or "attachment"
+    from omnigent.runtime.content_resolver import _resolve_content_type
+
+    content_type = _resolve_content_type(content_type, str(stored_name))
+    resource_metadata = meta.get("metadata")
+    source_metadata = (
+        resource_metadata.get("source_metadata")
+        if isinstance(resource_metadata, Mapping)
+        else None
+    )
+    new_block = stored_file_reference(
+        file_id, str(stored_name), content_type, source_metadata, detail=block.get("detail")
+    )
+    del new_block["file_id"]
     notice: dict[str, int] | None = None
-    if block.get("type") == "input_image":
+    if new_block["type"] == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
-        resource_metadata = meta.get("metadata")
-        if isinstance(resource_metadata, Mapping):
-            notice = resize_dimensions(resource_metadata.get("source_metadata"))
+        notice = resize_dimensions(source_metadata)
     else:
+        if (
+            isinstance(source_metadata, Mapping)
+            and source_metadata.get("delivery") == "filesystem"
+        ):
+            content_type = "application/octet-stream"
         new_block["file_data"] = f"data:{content_type};base64,{encoded}"
     return new_block, notice
 
