@@ -142,7 +142,8 @@ describe("CommandPalette — sessions", () => {
     "shows initial fetch errors with a retry (sessionsOnly=%s)",
     (sessionsOnly) => {
       const refetch = vi.fn();
-      useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
+      const error = new Error("500 Internal Server Error");
+      useConversations.mockReturnValue({ isError: true, error, isFetching: false, refetch });
       renderPalette({ sessionsOnly });
       expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
       expect(screen.queryByText("No results found")).toBeNull();
@@ -163,19 +164,6 @@ describe("CommandPalette — sessions", () => {
     expect(screen.queryByText("No results found")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(refetch).toHaveBeenCalledOnce();
-  });
-
-  it("keeps the generic load error for a non-timeout failure", () => {
-    useConversations.mockReturnValue({
-      isError: true,
-      error: new Error("500 Internal Server Error"),
-      isFetching: false,
-      refetch: vi.fn(),
-    });
-    renderPalette();
-    const status = screen.getByRole("status").textContent;
-    expect(status).toContain("Couldn't load sessions.");
-    expect(status).not.toContain("timed out");
   });
 
   it("does not show the timeout message for a successful search", () => {
