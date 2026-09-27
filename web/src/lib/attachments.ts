@@ -121,15 +121,11 @@ function deniedFilename(filename: string, denied: string[]): boolean {
     .split(":")
     .some((part) => {
       const segments = part.split(".").map((segment) => segment.trimEnd());
-      return segments.some(
-        (_, index) =>
-          index > 0 &&
-          denied.some(
-            (ext) =>
-              normalizedFilename(`.${segments.slice(index).join(".")}`).startsWith(`${ext}.`) ||
-              normalizedFilename(`.${segments.slice(index).join(".")}`) === ext,
-          ),
-      );
+      return segments.some((_, index) => {
+        if (index === 0) return false;
+        const suffix = normalizedFilename(`.${segments.slice(index).join(".")}`);
+        return denied.some((ext) => suffix.startsWith(`${ext}.`) || suffix === ext);
+      });
     });
 }
 
@@ -190,12 +186,9 @@ export function validateAttachments(
   const accepted: File[] = [];
   const errors: string[] = [];
 
-  let filesystemCount = existing.filter(
-    (file) => classifyAttachment(file, policy) === "file",
-  ).length;
-  let filesystemBytes = existing
-    .filter((file) => classifyAttachment(file, policy) === "file")
-    .reduce((sum, file) => sum + file.size, 0);
+  const filesystemFiles = existing.filter((file) => classifyAttachment(file, policy) === "file");
+  let filesystemCount = filesystemFiles.length;
+  let filesystemBytes = filesystemFiles.reduce((sum, file) => sum + file.size, 0);
   for (const file of files) {
     const name = file.name || "file";
     const filename = attachmentFilename(file);
