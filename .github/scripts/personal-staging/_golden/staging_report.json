@@ -11,13 +11,11 @@
       "--atomic",
       "--force-with-lease=refs/heads/main:22353f5fceba131785461953b028309894382cf5",
       "--force-with-lease=refs/heads/staging:",
-      "--force-with-lease=refs/heads/nightly-20260820:",
       "--force-with-lease=refs/tags/nightly-20260820:",
       "--force-with-lease=refs/tags/v1.2.3.dev20260820:",
       "origin",
       "22353f5fceba131785461953b028309894382cf5:refs/heads/main",
       "4cd66030779beffa0160d8203930daa5c7b3598b:refs/heads/staging",
-      "4cd66030779beffa0160d8203930daa5c7b3598b:refs/heads/nightly-20260820",
       "4cd66030779beffa0160d8203930daa5c7b3598b:refs/tags/nightly-20260820",
       "4cd66030779beffa0160d8203930daa5c7b3598b:refs/tags/v1.2.3.dev20260820"
     ]
@@ -44,16 +42,10 @@
         "expected": "4cd66030779beffa0160d8203930daa5c7b3598b",
         "observed": "4cd66030779beffa0160d8203930daa5c7b3598b",
         "ref": "refs/tags/nightly-20260820"
-      },
-      {
-        "expected": "4cd66030779beffa0160d8203930daa5c7b3598b",
-        "observed": "4cd66030779beffa0160d8203930daa5c7b3598b",
-        "ref": "refs/heads/nightly-20260820"
       }
     ],
     "base_matches_remote_main": true,
     "base_sha": "22353f5fceba131785461953b028309894382cf5",
-    "branch": "nightly-20260820",
     "date": "20260820",
     "dev_tag": "v1.2.3.dev20260820",
     "entry_zero": {

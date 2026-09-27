@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """Retire aged personal-ring pins on the fork.
 
-The staging and production nightlies each mint an immutable dated pin — a
-``<ring>-YYYYMMDD[-rerunN]`` tag, a same-name branch, and a dated
-prerelease — and staging also mints a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag.
+The staging and production nightlies each mint an immutable dated pin tag
+and prerelease, and staging also mints a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag.
+Before v0.15.0, ring pins also had a same-name compatibility branch.
 Nothing resolves a pin once the homelab has built it (fork CI re-fetches
 the canonical tag set, and dev versions are derived from pyproject, not
 from tags), so they accumulate forever. This prunes every pin whose
 datestamp is older than the retention window, keeping a floor of the
 newest few per family so a pipeline outage can never strip the repo bare.
 
-Deletion order within a pin is branch -> release -> tag, because
-``stage.py``'s ``pin_name()`` fails closed on a half-pin: a pin branch
-whose tag is absent is a hard error, while a tag whose branch is absent
-is tolerated. A run that dies mid-pin therefore leaves the tolerated
-state, and a stray half-pin branch is itself a prune candidate.
+Deletion order within a pin is branch -> release -> tag so pre-v0.15.0
+compatibility branches are cleaned up with the rest of their historical pin.
+A stray legacy branch is itself a prune candidate.
 
 Only the two dated pin families and the dev tags are matched at all, so
 floating refs (``production-latest``, ``nightly-latest``), ``pr-demos-*``,
@@ -57,7 +55,7 @@ DEV_TAG_RE = re.compile(
     re.ASCII,
 )
 DEV_FAMILY = "dev"
-# Families that mint a compatibility branch alongside the tag.
+# Families with pre-v0.15.0 same-name compatibility branches.
 BRANCHED_FAMILIES = ("production", "nightly")
 
 
@@ -284,8 +282,7 @@ def check_delete_ceiling(pruned: Plan) -> None:
 
 
 def execute(pruned: Plan, client: PinDeleter) -> list[str]:
-    """Delete the planned pins, branch -> release -> tag so a crash can only
-    ever leave the half-pin state stage.py tolerates."""
+    """Delete planned pins, including pre-v0.15.0 legacy branches."""
     check_delete_ceiling(pruned)
     done: list[str] = []
     try:
