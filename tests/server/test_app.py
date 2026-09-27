@@ -561,6 +561,17 @@ async def test_branding_snapshot_performs_no_request_time_io_or_decode(
     logo.write_bytes(payload)
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
 
+    attachment_policy = server_config_module.FilesystemAttachmentPolicy(
+        allowed_extensions=frozenset(),
+        denied_extensions=frozenset(),
+        max_bytes=1024,
+        max_files=1,
+        max_total_bytes=1024,
+    )
+    monkeypatch.setattr(
+        server_config_module, "filesystem_attachment_policy", lambda: attachment_policy
+    )
+
     config_loads = 0
     logo_reads = 0
     validations = 0
@@ -2171,3 +2182,30 @@ async def test_missing_conversation_is_a_404_not_an_unhandled_error(
     # Traced, but not as a fault.
     assert records[0].levelno == logging.INFO
     assert not records[0].getMessage().startswith("Unhandled exception:")
+
+
+async def test_info_publishes_effective_attachment_policy(
+    client: httpx.AsyncClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": ["MP4"],
+            "filesystem_attachment_denied_extensions": ["EXE"],
+            "filesystem_attachment_max_bytes": 7,
+            "filesystem_attachment_max_files": 2,
+            "filesystem_attachment_max_total_bytes": 11,
+        },
+    )
+    response = await client.get("/v1/info")
+    assert response.status_code == 200
+    published = response.json()["filesystem_attachment_policy"]
+    assert published.pop("inline_extensions")[".ics"] == "text"
+    assert published == {
+        "allowed_extensions": [".mp4"],
+        "denied_extensions": [".exe"],
+        "max_bytes": 7,
+        "max_files": 2,
+        "max_total_bytes": 11,
+        "harnesses": ["claude-native", "codex-native"],
+    }
