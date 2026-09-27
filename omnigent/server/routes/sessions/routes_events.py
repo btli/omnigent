@@ -197,6 +197,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_session_superseded,
     _publish_status,
     _remove_session_worktree_best_effort,
+    _request_attachment_policy,
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
     _resolve_harness,
@@ -961,6 +962,7 @@ def register_events_routes(
                 body.data.get("content"),
                 session_id=session_id,
                 file_store=file_store,
+                policy=_request_attachment_policy(request),
             )
             if content is not None:
                 body.data["content"] = content

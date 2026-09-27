@@ -8354,7 +8354,6 @@ def _filesystem_attachment_in_history(
     *,
     up_to_response_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
-    additional_filesystem_file_ids: frozenset[str] = frozenset(),
 ) -> str | None:
     """Find a retained attachment requiring filesystem tools, using its stored name.
 
@@ -8363,7 +8362,6 @@ def _filesystem_attachment_in_history(
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
     :param content: Additional incoming message blocks to check before stored history.
-    :param additional_filesystem_file_ids: Files newly classified for a pending fork.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
     from omnigent.inner.native_attachments import (
@@ -8378,9 +8376,7 @@ def _filesystem_attachment_in_history(
     while True:
         files_page = file_store.list(session_id, limit=1000, after=files_after, order="asc")
         for stored_file in files_page.data:
-            if stored_file.id in additional_filesystem_file_ids or stored_file_requires_filesystem(
-                stored_file.filename, stored_file.source_metadata
-            ):
+            if stored_file_requires_filesystem(stored_file.filename, stored_file.source_metadata):
                 filenames[stored_file.id] = stored_file.filename
         if not files_page.has_more or not files_page.data:
             break
@@ -10995,15 +10991,23 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _attachment_name_allowed(filename: str, policy: FilesystemAttachmentPolicy) -> str:
+def _request_attachment_policy(request: Request | None) -> FilesystemAttachmentPolicy:
+    """Use the application's advertised snapshot; standalone route mounts load their own policy."""
+    policy = getattr(request.app.state, "filesystem_attachment_policy", None) if request else None
+    return policy if policy is not None else filesystem_attachment_policy()
+
+
+def _attachment_name_allowed(
+    filename: str, policy: FilesystemAttachmentPolicy, *, filesystem: bool = False
+) -> str:
     from omnigent.inner.native_attachments import (
-        attachment_suffixes,
+        attachment_denied_extensions,
         normalized_attachment_filename,
     )
 
     try:
-        name = normalized_attachment_filename(filename)
-        denied = attachment_suffixes(name) & policy.denied_extensions
+        name = normalized_attachment_filename(filename, filesystem=filesystem)
+        denied = attachment_denied_extensions(name, policy.denied_extensions)
     except ValueError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     if denied:
@@ -11029,13 +11033,20 @@ def _classify_attachment_upload(
     )
 
     name = _attachment_name_allowed(filename, policy)
-    inline_type = attachment_text_type_for_extension(name) or _resolve_content_type(None, name)
+    base_name = name.split(":", 1)[0]
+    while base_name and (base_name[-1].isspace() or base_name[-1] == "."):
+        base_name = base_name[:-1]
+    legacy_filesystem = requires_filesystem(name) or requires_filesystem(base_name)
+    inline_type = _resolve_content_type(content_type, name)
+    if attachment_upload_limit(inline_type) is None:
+        inline_type = attachment_text_type_for_extension(name) or inline_type
     inline = attachment_upload_limit(inline_type) is not None
-    if policy.allows(name) and (
-        policy.allowed_extensions != "*" or requires_filesystem(name) or not inline
+    if (policy.allows(name) or policy.allows(base_name)) and (
+        policy.allowed_extensions != "*" or legacy_filesystem or not inline
     ):
+        name = _attachment_name_allowed(name, policy, filesystem=True)
         return name, "application/octet-stream", True
-    if requires_filesystem(name) or not inline:
+    if legacy_filesystem or not inline:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported attachment type '{content_type or 'unknown'}' for '{name}'. "
@@ -11052,6 +11063,7 @@ def _validate_attachment_content(
     policy: FilesystemAttachmentPolicy | None = None,
 ) -> list[dict[str, Any]] | None:
     """Validate inline payloads and replace stored references with authoritative metadata."""
+    from omnigent.db.db_models import InvalidUuidError
     from omnigent.inner.native_attachments import stored_file_reference
     from omnigent.runtime.content_resolver import attachment_upload_limit
 
@@ -11064,13 +11076,29 @@ def _validate_attachment_content(
             raise OmnigentError("Invalid attachment content block", code=ErrorCode.INVALID_INPUT)
         file_id = block.get("file_id")
         if file_id is not None:
-            stored = (
-                file_store.get(file_id)
-                if file_store
-                and isinstance(file_id, str)
-                and re.fullmatch(r"[a-fA-F0-9]{32}", file_id)
-                else None
-            )
+            if file_store is None:
+                normalized.append(
+                    {
+                        key: value
+                        for key, value in block.items()
+                        if key
+                        not in (
+                            "file_data",
+                            "image_url",
+                            "delivery",
+                            "source_metadata",
+                        )
+                    }
+                )
+                continue
+            try:
+                stored = file_store.get(file_id) if isinstance(file_id, str) else None
+            except ValueError:
+                stored = None
+            except StatementError as exc:
+                if not isinstance(exc.orig, InvalidUuidError):
+                    raise
+                stored = None
             if stored is None or stored.session_id not in (None, session_id):
                 raise OmnigentError(
                     f"Attachment {block.get('filename', file_id)!r} references a file "
@@ -11093,17 +11121,11 @@ def _validate_attachment_content(
             if key not in ("delivery", "source_metadata")
         }
         uri = block.get("file_data") or block.get("image_url")
-        if not isinstance(uri, str) or not uri.startswith("data:"):
-            if block.get("file_data"):
-                raise OmnigentError(
-                    "Attachments must be uploaded or use a data URI", code=ErrorCode.INVALID_INPUT
-                )
-            normalized.append(clean)
-            continue
-        header, separator, payload = uri.partition(",")
-        mime = header[5:].split(";", 1)[0]
+        data_uri = isinstance(uri, str) and uri.startswith("data:")
+        header, separator, payload = uri.partition(",") if data_uri else ("", "", "")
+        mime = header[5:].split(";", 1)[0] if data_uri else None
         filename = block.get("filename")
-        if isinstance(filename, str) and filename:
+        if isinstance(filename, str) and filename and (uri is not None):
             name, mime, filesystem = _classify_attachment_upload(filename, mime, policy)
             clean["filename"] = name
             if filesystem:
@@ -11112,7 +11134,14 @@ def _validate_attachment_content(
                     "and referenced by file_id.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        limit = attachment_upload_limit(mime)
+        if not data_uri:
+            if block.get("file_data"):
+                raise OmnigentError(
+                    "Attachments must be uploaded or use a data URI", code=ErrorCode.INVALID_INPUT
+                )
+            normalized.append(clean)
+            continue
+        limit = attachment_upload_limit(mime or "")
         if limit is None:
             raise HTTPException(
                 status_code=415,
@@ -11136,7 +11165,7 @@ def _validate_attachment_content(
             )
         clean.pop("file_data", None)
         clean.pop("image_url", None)
-        image = mime.startswith("image/")
+        image = (mime or "").startswith("image/")
         clean["type"] = "input_image" if image else "input_file"
         clean["image_url" if image else "file_data"] = f"data:{mime};base64,{payload}"
         normalized.append(clean)
@@ -11252,7 +11281,7 @@ def _enforce_filesystem_attachment_policy(
 
     policy = policy or filesystem_attachment_policy()
     for filename in filenames:
-        name = _attachment_name_allowed(filename, policy)
+        name = _attachment_name_allowed(filename, policy, filesystem=True)
         if not policy.allows(name):
             raise HTTPException(
                 status_code=415,

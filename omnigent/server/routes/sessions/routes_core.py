@@ -237,7 +237,6 @@ def _require_attachment_compatible_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
-    additional_filesystem_file_ids: frozenset[str] = frozenset(),
 ) -> str | None:
     """Reject a target that cannot replay files in the retained transcript.
 
@@ -246,7 +245,6 @@ def _require_attachment_compatible_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
-    :param additional_filesystem_file_ids: Files newly classified for a pending fork.
     :returns: A retained filesystem attachment's name, or ``None``.
     :raises OmnigentError: If the target cannot open a referenced attachment.
     """
@@ -257,7 +255,6 @@ def _require_attachment_compatible_history(
         conversation_store,
         file_store,
         up_to_response_id=up_to_response_id,
-        additional_filesystem_file_ids=additional_filesystem_file_ids,
     )
     if filename is not None:
         native = _native_coding_agent_for_agent(target_agent)
@@ -3382,7 +3379,6 @@ def register_core_routes(
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
         filesystem_sources: list[StoredFile] = []
-        fork_classifications: dict[str, tuple[str, str, bool]] = {}
         if file_store is not None and artifact_store is not None:
             files_after: str | None = None
             while True:
@@ -3401,32 +3397,17 @@ def register_core_routes(
                 files_after = files_page.last_id
 
             from omnigent.inner.native_attachments import stored_file_requires_filesystem
-            from omnigent.server.routes._sessions.helpers import _classify_attachment_upload
-            from omnigent.server.server_config import filesystem_attachment_policy
+            from omnigent.server.routes._sessions.helpers import (
+                _attachment_name_allowed,
+                _request_attachment_policy,
+            )
 
-            policy = filesystem_attachment_policy()
+            policy = _request_attachment_policy(request)
             for stored in fork_source_files:
-                classification = _classify_attachment_upload(
-                    stored.filename, stored.content_type, policy
-                )
-                fork_classifications[stored.id] = classification
-                filesystem = classification[2]
-                if filesystem or stored_file_requires_filesystem(
-                    stored.filename, stored.source_metadata
-                ):
+                _attachment_name_allowed(stored.filename, policy)
+                if stored_file_requires_filesystem(stored.filename, stored.source_metadata):
                     filesystem_sources.append(stored)
             if filesystem_sources:
-                await asyncio.to_thread(
-                    _require_attachment_compatible_history,
-                    source_id,
-                    base_agent,
-                    conversation_store,
-                    file_store,
-                    up_to_response_id=body.up_to_response_id,
-                    additional_filesystem_file_ids=frozenset(
-                        stored.id for stored in filesystem_sources
-                    ),
-                )
                 await asyncio.to_thread(
                     _enforce_filesystem_attachment_policy,
                     [stored.filename or "" for stored in filesystem_sources],
@@ -3513,12 +3494,12 @@ def register_core_routes(
                 try:
                     await asyncio.to_thread(
                         file_store.create,
-                        filename=fork_classifications[stored_file.id][0],
+                        filename=stored_file.filename,
                         bytes=stored_file.bytes,
                         content_type=(
                             "application/octet-stream"
                             if stored_file in filesystem_sources
-                            else fork_classifications[stored_file.id][1]
+                            else stored_file.content_type
                         ),
                         session_id=new_conv.id,
                         file_id=copied_file_id,
