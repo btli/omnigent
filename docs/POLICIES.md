@@ -104,14 +104,20 @@ does not. Invalid extension entries are skipped, and an invalid allowlist value
 admits no filesystem files. Omit the setting to retain the built-in set.
 
 The denylist and all applicable caps win over the allowlist. Matching strips
-trailing dots/spaces and ignores case; the denylist examines every component of
+trailing dots and Unicode whitespace and ignores case; the denylist examines every component of
 compound suffixes (`payload.exe.txt` and `payload.txt.exe` both match `.exe`).
-Names containing control characters or `:` (alternate data streams) are rejected.
-Directory components are reduced to a basename. Explicitly allowed extensions
+Names containing Unicode control, format, line-separator, or paragraph-separator
+characters are rejected, including percent-encoded forms. Filesystem delivery
+also rejects `:` (alternate data streams); inline names such as `Screen 10:30.png`
+remain valid. Directory components are reduced to a basename, which must fit in
+255 UTF-8 bytes after normalization. Explicitly allowed extensions
 are classified for filesystem delivery before MIME hints, so `clip.mp4` declared
-as `text/plain` or `image/png` remains opaque. Wildcard admission preserves the
-existing inline image, PDF, and text/code filename formats and their limits;
-other names use filesystem delivery. MIME alone cannot admit an unknown filename.
+as `text/plain` or `image/png` remains opaque. Otherwise, supported declared MIME
+types retain inline delivery (for example, a `text/plain` README or an `image/png`
+file named photo), with filename fallback for missing/generic MIME and known
+text/code extensions. Wildcard admission preserves these inline types and their
+limits; other names use filesystem delivery. Legacy built-in filesystem formats
+cannot become inline through a MIME hint.
 
 The server checks uploads, copies, forks, message/slash events, and initial
 session items. Filesystem payloads must first be uploaded and then referenced by
@@ -123,6 +129,8 @@ Older rows without the entry use the original built-in extension rule. Removing
 an extension prevents new uploads, copies, and forks but keeps existing
 same-session files usable and counted toward quotas. Retained filesystem history
 cannot switch/fork to an SDK harness; unsent files are checked again when sent.
+Forks preserve each source row's delivery classification. Copies are new admission:
+an inline row whose suffix is now explicitly allowed becomes a filesystem row.
 
 Upgrade the server, web client, and execution host/runner together. Both connected
 host and runner must advertise `generalized_filesystem_attachments` for new types;
@@ -133,6 +141,25 @@ these for early feedback and all three pickers; under `"*"` it omits the picker
 filter. An older server without the policy leaves unknown types to server
 validation, with upload errors preserving the draft. Older web bundles may still
 reject video or apply their former fixed 50 MiB filesystem ceiling.
+The effective policy, including the denylist, is public on unauthenticated
+`/v1/info`; the server remains the enforcement point. Policy is snapshotted at
+server startup and cached by each browser tab. After changing configuration,
+restart the server and reload every open page to receive the new policy.
+Malformed policy responses use the older-server fallback instead of breaking
+the composer. Stale permissive tabs still receive authoritative server errors.
+
+Before rolling back a server, check stored file metadata and retained histories
+for generalized filesystem attachments (including inline suffixes explicitly
+admitted for filesystem delivery). Previous releases ignore the persisted marker:
+they may inline those bytes, omit them from filesystem quotas, and permit SDK
+switches/forks. Restoring the allowlist to the built-in set and restarting stops
+new generalized admission, but does **not** remove or reclassify existing rows.
+Before deploying an older server, remove generalized attachments and their
+references from all retained source/copy/fork histories, or restore a compatible
+database and artifact backup from before their admission. Otherwise retain a
+server version that understands the marker and capability gate. No compatibility
+backport is provided. Rolling back only hosts/runners leaves the new server's
+upgrade gate active; older web bundles retain their older picker restrictions.
 
 These controls inspect names, not file contents. They do not sniff formats, scan
 archive contents, detect renamed binaries, or constrain files agents obtain via
