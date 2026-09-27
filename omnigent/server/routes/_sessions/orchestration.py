@@ -10400,6 +10400,39 @@ async def _create_session_from_existing_agent(
         pass
 
     if body.initial_items:
+        from omnigent.server.routes._sessions.helpers import (
+            _require_filesystem_attachment_harness,
+            _validate_attachment_content,
+            require_filesystem_attachment_runtime,
+        )
+        from omnigent.server.server_config import filesystem_attachment_policy
+
+        attachment_policy = filesystem_attachment_policy()
+        for item in body.initial_items:
+            if item.type not in ("message", "slash_command"):
+                continue
+            content = await asyncio.to_thread(
+                _validate_attachment_content,
+                item.data.get("content"),
+                session_id=conv.id,
+                file_store=file_store,
+                policy=attachment_policy,
+            )
+            if content is not None:
+                item.data["content"] = content
+                for block in content:
+                    if block.get("delivery") == "filesystem":
+                        await _require_filesystem_attachment_harness(conv, block["filename"])
+                        require_filesystem_attachment_runtime(
+                            filename=block["filename"],
+                            host_id=conv.host_id,
+                            runner_id=conv.runner_id,
+                            host_registry=getattr(request.app.state, "host_registry", None),
+                            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                            runner_router=runner_router,
+                        )
+
+    if body.initial_items:
         runner_client = await _get_runner_client(
             conv.id,
             runner_router,
