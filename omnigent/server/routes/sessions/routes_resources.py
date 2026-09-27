@@ -1715,9 +1715,9 @@ def register_resources_routes(
             image_filename_for_content_type,
             image_needs_compression,
         )
-        from omnigent.server.server_config import filesystem_attachment_policy
+        from omnigent.server.routes._sessions.helpers import _request_attachment_policy
 
-        policy = filesystem_attachment_policy()
+        policy = _request_attachment_policy(request)
         filename, content_type, filesystem_required = _classify_attachment_upload(
             file.filename, file.content_type, policy
         )
@@ -1737,7 +1737,10 @@ def register_resources_routes(
                 )
             else:
                 type_limit = attachment_upload_limit(content_type)
-                assert type_limit is not None
+                if type_limit is None:
+                    raise HTTPException(
+                        status_code=415, detail="Unsupported inline attachment type"
+                    )
                 read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
             # Persist original dimensions only after a downscale.
             source_dims: tuple[int, int] | None = None
@@ -2077,13 +2080,31 @@ def register_resources_routes(
             requires_filesystem,
             stored_file_requires_filesystem,
         )
-        from omnigent.server.server_config import filesystem_attachment_policy
+        from omnigent.server.routes._sessions.helpers import _request_attachment_policy
 
-        policy = filesystem_attachment_policy()
-        classifications = {
-            stored.id: _classify_attachment_upload(stored.filename, stored.content_type, policy)
-            for stored in sources
-        }
+        policy = _request_attachment_policy(request)
+        from omnigent.server.routes._sessions.helpers import _attachment_name_allowed
+
+        classifications: dict[str, tuple[str, str | None, bool]] = {}
+        for stored in sources:
+            name = _attachment_name_allowed(stored.filename, policy)
+            base_name = name.split(":", 1)[0]
+            while base_name and (base_name[-1].isspace() or base_name[-1] == "."):
+                base_name = base_name[:-1]
+            filesystem = stored_file_requires_filesystem(stored.filename, stored.source_metadata)
+            classification = (
+                _classify_attachment_upload(stored.filename, stored.content_type, policy)
+                if filesystem
+                or policy.allows(name)
+                or policy.allows(base_name)
+                or requires_filesystem(base_name)
+                else (stored.filename, stored.content_type, False)
+            )
+            classifications[stored.id] = (
+                classification
+                if filesystem or classification[2]
+                else (stored.filename, stored.content_type, False)
+            )
         filesystem_sources = [
             stored
             for stored in sources
