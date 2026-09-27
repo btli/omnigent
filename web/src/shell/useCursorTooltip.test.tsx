@@ -1,9 +1,14 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { setEmbedRoot } from "@/lib/host";
 import { useCursorTooltip } from "./useCursorTooltip";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  setEmbedRoot(null);
+  document.body.replaceChildren();
+});
 
 // Mirrors a virtualized FolderTree row: the wrapper's transform would become
 // the containing block for a fixed tooltip rendered inside it.
@@ -35,5 +40,16 @@ describe("useCursorTooltip", () => {
 
     fireEvent.mouseLeave(label);
     expect(screen.queryByText("folder/file.ts")).not.toBeInTheDocument();
+  });
+
+  it("portals into the embed root when one is registered", () => {
+    const embedRoot = document.createElement("div");
+    document.body.appendChild(embedRoot);
+    setEmbedRoot(embedRoot);
+    render(<TransformedRow />);
+
+    fireEvent.mouseMove(screen.getByText("file.ts"), { clientX: 120, clientY: 200 });
+
+    expect(screen.getByText("folder/file.ts").parentElement).toBe(embedRoot);
   });
 });
