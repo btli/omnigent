@@ -32,13 +32,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from PIL import Image, ImageSequence, UnidentifiedImageError
@@ -137,7 +138,7 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
     return value
 
 
-def _config_positive_int(key: str, default: int) -> int:
+def _config_positive_int(key: str, default: int, config: Mapping[str, Any] | None = None) -> int:
     """Read a positive-int setting from the server config, else *default*.
 
     A missing, non-numeric, or non-positive value falls back to *default*
@@ -148,7 +149,7 @@ def _config_positive_int(key: str, default: int) -> int:
     :param default: Value used when the key is absent or invalid.
     :returns: The configured positive int, or *default*.
     """
-    raw = load_server_config().get(key)
+    raw = (load_server_config() if config is None else config).get(key)
     if raw is None:
         return default
     try:
@@ -269,6 +270,88 @@ def filesystem_attachment_denied_extensions() -> frozenset[str]:
         value = entry.strip().lower()
         denied.add(value if value.startswith(".") else f".{value}")
     return frozenset(denied)
+
+
+def _attachment_extensions(raw: object) -> frozenset[str]:
+    if not isinstance(raw, list):
+        logger.warning("attachment extensions must be a list; disabling this list")
+        return frozenset()
+    extensions: set[str] = set()
+    for entry in raw:
+        value = entry.strip().lower().lstrip(".") if isinstance(entry, str) else ""
+        if not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*", value):
+            logger.warning("invalid attachment extension %r; skipping", entry)
+            continue
+        extensions.add(f".{value}")
+    return frozenset(extensions)
+
+
+@dataclass(frozen=True)
+class FilesystemAttachmentPolicy:
+    """One immutable configuration snapshot for an admission operation."""
+
+    allowed_extensions: frozenset[str] | Literal["*"]
+    denied_extensions: frozenset[str]
+    max_bytes: int
+    max_files: int
+    max_total_bytes: int
+
+    def allows(self, filename: str) -> bool:
+        name = filename.lower()
+        return self.allowed_extensions == "*" or any(
+            name.endswith(extension) for extension in self.allowed_extensions
+        )
+
+    def public_dict(self) -> dict[str, Any]:
+        from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
+        from omnigent.runtime.content_resolver import inline_attachment_extensions
+
+        return {
+            "allowed_extensions": "*"
+            if self.allowed_extensions == "*"
+            else sorted(self.allowed_extensions),
+            "denied_extensions": sorted(self.denied_extensions),
+            "max_bytes": self.max_bytes,
+            "max_files": self.max_files,
+            "max_total_bytes": self.max_total_bytes,
+            "harnesses": sorted(FILESYSTEM_ATTACHMENT_HARNESSES),
+            "inline_extensions": inline_attachment_extensions(),
+        }
+
+
+def filesystem_attachment_policy() -> FilesystemAttachmentPolicy:
+    """Read admission settings once; a present list replaces the built-in set."""
+    from omnigent.inner.native_attachments import (
+        _FILESYSTEM_ATTACHMENT_EXTENSIONS,
+        MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES,
+        MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES,
+        MAX_SESSION_FILESYSTEM_ATTACHMENTS,
+    )
+
+    config = load_server_config()
+    raw = config.get("filesystem_attachment_allowed_extensions")
+    allowed = (
+        _FILESYSTEM_ATTACHMENT_EXTENSIONS
+        if "filesystem_attachment_allowed_extensions" not in config
+        else "*"
+        if raw == "*"
+        else _attachment_extensions(raw)
+    )
+
+    def limit(key: str, default: int) -> int:
+        return _config_positive_int(key, default, config)
+
+    return FilesystemAttachmentPolicy(
+        allowed_extensions=allowed,
+        denied_extensions=_attachment_extensions(
+            config.get("filesystem_attachment_denied_extensions", [])
+        ),
+        max_bytes=limit("filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES),
+        max_files=limit("filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS),
+        max_total_bytes=limit(
+            "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+        ),
+    )
 
 
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
