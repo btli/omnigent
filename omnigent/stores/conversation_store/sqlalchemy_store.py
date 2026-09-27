@@ -23,6 +23,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     tuple_,
     update,
 )
@@ -107,6 +108,11 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     pinned_label_key,
 )
+from omnigent.stores.conversation_store.content_search import (
+    is_trigram_eligible,
+    legacy_content_matches,
+    select_content_search,
+)
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
 )
@@ -146,16 +152,9 @@ def _encode_session_state(
     return json.dumps(payload, separators=(",", ":"))
 
 
-# Server-side deadline (ms) for the content-search query in
-# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
-# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
-# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
-# scan can run unbounded and — since the query runs in a worker thread — a
-# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
-# a degraded deployment fails the search fast instead of pinning a DB
-# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
-# to the connection's next pooled use. Longer than the client's own
-# ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
+# Content ILIKE has no trigram index; rare matches can scan all candidate items.
+# SET LOCAL bounds each Postgres search statement and resets on transaction end.
+# Client disconnects do not stop the worker-thread query.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
 # Upper bound on rows fetched per SQL statement when listing conversation
@@ -630,72 +629,74 @@ def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
     query: str,
+    *,
+    earliest_match_positions: Mapping[str, int] | None = None,
 ) -> dict[str, str]:
-    """
-    Build a per-conversation preview excerpt of matching chat content.
+    """Build snippets from the earliest matching position, preserving tied rows.
 
-    For each conversation whose body matched ``query`` (case-insensitive
-    substring on ``search_text``), returns a short snippet centered on the
-    match so the search UI can show *where* the session matched. The
-    earliest matching item per conversation wins.
-
-    Bulk (no N+1) *and* bounded to one row per conversation: a grouped
-    subquery finds the min matching ``position`` per conversation, then the
-    outer query materializes only those rows. Without the ``MIN(position)``
-    join, the plain ``LIKE`` would stream every matching item's full
-    ``search_text`` body — potentially thousands per long conversation —
-    just to keep the first.
-
-    :param session: The active SQLAlchemy session.
-    :param conversation_ids: Conversation IDs to build snippets for,
-        e.g. ``["conv_a", "conv_b"]``.
-    :param query: The user's search string.
-    :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
-        only match was the title (no item body match) are absent — the
-        caller leaves their ``search_snippet`` as ``None``.
+    Exact locators can bypass the per-session lookup. Otherwise Postgres uses a
+    lateral early-stop probe; other dialects use a correlated scalar subquery.
+    Title-only matches have no snippet. Duplicate positions retain the legacy
+    join-back and last nonempty snippet encountered (no tie order is promised).
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
     workspace_id = current_workspace_id()
-    # workspace_id leads the (workspace_id, conversation_id, position) index.
-    # Both the aggregate and the join-back below must include it or Postgres
-    # can't use that index and falls back to a full table scan of every item.
-    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
-    # same reason as the content match in ``list_conversations``: the lower()
-    # form matches the pg_trgm index expression, and the planner then scans the
-    # whole workspace even though this is already scoped to one page of ids.
-    match_pred = and_(
-        SqlConversationItem.workspace_id == workspace_id,
-        SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
-    )
-    # Earliest matching position per conversation — a small (conv_id, position)
-    # aggregate, no bodies materialized.
-    earliest = (
-        select(
-            SqlConversationItem.conversation_id.label("cid"),
-            func.min(SqlConversationItem.position).label("pos"),
-        )
-        .where(match_pred)
-        .group_by(SqlConversationItem.conversation_id)
-        .subquery()
-    )
-    # Join back to pull exactly one search_text body per conversation. The
-    # workspace_id predicate keeps this on the composite index.
-    rows = session.execute(
-        select(
-            SqlConversationItem.conversation_id,
-            SqlConversationItem.search_text,
-        ).join(
-            earliest,
-            and_(
-                SqlConversationItem.workspace_id == workspace_id,
-                SqlConversationItem.conversation_id == earliest.c.cid,
-                SqlConversationItem.position == earliest.c.pos,
+    if earliest_match_positions is not None:
+        positions = [
+            (cid, earliest_match_positions[cid])
+            for cid in conversation_ids
+            if cid in earliest_match_positions
+        ]
+        if not positions:
+            return {}
+        stmt = select(SqlConversationItem.conversation_id, SqlConversationItem.search_text).where(
+            SqlConversationItem.workspace_id == workspace_id,
+            tuple_(SqlConversationItem.conversation_id, SqlConversationItem.position).in_(
+                positions
             ),
         )
-    ).all()
+    else:
+        conversations = (
+            select(SqlConversation.id.label("cid"))
+            .where(
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id.in_(conversation_ids),
+            )
+            .subquery()
+        )
+        earliest = (
+            select(SqlConversationItem.position.label("pos"))
+            .where(
+                SqlConversationItem.workspace_id == workspace_id,
+                SqlConversationItem.conversation_id == conversations.c.cid,
+                SqlConversationItem.search_text.ilike(f"%{query.lower()}%"),
+            )
+            .order_by(SqlConversationItem.position)
+            .limit(1)
+            .correlate(conversations)
+        )
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            first_match = earliest.lateral()
+            source = conversations.outerjoin(first_match, true())
+            position = first_match.c.pos
+        else:
+            source = conversations
+            position = earliest.scalar_subquery()
+        # Join back by position so duplicate positions retain all legacy ties.
+        stmt = (
+            select(conversations.c.cid, SqlConversationItem.search_text)
+            .select_from(source)
+            .outerjoin(
+                SqlConversationItem,
+                and_(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversations.c.cid,
+                    SqlConversationItem.position == position,
+                ),
+            )
+        )
+    rows = session.execute(stmt).all()
     out: dict[str, str] = {}
     for conv_id, search_text in rows:
         if not search_text:
@@ -2906,33 +2907,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            content_matches = None
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
-                # form is uncorrelated, so the match set is built for the WHOLE
-                # workspace before the outer query discards every row the caller
-                # cannot see. Correlating on conversation_id keeps each probe on
-                # the (workspace_id, conversation_id) index and lets it stop at
-                # the first matching item per conversation.
-                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
-                # the latter matches the ``lower(search_text)`` pg_trgm index
-                # expression, and the planner then prefers that index — scanning
-                # every item in the workspace out of a multi-GB index that does
-                # not fit in shared_buffers. ILIKE is the same case-insensitive
-                # match but cannot use that index, so the probe stays on the
-                # (workspace_id, conversation_id) btree above. Do not "simplify"
-                # this back to lower(...) LIKE; see the covering test.
-                content_match = (
-                    select(SqlConversationItem.conversation_id)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
-                    )
-                    .exists()
+                strategy = select_content_search(
+                    trigram_eligible=is_trigram_eligible(search_query)
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                content_matches = strategy(session, search_query)
+                if content_matches.completeness == "overflow":
+                    content_matches = legacy_content_matches(session, search_query)
+                stmt = stmt.where(or_(title_match, content_matches.predicate))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3064,7 +3049,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(
+                    session,
+                    row_ids,
+                    search_query,
+                    earliest_match_positions=content_matches.earliest_match_positions,
+                )
+                if search_query and content_matches is not None
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
