@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
+import type * as ConversationsModule from "@/hooks/useConversations";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -10,7 +11,8 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 const useConversations = vi.fn();
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  isAbortTimeout: (await importOriginal<typeof ConversationsModule>()).isAbortTimeout,
   useConversations: (...args: unknown[]) => useConversations(...args),
 }));
 
@@ -140,7 +142,8 @@ describe("CommandPalette — sessions", () => {
     "shows initial fetch errors with a retry (sessionsOnly=%s)",
     (sessionsOnly) => {
       const refetch = vi.fn();
-      useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
+      const error = new Error("500 Internal Server Error");
+      useConversations.mockReturnValue({ isError: true, error, isFetching: false, refetch });
       renderPalette({ sessionsOnly });
       expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
       expect(screen.queryByText("No results found")).toBeNull();
@@ -148,6 +151,57 @@ describe("CommandPalette — sessions", () => {
       expect(refetch).toHaveBeenCalledOnce();
     },
   );
+
+  it("shows a search timeout distinctly, then clears it once the search succeeds", () => {
+    vi.useFakeTimers();
+    try {
+      // What a fired AbortSignal.timeout rejects the search fetch with.
+      const timeout = new DOMException("signal timed out", "TimeoutError");
+      const refetch = vi.fn();
+      useConversations.mockReturnValue({
+        isError: true,
+        error: timeout,
+        isFetching: false,
+        refetch,
+      });
+      const props = {
+        open: true,
+        onOpenChange: vi.fn(),
+        onToggleLeftSidebar: vi.fn(),
+        onToggleRightSidebar: vi.fn(),
+      };
+      const { rerender } = render(<CommandPalette {...props} />);
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "matching" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(useConversations).toHaveBeenLastCalledWith("matching", false, { enabled: true });
+      const status = screen.getByRole("status").textContent;
+      expect(status).toContain("Search timed out.");
+      expect(status).not.toContain("Couldn't load sessions.");
+      expect(screen.queryByText("No results found")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(refetch).toHaveBeenCalledOnce();
+
+      // The retried search succeeds: a leftover TimeoutError must not keep the
+      // timeout message up once the query is no longer in error.
+      useConversations.mockReturnValue({
+        data: { pages: [{ data: [conv("hit", "Matching session")] }] },
+        isError: false,
+        error: timeout,
+        isFetching: false,
+        refetch,
+      });
+      rerender(<CommandPalette {...props} />);
+      expect(labelRow("Matching session")).toBeTruthy();
+      expect(screen.queryByText(/timed out/)).toBeNull();
+      expect(screen.queryByText(/Couldn't load/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("shows only one loading message during the initial session fetch", () => {
     setSessions([], true);
