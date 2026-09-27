@@ -1,4 +1,5 @@
 import type { FilesystemAttachmentPolicy } from "./capabilities";
+import { formatBytes } from "@/shell/fileStatusUtils";
 
 // Inline limits mirror content_resolver.py; filesystem limits come from /v1/info.
 export const ATTACHMENT_SIZE_LIMITS_MB = {
@@ -106,47 +107,80 @@ const TEXT_CODE_EXTENSIONS = new Set([
 ]);
 
 function normalizedFilename(filename: string): string {
-  return filename.toLowerCase().replace(/[. ]+$/g, "");
+  return filename.toLowerCase().replace(/[.\p{White_Space}]+$/gu, "");
 }
 
 function extensionOf(filename: string): string {
-  const name = normalizedFilename(filename.split(":")[0]);
+  const name = normalizedFilename(filename);
   const dot = name.lastIndexOf(".");
   return dot >= 0 ? name.slice(dot) : "";
 }
 
 function deniedFilename(filename: string, denied: string[]): boolean {
-  return filename
-    .toLowerCase()
+  const name = normalizedFilename(filename)
     .split(":")
-    .some((part) => {
-      const segments = part.split(".").map((segment) => segment.trimEnd());
-      return segments.some((_, index) => {
-        if (index === 0) return false;
-        const suffix = normalizedFilename(`.${segments.slice(index).join(".")}`);
-        return denied.some((ext) => suffix.startsWith(`${ext}.`) || suffix === ext);
-      });
-    });
+    .map((part) =>
+      part
+        .split(".")
+        .map((segment) => segment.trimEnd())
+        .join("."),
+    )
+    .join(":");
+  return denied.some((extension) => {
+    let index = name.indexOf(extension);
+    while (index !== -1) {
+      const end = index + extension.length;
+      if (end === name.length || name[end] === "." || name[end] === ":") return true;
+      index = name.indexOf(extension, index + 1);
+    }
+    return false;
+  });
 }
+
+// Legacy filesystem formats cannot become inline through a browser MIME hint.
+const LEGACY_FILESYSTEM_SUFFIXES = [
+  ".zip",
+  ".docx",
+  ".xlsx",
+  ".pptx",
+  ".db",
+  ".sqlite",
+  ".sqlite3",
+];
+const TEXT_APPLICATION_MIMES = new Set([
+  "application/json",
+  "application/javascript",
+  "application/jsonl",
+  "application/x-ndjson",
+  "application/x-ipynb+json",
+]);
 
 /** Explicit filesystem extensions take precedence over browser MIME hints. */
 export function classifyAttachment(
   file: File,
   policy?: FilesystemAttachmentPolicy,
 ): AttachmentCategory | null {
-  const ext = extensionOf(attachmentFilename(file));
-  if (
-    Array.isArray(policy?.allowed_extensions) &&
-    policy.allowed_extensions.some((suffix) =>
-      normalizedFilename(file.name.split(":")[0]).endsWith(suffix),
-    )
-  )
+  const name = normalizedFilename(attachmentFilename(file));
+  const ext = extensionOf(name);
+  const matches = (suffix: string) =>
+    name.endsWith(suffix) || normalizedFilename(name.split(":")[0]).endsWith(suffix);
+  if (Array.isArray(policy?.allowed_extensions) && policy.allowed_extensions.some(matches))
     return "file";
+  if (LEGACY_FILESYSTEM_SUFFIXES.some(matches)) {
+    return !policy || policy.allowed_extensions === "*" ? "file" : null;
+  }
+  const mime = file.type.split(";", 1)[0].trim().toLowerCase();
   const publishedInline = policy?.inline_extensions?.[ext];
-  if (publishedInline) return publishedInline;
-  if (/\.(png|jpe?g|gif|webp|svg|bmp|tiff?|ico|avif|heic|heif)$/.test(ext)) return "image";
-  if (ext === ".pdf") return "pdf";
-  if (TEXT_CODE_EXTENSIONS.has(ext)) return "text";
+  if (mime && mime !== "application/octet-stream") {
+    if (mime.startsWith("image/")) return "image";
+    if (mime === "application/pdf") return "pdf";
+    if (mime.startsWith("text/") || TEXT_APPLICATION_MIMES.has(mime)) return "text";
+  } else {
+    if (publishedInline) return publishedInline;
+    if (/\.(png|jpe?g|gif|webp|svg|bmp|tiff?|ico|avif|heic|heif)$/.test(ext)) return "image";
+    if (ext === ".pdf") return "pdf";
+  }
+  if (publishedInline === "text" || TEXT_CODE_EXTENSIONS.has(ext)) return "text";
   return !policy || policy.allowed_extensions === "*" ? "file" : null;
 }
 
@@ -192,26 +226,29 @@ export function validateAttachments(
   for (const file of files) {
     const name = file.name || "file";
     const filename = attachmentFilename(file);
-    const decodedFilename = filename.replace(/%([a-f0-9]{2})/gi, (_, hex: string) =>
-      String.fromCharCode(parseInt(hex, 16)),
+    const decodedFilename = filename.replace(/(?:%[a-f0-9]{2})+/gi, (encoded) =>
+      new TextDecoder().decode(
+        Uint8Array.from(encoded.match(/[a-f0-9]{2}/gi) ?? [], (hex) => parseInt(hex, 16)),
+      ),
     );
     if (
-      [...decodedFilename].some(
-        (char) =>
-          char.charCodeAt(0) < 32 || (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159),
-      ) ||
-      decodedFilename.includes(":") ||
+      /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(decodedFilename) ||
       /[/\\]/.test(filename) ||
-      !normalizedFilename(filename)
+      !normalizedFilename(filename) ||
+      new TextEncoder().encode(normalizedFilename(filename)).length > 255
     ) {
       errors.push(`"${name}" has an invalid filename.`);
+      continue;
+    }
+    const category = classifyAttachment(file, policy);
+    if (category === "file" && decodedFilename.includes(":")) {
+      errors.push(`"${name}" has an invalid filesystem filename.`);
       continue;
     }
     if (policy && deniedFilename(filename, policy.denied_extensions)) {
       errors.push(`"${name}" can't be attached: this extension is denied by server policy.`);
       continue;
     }
-    const category = classifyAttachment(file, policy);
     if (category === null) {
       errors.push(`"${name}" can't be attached: this file type is not allowed by server policy.`);
       continue;
@@ -219,7 +256,7 @@ export function validateAttachments(
     if (category === "file") {
       if (policy && file.size > policy.max_bytes) {
         errors.push(
-          `"${name}" is too large — the server limit is ${policy.max_bytes / 1024 / 1024} MB.`,
+          `"${name}" is too large — the server limit is ${formatBytes(policy.max_bytes)}.`,
         );
       } else if (policy && filesystemCount >= policy.max_files) {
         errors.push(`"${name}" exceeds the server limit of ${policy.max_files} files.`);
