@@ -756,6 +756,39 @@ def test_generalized_inline_bytes_cannot_bypass_admission(
     assert name in response.text
 
 
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+@pytest.mark.parametrize("name", ["clip.mp4", "payload.exe.png"])
+def test_remote_images_cannot_bypass_event_admission(
+    upload_client, monkeypatch, event_type, name
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": [".mp4"],
+            "filesystem_attachment_denied_extensions": [".exe"],
+        },
+    )
+    client, session_id = upload_client
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": event_type,
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "filename": name,
+                        "image_url": f"https://example.com/{name}",
+                    }
+                ],
+            },
+        },
+    )
+    assert response.status_code in (400, 415), response.text
+    assert name in response.text
+
+
 @pytest.mark.parametrize(
     "name", ["opaque", "clip.MP4. ", "../clip.mp4", "folder\\clip.mp4", ".env"]
 )
@@ -775,7 +808,7 @@ def test_wildcard_admission_normalizes_portable_names(upload_client, monkeypatch
         config["filesystem_attachment_denied_extensions"] = [".env"]
         assert _upload(client, session_id, name, content_type="text/plain").status_code == 415
     else:
-        assert stored["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+        assert stored["metadata"]["source_metadata"] is None
 
 
 @pytest.mark.parametrize(

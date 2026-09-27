@@ -21,6 +21,30 @@ from omnigent.runtime.content_resolver import (
 # ── Fake stores ──────────────────────────────────────────────────────
 
 
+def test_inline_extension_map_is_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runtime import content_resolver as resolver
+
+    clear_cache = getattr(resolver.inline_attachment_extensions, "cache_clear", lambda: None)
+    clear_cache()
+    resolve_mime = resolver._resolve_content_type
+    calls = []
+
+    def counted(content_type, filename):
+        calls.append(filename)
+        return resolve_mime(content_type, filename)
+
+    monkeypatch.setattr(resolver, "_resolve_content_type", counted)
+    try:
+        first = resolver.inline_attachment_extensions()
+        count = len(calls)
+        assert count > 0
+        assert first[".ics"] == "text"
+        assert resolver.inline_attachment_extensions() == first
+        assert len(calls) == count
+    finally:
+        clear_cache()
+
+
 @dataclass
 class FakeFileStore:
     """
