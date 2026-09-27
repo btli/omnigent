@@ -1,0 +1,56 @@
+"""Admission checks run before initial session items can be seeded or dispatched."""
+
+import httpx
+import pytest
+
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.helpers import create_test_agent
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+@pytest.mark.parametrize(
+    "filename,mime",
+    [("clip.mp4", "video/mp4"), ("clip.mp4", "text/plain"), ("payload.exe.txt", "text/plain")],
+)
+async def test_initial_items_reject_inline_binary_before_seed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    filename: str,
+    mime: str,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": [".mp4"],
+            "filesystem_attachment_denied_extensions": [".exe"],
+        },
+    )
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [
+                {
+                    "type": event_type,
+                    "data": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "filename": filename,
+                                "file_data": f"data:{mime};base64,AA==",
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code in (400, 415), response.text
+    assert filename in response.text
+    conversations = SqlAlchemyConversationStore(db_uri)
+    for conv in conversations.list_conversations(limit=100).data:
+        assert not conversations.list_items(conv.id).data
