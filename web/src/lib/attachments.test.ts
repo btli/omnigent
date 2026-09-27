@@ -6,9 +6,7 @@ import {
   attachmentAccept,
   attachmentKey,
   classifyAttachment,
-  classifyAttachment as classifyWithPolicy,
   validateAttachments,
-  validateAttachments as validateWithPolicy,
 } from "./attachments";
 
 function makeFile(name: string, type: string, bytes = 10): File {
@@ -59,7 +57,7 @@ describe("attachmentKey", () => {
 
 describe("classifyAttachment", () => {
   const classifyDefaultAttachment = (file: File) =>
-    classifyWithPolicy(file, defaultAttachmentPolicy);
+    classifyAttachment(file, defaultAttachmentPolicy);
   it("classifies images by MIME", () => {
     expect(classifyDefaultAttachment(makeFile("a.png", "image/png"))).toBe("image");
     expect(classifyDefaultAttachment(makeFile("a.jpg", "image/jpeg"))).toBe("image");
@@ -115,7 +113,7 @@ describe("classifyAttachment", () => {
 
 describe("validateAttachments", () => {
   const validateDefaultAttachments = (files: File[]) =>
-    validateWithPolicy(files, defaultAttachmentPolicy);
+    validateAttachments(files, defaultAttachmentPolicy);
   it("accepts supported files within their size limit", () => {
     const files = [makeFile("a.png", "image/png"), makeFile("a.pdf", "application/pdf")];
     const { accepted, errors } = validateDefaultAttachments(files);
