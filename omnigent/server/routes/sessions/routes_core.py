@@ -244,6 +244,7 @@ def _require_attachment_compatible_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    additional_filesystem_file_ids: frozenset[str] = frozenset(),
 ) -> str | None:
     """Reject a target that cannot replay files in the retained transcript.
 
@@ -252,13 +253,18 @@ def _require_attachment_compatible_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param additional_filesystem_file_ids: Files newly classified for a pending fork.
     :returns: A retained filesystem attachment's name, or ``None``.
     :raises OmnigentError: If the target cannot open a referenced attachment.
     """
     from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
 
     filename = _filesystem_attachment_in_history(
-        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+        session_id,
+        conversation_store,
+        file_store,
+        up_to_response_id=up_to_response_id,
+        additional_filesystem_file_ids=additional_filesystem_file_ids,
     )
     if filename is not None:
         native = _native_coding_agent_for_agent(target_agent)
@@ -3586,6 +3592,8 @@ def register_core_routes(
         # degrades — so a probe would only trade latency for the same outcome.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
+        filesystem_sources: list[StoredFile] = []
+        fork_classifications: dict[str, tuple[str, str, bool]] = {}
         if file_store is not None and artifact_store is not None:
             files_after: str | None = None
             while True:
@@ -3603,18 +3611,40 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.inner.native_attachments import stored_file_requires_filesystem
+            from omnigent.server.routes._sessions.helpers import _classify_attachment_upload
+            from omnigent.server.server_config import filesystem_attachment_policy
 
-            filesystem_sources = [
-                stored for stored in fork_source_files if requires_filesystem(stored.filename)
-            ]
+            policy = filesystem_attachment_policy()
+            for stored in fork_source_files:
+                classification = _classify_attachment_upload(
+                    stored.filename, stored.content_type, policy
+                )
+                fork_classifications[stored.id] = classification
+                filesystem = classification[2]
+                if filesystem or stored_file_requires_filesystem(
+                    stored.filename, stored.source_metadata
+                ):
+                    filesystem_sources.append(stored)
             if filesystem_sources:
+                await asyncio.to_thread(
+                    _require_attachment_compatible_history,
+                    source_id,
+                    base_agent,
+                    conversation_store,
+                    file_store,
+                    up_to_response_id=body.up_to_response_id,
+                    additional_filesystem_file_ids=frozenset(
+                        stored.id for stored in filesystem_sources
+                    ),
+                )
                 await asyncio.to_thread(
                     _enforce_filesystem_attachment_policy,
                     [stored.filename or "" for stored in filesystem_sources],
                     session_id=None,
                     file_store=file_store,
                     sizes=[stored.bytes for stored in filesystem_sources],
+                    policy=policy,
                 )
 
         # Copied last, after every validation above; the copy row itself is
@@ -3716,13 +3746,21 @@ def register_core_routes(
                 try:
                     await asyncio.to_thread(
                         file_store.create,
-                        filename=stored_file.filename,
+                        filename=fork_classifications[stored_file.id][0],
                         bytes=stored_file.bytes,
-                        content_type=stored_file.content_type,
+                        content_type=(
+                            "application/octet-stream"
+                            if stored_file in filesystem_sources
+                            else fork_classifications[stored_file.id][1]
+                        ),
                         session_id=new_conv.id,
                         file_id=copied_file_id,
                         blob_key=stored_file.blob_key or stored_file.id,
-                        source_metadata=stored_file.source_metadata,
+                        source_metadata=(
+                            {**(stored_file.source_metadata or {}), "delivery": "filesystem"}
+                            if stored_file in filesystem_sources
+                            else stored_file.source_metadata
+                        ),
                     )
                 except Exception:
                     _logger.warning(
