@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import stat
+import unicodedata
 import urllib.parse
 import uuid
 from collections.abc import Mapping
@@ -108,28 +109,29 @@ CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
 CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS = "generalized_filesystem_attachments"
 
 
-def normalized_attachment_filename(filename: str) -> str:
-    """Return a portable basename, rejecting controls and alternate data streams."""
-    if re.search(r"[\x00-\x1f\x7f-\x9f:]", urllib.parse.unquote(filename)):
+def normalized_attachment_filename(filename: str, *, filesystem: bool = True) -> str:
+    """Normalize a bounded basename; filesystem names also reject alternate data streams."""
+    decoded = urllib.parse.unquote(filename)
+    if any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in decoded):
         raise ValueError(
-            f"Invalid attachment filename {filename!r}: controls and ':' are forbidden"
+            f"Invalid attachment filename {filename!r}: control characters are forbidden"
         )
-    name = filename.replace("\\", "/").rsplit("/", 1)[-1].rstrip(" .")
+    if filesystem and ":" in decoded:
+        raise ValueError(f"Invalid filesystem attachment filename {filename!r}: ':' is forbidden")
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    while name and (name[-1].isspace() or name[-1] == "."):
+        name = name[:-1]
     if not name:
         raise ValueError(f"Invalid attachment filename {filename!r}")
+    if len(name.encode("utf-8")) > 255:
+        raise ValueError("Attachment filename exceeds the 255-byte limit")
     return name
 
 
-def attachment_suffixes(filename: str) -> frozenset[str]:
-    """Include compound suffixes and their components for denylist matching."""
-    parts = [
-        part.rstrip(" ") for part in normalized_attachment_filename(filename).lower().split(".")
-    ]
-    return frozenset(
-        "." + ".".join(parts[start:end])
-        for start in range(1, len(parts))
-        for end in range(start + 1, len(parts) + 1)
-    )
+def attachment_denied_extensions(filename: str, denied: frozenset[str]) -> frozenset[str]:
+    """Match only configured suffixes at component boundaries, including compound suffixes."""
+    name = ".".join(part.rstrip() for part in filename.lower().replace(":", ".").split("."))
+    return frozenset(extension for extension in denied if f"{extension}." in f"{name}.")
 
 
 def stored_file_requires_filesystem(filename: str | None, source_metadata: object) -> bool:
@@ -460,16 +462,8 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
 
 
 def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
-    """
-    True if *block* carries a ``file_id`` no resolver has inlined yet.
-
-    :param block: Message content block dict.
-    :returns: Whether the block still needs :func:`resolve_file_id_block`.
-    """
-    file_id = block.get("file_id")
-    if not isinstance(file_id, str) or not file_id:
-        return False
-    return True
+    """Resolve every stored file reference, including blocks containing client-supplied bytes."""
+    return bool(block.get("file_id"))
 
 
 def resize_notice(source_metadata: object) -> str | None:
