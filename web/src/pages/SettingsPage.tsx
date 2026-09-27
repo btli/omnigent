@@ -848,9 +848,9 @@ const SWIPE_ACTION_TONES: Record<SwipeAction, string | undefined> = {
 };
 
 // Dark bg-muted highlights drop these tones below AA, so highlighted text falls back to foreground.
-const SWIPE_ACTION_MENU_TONES: Record<SwipeAction, string | undefined> = {
-  archive: "text-accent-foreground focus:text-accent-foreground dark:focus:text-foreground",
-  delete: "text-destructive focus:text-destructive dark:focus:text-foreground",
+const SWIPE_ACTION_FOCUS_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "focus:text-accent-foreground dark:focus:text-foreground",
+  delete: "focus:text-destructive dark:focus:text-foreground",
   none: undefined,
 };
 
@@ -935,7 +935,10 @@ function SwipeActionsControl() {
                       data-testid={`swipe-action-${direction}-${option}`}
                       className={cn(
                         "gap-3 [&_svg]:text-current",
-                        option === action && SWIPE_ACTION_MENU_TONES[option],
+                        option === action && [
+                          SWIPE_ACTION_TONES[option],
+                          SWIPE_ACTION_FOCUS_TONES[option],
+                        ],
                       )}
                     >
                       <span className="w-24 shrink-0">
