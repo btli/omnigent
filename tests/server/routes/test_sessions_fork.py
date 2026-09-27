@@ -2657,3 +2657,104 @@ def test_fork_enforces_current_policy_before_creating_destination(
         assert not conv_store.fork_calls
         assert len(conv_store._convs) == 1
         assert file_store.files == original_files
+
+
+@pytest.mark.parametrize(
+    "target,cutoff,status",
+    [
+        ("claude-native", None, 201),
+        ("codex-native", None, 201),
+        ("claude-sdk", None, 400),
+        ("claude-sdk", "resp_before", 201),
+    ],
+)
+def test_fork_retains_generalized_delivery_and_checks_cutoff(
+    monkeypatch, target, cutoff, status
+) -> None:
+    client, conversations, files = _attachment_fork_client(monkeypatch, "clip.mp4", target)
+    source = next(iter(files.files.values()))
+    source.source_metadata = {"delivery": "filesystem"}
+    source.content_type = "text/plain"
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".mp4"]},
+    )
+    response = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303", "up_to_response_id": cutoff},
+    )
+    assert response.status_code == status, response.text
+    if status == 201:
+        copied = next(stored for stored in files.files.values() if stored.id != source.id)
+        assert copied.source_metadata == {"delivery": "filesystem"}
+        assert copied.content_type == "application/octet-stream"
+    else:
+        assert not conversations.fork_calls
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"filesystem_attachment_allowed_extensions": []},
+        {"filesystem_attachment_allowed_extensions": [".zip"]},
+        {
+            "filesystem_attachment_allowed_extensions": "*",
+            "filesystem_attachment_denied_extensions": [".mp4"],
+        },
+    ],
+)
+def test_fork_cannot_grandfather_video_into_new_session(monkeypatch, policy) -> None:
+    client, conversations, files = _attachment_fork_client(
+        monkeypatch, "clip.mp4", "claude-native"
+    )
+    next(iter(files.files.values())).source_metadata = {"delivery": "filesystem"}
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: policy)
+    response = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+    )
+    assert response.status_code == 415, response.text
+    assert not conversations.fork_calls
+
+
+def test_fork_reclassified_inline_attachment_rejects_sdk_and_allows_safe_forks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".txt"]},
+    )
+    client, conversations, files = _attachment_fork_client(monkeypatch, "note.txt", "claude-sdk")
+    source = next(iter(files.files.values()))
+    source.content_type = "text/plain"
+    source.source_metadata = {"delivery": "inline"}
+    url = "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork"
+    target = {"agent_id": "280d725b404d2915f9e9d6cccce91303"}
+    rejected = client.post(url, json=target)
+    assert rejected.status_code == 400, rejected.text
+    assert "note.txt" in rejected.json()["error"]["message"]
+    assert "Claude Code or Codex" in rejected.json()["error"]["message"]
+    assert not conversations.fork_calls
+    assert len(files.files) == 1
+
+    cutoff = client.post(url, json={**target, "up_to_response_id": "resp_before"})
+    assert cutoff.status_code == 201, cutoff.text
+    assert len(conversations.fork_calls) == 1
+    assert all(
+        not block.get("file_id")
+        for item in conversations._items[cutoff.json()["id"]]
+        if isinstance(item.data, MessageData)
+        for block in item.data.content
+    )
+
+    for harness in ("claude-native", "codex-native"):
+        client, conversations, files = _attachment_fork_client(monkeypatch, "note.txt", harness)
+        source = next(iter(files.files.values()))
+        source.content_type = "text/plain"
+        source.source_metadata = {"delivery": "inline"}
+        accepted = client.post(url, json=target)
+        assert accepted.status_code == 201, accepted.text
+        copied = next(stored for stored in files.files.values() if stored.id != source.id)
+        assert copied.source_metadata == {"delivery": "filesystem"}
+        assert copied.content_type == "application/octet-stream"
+        assert len(conversations.fork_calls) == 1

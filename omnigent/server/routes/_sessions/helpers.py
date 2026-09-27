@@ -8,6 +8,8 @@ Imports shared state/constants from ``.common``; imported by
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import math
@@ -27,7 +29,6 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
 import httpx
@@ -290,6 +291,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     ToolOutputDeltaEvent,
 )
+from omnigent.server.server_config import FilesystemAttachmentPolicy, filesystem_attachment_policy
 from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.spec.types import (
     AgentSpec,
@@ -7397,7 +7399,12 @@ def _build_skill_slash_command_policy_body(body: SessionEventInput) -> SessionEv
         type="message",
         data={
             "role": "user",
-            "content": [{"type": "input_text", "text": command_text}],
+            "content": [{"type": "input_text", "text": command_text}]
+            + [
+                block
+                for block in body.data.get("content", [])
+                if isinstance(block, dict) and block.get("type") in {"input_file", "input_image"}
+            ],
         },
     )
 
@@ -8620,6 +8627,7 @@ def _filesystem_attachment_in_history(
     *,
     up_to_response_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
+    additional_filesystem_file_ids: frozenset[str] = frozenset(),
 ) -> str | None:
     """Find a retained attachment requiring filesystem tools, using its stored name.
 
@@ -8628,9 +8636,13 @@ def _filesystem_attachment_in_history(
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
     :param content: Additional incoming message blocks to check before stored history.
+    :param additional_filesystem_file_ids: Files newly classified for a pending fork.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import (
+        requires_filesystem,
+        stored_file_requires_filesystem,
+    )
 
     if file_store is None:
         return None
@@ -8639,7 +8651,9 @@ def _filesystem_attachment_in_history(
     while True:
         files_page = file_store.list(session_id, limit=1000, after=files_after, order="asc")
         for stored_file in files_page.data:
-            if requires_filesystem(stored_file.filename):
+            if stored_file.id in additional_filesystem_file_ids or stored_file_requires_filesystem(
+                stored_file.filename, stored_file.source_metadata
+            ):
                 filenames[stored_file.id] = stored_file.filename
         if not files_page.has_more or not files_page.data:
             break
@@ -8647,10 +8661,13 @@ def _filesystem_attachment_in_history(
     if not filenames:
         return None
 
+    legacy: str | None = None
     for block in content:
         file_id = block.get("file_id")
         if isinstance(file_id, str) and file_id in filenames:
-            return filenames[file_id]
+            if not requires_filesystem(filenames[file_id]):
+                return filenames[file_id]
+            legacy = filenames[file_id]
 
     # Descending order finds the last item of the cutoff response first,
     # matching the fork store's inclusive position cutoff.
@@ -8668,9 +8685,11 @@ def _filesystem_attachment_in_history(
             for block in item.data.content:
                 file_id = block.get("file_id")
                 if isinstance(file_id, str) and file_id in filenames:
-                    return filenames[file_id]
+                    if not requires_filesystem(filenames[file_id]):
+                        return filenames[file_id]
+                    legacy = filenames[file_id]
         if not page.has_more or not page.data:
-            return None
+            return legacy
         items_after = page.last_id
 
 
@@ -11310,6 +11329,154 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _attachment_name_allowed(filename: str, policy: FilesystemAttachmentPolicy) -> str:
+    from omnigent.inner.native_attachments import (
+        attachment_suffixes,
+        normalized_attachment_filename,
+    )
+
+    try:
+        name = normalized_attachment_filename(filename)
+        denied = attachment_suffixes(name) & policy.denied_extensions
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    if denied:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Attachment '{name}' is not accepted by this deployment "
+                f"({', '.join(sorted(denied))})."
+            ),
+        )
+    return name
+
+
+def _classify_attachment_upload(
+    filename: str, content_type: str | None, policy: FilesystemAttachmentPolicy
+) -> tuple[str, str, bool]:
+    """Classify new files by admitted extension before considering inline delivery."""
+    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.runtime.content_resolver import (
+        _resolve_content_type,
+        attachment_text_type_for_extension,
+        attachment_upload_limit,
+    )
+
+    name = _attachment_name_allowed(filename, policy)
+    inline_type = attachment_text_type_for_extension(name) or _resolve_content_type(None, name)
+    inline = attachment_upload_limit(inline_type) is not None
+    if policy.allows(name) and (
+        policy.allowed_extensions != "*" or requires_filesystem(name) or not inline
+    ):
+        return name, "application/octet-stream", True
+    if requires_filesystem(name) or not inline:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported attachment type '{content_type or 'unknown'}' for '{name}'. "
+            "This deployment does not allow this filesystem attachment type.",
+        )
+    return name, inline_type, False
+
+
+def _validate_attachment_content(
+    content: object,
+    *,
+    session_id: str,
+    file_store: FileStore | None,
+    policy: FilesystemAttachmentPolicy | None = None,
+) -> list[dict[str, Any]] | None:
+    """Validate inline payloads and replace stored references with authoritative metadata."""
+    from omnigent.inner.native_attachments import stored_file_reference
+    from omnigent.runtime.content_resolver import attachment_upload_limit
+
+    if not isinstance(content, list):
+        return None
+    policy = policy or filesystem_attachment_policy()
+    normalized: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise OmnigentError("Invalid attachment content block", code=ErrorCode.INVALID_INPUT)
+        file_id = block.get("file_id")
+        if file_id is not None:
+            stored = (
+                file_store.get(file_id)
+                if file_store
+                and isinstance(file_id, str)
+                and re.fullmatch(r"[a-fA-F0-9]{32}", file_id)
+                else None
+            )
+            if stored is None or stored.session_id not in (None, session_id):
+                raise OmnigentError(
+                    f"Attachment {block.get('filename', file_id)!r} references a file "
+                    "not found in this session.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            normalized.append(
+                stored_file_reference(
+                    stored.id,
+                    stored.filename,
+                    stored.content_type,
+                    stored.source_metadata,
+                    detail=block.get("detail"),
+                )
+            )
+            continue
+        clean = {
+            key: value
+            for key, value in block.items()
+            if key not in ("delivery", "source_metadata")
+        }
+        uri = block.get("file_data") or block.get("image_url")
+        if not isinstance(uri, str) or not uri.startswith("data:"):
+            if block.get("file_data"):
+                raise OmnigentError(
+                    "Attachments must be uploaded or use a data URI", code=ErrorCode.INVALID_INPUT
+                )
+            normalized.append(clean)
+            continue
+        header, separator, payload = uri.partition(",")
+        mime = header[5:].split(";", 1)[0]
+        filename = block.get("filename")
+        if isinstance(filename, str) and filename:
+            name, mime, filesystem = _classify_attachment_upload(filename, mime, policy)
+            clean["filename"] = name
+            if filesystem:
+                raise OmnigentError(
+                    f"Attachment {name!r} must be uploaded to the session's files "
+                    "and referenced by file_id.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        limit = attachment_upload_limit(mime)
+        if limit is None:
+            raise HTTPException(
+                status_code=415,
+                detail="Unsupported inline attachment type; upload the file first.",
+            )
+        if not separator or not header.endswith(";base64"):
+            raise OmnigentError(
+                "Attachments require a base64 data URI", code=ErrorCode.INVALID_INPUT
+            )
+        if len(payload) > 4 * ((limit + 2) // 3):
+            raise HTTPException(
+                status_code=413, detail="Inline attachment exceeds its size limit."
+            )
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise OmnigentError("Invalid attachment base64", code=ErrorCode.INVALID_INPUT) from exc
+        if len(raw) > limit:
+            raise HTTPException(
+                status_code=413, detail="Inline attachment exceeds its size limit."
+            )
+        clean.pop("file_data", None)
+        clean.pop("image_url", None)
+        image = mime.startswith("image/")
+        clean["type"] = "input_image" if image else "input_file"
+        clean["image_url" if image else "file_data"] = f"data:{mime};base64,{payload}"
+        normalized.append(clean)
+    return normalized
+
+
 # Page size for walking a session's files when totalling its filesystem attachments.
 _FILESYSTEM_QUOTA_PAGE_SIZE = 100
 
@@ -11336,6 +11503,7 @@ async def _require_filesystem_attachment_harness(conv: Conversation, filename: s
 
 def require_filesystem_attachment_runtime(
     *,
+    filename: str | None = None,
     host_id: str | None,
     runner_id: str | None,
     host_registry: HostRegistry | None,
@@ -11351,18 +11519,25 @@ def require_filesystem_attachment_runtime(
     :param runner_router: Router used to distinguish a remote host from an offline one.
     :raises OmnigentError: When the runtime needs an upgrade, connection, or reroute.
     """
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENTS,
+        CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS,
+        requires_filesystem,
+    )
+
+    capability = (
+        CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS
+        if filename is not None and not requires_filesystem(filename)
+        else CAP_FILESYSTEM_ATTACHMENTS
+    )
 
     host = host_registry.get(host_id) if host_id and host_registry is not None else None
     runner = tunnel_registry.get(runner_id) if runner_id and tunnel_registry is not None else None
     for connection in (host, runner):
-        if (
-            connection is not None
-            and CAP_FILESYSTEM_ATTACHMENTS not in connection.hello.capabilities
-        ):
+        if connection is not None and capability not in connection.hello.capabilities:
             raise OmnigentError(
-                "Update Omnigent on this host and restart it before attaching archives, "
-                "Office documents, or databases. This host cannot restore these files "
+                "Update Omnigent on this host and restart the host and runner before "
+                "attaching filesystem files. This runtime cannot restore these files "
                 "when a session resumes.",
                 code=ErrorCode.CONFLICT,
             )
@@ -11386,6 +11561,7 @@ def _enforce_filesystem_attachment_policy(
     session_id: str | None,
     file_store: FileStore,
     sizes: Sequence[int] | None = None,
+    policy: FilesystemAttachmentPolicy | None = None,
 ) -> int:
     """
     Apply deployment policy to files requiring filesystem tools entering a session.
@@ -11406,26 +11582,19 @@ def _enforce_filesystem_attachment_policy(
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
-    from omnigent.server.server_config import (
-        filesystem_attachment_denied_extensions,
-        filesystem_attachment_file_limit,
-        filesystem_attachment_total_bytes_limit,
-        filesystem_attachment_upload_limit,
-    )
+    from omnigent.inner.native_attachments import stored_file_requires_filesystem
 
-    denied = filesystem_attachment_denied_extensions()
+    policy = policy or filesystem_attachment_policy()
     for filename in filenames:
-        suffix = PurePath(filename).suffix.lower()
-        if suffix in denied:
+        name = _attachment_name_allowed(filename, policy)
+        if not policy.allows(name):
             raise HTTPException(
                 status_code=415,
-                detail=f"Attachments of type '{suffix}' are not accepted by this deployment.",
+                detail=f"Unsupported attachment type: '{name}' is not allowed by this deployment.",
             )
-
-    max_files = filesystem_attachment_file_limit()
-    max_total_bytes = filesystem_attachment_total_bytes_limit()
-    per_file = filesystem_attachment_upload_limit()
+    max_files = policy.max_files
+    max_total_bytes = policy.max_total_bytes
+    per_file = policy.max_bytes
 
     used_files = 0
     used_bytes = 0
@@ -11446,7 +11615,7 @@ def _enforce_filesystem_attachment_policy(
         )
         for stored in page.data:
             # This quota covers the types that require filesystem tools.
-            if requires_filesystem(stored.filename):
+            if stored_file_requires_filesystem(stored.filename, stored.source_metadata):
                 used_files += 1
                 used_bytes += stored.bytes
         if not page.has_more or page.last_id is None:
