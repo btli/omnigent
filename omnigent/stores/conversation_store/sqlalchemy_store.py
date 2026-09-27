@@ -2912,7 +2912,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
                 strategy = select_content_search(
-                    trigram_eligible=is_trigram_eligible(search_query)
+                    _trigram_eligible=is_trigram_eligible(search_query)
                 )
                 content_matches = strategy(session, search_query)
                 if content_matches.completeness == "overflow":

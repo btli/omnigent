@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from unittest.mock import patch
 
@@ -33,6 +35,20 @@ def _append(store: SqlAlchemyConversationStore, cid: str, texts: list[str]) -> N
             for i, text in enumerate(texts)
         ],
     )
+
+
+@contextmanager
+def _captured_sql(store: SqlAlchemyConversationStore) -> Iterator[list[str]]:
+    statements: list[str] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement.lower())
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        yield statements
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
 
 
 def _legacy_snippets(session: Session, conversation_ids: list[str], query: str, **kwargs):
@@ -106,7 +122,7 @@ def test_selector_always_uses_complete_legacy(eligible: bool) -> None:
         select_content_search,
     )
 
-    strategy = select_content_search(trigram_eligible=eligible)
+    strategy = select_content_search(_trigram_eligible=eligible)
     assert strategy is legacy_content_matches
     with Session() as session:
         matches = strategy(session, "abc")
@@ -150,20 +166,19 @@ def test_duplicate_position_snippets_keep_legacy_ties(
 
 @pytest.mark.parametrize("query", ["needle", "%", "_", r"a\b", "日本語", "naïve", "ab", "absent"])
 @pytest.mark.parametrize("order", ["asc", "desc"])
-@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
 def test_search_seam_parity(
-    conversation_store: SqlAlchemyConversationStore,
-    split_db_conversation_store: SqlAlchemyConversationStore,
+    request: pytest.FixtureRequest,
     query: str,
     order: str,
-    split: bool,
+    store_fixture: str,
 ) -> None:
     from omnigent.stores.conversation_store.content_search import (
         ContentMatches,
         is_trigram_eligible,
     )
 
-    store = split_db_conversation_store if split else conversation_store
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
     body = r"needle 100% under_score a\b 日本語 naïve ab"
     visible = [store.create_conversation(title="ordinary") for _ in range(4)]
     title_only = store.create_conversation(title=body)
@@ -214,7 +229,7 @@ def test_search_seam_parity(
         actual = pages()
         assert selector.call_count == len(actual)
         assert all(
-            call.kwargs == {"trigram_eligible": is_trigram_eligible(query)}
+            call.kwargs == {"_trigram_eligible": is_trigram_eligible(query)}
             for call in selector.call_args_list
         )
 
@@ -254,19 +269,11 @@ def test_snippet_lookup_stops_at_first_position(
     cid = conversation_store.create_conversation(title="needle").id
     _append(conversation_store, cid, ["unrelated", "early needle", "late needle"])
     title_id = conversation_store.create_conversation(title="needle").id
-    statements = []
-
-    def capture(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement.lower())
-
-    event.listen(conversation_store._conv_engine, "before_cursor_execute", capture)
-    try:
+    with _captured_sql(conversation_store) as statements:
         with conversation_store._conv_session("test_search_snippets") as session:
             assert store_module._fetch_search_snippets(session, [cid, title_id], "needle") == {
                 cid: "early needle"
             }
-    finally:
-        event.remove(conversation_store._conv_engine, "before_cursor_execute", capture)
     sql = " ".join(statements)
     assert "group by" not in sql
     assert "order by conversation_items.position" in sql
@@ -297,17 +304,9 @@ def test_candidates_locators_and_overflow(
             earliest_match_positions={cid: 1 if completeness == "complete" else 2},
         )
 
-    statements = []
-
-    def capture(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement.lower())
-
-    event.listen(conversation_store._conv_engine, "before_cursor_execute", capture)
-    try:
+    with _captured_sql(conversation_store) as statements:
         with patch.object(store_module, "select_content_search", return_value=strategy):
             page = conversation_store.list_conversations(search_query="needle")
-    finally:
-        event.remove(conversation_store._conv_engine, "before_cursor_execute", capture)
     by_id = {conv.id: conv.search_snippet for conv in page.data}
     assert by_id[cid] == "early needle"
     assert by_id[title_id] is None

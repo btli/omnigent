@@ -37,6 +37,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import DBAPIError
 
 from omnigent.stores.conversation_store.sqlalchemy_store import (
+    _SEARCH_STATEMENT_TIMEOUT_MS,
     SqlAlchemyConversationStore,
     _fetch_search_snippets,
 )
@@ -54,7 +55,9 @@ QUERIES = {
 def seed(store: SqlAlchemyConversationStore, items: int, sessions: int) -> None:
     """Bulk-load synthetic rows while preserving the production schema and indexes."""
     rng = random.Random(8291)
-    payload = "".join(rng.choices(string.ascii_lowercase + string.digits + " ", k=2**21))
+    payload = "".join(rng.choices(string.ascii_lowercase + string.digits + " ", k=2**21)).encode(
+        "ascii"
+    )
     hot_sessions = max(1, sessions // 100)
     with store._conv_session("benchmark_seed_sessions") as session:
         session.execute(
@@ -69,7 +72,7 @@ def seed(store: SqlAlchemyConversationStore, items: int, sessions: int) -> None:
             {"items": items, "sessions": sessions},
         )
         for name, threshold in [
-            ("narrow", max(1, sessions // 100)),
+            ("narrow", hot_sessions),
             ("broad", sessions * 9 // 10),
         ]:
             session.execute(
@@ -108,7 +111,7 @@ def seed(store: SqlAlchemyConversationStore, items: int, sessions: int) -> None:
                     "stop": min(items, start + 9999),
                     "sessions": sessions,
                     "hot": hot_sessions,
-                    "payload": payload.encode("ascii"),
+                    "payload": payload,
                     "unicode": QUERIES["non_ascii"] + " ",
                 },
             )
@@ -192,7 +195,9 @@ def main() -> None:
 
             def snippets(ids=ids, query=query):
                 with store._conv_session("benchmark_search_snippets") as session:
-                    session.execute(text("SET LOCAL statement_timeout = 15000"))
+                    session.execute(
+                        text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                    )
                     return _fetch_search_snippets(session, ids, query)
 
             for path, run in [("list_with_snippets", listing), ("snippets", snippets)]:

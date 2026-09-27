@@ -51,9 +51,7 @@ def legacy_content_matches(_session: Session, query: str) -> ContentMatches:
 
 def select_content_search(
     *,
-    trigram_eligible: bool,
+    _trigram_eligible: bool,
 ) -> Callable[[Session, str], ContentMatches]:
-    """Always use legacy search, including queries eligible for future strategies."""
-    if trigram_eligible:
-        return legacy_content_matches
+    """Select legacy search regardless of trigram eligibility."""
     return legacy_content_matches
