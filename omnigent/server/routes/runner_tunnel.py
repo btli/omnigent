@@ -485,6 +485,7 @@ def create_runner_tunnel_router(
             }
 
         notify_disconnect = False
+        deregistered = False
 
         try:
             # 3. Receive hello frame.
@@ -639,7 +640,7 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
-                session = None
+                deregistered = True
                 notify_disconnect = True
 
         except WebSocketDisconnect as exc:
@@ -665,7 +666,7 @@ def create_runner_tunnel_router(
                 runner_id,
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
-            if session is not None:
+            if session is not None and not deregistered:
                 registry.deregister(runner_id, session)
         finally:
             if notify_disconnect and on_runner_disconnect is not None:
