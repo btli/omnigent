@@ -13985,6 +13985,7 @@ def login(server_url: str) -> None:
                 # Login-issued refresh grant (newer servers) — lets the
                 # host/CLI renew past session expiry unattended.
                 refresh_token=result.get("refresh_token"),
+                refresh_expires_at=result.get("refresh_expires_at"),
             )
             click.echo(f"Logged in as {user_id}")
             _remember_default_server(server)
@@ -14123,6 +14124,7 @@ def _accounts_login(server: str) -> None:
         user_id=user_id,
         expires_at=_time.time() + expires_in,
         refresh_token=body.get("refresh_token"),
+        refresh_expires_at=body.get("refresh_expires_at"),
     )
     click.echo(f"Logged in as {user_id}.")
 
