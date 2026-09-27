@@ -676,22 +676,25 @@ def _fetch_search_snippets(
             .limit(1)
             .correlate(conversations)
         )
+        conversation_id = conversations.c.cid
         if session.bind is not None and session.bind.dialect.name == "postgresql":
             first_match = earliest.lateral()
             source = conversations.outerjoin(first_match, true())
             position = first_match.c.pos
         else:
-            source = conversations
-            position = earliest.scalar_subquery()
+            # Keep MySQL from re-running the scalar probe for each row in the join.
+            source = select(conversation_id, earliest.scalar_subquery().label("pos")).subquery()
+            conversation_id = source.c.cid
+            position = source.c.pos
         # Join back by position so duplicate positions retain all legacy ties.
         stmt = (
-            select(conversations.c.cid, SqlConversationItem.search_text)
+            select(conversation_id, SqlConversationItem.search_text)
             .select_from(source)
             .outerjoin(
                 SqlConversationItem,
                 and_(
                     SqlConversationItem.workspace_id == workspace_id,
-                    SqlConversationItem.conversation_id == conversations.c.cid,
+                    SqlConversationItem.conversation_id == conversation_id,
                     SqlConversationItem.position == position,
                 ),
             )
@@ -2912,7 +2915,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
                 strategy = select_content_search(
-                    _trigram_eligible=is_trigram_eligible(search_query)
+                    trigram_eligible=is_trigram_eligible(search_query)
                 )
                 content_matches = strategy(session, search_query)
                 if content_matches.completeness == "overflow":

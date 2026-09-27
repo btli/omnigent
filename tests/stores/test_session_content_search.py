@@ -122,7 +122,7 @@ def test_selector_always_uses_complete_legacy(eligible: bool) -> None:
         select_content_search,
     )
 
-    strategy = select_content_search(_trigram_eligible=eligible)
+    strategy = select_content_search(trigram_eligible=eligible)
     assert strategy is legacy_content_matches
     with Session() as session:
         matches = strategy(session, "abc")
@@ -179,7 +179,7 @@ def test_search_seam_parity(
     )
 
     store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
-    body = r"needle 100% under_score a\b 日本語 naïve ab"
+    body = r"Needle DEPLOYMENT 100% under_score a\b 日本語 Naïve ab"
     visible = [store.create_conversation(title="ordinary") for _ in range(4)]
     title_only = store.create_conversation(title=body)
     hidden = store.create_conversation(title=body)
@@ -229,7 +229,7 @@ def test_search_seam_parity(
         actual = pages()
         assert selector.call_count == len(actual)
         assert all(
-            call.kwargs == {"_trigram_eligible": is_trigram_eligible(query)}
+            call.kwargs == {"trigram_eligible": is_trigram_eligible(query)}
             for call in selector.call_args_list
         )
 
@@ -283,6 +283,20 @@ def test_snippet_lookup_stops_at_first_position(
         assert "left outer join lateral" in sql
     else:
         assert "lateral" not in sql
+        assert "select" not in sql.rsplit(" on ", 1)[1]
+
+
+@pytest.mark.parametrize("query", ["deployment", "NAÏVE"])
+def test_snippet_match_preserves_case_insensitive_legacy(
+    conversation_store: SqlAlchemyConversationStore, query: str
+) -> None:
+    cid = conversation_store.create_conversation().id
+    body = "Needle DEPLOYMENT Naïve"
+    _append(conversation_store, cid, ["unrelated", body, f"later {query}"])
+    with conversation_store._conv_session("test_case_insensitive_snippets") as session:
+        expected = _legacy_snippets(session, [cid], query)
+        actual = store_module._fetch_search_snippets(session, [cid], query)
+    assert actual == expected == {cid: body}
 
 
 @pytest.mark.parametrize("completeness", ["complete", "overflow"])

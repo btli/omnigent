@@ -35,6 +35,8 @@ def is_trigram_eligible(query: str) -> bool:
 
 def legacy_content_matches(_session: Session, query: str) -> ContentMatches:
     """Probe each candidate session with the existing case-insensitive LIKE pattern."""
+    # Correlated EXISTS scopes probes; raw ILIKE avoids matching a lower(search_text) GIN index.
+    # Guarded by test_search_predicate_avoids_the_trigram_index_expression.
     return ContentMatches(
         predicate=(
             select(SqlConversationItem.conversation_id)
@@ -51,7 +53,8 @@ def legacy_content_matches(_session: Session, query: str) -> ContentMatches:
 
 def select_content_search(
     *,
-    _trigram_eligible: bool,
+    trigram_eligible: bool,
 ) -> Callable[[Session, str], ContentMatches]:
-    """Select legacy search regardless of trigram eligibility."""
+    """Select legacy search; eligibility is ignored while it is the only strategy."""
+    del trigram_eligible
     return legacy_content_matches
