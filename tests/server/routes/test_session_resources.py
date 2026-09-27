@@ -2921,13 +2921,8 @@ async def test_copy_files_then_download_returns_bytes(
     file_client: httpx.AsyncClient,
 ) -> None:
     """After copy, the child can download the copied content."""
-    rejected = await file_client.post(
-        "/v1/sessions/b460374fc8e697b296708f52dc9d8179/resources/files",
-        files={"file": ("payload.bin", b"\x00\xff", "text/plain")},
-    )
-    assert rejected.status_code == 415, rejected.text
     parent_file = await _upload_file(
-        file_client, "b460374fc8e697b296708f52dc9d8179", "payload.txt", b"\x00\x01\x02data"
+        file_client, "b460374fc8e697b296708f52dc9d8179", "payload.bin", b"\x00\x01\x02data"
     )
 
     copy_resp = await file_client.post(
@@ -2941,6 +2936,62 @@ async def test_copy_files_then_download_returns_bytes(
     )
     assert resp.status_code == 200
     assert resp.content == b"\x00\x01\x02data"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "filename,mime",
+    [("README", "text/plain"), ("Screen 10:30.png", "image/png"), ("opaque.bin", None)],
+)
+async def test_copy_preserves_historic_inline_metadata(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    mime: str | None,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".mp4"]},
+    )
+    source_session = "b460374fc8e697b296708f52dc9d8179"
+    target_session = "405bfe154d5c0e795a2b87021bc897bf"
+    metadata = {"original_name": filename}
+    source = file_store.create(
+        filename=filename,
+        bytes=4,
+        content_type=mime,
+        session_id=source_session,
+        source_metadata=metadata,
+    )
+    artifact_store.put(source.id, b"data")
+    response = await file_client.post(
+        f"/v1/sessions/{target_session}/resources/files:copy",
+        json={"source_session_id": source_session, "file_ids": [source.id]},
+    )
+    assert response.status_code == 200, response.text
+    copied = file_store.get(response.json()["mapping"][source.id]["new_id"])
+    assert (copied.filename, copied.content_type, copied.source_metadata) == (
+        filename,
+        mime,
+        metadata,
+    )
+    assert artifact_store.get(copied.blob_key) == b"data"
+    for unsafe_name in (
+        "clip.mp4:stream.txt",
+        "clip.mp4\u00a0:stream.txt",
+        "archive.zip:notes.txt",
+    ):
+        unsafe = file_store.create(
+            filename=unsafe_name, bytes=4, content_type="text/plain", session_id=source_session
+        )
+        artifact_store.put(unsafe.id, b"data")
+        rejected = await file_client.post(
+            f"/v1/sessions/{target_session}/resources/files:copy",
+            json={"source_session_id": source_session, "file_ids": [unsafe.id]},
+        )
+        assert rejected.status_code == 415, rejected.text
 
 
 # ── Phase 1d: integration hardening tests ────────────────────────
