@@ -911,8 +911,14 @@ class ErrorDetail(BaseModel):
     """
     Machine-readable error information attached to a failed response.
 
+    Session-status failure codes include ``runner_disconnected`` (tunnel
+    close or newest-wins replacement — recoverable on reconnect) and
+    ``session_stream_lost`` (SSE stream failed while the runner tunnel is
+    still registered).
+
     :param code: Error code string, e.g. ``"server_error"``,
-        ``"invalid_input"``.
+        ``"invalid_input"``, ``"runner_disconnected"``,
+        ``"session_stream_lost"``.
     :param message: Human-readable error description. Always populated; older
         clients render this verbatim.
     :param title: Optional short headline naming what went wrong, e.g.
@@ -923,6 +929,9 @@ class ErrorDetail(BaseModel):
         Paired with ``title``.
     :param remediation: Optional concrete next step to fix it, e.g. a command
         to run. ``None`` when there is no single clear fix.
+    :param undelivered: ``True`` when the harness reports it never received the
+        message this turn carried (it failed before delivery), so the sender's
+        queued copy is the only record of it; absent otherwise.
     """
 
     code: str
@@ -930,6 +939,7 @@ class ErrorDetail(BaseModel):
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None
+    undelivered: bool | None = None
 
 
 class ErrorResponse(BaseModel):

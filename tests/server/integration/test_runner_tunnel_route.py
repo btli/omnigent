@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Callable
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
 
@@ -126,6 +127,7 @@ def _tunnel_route_app(
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    on_runner_disconnect: Callable[[str], Awaitable[None]] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -137,6 +139,8 @@ def _tunnel_route_app(
     :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
         resolver for server-managed sandbox runners (binding-token auth,
         no user session). ``None`` disables the managed-runner lookup.
+    :param on_runner_disconnect: Optional async callback fired when the
+        runner tunnel tears down. ``None`` skips the disconnect hook.
     :returns: The FastAPI app and registry owned by its route.
     """
     registry = TunnelRegistry()
@@ -148,6 +152,7 @@ def _tunnel_route_app(
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
+            on_runner_disconnect=on_runner_disconnect,
         ),
         prefix="/v1",
     )
@@ -192,12 +197,14 @@ async def _send_hello(
     registry: TunnelRegistry,
     *,
     runner_id: str = _RUNNER_ID,
+    connection_id: str | None = None,
 ) -> None:
     """Send the runner hello frame.
 
     :param communicator: Connected ASGI WebSocket communicator.
     :param registry: Registry shared with the tunnel router.
     :param runner_id: Runner id expected to register.
+    :param connection_id: Optional runner-minted connection id to advertise.
     :returns: None.
     """
     hello = HelloFrame(
@@ -205,6 +212,7 @@ async def _send_hello(
         frame_protocol_version=1,
         harnesses=["claude-sdk"],
         envs=["os_sandbox"],
+        connection_id=connection_id,
     )
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(hello)},
@@ -317,14 +325,42 @@ async def test_ws_tunnel_route_round_trips_request_to_runner(
     assert response.json() == {"status": "ok"}
 
 
-async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
+async def test_on_runner_disconnect_fires_once_per_teardown() -> None:
+    """Tunnel teardown invokes ``on_runner_disconnect`` exactly once.
+
+    A helper-task disconnect passes through task cleanup and route-level
+    exception handling but still represents one teardown.
+    """
+    disconnect_calls: list[str] = []
+
+    async def _on_disconnect(runner_id: str) -> None:
+        disconnect_calls.append(runner_id)
+
+    route_app = _tunnel_route_app(on_runner_disconnect=_on_disconnect)
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    await _send_hello(communicator, route_app.registry)
+    assert route_app.registry.online_runner_ids() == [_RUNNER_ID]
+
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await communicator.wait(timeout=1.0)
+
+    assert disconnect_calls == [_RUNNER_ID]
+    assert route_app.registry.get(_RUNNER_ID) is None
+
+
+async def test_ws_tunnel_status_reports_registration(
+    app: FastAPI, caplog: pytest.LogCaptureFixture
+) -> None:
     """Runner status flips online after tunnel registration.
 
     :param app: Production FastAPI app from ``tests.server``
         fixtures.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
     registry = app.state.tunnel_registry
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -333,7 +369,7 @@ async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
         offline = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
 
         communicator = await _connect_route(app, _TUNNEL_PATH)
-        await _send_hello(communicator, registry)
+        await _send_hello(communicator, registry, connection_id="conn-status-1")
         try:
             online = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
         finally:
@@ -343,6 +379,19 @@ async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
 
     assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
     assert online.json() == {"runner_id": _RUNNER_ID, "online": True}
+    # Both tunnel rows carry the hello's connection id; the disconnect row adds
+    # the connection's age and the helper task that observed the close.
+    rows = {
+        r.attributes["phase"]: r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel"
+    }
+    assert rows["connected"]["connection_id"] == "conn-status-1"
+    disconnected = rows["disconnected"]
+    assert disconnected["connection_id"] == "conn-status-1"
+    assert disconnected["code"] == 1000
+    assert disconnected["ended_by"] == "tunnel-receive"
+    assert disconnected["connection_age_s"] >= 0
 
 
 async def test_ws_tunnel_list_runners_reports_online_harnesses(app: FastAPI) -> None:
@@ -1238,6 +1287,71 @@ async def test_ping_loop_restamps_runner_liveness(
         session_live_state.configure(None)
 
 
+async def test_ping_timeout_closes_tunnel_and_names_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A silent runner is closed by the server and both rows name the socket.
+
+    Once no frame arrives within the liveness window the ping loop declares
+    the runner dead and closes the tunnel. The ``runner_ping_timeout`` row and
+    the tunnel's end row must carry the hello's connection id, the
+    connection's age and the silence, and name the ping task among what ended
+    the tunnel. Whether the peer's close reply has arrived by the time the
+    handler observes the end is timing dependent, so the end row is either
+    ``closed`` (ping task alone) or ``disconnected`` (peer close seen too).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import omnigent.server.routes.runner_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 1)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-silent-1")
+        # The runner sends nothing more; pings go unanswered until the server
+        # closes the tunnel with the ping-timeout code.
+        deadline = asyncio.get_event_loop().time() + budget(2.0)
+        while True:
+            message = await communicator.receive_output(timeout=budget(1.0))
+            if message["type"] == "websocket.close":
+                break
+            assert asyncio.get_event_loop().time() < deadline, "ping timeout never closed"
+        assert message["code"] == 4003
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 4003})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=budget(1.0))
+
+    timeouts = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_ping_timeout"
+    ]
+    assert len(timeouts) == 1
+    assert timeouts[0]["runner_id"] == _RUNNER_ID
+    assert timeouts[0]["connection_id"] == "conn-silent-1"
+    assert timeouts[0]["connection_age_s"] >= 0
+    assert timeouts[0]["silent_s"] > 0
+    ends = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel"
+        and r.attributes["phase"] in {"closed", "disconnected"}
+    ]
+    assert len(ends) == 1
+    assert ends[0]["connection_id"] == "conn-silent-1"
+    assert "tunnel-ping" in ends[0]["ended_by"].split(",")
+    assert ends[0]["connection_age_s"] >= 0
+    if ends[0]["phase"] == "disconnected":
+        assert ends[0]["code"] == 4003
+
+
 async def test_keepalive_loop_fires_faster_than_the_ping_interval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1257,3 +1371,31 @@ async def test_keepalive_loop_fires_faster_than_the_ping_interval(
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert len(calls) >= 3 and set(calls) == {"r1"}
+
+
+async def test_ws_tunnel_pre_hello_failure_keeps_live_generation_registered() -> None:
+    """A connection failing before hello must not pop a live tunnel.
+
+    A stale/broken handshake (e.g. malformed hello JSON) errors out
+    between ``accept()`` and ``registry.register()``; its teardown owns
+    no registration and must leave the other generation untouched.
+    """
+    route_app = _tunnel_route_app()
+    registry = route_app.registry
+
+    live = await _connect_route(route_app.app, _TUNNEL_PATH)
+    await _send_hello(live, registry)
+    live_session = registry.get(_RUNNER_ID)
+    assert live_session is not None
+
+    stale = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await stale.send_input({"type": "websocket.receive", "text": "not-json"})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await stale.wait(timeout=budget(1.0))
+
+        assert registry.get(_RUNNER_ID) is live_session
+    finally:
+        await live.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await live.wait(timeout=budget(1.0))
