@@ -607,7 +607,7 @@ def attachment_text_type_for_extension(filename: str | None) -> str | None:
 
     if not filename:
         return None
-    suffix = PurePath(filename).suffix.lower()
+    suffix = PurePath(filename).suffix.lower() or filename.lower()
     if suffix not in _TEXT_CODE_EXTENSIONS:
         return None
     mapped = _EXTRA_MIME_TYPES.get(suffix)
@@ -617,6 +617,28 @@ def attachment_text_type_for_extension(filename: str | None) -> str | None:
     if guessed and (guessed.startswith("text/") or guessed in _TEXT_LIKE_APPLICATION_MIMES):
         return guessed
     return "text/plain"
+
+
+def inline_attachment_extensions() -> dict[str, str]:
+    """Publish the same filename formats used for server inline admission."""
+    import mimetypes
+
+    if not mimetypes.inited:
+        mimetypes.init()
+    extensions = set(mimetypes.types_map) | _TEXT_CODE_EXTENSIONS | set(_EXTRA_MIME_TYPES)
+    result: dict[str, str] = {}
+    for extension in extensions:
+        name = f"attachment{extension}"
+        mime = attachment_text_type_for_extension(name) or _resolve_content_type(None, name)
+        if attachment_upload_limit(mime) is not None:
+            result[extension] = (
+                "image"
+                if mime.startswith("image/")
+                else "pdf"
+                if mime == "application/pdf"
+                else "text"
+            )
+    return result
 
 
 # ── Text-attachment extraction for input-phase policy scanning ─────────
@@ -664,7 +686,7 @@ def extract_text_attachments(
     :returns: A list of ``{"filename", "content_type", "text"}`` entries
         in order. Files requiring filesystem tools carry an empty ``text``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import stored_file_requires_filesystem
 
     attachments: list[dict[str, str]] = []
     for block in content:
@@ -692,7 +714,7 @@ def extract_text_attachments(
         # Checked before the text-like test: delivery follows the filename, so an
         # archive stored under a text MIME still reaches the filesystem. It has no
         # scannable text, but is announced by name so a policy can refuse it.
-        if requires_filesystem(file_meta.filename):
+        if stored_file_requires_filesystem(file_meta.filename, file_meta.source_metadata):
             attachments.append(
                 {
                     "filename": file_meta.filename or "",
@@ -901,11 +923,19 @@ def _resolve_file_id_block(
     # Types requiring filesystem tools never reach a model as bytes (a native
     # harness reads them off disk instead), so inlining one here would send
     # a payload the provider can't interpret. Fail with an actionable error.
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import stored_file_requires_filesystem
 
-    if requires_filesystem(file_meta.filename):
+    if stored_file_requires_filesystem(file_meta.filename, file_meta.source_metadata):
         if defer_filesystem_files:
-            return dict(block), None
+            from omnigent.inner.native_attachments import stored_file_reference
+
+            return stored_file_reference(
+                file_id,
+                file_meta.filename,
+                file_meta.content_type,
+                file_meta.source_metadata,
+                detail=block.get("detail"),
+            ), None
         raise ValueError(
             f"Attachment '{file_meta.filename}' requires a filesystem-capable "
             "harness (e.g. Claude Code, Codex) and cannot be used with this model."
@@ -923,15 +953,23 @@ def _resolve_file_id_block(
             cache[file_id] = encoded
 
     # Copy all fields except file_id.
-    resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
+    from omnigent.inner.native_attachments import stored_file_reference
+
+    content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+    resolved = stored_file_reference(
+        file_id,
+        file_meta.filename,
+        content_type,
+        file_meta.source_metadata,
+        detail=block.get("detail"),
+    )
+    del resolved["file_id"]
     if file_meta.filename:
         # The stored name decides delivery; the block's own filename is
         # client-supplied and must not be able to relabel the file.
         resolved["filename"] = file_meta.filename
 
-    content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
-
-    block_type = block.get("type")
+    block_type = resolved["type"]
     notice: dict[str, int] | None = None
     if block_type == "input_image":
         resolved["image_url"] = f"data:{content_type};base64,{encoded}"
