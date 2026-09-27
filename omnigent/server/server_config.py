@@ -298,9 +298,7 @@ class FilesystemAttachmentPolicy:
 
     def allows(self, filename: str) -> bool:
         name = filename.lower()
-        return self.allowed_extensions == "*" or any(
-            name.endswith(extension) for extension in self.allowed_extensions
-        )
+        return self.allowed_extensions == "*" or name.endswith(tuple(self.allowed_extensions))
 
     def public_dict(self) -> dict[str, Any]:
         from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
@@ -338,18 +336,21 @@ def filesystem_attachment_policy() -> FilesystemAttachmentPolicy:
         else _attachment_extensions(raw)
     )
 
-    def limit(key: str, default: int) -> int:
-        return _config_positive_int(key, default, config)
-
     return FilesystemAttachmentPolicy(
         allowed_extensions=allowed,
         denied_extensions=_attachment_extensions(
             config.get("filesystem_attachment_denied_extensions", [])
         ),
-        max_bytes=limit("filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES),
-        max_files=limit("filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS),
-        max_total_bytes=limit(
-            "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+        max_bytes=_config_positive_int(
+            "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES, config
+        ),
+        max_files=_config_positive_int(
+            "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS, config
+        ),
+        max_total_bytes=_config_positive_int(
+            "filesystem_attachment_max_total_bytes",
+            MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES,
+            config,
         ),
     )
 
