@@ -299,7 +299,7 @@ it.each([[], [".mp4"], "*"] as const)(
   },
 );
 
-describe("review policy compatibility", () => {
+describe("attachment policy compatibility", () => {
   it.each([
     ["README", "text/plain", "text"],
     ["Makefile", "text/plain", "text"],
