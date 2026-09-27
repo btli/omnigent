@@ -208,6 +208,7 @@ class ServerInfoResponse(BaseModel):
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
     branding: BrandingInfo
+    filesystem_attachment_policy: dict[str, Any]
 
 
 def _resolve_extension_state(
@@ -3125,6 +3126,7 @@ def create_app(
         # config presence only (extra installed + models on disk) — no
         # model is loaded here.
         from omnigent.server.dictation import engine_availability
+        from omnigent.server.server_config import filesystem_attachment_policy
 
         dictation_available, _ = engine_availability()
         return ServerInfoResponse.model_validate(
@@ -3155,6 +3157,7 @@ def create_app(
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "branding": branding_snapshot.config(),
+                "filesystem_attachment_policy": filesystem_attachment_policy().public_dict(),
             }
         )
 
