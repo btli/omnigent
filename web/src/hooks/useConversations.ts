@@ -93,7 +93,8 @@ export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
  * fires. Used to keep the query layer from retrying a client-side search
  * timeout: retrying would just re-arm the same slow request three more times
  * (React Query's default), turning one hung spinner into a retry storm. A real
- * server/network error still retries normally.
+ * server/network error still retries normally. The palette also uses it to tell
+ * a search timeout apart from a failed load.
  */
 export function isAbortTimeout(error: unknown): boolean {
   return error instanceof DOMException && error.name === "TimeoutError";

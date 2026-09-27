@@ -166,10 +166,21 @@ describe("CommandPalette — sessions", () => {
     expect(refetch).toHaveBeenCalledOnce();
   });
 
-  it("does not show the timeout message for a successful search", () => {
-    setSessions([conv("hit", "Matching session")]);
-    renderPalette();
-    expect(screen.getByText("Matching session")).toBeTruthy();
+  it("ignores a stale timeout error once the search has succeeded", () => {
+    // Results are loaded and the query is not in error, so a leftover
+    // TimeoutError object alone must not surface the timeout message.
+    useConversations.mockReturnValue({
+      data: { pages: [{ data: [conv("hit", "Matching session")] }] },
+      isError: false,
+      error: new DOMException("signal timed out", "TimeoutError"),
+      isFetching: true,
+    });
+    renderPalette({ sessionsOnly: true });
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "matching" },
+    });
+    expect(labelRow("Matching session")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
     expect(screen.queryByText(/timed out/)).toBeNull();
     expect(screen.queryByText(/Couldn't load/)).toBeNull();
   });
