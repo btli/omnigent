@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import copy
 import logging
+from functools import cache
 from typing import Any
 
 from omnigent.entities import ConversationItem, MessageData
@@ -619,6 +620,7 @@ def attachment_text_type_for_extension(filename: str | None) -> str | None:
     return "text/plain"
 
 
+@cache
 def inline_attachment_extensions() -> dict[str, str]:
     """Publish the same filename formats used for server inline admission."""
     import mimetypes
@@ -964,11 +966,6 @@ def _resolve_file_id_block(
         detail=block.get("detail"),
     )
     del resolved["file_id"]
-    if file_meta.filename:
-        # The stored name decides delivery; the block's own filename is
-        # client-supplied and must not be able to relabel the file.
-        resolved["filename"] = file_meta.filename
-
     block_type = resolved["type"]
     notice: dict[str, int] | None = None
     if block_type == "input_image":
