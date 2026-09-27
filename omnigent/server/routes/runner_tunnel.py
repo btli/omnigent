@@ -484,6 +484,9 @@ def create_runner_tunnel_router(
                 ),
             }
 
+        notify_disconnect = False
+        deregistered = False
+
         try:
             # 3. Receive hello frame.
             raw = await ws.receive_text()
@@ -637,16 +640,11 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
-                if on_runner_disconnect is not None:
-                    try:
-                        await on_runner_disconnect(runner_id)
-                    except Exception:
-                        _logger.exception(
-                            "on_runner_disconnect callback failed for %s",
-                            runner_id,
-                        )
+                deregistered = True
+                notify_disconnect = True
 
         except WebSocketDisconnect as exc:
+            notify_disconnect = True
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
             _logger.warning(
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
@@ -661,25 +659,17 @@ def create_runner_tunnel_router(
                     **_connection_attrs(),
                 ),
             )
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
         except Exception:
+            notify_disconnect = True
             _logger.exception(
                 "Tunnel error for runner %s",
                 runner_id,
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
-            if session is not None:
+            if session is not None and not deregistered:
                 registry.deregister(runner_id, session)
-            else:
-                registry.deregister(runner_id)
-            if on_runner_disconnect is not None:
+        finally:
+            if notify_disconnect and on_runner_disconnect is not None:
                 try:
                     await on_runner_disconnect(runner_id)
                 except Exception:
