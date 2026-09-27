@@ -69,8 +69,19 @@ export type FeatureKey =
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
+export interface FilesystemAttachmentPolicy {
+  inline_extensions?: Record<string, "image" | "pdf" | "text">;
+  allowed_extensions: string[] | "*";
+  denied_extensions: string[];
+  max_bytes: number;
+  max_files: number;
+  max_total_bytes: number;
+  harnesses: string[];
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  filesystem_attachment_policy?: FilesystemAttachmentPolicy;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -393,6 +404,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           branding: parseBranding(data.branding),
+          filesystem_attachment_policy: data.filesystem_attachment_policy,
         };
         return cachedServerInfo;
       }
