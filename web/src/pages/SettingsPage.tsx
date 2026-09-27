@@ -45,9 +45,11 @@ import {
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
+  ArchiveIcon,
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   BotIcon,
+  ChevronDownIcon,
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
@@ -75,11 +77,14 @@ import {
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
-import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+import { CardRadioGroup, themeCardClass } from "@/components/theme/CardRadioGroup";
 import {
+  DARK_MODE_PREVIEW,
+  LIGHT_MODE_PREVIEW,
   ModePreview,
   PaletteChip,
   PaletteSwatchPreview,
+  SwipeActionPreview,
 } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -91,6 +96,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogClose,
@@ -346,16 +358,18 @@ function Section({
   title,
   description,
   descriptionClassName,
+  heading: Heading = "h1",
   children,
 }: {
   title: string;
   description?: string;
   descriptionClassName?: string;
+  heading?: "h1" | "h2";
   children: ReactNode;
 }) {
   return (
     <section>
-      <h1 className="text-2xl font-semibold">{title}</h1>
+      <Heading className="text-2xl font-semibold">{title}</Heading>
       {description && (
         <p className={cn("mt-1 text-muted-foreground", descriptionClassName ?? "text-ui")}>
           {description}
@@ -408,10 +422,14 @@ const workspaceTabCards: {
 ];
 
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
+function iconCardBody(
+  Icon: ComponentType<{ className?: string }>,
+  label: string,
+  iconClassName?: string,
+) {
   return (
     <>
-      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className={cn("size-6 text-muted-foreground", iconClassName)} />
       <span className="text-ui font-medium">{label}</span>
     </>
   );
@@ -820,16 +838,38 @@ const SWIPE_ACTION_LABELS: Record<SwipeAction, string> = {
   none: "None",
 };
 
+/** Swipe-tile colours for the chosen action; None stays neutral. */
+const SWIPE_ACTION_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "text-accent-foreground",
+  delete: "text-destructive",
+  none: undefined,
+};
+
+// Dark bg-muted highlights drop these tones below AA, so highlighted text falls back to foreground.
+const SWIPE_ACTION_MENU_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "text-accent-foreground focus:text-accent-foreground dark:focus:text-foreground",
+  delete: "text-destructive focus:text-destructive dark:focus:text-foreground",
+  none: undefined,
+};
+
+const SWIPE_ACTION_ICONS: Record<SwipeAction, ComponentType<{ className?: string }>> = {
+  archive: ArchiveIcon,
+  delete: Trash2Icon,
+  none: MinusIcon,
+};
+
 /**
- * Per-device swipe-action preference for session rows on touch devices. Two
- * selects — one per direction — each mapping a horizontal swipe to Archive,
- * Delete, or None. Both directions may map to the same action. Delete stays
- * behind the row's confirm dialog; None makes that direction inert.
+ * Per-device swipe actions for sidebar session rows on touch devices. One
+ * card per direction, laid out like the Default transcript view cards; each
+ * opens a menu of Archive / Delete / None. Delete stays behind the row's
+ * confirm dialog; None makes that direction inert.
  */
 function SwipeActionsControl() {
-  // Live subscription so the selects reflect writes from anywhere (other tabs,
+  // Live subscription so the cards reflect writes from anywhere (other tabs,
   // and the shared source every session row reads). writeSwipeActions notifies.
   const actions = useSwipeActions();
+  const swatch = useResolvedThemeMode() === "dark" ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW;
+  const [openDirection, setOpenDirection] = useState<SwipeDirection | null>(null);
   const labelId = useId();
 
   const choose = useCallback(
@@ -843,41 +883,70 @@ function SwipeActionsControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Swipe actions"
-      helper="On touch devices, swipe a session row horizontally to run an action. Delete still asks to confirm."
+      helper="Choose what swiping a session in the sidebar does. Delete always asks first."
     >
-      <div className="flex flex-col gap-3">
-        {(["left", "right"] as const).map((direction) => (
-          <div key={direction} className="flex items-center justify-between gap-4">
-            <span className="text-sm">
-              Swipe {direction} <span aria-hidden>{direction === "left" ? "←" : "→"}</span>
-            </span>
-            <Select
-              value={actions[direction]}
-              onValueChange={(next: string) => {
-                if (isSwipeAction(next)) choose(direction, next);
-              }}
+      <div role="group" aria-labelledby={labelId} className="grid grid-cols-2 gap-3">
+        {(["right", "left"] as const).map((direction) => {
+          const action = actions[direction];
+          const tone = SWIPE_ACTION_TONES[action];
+          const open = openDirection === direction;
+          return (
+            <DropdownMenu
+              key={direction}
+              open={open}
+              onOpenChange={(next) => setOpenDirection(next ? direction : null)}
             >
-              <SelectTrigger
-                aria-label={`Swipe ${direction} action`}
-                data-testid={`swipe-action-${direction}`}
-                className="w-40"
-              >
-                <SelectValue>{SWIPE_ACTION_LABELS[actions[direction]]}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {swipeActionOptions.map((action) => (
-                  <SelectItem
-                    key={action}
-                    value={action}
-                    data-testid={`swipe-action-${direction}-${action}`}
+              <DropdownMenuTrigger asChild>
+                {/* The border shows "selected" only while this card's menu is open. */}
+                <button
+                  type="button"
+                  aria-label={`Swipe ${direction}: ${SWIPE_ACTION_LABELS[action]}`}
+                  data-testid={`swipe-action-${direction}`}
+                  className={themeCardClass(open, "group items-center gap-2 p-4")}
+                >
+                  {iconCardBody(SWIPE_ACTION_ICONS[action], `Swipe ${direction}`, tone)}
+                  <span
+                    data-testid={`swipe-action-${direction}-label`}
+                    className={cn(
+                      "flex items-center gap-1 text-sm text-muted-foreground",
+                      tone,
+                      tone && "dark:group-hover:text-foreground",
+                    )}
                   >
                     {SWIPE_ACTION_LABELS[action]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        ))}
+                    <ChevronDownIcon aria-hidden="true" className="size-4 text-muted-foreground" />
+                  </span>
+                </button>
+              </DropdownMenuTrigger>
+              {/* Radix names the menu after its card, e.g. "Swipe right: Archive". */}
+              <DropdownMenuContent className="min-w-(--radix-dropdown-menu-trigger-width)">
+                <DropdownMenuRadioGroup
+                  value={action}
+                  onValueChange={(next) => {
+                    if (isSwipeAction(next)) choose(direction, next);
+                  }}
+                >
+                  {swipeActionOptions.map((option) => (
+                    <DropdownMenuRadioItem
+                      key={option}
+                      value={option}
+                      data-testid={`swipe-action-${direction}-${option}`}
+                      className={cn(
+                        "gap-3 [&_svg]:text-current",
+                        option === action && SWIPE_ACTION_MENU_TONES[option],
+                      )}
+                    >
+                      <span className="w-24 shrink-0">
+                        <SwipeActionPreview swatch={swatch} direction={direction} action={option} />
+                      </span>
+                      {SWIPE_ACTION_LABELS[option]}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          );
+        })}
       </div>
     </ThemeSubsection>
   );
@@ -1032,8 +1101,6 @@ function AppearanceSection() {
 
         <HideUnconfiguredHarnessesControl />
 
-        <SwipeActionsControl />
-
         <UiFontSizeControl />
 
         <UiFontFamilyControl />
@@ -1047,6 +1114,17 @@ function AppearanceSection() {
         <UiCodeFontFamilyControl />
 
         <UiCodeFontWeightControl />
+
+        <div className="mt-4">
+          <Section
+            title="Touch & mobile"
+            heading="h2"
+            description="Settings for phones, tablets and other touch screens."
+            descriptionClassName="text-sm"
+          >
+            <SwipeActionsControl />
+          </Section>
+        </div>
       </div>
 
       <div className="mt-8 flex items-center justify-end gap-2">
