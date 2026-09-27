@@ -1,10 +1,12 @@
 import { useState } from "react";
+import { createPortal } from "react-dom";
 
 /**
  * Returns mouse event handlers for a trigger element and a fixed-positioned
  * tooltip node that follows the cursor. Render `tooltip` as a sibling to the
- * trigger (outside any interactive element) — it uses `position: fixed` so it
- * escapes all overflow / stacking contexts automatically.
+ * trigger (outside any interactive element). It is portalled to `document.body`
+ * because a transformed ancestor (e.g. a virtualized row) would otherwise
+ * become its containing block and push it into the scroll area.
  */
 export function useCursorTooltip(text: string): {
   handlers: {
@@ -20,14 +22,22 @@ export function useCursorTooltip(text: string): {
     onMouseLeave: () => setCursorPos(null),
   };
 
-  const tooltip = cursorPos ? (
-    <div
-      style={{ position: "fixed", left: cursorPos.x, top: cursorPos.y + 14, pointerEvents: "none" }}
-      className="z-50 inline-flex w-fit items-center rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-tooltip"
-    >
-      {text}
-    </div>
-  ) : null;
+  const tooltip = cursorPos
+    ? createPortal(
+        <div
+          style={{
+            position: "fixed",
+            left: cursorPos.x,
+            top: cursorPos.y + 14,
+            pointerEvents: "none",
+          }}
+          className="z-50 inline-flex w-fit items-center rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-tooltip"
+        >
+          {text}
+        </div>,
+        document.body,
+      )
+    : null;
 
   return { handlers, tooltip };
 }
