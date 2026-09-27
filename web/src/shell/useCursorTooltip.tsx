@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
+import { getEmbedRoot } from "@/lib/host";
 
 /**
  * Returns mouse event handlers for a trigger element and a fixed-positioned
  * tooltip node that follows the cursor. Render `tooltip` as a sibling to the
- * trigger (outside any interactive element). It is portalled to `document.body`
- * because a transformed ancestor (e.g. a virtualized row) would otherwise
- * become its containing block and push it into the scroll area.
+ * trigger (outside any interactive element). It is portalled to the embed root
+ * (or `document.body` standalone) because a transformed ancestor, such as a
+ * virtualized row, would otherwise become its containing block.
  */
 export function useCursorTooltip(text: string): {
   handlers: {
@@ -35,7 +36,7 @@ export function useCursorTooltip(text: string): {
         >
           {text}
         </div>,
-        document.body,
+        getEmbedRoot() ?? document.body,
       )
     : null;
 
