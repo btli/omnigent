@@ -266,28 +266,125 @@ describe("filename-based inline eligibility", () => {
       expect(validateAttachments([file], wildcard).accepted).toEqual([file]);
     },
   );
-  it.each(["text/plain", "image/png"])("rejects unlisted video despite MIME: %s", (type) => {
-    expect(
-      validateAttachments([makeFile("clip.mp4", type)], { ...policy, allowed_extensions: [] })
-        .errors[0],
-    ).toContain("server policy");
-  });
+  it.each(["text/plain", "image/png"])(
+    "keeps unlisted video inline when its declared MIME is supported: %s",
+    (type) => {
+      const file = makeFile("clip.mp4", type);
+      expect(validateAttachments([file], { ...policy, allowed_extensions: [] }).accepted).toEqual([
+        file,
+      ]);
+    },
+  );
 });
 
-it.each([[], [".mp4"], "*"] as const)("uses published inline formats under %j", (allowed) => {
-  const inlinePolicy = {
-    allowed_extensions: allowed === "*" ? ("*" as const) : [...allowed],
-    denied_extensions: [],
-    max_bytes: 10,
-    max_files: 2,
-    max_total_bytes: 20,
-    harnesses: ["claude-native"],
-    inline_extensions: { ".ics": "text" as const },
-  };
-  const calendar = new File(["BEGIN:VCALENDAR"], "calendar.ics", { type: "image/png" });
-  expect(classifyAttachment(calendar, inlinePolicy)).toBe("text");
-  expect(validateAttachments([calendar], inlinePolicy).accepted).toEqual([calendar]);
-  expect(
-    validateAttachments([calendar], { ...inlinePolicy, denied_extensions: [".ics"] }).accepted,
-  ).toEqual([]);
+it.each([[], [".mp4"], "*"] as const)(
+  "uses MIME before published inline filename fallback under %j",
+  (allowed) => {
+    const inlinePolicy = {
+      allowed_extensions: allowed === "*" ? ("*" as const) : [...allowed],
+      denied_extensions: [],
+      max_bytes: 10,
+      max_files: 2,
+      max_total_bytes: 20,
+      harnesses: ["claude-native"],
+      inline_extensions: { ".ics": "text" as const },
+    };
+    const calendar = new File(["BEGIN:VCALENDAR"], "calendar.ics", { type: "image/png" });
+    expect(classifyAttachment(calendar, inlinePolicy)).toBe("image");
+    expect(classifyAttachment(new File(["calendar"], "calendar.ics"), inlinePolicy)).toBe("text");
+    expect(validateAttachments([calendar], inlinePolicy).accepted).toEqual([calendar]);
+    expect(
+      validateAttachments([calendar], { ...inlinePolicy, denied_extensions: [".ics"] }).accepted,
+    ).toEqual([]);
+  },
+);
+
+describe("review policy compatibility", () => {
+  it.each([
+    ["README", "text/plain", "text"],
+    ["Makefile", "text/plain", "text"],
+    ["Dockerfile", "text/plain", "text"],
+    ["photo", "image/png", "image"],
+    ["payload.bin", "text/plain", "text"],
+    ["structured.bin", "application/json", "text"],
+    ["report", "application/pdf", "pdf"],
+  ])("keeps MIME-typed %s inline", (name, mime, category) => {
+    const file = makeFile(name, mime);
+    for (const allowed of [[], [".mp4"], "*"] as const) {
+      const active = {
+        ...policy,
+        allowed_extensions: allowed === "*" ? ("*" as const) : [...allowed],
+      };
+      expect(classifyAttachment(file, active)).toBe(category);
+      expect(validateAttachments([file], active).accepted).toEqual([file]);
+      for (const extension of [".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"]) {
+        expect(classifyAttachment(makeFile(`legacy${extension}`, mime), active)).toBe(
+          allowed === "*" ? "file" : null,
+        );
+      }
+    }
+    expect(classifyAttachment(file)).toBe(category);
+    expect(
+      validateAttachments([file], { ...policy, allowed_extensions: [".bin"] }).accepted,
+    ).toEqual([file]);
+  });
+  it.each(["Screen 10:30.png", "notes:2026.txt", "notes%3A2026.txt"])(
+    "permits inline colon filename %s but rejects filesystem delivery",
+    (name) => {
+      const file = makeFile(name, name.endsWith(".png") ? "image/png" : "text/plain");
+      expect(validateAttachments([file], policy).accepted).toEqual([file]);
+      expect(
+        validateAttachments([file], { ...policy, allowed_extensions: [".png", ".txt"] }).errors[0],
+      ).toContain("filename");
+    },
+  );
+  it.each(["a\u200b.txt", "a\u202e.txt", "a\u2028.txt", "a\u2029.txt"])(
+    "rejects Unicode unsafe filename %j",
+    (name) => {
+      expect(validateAttachments([makeFile(name, "text/plain")], policy).errors[0]).toContain(
+        "filename",
+      );
+      expect(
+        validateAttachments([makeFile(encodeURIComponent(name), "text/plain")], policy).errors[0],
+      ).toContain("filename");
+    },
+  );
+  it.each(["a.exe\u00a0", "a.exe\u2003.", "a.exe\u3000.txt", "a.tar\u00a0.gz.txt"])(
+    "normalizes Unicode whitespace for allow and deny rules %j",
+    (name) => {
+      expect(
+        validateAttachments([makeFile(name, "text/plain")], {
+          ...policy,
+          denied_extensions: [".exe", ".tar.gz"],
+          allowed_extensions: "*",
+        }).errors[0],
+      ).toContain("denied");
+      const allowed = makeFile("clip.MP4\u00a0.\u3000", "text/plain");
+      expect(classifyAttachment(allowed, policy)).toBe("file");
+      expect(validateAttachments([allowed], policy).accepted).toEqual([allowed]);
+    },
+  );
+  it.each(["a".repeat(252) + ".txt", "é".repeat(126) + ".txt", "a.".repeat(200) + "txt"])(
+    "bounds UTF8 filename bytes %j",
+    (name) => {
+      expect(validateAttachments([makeFile(name, "text/plain")], policy).errors[0]).toContain(
+        "filename",
+      );
+      const boundary = makeFile("é".repeat(125) + "a.txt .\u00a0", "text/plain");
+      expect(validateAttachments([boundary], policy).accepted).toEqual([boundary]);
+    },
+  );
+  it.each([
+    [12, "12 B"],
+    [1536, "1.5 KB"],
+    [1_400_000, "1.3 MB"],
+  ])("formats the byte limit %s readably", (bytes, label) => {
+    const maximum = Number(bytes);
+    expect(
+      validateAttachments([makeFile("clip.mp4", "video/mp4", maximum + 1)], {
+        ...policy,
+        max_bytes: maximum,
+      }).errors[0],
+    ).toContain(`limit is ${label}.`);
+  });
 });

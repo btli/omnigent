@@ -2717,44 +2717,33 @@ def test_fork_cannot_grandfather_video_into_new_session(monkeypatch, policy) -> 
     assert not conversations.fork_calls
 
 
-def test_fork_reclassified_inline_attachment_rejects_sdk_and_allows_safe_forks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.parametrize(
+    "filename,mime",
+    [
+        ("note.txt", "text/plain"),
+        ("README", "text/plain"),
+        ("Screen 10:30.png", "image/png"),
+        ("opaque.bin", None),
+    ],
+)
+def test_fork_preserves_inline_delivery_under_new_policy(monkeypatch, filename, mime) -> None:
     monkeypatch.setattr(
         "omnigent.server.server_config.load_server_config",
-        lambda: {"filesystem_attachment_allowed_extensions": [".txt"]},
+        lambda: {"filesystem_attachment_allowed_extensions": [".txt", ".png"]},
     )
-    client, conversations, files = _attachment_fork_client(monkeypatch, "note.txt", "claude-sdk")
+    client, conversations, files = _attachment_fork_client(monkeypatch, filename, "claude-sdk")
     source = next(iter(files.files.values()))
-    source.content_type = "text/plain"
-    source.source_metadata = {"delivery": "inline"}
-    url = "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork"
-    target = {"agent_id": "280d725b404d2915f9e9d6cccce91303"}
-    rejected = client.post(url, json=target)
-    assert rejected.status_code == 400, rejected.text
-    assert "note.txt" in rejected.json()["error"]["message"]
-    assert "Claude Code or Codex" in rejected.json()["error"]["message"]
-    assert not conversations.fork_calls
-    assert len(files.files) == 1
-
-    cutoff = client.post(url, json={**target, "up_to_response_id": "resp_before"})
-    assert cutoff.status_code == 201, cutoff.text
-    assert len(conversations.fork_calls) == 1
-    assert all(
-        not block.get("file_id")
-        for item in conversations._items[cutoff.json()["id"]]
-        if isinstance(item.data, MessageData)
-        for block in item.data.content
+    source.content_type = mime
+    source.source_metadata = {"source": "legacy-upload"}
+    accepted = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
     )
-
-    for harness in ("claude-native", "codex-native"):
-        client, conversations, files = _attachment_fork_client(monkeypatch, "note.txt", harness)
-        source = next(iter(files.files.values()))
-        source.content_type = "text/plain"
-        source.source_metadata = {"delivery": "inline"}
-        accepted = client.post(url, json=target)
-        assert accepted.status_code == 201, accepted.text
-        copied = next(stored for stored in files.files.values() if stored.id != source.id)
-        assert copied.source_metadata == {"delivery": "filesystem"}
-        assert copied.content_type == "application/octet-stream"
-        assert len(conversations.fork_calls) == 1
+    assert accepted.status_code == 201, accepted.text
+    copied = next(stored for stored in files.files.values() if stored.id != source.id)
+    assert (copied.filename, copied.content_type, copied.source_metadata) == (
+        filename,
+        mime,
+        {"source": "legacy-upload"},
+    )
+    assert len(conversations.fork_calls) == 1
