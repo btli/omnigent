@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
+import type * as ConversationsModule from "@/hooks/useConversations";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -10,7 +11,8 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 const useConversations = vi.fn();
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  isAbortTimeout: (await importOriginal<typeof ConversationsModule>()).isAbortTimeout,
   useConversations: (...args: unknown[]) => useConversations(...args),
 }));
 
@@ -148,6 +150,41 @@ describe("CommandPalette — sessions", () => {
       expect(refetch).toHaveBeenCalledOnce();
     },
   );
+
+  it("shows a search timeout distinctly from a load failure or an empty result", () => {
+    // What a fired AbortSignal.timeout rejects the search fetch with.
+    const timeout = new DOMException("signal timed out", "TimeoutError");
+    const refetch = vi.fn();
+    useConversations.mockReturnValue({ isError: true, error: timeout, isFetching: false, refetch });
+    renderPalette();
+    const status = screen.getByRole("status").textContent;
+    expect(status).toContain("Search timed out.");
+    expect(status).not.toContain("Couldn't load sessions.");
+    expect(screen.queryByText("No results found")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the generic load error for a non-timeout failure", () => {
+    useConversations.mockReturnValue({
+      isError: true,
+      error: new Error("500 Internal Server Error"),
+      isFetching: false,
+      refetch: vi.fn(),
+    });
+    renderPalette();
+    const status = screen.getByRole("status").textContent;
+    expect(status).toContain("Couldn't load sessions.");
+    expect(status).not.toContain("timed out");
+  });
+
+  it("does not show the timeout message for a successful search", () => {
+    setSessions([conv("hit", "Matching session")]);
+    renderPalette();
+    expect(screen.getByText("Matching session")).toBeTruthy();
+    expect(screen.queryByText(/timed out/)).toBeNull();
+    expect(screen.queryByText(/Couldn't load/)).toBeNull();
+  });
 
   it("shows only one loading message during the initial session fetch", () => {
     setSessions([], true);

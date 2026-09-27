@@ -79,7 +79,7 @@ export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
  * search is a substring scan server-side; if its trigram index is ever missing
  * the query can run for tens of seconds, and the palette would otherwise sit on
  * "Searching…" forever (the fetch has no timeout of its own). Aborting here
- * settles the query to a terminal state so the user sees "No results found"
+ * settles the query to a terminal error the palette shows as "Search timed out"
  * rather than an endless spinner. Deliberately shorter than the server's own
  * search `statement_timeout` (see `_SEARCH_STATEMENT_TIMEOUT_MS` in the store)
  * so the client gives up first and the row-limited fast path still has room.
@@ -95,7 +95,7 @@ export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
  * (React Query's default), turning one hung spinner into a retry storm. A real
  * server/network error still retries normally.
  */
-function isAbortTimeout(error: unknown): boolean {
+export function isAbortTimeout(error: unknown): boolean {
   return error instanceof DOMException && error.name === "TimeoutError";
 }
 

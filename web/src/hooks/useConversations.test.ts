@@ -34,6 +34,7 @@ import {
   useStopSession,
   useTogglePinnedConversation,
   fetchPinnedConversations,
+  isAbortTimeout,
   clearSessionTombstones,
   markRecentlyCreated,
   clearRecentlyCreated,
@@ -334,6 +335,26 @@ describe("useConversations search timeout", () => {
     // A genuine server/network error still retries (up to the default cap).
     expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);
     expect(retry(3, new Error("500 Internal Server Error"))).toBe(false);
+  });
+
+  it("settles a timed-out search to a single terminal timeout error", async () => {
+    fetchMock.mockRejectedValue(new DOMException("signal timed out", "TimeoutError"));
+    const queryClient = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("rare-term", false), { wrapper });
+
+    // The palette keys its "Search timed out" message off this error.
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(isAbortTimeout(result.current.error)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    queryClient.clear();
+  });
+
+  it("recognizes only the timeout abort as a search timeout", () => {
+    expect(isAbortTimeout(new DOMException("signal timed out", "TimeoutError"))).toBe(true);
+    expect(isAbortTimeout(new DOMException("aborted", "AbortError"))).toBe(false);
+    expect(isAbortTimeout(new Error("500 Internal Server Error"))).toBe(false);
   });
 });
 
