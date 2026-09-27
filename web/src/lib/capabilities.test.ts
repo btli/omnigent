@@ -248,7 +248,7 @@ const validAttachmentPolicy = {
   harnesses: ["claude-native"],
   inline_extensions: { ".txt": "text" },
 };
-describe("review attachment policy parsing", () => {
+describe("attachment policy parsing", () => {
   it.each([
     ["null", null],
     ["array", []],
