@@ -2954,7 +2954,16 @@ async def test_copy_files_then_download_returns_bytes(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "filename,mime",
-    [("README", "text/plain"), ("Screen 10:30.png", "image/png"), ("opaque.bin", None)],
+    [
+        ("README", "text/plain"),
+        ("Screen 10:30.png", "image/png"),
+        ("opaque.bin", None),
+        pytest.param("x" * 256 + ".txt", "text/plain", id="historic-long-name"),
+        pytest.param("family👨‍👩.png", "image/png", id="historic-joiner"),
+        pytest.param("résumé\u00ad.pdf", "application/pdf", id="historic-soft-hyphen"),
+        pytest.param("שלום\u200f.txt", "text/plain", id="historic-rtl-mark"),
+        pytest.param("\ufeffnote.txt", "text/plain", id="historic-bom"),
+    ],
 )
 async def test_copy_preserves_historic_inline_metadata(
     file_client: httpx.AsyncClient,

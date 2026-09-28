@@ -106,18 +106,24 @@ admits no filesystem files. Omit the setting to retain the built-in set.
 The denylist and all applicable caps win over the allowlist. Matching strips
 trailing dots and Unicode whitespace and ignores case; the denylist examines every component of
 compound suffixes (`payload.exe.txt` and `payload.txt.exe` both match `.exe`).
-Names containing Unicode control, format, line-separator, or paragraph-separator
-characters are rejected, including percent-encoded forms. Filesystem delivery
+Names containing Unicode control, bidi embedding/override/isolate, line-separator,
+or paragraph-separator characters are rejected, including percent-encoded forms.
+Other format characters (such as emoji joiners, soft hyphens, and RTL marks) stay
+in display names but are ignored for allowlist and denylist matching. Filesystem delivery
 also rejects `:` (alternate data streams); inline names such as `Screen 10:30.png`
-remain valid. Directory components are reduced to a basename, which must fit in
-255 UTF-8 bytes after normalization. Explicitly allowed extensions
+remain valid. New filenames, as sent, must fit in 255 UTF-8 bytes, so oversized
+padding is rejected before any character processing. Directory components are
+reduced to a basename. Explicitly allowed extensions
 are classified for filesystem delivery before MIME hints, so `clip.mp4` declared
-as `text/plain` or `image/png` remains opaque. Otherwise, supported declared MIME
-types retain inline delivery (for example, a `text/plain` README or an `image/png`
-file named photo), with filename fallback for missing/generic MIME and known
-text/code extensions. Wildcard admission preserves these inline types and their
-limits; other names use filesystem delivery. Legacy built-in filesystem formats
-cannot become inline through a MIME hint.
+as `text/plain` or `image/png` remains opaque. Under `"*"`, the same applies to
+every suffix with a known non-inline type or compression (for example `.mp4`,
+`.mov`, `.gz`, `.tex`), including its caps and runtime checks; `/v1/info` lists
+these suffixes. Otherwise, supported declared MIME types retain inline delivery
+(for example, a `text/plain` README or payload.bin, or an `image/png` file named
+photo), with filename fallback for missing/generic MIME and known text/code
+extensions. Wildcard admission preserves these inline types and their limits;
+other names use filesystem delivery. Legacy built-in filesystem formats cannot
+become inline through a MIME hint.
 
 The server checks uploads, copies, forks, message/slash events, and initial
 session items. Filesystem payloads must first be uploaded and then referenced by
@@ -131,12 +137,15 @@ same-session files usable and counted toward quotas. Retained filesystem history
 cannot switch/fork to an SDK harness; unsent files are checked again when sent.
 Forks preserve each source row's delivery classification. Copies are new admission:
 an inline row whose suffix is now explicitly allowed becomes a filesystem row.
+Historic rows that remain inline are checked only against the denylist when
+copied or forked, so newer filename length and character rules do not break them.
 
 Upgrade the server, web client, and execution host/runner together. Both connected
 host and runner must advertise `generalized_filesystem_attachments` for new types;
 legacy built-in formats retain their `filesystem_attachments` compatibility.
 Missing support yields an upgrade error before sending. `/v1/info` publishes the
-effective allowlist, denylist, caps, capable harnesses, and inline filename formats. The web client uses
+effective allowlist, denylist, caps, capable harnesses, and known inline/non-inline
+filename suffixes. The web client uses
 these for early feedback and all three pickers; under `"*"` it omits the picker
 filter. An older server without the policy leaves unknown types to server
 validation, with upload errors preserving the draft. Older web bundles may still
