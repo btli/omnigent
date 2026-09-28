@@ -4,10 +4,9 @@ import { getEmbedRoot } from "@/lib/host";
 
 /**
  * Returns mouse event handlers for a trigger element and a fixed-positioned
- * tooltip node that follows the cursor. Render `tooltip` as a sibling to the
- * trigger (outside any interactive element). It is portalled to the embed root
- * (or `document.body` standalone) because a transformed ancestor, such as a
- * virtualized row, would otherwise become its containing block.
+ * tooltip node that follows the cursor. The node is portalled to the embed root
+ * (or `document.body` standalone), so a transformed ancestor such as a
+ * virtualized row can't become its containing block.
  */
 export function useCursorTooltip(text: string): {
   handlers: {
