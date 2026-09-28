@@ -2081,22 +2081,11 @@ def register_resources_routes(
         from omnigent.server.routes._sessions.helpers import _request_attachment_policy
 
         policy = _request_attachment_policy(request)
-        from omnigent.server.routes._sessions.helpers import _attachment_name_allowed
-
         classifications: dict[str, tuple[str, str | None, bool]] = {}
         for stored in sources:
-            name = _attachment_name_allowed(stored.filename, policy)
-            base_name = name.split(":", 1)[0]
-            while base_name and (base_name[-1].isspace() or base_name[-1] == "."):
-                base_name = base_name[:-1]
             filesystem = stored_file_requires_filesystem(stored.filename, stored.source_metadata)
-            classification = (
-                _classify_attachment_upload(stored.filename, stored.content_type, policy)
-                if filesystem
-                or policy.allows(name)
-                or policy.allows(base_name)
-                or requires_filesystem(base_name)
-                else (stored.filename, stored.content_type, False)
+            classification = _classify_attachment_upload(
+                stored.filename, stored.content_type, policy, historic_inline=not filesystem
             )
             classifications[stored.id] = (
                 classification
