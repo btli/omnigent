@@ -107,7 +107,10 @@ const TEXT_CODE_EXTENSIONS = new Set([
 ]);
 
 function normalizedFilename(filename: string): string {
-  return filename.toLowerCase().replace(/[.\p{White_Space}]+$/gu, "");
+  return filename
+    .replace(/\p{Cf}/gu, "")
+    .toLowerCase()
+    .replace(/[.\p{White_Space}]+$/gu, "");
 }
 
 function extensionOf(filename: string): string {
@@ -169,6 +172,9 @@ export function classifyAttachment(
   if (LEGACY_FILESYSTEM_SUFFIXES.some(matches)) {
     return !policy || policy.allowed_extensions === "*" ? "file" : null;
   }
+  // Under "*", MIME hints steer only extensionless or generic names such as payload.bin.
+  if (policy?.allowed_extensions === "*" && policy.non_inline_extensions?.some(matches))
+    return "file";
   const mime = file.type.split(";", 1)[0].trim().toLowerCase();
   const publishedInline = policy?.inline_extensions?.[ext];
   if (mime && mime !== "application/octet-stream") {
@@ -226,16 +232,19 @@ export function validateAttachments(
   for (const file of files) {
     const name = file.name || "file";
     const filename = attachmentFilename(file);
+    if (filename.length > 255 || new TextEncoder().encode(filename).length > 255) {
+      errors.push(`"${name}" has an invalid filename.`);
+      continue;
+    }
     const decodedFilename = filename.replace(/(?:%[a-f0-9]{2})+/gi, (encoded) =>
       new TextDecoder().decode(
         Uint8Array.from(encoded.match(/[a-f0-9]{2}/gi) ?? [], (hex) => parseInt(hex, 16)),
       ),
     );
     if (
-      /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(decodedFilename) ||
+      /[\p{Cc}\p{Zl}\p{Zp}\u202a-\u202e\u2066-\u2069]/u.test(decodedFilename) ||
       /[/\\]/.test(filename) ||
-      !normalizedFilename(filename) ||
-      new TextEncoder().encode(normalizedFilename(filename)).length > 255
+      !normalizedFilename(filename)
     ) {
       errors.push(`"${name}" has an invalid filename.`);
       continue;
