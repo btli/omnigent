@@ -2724,6 +2724,11 @@ def test_fork_cannot_grandfather_video_into_new_session(monkeypatch, policy) -> 
         ("README", "text/plain"),
         ("Screen 10:30.png", "image/png"),
         ("opaque.bin", None),
+        pytest.param("x" * 256 + ".txt", "text/plain", id="historic-long-name"),
+        pytest.param("family👨‍👩.png", "image/png", id="historic-joiner"),
+        pytest.param("résumé\u00ad.pdf", "application/pdf", id="historic-soft-hyphen"),
+        pytest.param("שלום\u200f.txt", "text/plain", id="historic-rtl-mark"),
+        pytest.param("\ufeffnote.txt", "text/plain", id="historic-bom"),
     ],
 )
 def test_fork_preserves_inline_delivery_under_new_policy(monkeypatch, filename, mime) -> None:
