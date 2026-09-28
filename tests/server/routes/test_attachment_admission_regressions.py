@@ -10,7 +10,7 @@ from omnigent.server.routes._sessions.helpers import (
     _classify_attachment_upload,
     _validate_attachment_content,
 )
-from omnigent.server.server_config import FilesystemAttachmentPolicy
+from omnigent.server.server_config import FilesystemAttachmentPolicy, filesystem_attachment_policy
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 
@@ -123,3 +123,68 @@ def test_supported_declared_mime_precedes_inline_filename_fallback() -> None:
         "image/png",
         False,
     )
+
+
+@pytest.mark.parametrize(
+    "filename,mime",
+    [
+        ("family👨‍👩.png", "image/png"),
+        ("résumé\u00ad.pdf", "application/pdf"),
+        ("שלום\u200f.txt", "text/plain"),
+        ("\ufeffnote.txt", "text/plain"),
+    ],
+)
+def test_format_characters_keep_display_names(filename, mime) -> None:
+    assert _classify_attachment_upload(filename, mime, _policy()) == (filename, mime, False)
+
+
+def test_format_characters_are_ignored_for_policy_matching() -> None:
+    assert _classify_attachment_upload("clip.m\u200bp4", "text/plain", _policy([".mp4"])) == (
+        "clip.m\u200bp4",
+        "application/octet-stream",
+        True,
+    )
+    for denied in ("a.exe ", "a.exe\u200b", "a.e\u200dxe"):
+        with pytest.raises(HTTPException, match="not accepted"):
+            _classify_attachment_upload(denied, "text/plain", _policy("*", [".exe"]))
+    for control in ("\u202a", "\u202e", "\u2066", "\u2069"):
+        with pytest.raises(HTTPException, match="control characters"):
+            _classify_attachment_upload(f"a{control}.png", "image/png", _policy())
+
+
+def test_padded_filename_is_bounded_before_character_processing(monkeypatch) -> None:
+    from omnigent.inner import native_attachments
+
+    calls = 0
+    category = native_attachments.unicodedata.category
+
+    def counted(char):
+        nonlocal calls
+        calls += 1
+        return category(char)
+
+    monkeypatch.setattr(native_attachments.unicodedata, "category", counted)
+    with pytest.raises(ValueError, match="255-byte"):
+        native_attachments.normalized_attachment_filename("clip.mp4" + " " * 200_000)
+    assert calls == 0
+
+
+def test_wildcard_declared_mime_steers_only_generic_names() -> None:
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        for allowed in ("*", [".mp4"]):
+            assert _classify_attachment_upload("clip.mp4", mime, _policy(allowed)) == (
+                "clip.mp4",
+                "application/octet-stream",
+                True,
+            )
+            with pytest.raises(HTTPException, match="':' is forbidden"):
+                _classify_attachment_upload("clip.mp4:x.png", mime, _policy(allowed))
+    for filename, mime in (
+        ("README", "text/plain"),
+        ("Makefile", "text/plain"),
+        ("Dockerfile", "text/plain"),
+        ("photo", "image/png"),
+        ("payload.bin", "text/plain"),
+    ):
+        for policy in (filesystem_attachment_policy({}), _policy("*")):
+            assert _classify_attachment_upload(filename, mime, policy) == (filename, mime, False)
