@@ -111,26 +111,48 @@ CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS = "generalized_filesystem_attachments"
 
 def normalized_attachment_filename(filename: str, *, filesystem: bool = True) -> str:
     """Normalize a bounded basename; filesystem names also reject alternate data streams."""
+    if len(filename) > 255 or len(filename.encode("utf-8")) > 255:
+        raise ValueError("Attachment filename exceeds the 255-byte limit")
     decoded = urllib.parse.unquote(filename)
-    if any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in decoded):
+    if any(
+        unicodedata.category(char) in {"Cc", "Zl", "Zp"}
+        or "\u202a" <= char <= "\u202e"
+        or "\u2066" <= char <= "\u2069"
+        for char in decoded
+    ):
         raise ValueError(
             f"Invalid attachment filename {filename!r}: control characters are forbidden"
         )
     if filesystem and ":" in decoded:
         raise ValueError(f"Invalid filesystem attachment filename {filename!r}: ':' is forbidden")
     name = filename.replace("\\", "/").rsplit("/", 1)[-1]
-    while name and (name[-1].isspace() or name[-1] == "."):
-        name = name[:-1]
+    name = _strip_attachment_padding(name)
     if not name:
         raise ValueError(f"Invalid attachment filename {filename!r}")
-    if len(name.encode("utf-8")) > 255:
-        raise ValueError("Attachment filename exceeds the 255-byte limit")
     return name
+
+
+def _strip_attachment_padding(name: str) -> str:
+    """Trim trailing dots and Unicode whitespace without repeated string copies."""
+    end = len(name)
+    while end and (name[end - 1].isspace() or name[end - 1] == "."):
+        end -= 1
+    return name[:end]
+
+
+def attachment_matching_filename(filename: str) -> str:
+    """Ignore format characters for admission matching while preserving display names."""
+    return _strip_attachment_padding(
+        "".join(char for char in filename if unicodedata.category(char) != "Cf")
+    ).lower()
 
 
 def attachment_denied_extensions(filename: str, denied: frozenset[str]) -> frozenset[str]:
     """Match only configured suffixes at component boundaries, including compound suffixes."""
-    name = ".".join(part.rstrip() for part in filename.lower().replace(":", ".").split("."))
+    name = ".".join(
+        part.rstrip()
+        for part in attachment_matching_filename(filename).replace(":", ".").split(".")
+    )
     return frozenset(extension for extension in denied if f"{extension}." in f"{name}.")
 
 
