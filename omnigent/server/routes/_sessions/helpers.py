@@ -11065,7 +11065,11 @@ def _request_attachment_policy(request: Request | None) -> FilesystemAttachmentP
 
 
 def _attachment_name_allowed(
-    filename: str, policy: FilesystemAttachmentPolicy, *, filesystem: bool = False
+    filename: str,
+    policy: FilesystemAttachmentPolicy,
+    *,
+    filesystem: bool = False,
+    historic_inline: bool = False,
 ) -> str:
     from omnigent.inner.native_attachments import (
         attachment_denied_extensions,
@@ -11073,7 +11077,11 @@ def _attachment_name_allowed(
     )
 
     try:
-        name = normalized_attachment_filename(filename, filesystem=filesystem)
+        name = (
+            filename
+            if historic_inline
+            else normalized_attachment_filename(filename, filesystem=filesystem)
+        )
         denied = attachment_denied_extensions(name, policy.denied_extensions)
     except ValueError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
@@ -11089,31 +11097,41 @@ def _attachment_name_allowed(
 
 
 def _classify_attachment_upload(
-    filename: str, content_type: str | None, policy: FilesystemAttachmentPolicy
+    filename: str,
+    content_type: str | None,
+    policy: FilesystemAttachmentPolicy,
+    *,
+    historic_inline: bool = False,
 ) -> tuple[str, str, bool]:
     """Classify new files by admitted extension before considering inline delivery."""
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import (
+        attachment_matching_filename,
+        requires_filesystem,
+    )
     from omnigent.runtime.content_resolver import (
         _resolve_content_type,
         attachment_text_type_for_extension,
         attachment_upload_limit,
+        non_inline_attachment_extensions,
     )
 
-    name = _attachment_name_allowed(filename, policy)
-    base_name = name.split(":", 1)[0]
-    while base_name and (base_name[-1].isspace() or base_name[-1] == "."):
-        base_name = base_name[:-1]
-    legacy_filesystem = requires_filesystem(name) or requires_filesystem(base_name)
-    inline_type = _resolve_content_type(content_type, name)
+    name = _attachment_name_allowed(filename, policy, historic_inline=historic_inline)
+    matching_name = attachment_matching_filename(name)
+    candidates = (matching_name, attachment_matching_filename(matching_name.split(":", 1)[0]))
+    legacy_filesystem = any(requires_filesystem(candidate) for candidate in candidates)
+    # Under "*", MIME hints steer only extensionless or generic names such as payload.bin.
+    non_inline_suffixes = tuple(non_inline_attachment_extensions())
+    known_non_inline = any(candidate.endswith(non_inline_suffixes) for candidate in candidates)
+    inline_type = _resolve_content_type(content_type, matching_name)
     if attachment_upload_limit(inline_type) is None:
-        inline_type = attachment_text_type_for_extension(name) or inline_type
+        inline_type = attachment_text_type_for_extension(matching_name) or inline_type
     inline = attachment_upload_limit(inline_type) is not None
-    if (policy.allows(name) or policy.allows(base_name)) and (
-        policy.allowed_extensions != "*" or legacy_filesystem or not inline
+    if any(policy.allows(candidate) for candidate in candidates) and (
+        policy.allowed_extensions != "*" or legacy_filesystem or known_non_inline or not inline
     ):
         name = _attachment_name_allowed(name, policy, filesystem=True)
         return name, "application/octet-stream", True
-    if legacy_filesystem or not inline:
+    if legacy_filesystem or (not inline and not historic_inline):
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported attachment type '{content_type or 'unknown'}' for '{name}'. "

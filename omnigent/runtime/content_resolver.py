@@ -643,6 +643,29 @@ def inline_attachment_extensions() -> dict[str, str]:
     return result
 
 
+@cache
+def non_inline_attachment_extensions() -> frozenset[str]:
+    """Suffixes with a specific non-inline type or compression; generic ``.bin`` is excluded."""
+    import mimetypes
+
+    inline = inline_attachment_extensions()
+    extensions = {
+        *mimetypes.types_map,
+        *mimetypes.encodings_map,
+        *mimetypes.suffix_map,
+        *_EXTRA_MIME_TYPES,
+    }
+    return frozenset(
+        extension.lower()
+        for extension in extensions
+        if extension.lower() not in inline
+        and (
+            mimetypes.guess_type(f"attachment{extension}")[1] is not None
+            or _resolve_content_type(None, f"attachment{extension}") != "application/octet-stream"
+        )
+    )
+
+
 # ── Text-attachment extraction for input-phase policy scanning ─────────
 
 
