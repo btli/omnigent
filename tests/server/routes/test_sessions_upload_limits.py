@@ -810,7 +810,9 @@ def test_wildcard_admission_normalizes_portable_names(upload_client, monkeypatch
         config["filesystem_attachment_denied_extensions"] = [".env"]
         assert _upload(client, session_id, name, content_type="text/plain").status_code == 415
     else:
-        assert stored["metadata"]["source_metadata"] is None
+        assert stored["metadata"]["source_metadata"] == (
+            None if name == "opaque" else {"delivery": "filesystem"}
+        )
 
 
 @pytest.mark.parametrize(
@@ -916,3 +918,88 @@ def test_arbitrary_files_download_privately_as_attachments(
     assert download.headers["content-disposition"].startswith("attachment;")
     assert download.headers["x-content-type-options"] == "nosniff"
     assert "private" in download.headers["cache-control"]
+
+
+def test_wildcard_video_upload_preserves_opaque_bytes_for_every_declared_mime(
+    upload_client,
+    db_uri,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": "*"},
+    )
+    client, session_id = upload_client
+    payload = b"\x00\xffvideo"
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = _upload(client, session_id, "clip.mp4", payload, mime)
+        assert response.status_code == 201, response.text
+        resource = response.json()
+        assert resource["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+        content = client.get(f"/v1/sessions/{session_id}/resources/files/{resource['id']}/content")
+        assert content.content == payload
+        stored = SqlAlchemyFileStore(db_uri).get(resource["id"])
+        assert stored.content_type == "application/octet-stream"
+
+
+@pytest.mark.parametrize("cap", ["max_bytes", "max_files", "max_total_bytes"])
+def test_wildcard_video_mime_cannot_bypass_filesystem_caps(
+    upload_client, monkeypatch, cap
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": "*",
+            f"filesystem_attachment_{cap}": 1,
+        },
+    )
+    client, session_id = upload_client
+    assert _upload(client, session_id, "seed.mp4", b"x", "video/mp4").status_code == 201
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = _upload(client, session_id, "clip.mp4", b"xx", mime)
+        assert response.status_code == 413, response.text
+
+
+def test_wildcard_video_mime_cannot_enter_sdk_session(upload_client, db_uri, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": "*"},
+    )
+    client, _ = upload_client
+    sdk = SqlAlchemyConversationStore(db_uri).create_conversation(
+        title="sdk", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = _upload(client, sdk.id, "clip.mp4", b"video", mime)
+        assert response.status_code == 415, response.text
+        assert "Claude Code or Codex" in response.text
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+def test_wildcard_video_cannot_be_inlined_in_events(
+    upload_client, monkeypatch, event_type
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": "*"},
+    )
+    client, session_id = upload_client
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": event_type,
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "clip.mp4",
+                            "file_data": f"data:{mime};base64,eA==",
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "must be uploaded" in response.text
