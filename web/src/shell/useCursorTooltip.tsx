@@ -1,10 +1,12 @@
 import { useState } from "react";
+import { createPortal } from "react-dom";
+import { getEmbedRoot } from "@/lib/host";
 
 /**
  * Returns mouse event handlers for a trigger element and a fixed-positioned
- * tooltip node that follows the cursor. Render `tooltip` as a sibling to the
- * trigger (outside any interactive element) — it uses `position: fixed` so it
- * escapes all overflow / stacking contexts automatically.
+ * tooltip node that follows the cursor. The node is portalled to the embed root
+ * (or `document.body` standalone), so a transformed ancestor such as a
+ * virtualized row can't become its containing block.
  */
 export function useCursorTooltip(text: string): {
   handlers: {
@@ -20,14 +22,22 @@ export function useCursorTooltip(text: string): {
     onMouseLeave: () => setCursorPos(null),
   };
 
-  const tooltip = cursorPos ? (
-    <div
-      style={{ position: "fixed", left: cursorPos.x, top: cursorPos.y + 14, pointerEvents: "none" }}
-      className="z-50 inline-flex w-fit items-center rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-tooltip"
-    >
-      {text}
-    </div>
-  ) : null;
+  const tooltip = cursorPos
+    ? createPortal(
+        <div
+          style={{
+            position: "fixed",
+            left: cursorPos.x,
+            top: cursorPos.y + 14,
+            pointerEvents: "none",
+          }}
+          className="z-50 inline-flex w-fit items-center rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-tooltip"
+        >
+          {text}
+        </div>,
+        getEmbedRoot() ?? document.body,
+      )
+    : null;
 
   return { handlers, tooltip };
 }
