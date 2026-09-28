@@ -3404,8 +3404,11 @@ def register_core_routes(
 
             policy = _request_attachment_policy(request)
             for stored in fork_source_files:
-                _attachment_name_allowed(stored.filename, policy)
-                if stored_file_requires_filesystem(stored.filename, stored.source_metadata):
+                filesystem = stored_file_requires_filesystem(
+                    stored.filename, stored.source_metadata
+                )
+                _attachment_name_allowed(stored.filename, policy, historic_inline=not filesystem)
+                if filesystem:
                     filesystem_sources.append(stored)
             if filesystem_sources:
                 await asyncio.to_thread(
