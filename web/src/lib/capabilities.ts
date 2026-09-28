@@ -64,6 +64,7 @@ export type FeatureValues = Record<string, boolean>;
 
 export interface FilesystemAttachmentPolicy {
   inline_extensions?: Record<string, "image" | "pdf" | "text">;
+  non_inline_extensions?: string[];
   allowed_extensions: string[] | "*";
   denied_extensions: string[];
   max_bytes: number;
@@ -235,6 +236,7 @@ function parseFilesystemAttachmentPolicy(raw: unknown): FilesystemAttachmentPoli
     max_total_bytes,
     harnesses,
     inline_extensions,
+    non_inline_extensions,
   } = value;
   if (
     (allowed_extensions !== "*" && !extensions(allowed_extensions)) ||
@@ -249,11 +251,10 @@ function parseFilesystemAttachmentPolicy(raw: unknown): FilesystemAttachmentPoli
     inline_extensions !== undefined &&
     (inline_extensions === null ||
       typeof inline_extensions !== "object" ||
-      Array.isArray(inline_extensions) ||
-      !Object.entries(inline_extensions).every(
-        ([extension, category]) => suffix(extension) && ["image", "pdf", "text"].includes(category),
-      ))
+      Array.isArray(inline_extensions))
   )
+    return undefined;
+  if (non_inline_extensions !== undefined && !Array.isArray(non_inline_extensions))
     return undefined;
   return {
     allowed_extensions,
@@ -265,7 +266,19 @@ function parseFilesystemAttachmentPolicy(raw: unknown): FilesystemAttachmentPoli
     ...(inline_extensions === undefined
       ? {}
       : {
-          inline_extensions: inline_extensions as FilesystemAttachmentPolicy["inline_extensions"],
+          inline_extensions: Object.fromEntries(
+            Object.entries(inline_extensions).filter(
+              ([extension, category]) =>
+                suffix(extension) && ["image", "pdf", "text"].includes(category),
+            ),
+          ) as FilesystemAttachmentPolicy["inline_extensions"],
+        }),
+    ...(non_inline_extensions === undefined
+      ? {}
+      : {
+          non_inline_extensions: non_inline_extensions.filter(
+            (entry): entry is string => typeof entry === "string" && suffix(entry),
+          ),
         }),
   };
 }

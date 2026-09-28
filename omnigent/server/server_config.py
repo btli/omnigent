@@ -226,12 +226,17 @@ class FilesystemAttachmentPolicy:
     max_total_bytes: int
 
     def allows(self, filename: str) -> bool:
-        name = filename.lower()
+        from omnigent.inner.native_attachments import attachment_matching_filename
+
+        name = attachment_matching_filename(filename)
         return self.allowed_extensions == "*" or name.endswith(tuple(self.allowed_extensions))
 
     def public_dict(self) -> dict[str, Any]:
         from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
-        from omnigent.runtime.content_resolver import inline_attachment_extensions
+        from omnigent.runtime.content_resolver import (
+            inline_attachment_extensions,
+            non_inline_attachment_extensions,
+        )
 
         return {
             "allowed_extensions": "*"
@@ -243,6 +248,7 @@ class FilesystemAttachmentPolicy:
             "max_total_bytes": self.max_total_bytes,
             "harnesses": sorted(FILESYSTEM_ATTACHMENT_HARNESSES),
             "inline_extensions": inline_attachment_extensions(),
+            "non_inline_extensions": sorted(non_inline_attachment_extensions()),
         }
 
 

@@ -2157,6 +2157,9 @@ async def test_info_publishes_effective_attachment_policy(
     assert response.status_code == 200
     published = response.json()["filesystem_attachment_policy"]
     assert published.pop("inline_extensions")[".ics"] == "text"
+    non_inline = published.pop("non_inline_extensions")
+    assert ".mp4" in non_inline and ".gz" in non_inline
+    assert ".bin" not in non_inline and ".txt" not in non_inline
     assert published == {
         "allowed_extensions": [".mp4"],
         "denied_extensions": [".exe"],
@@ -2196,19 +2199,28 @@ async def test_attachment_admission_uses_the_published_startup_policy(
     assert "Claude Code or Codex" in response.text
 
 
-async def test_attachment_snapshot_loads_environment_config_with_cli_title_override(
-    db_uri, runtime_init, tmp_path, monkeypatch
+@pytest.mark.parametrize("explicit_config", [{}, {"session_title_instructions": "Brief"}])
+async def test_attachment_snapshot_uses_explicit_config_without_disk_inheritance(
+    db_uri, runtime_init, tmp_path, monkeypatch, explicit_config
 ) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server import server_config as config_module
+
     config = tmp_path / "attachment-policy.yaml"
     config.write_text('filesystem_attachment_allowed_extensions: [".mp4"]\n')
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    load = Mock(wraps=config_module.load_server_config)
+    monkeypatch.setattr(config_module, "load_server_config", load)
     app = _build_branding_app(
-        db_uri, tmp_path, "attachment-env", server_config={"session_title_instructions": "Brief"}
+        db_uri, tmp_path, "attachment-explicit", server_config=explicit_config
     )
-    config.write_text("filesystem_attachment_allowed_extensions: []\n")
+    load.assert_not_called()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.get("/v1/info")
-    assert response.json()["filesystem_attachment_policy"]["allowed_extensions"] == [".mp4"]
-    assert app.state.filesystem_attachment_policy.allows("clip.mp4")
+    allowed = response.json()["filesystem_attachment_policy"]["allowed_extensions"]
+    assert ".zip" in allowed
+    assert ".mp4" not in allowed
+    assert not app.state.filesystem_attachment_policy.allows("clip.mp4")
