@@ -16,6 +16,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
 }));
 
+const TIMED_OUT = "Search timed out. Try a more specific search.";
+const LOAD_ERROR = "Couldn't load sessions.";
+
 function conv(
   id: string,
   title: string | null,
@@ -171,10 +174,8 @@ describe("CommandPalette — sessions", () => {
       });
       act(() => vi.advanceTimersByTime(300));
 
-      expect(screen.getByRole("status").textContent).toContain(
-        "Search timed out. Try a more specific search.",
-      );
-      expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
+      expect(screen.getByRole("status").textContent).toContain(TIMED_OUT);
+      expect(screen.queryByText(LOAD_ERROR)).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Retry" }));
       expect(refetch).toHaveBeenCalledOnce();
       useConversations.mockReturnValue({
@@ -187,8 +188,8 @@ describe("CommandPalette — sessions", () => {
         target: { value: "another term" },
       });
       act(() => vi.advanceTimersByTime(300));
-      expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
-      expect(screen.queryByText("Search timed out. Try a more specific search.")).toBeNull();
+      expect(screen.getByRole("status").textContent).toContain(LOAD_ERROR);
+      expect(screen.queryByText(TIMED_OUT)).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -219,11 +220,11 @@ describe("CommandPalette — sessions", () => {
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "faster" },
       });
-      expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
-      expect(screen.queryByText("Search timed out. Try a more specific search.")).toBeNull();
+      expect(screen.queryByText(LOAD_ERROR)).toBeNull();
+      expect(screen.queryByText(TIMED_OUT)).toBeNull();
       act(() => vi.advanceTimersByTime(300));
-      expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
-      expect(screen.queryByText("Search timed out. Try a more specific search.")).toBeNull();
+      expect(screen.queryByText(LOAD_ERROR)).toBeNull();
+      expect(screen.queryByText(TIMED_OUT)).toBeNull();
     } finally {
       vi.useRealTimers();
     }
