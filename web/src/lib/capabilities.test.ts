@@ -281,7 +281,6 @@ describe("attachment policy parsing", () => {
     ["harnesses string", { ...validAttachmentPolicy, harnesses: "claude-native" }],
     ["harnesses mixed", { ...validAttachmentPolicy, harnesses: [1] }],
     ["inline array", { ...validAttachmentPolicy, inline_extensions: [] }],
-    ["inline category", { ...validAttachmentPolicy, inline_extensions: { ".txt": "file" } }],
   ])("falls back safely for malformed %s", async (_label, malformed) => {
     const result = await probe({ filesystem_attachment_policy: malformed });
     expect(result.filesystem_attachment_policy).toBeUndefined();
@@ -308,5 +307,56 @@ describe("attachment policy parsing", () => {
       validAttachmentPolicy,
     );
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("additive attachment policy fields", () => {
+  it.each([
+    { ".future": "video" },
+    { "invalid/suffix": "text" },
+    { txt: "text" },
+    { ".empty": null },
+  ])("keeps core policy and valid inline entries alongside %j", async (unknown) => {
+    const mixed = {
+      ...validAttachmentPolicy,
+      inline_extensions: { ".txt": "text", ".pdf": "pdf", ...unknown },
+    };
+    const result = await probe({ filesystem_attachment_policy: mixed });
+    expect(result.filesystem_attachment_policy).toEqual({
+      ...validAttachmentPolicy,
+      inline_extensions: { ".txt": "text", ".pdf": "pdf" },
+    });
+    expect(attachmentAccept(result.filesystem_attachment_policy)).toContain(".mp4");
+    expect(
+      validateAttachments([new File(["content"], "note.txt")], result.filesystem_attachment_policy)
+        .accepted,
+    ).toHaveLength(1);
+  });
+  it("uses valid non-inline suffix knowledge and drops invalid entries", async () => {
+    const result = await probe({
+      filesystem_attachment_policy: {
+        ...validAttachmentPolicy,
+        allowed_extensions: "*",
+        non_inline_extensions: [".mp4", "bad/path", 1],
+      },
+    });
+    expect(result.filesystem_attachment_policy?.non_inline_extensions).toEqual([".mp4"]);
+    const video = new File(["longer than quota"], "clip.mp4", { type: "text/plain" });
+    expect(
+      validateAttachments([video], { ...result.filesystem_attachment_policy!, max_bytes: 1 })
+        .errors[0],
+    ).toContain("too large");
+  });
+  it("falls back safely for a malformed non-inline suffix container", async () => {
+    expect(
+      (
+        await probe({
+          filesystem_attachment_policy: {
+            ...validAttachmentPolicy,
+            non_inline_extensions: { ".mp4": true },
+          },
+        })
+      ).filesystem_attachment_policy,
+    ).toBeUndefined();
   });
 });
