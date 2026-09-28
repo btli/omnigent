@@ -843,7 +843,7 @@ const SWIPE_ACTION_LABELS: Record<SwipeAction, string> = {
 
 /**
  * Archive is always blue and Delete always red, whatever the colour palette. These
- * shades keep AA contrast on every palette's card, hover, open and menu surfaces.
+ * shades keep AA contrast on every built-in palette's card, hover, open and menu surfaces.
  */
 const SWIPE_ACTION_TONES: Record<SwipeAction, string | undefined> = {
   archive: "text-blue-700 dark:text-blue-300",
