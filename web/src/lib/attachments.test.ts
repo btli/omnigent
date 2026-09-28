@@ -24,6 +24,7 @@ const defaultAttachmentPolicy = {
 
 const policy: FilesystemAttachmentPolicy = {
   allowed_extensions: [".mp4"],
+  non_inline_extensions: [".mp4"],
   denied_extensions: [".exe"],
   max_bytes: 100 * 1024 * 1024,
   max_files: 2,
@@ -338,7 +339,7 @@ describe("attachment policy compatibility", () => {
       ).toContain("filename");
     },
   );
-  it.each(["a\u200b.txt", "a\u202e.txt", "a\u2028.txt", "a\u2029.txt"])(
+  it.each(["a\u202e.txt", "a\u2028.txt", "a\u2029.txt"])(
     "rejects Unicode unsafe filename %j",
     (name) => {
       expect(validateAttachments([makeFile(name, "text/plain")], policy).errors[0]).toContain(
@@ -365,13 +366,15 @@ describe("attachment policy compatibility", () => {
     },
   );
   it.each(["a".repeat(252) + ".txt", "é".repeat(126) + ".txt", "a.".repeat(200) + "txt"])(
-    "bounds UTF8 filename bytes %j",
+    "bounds raw UTF8 filename bytes %j",
     (name) => {
       expect(validateAttachments([makeFile(name, "text/plain")], policy).errors[0]).toContain(
         "filename",
       );
       const boundary = makeFile("é".repeat(125) + "a.txt .\u00a0", "text/plain");
-      expect(validateAttachments([boundary], policy).accepted).toEqual([boundary]);
+      expect(validateAttachments([boundary], policy).errors[0]).toContain("filename");
+      const exactBoundary = makeFile("é".repeat(125) + "a.txt", "text/plain");
+      expect(validateAttachments([exactBoundary], policy).accepted).toEqual([exactBoundary]);
     },
   );
   it.each([
@@ -386,5 +389,71 @@ describe("attachment policy compatibility", () => {
         max_bytes: maximum,
       }).errors[0],
     ).toContain(`limit is ${label}.`);
+  });
+});
+
+describe("wildcard filename-derived delivery", () => {
+  it("lets declared MIME steer only generic names", () => {
+    const wildcard = { ...policy, allowed_extensions: "*" as const, max_bytes: 1 };
+    for (const mime of ["text/plain", "image/png", "", "application/octet-stream"]) {
+      for (const name of ["clip.mp4", "clip.mp4:x.png"]) {
+        const file = makeFile(name, mime);
+        expect(classifyAttachment(file, wildcard)).toBe("file");
+        expect(validateAttachments([file], wildcard).errors[0]).toContain(
+          name.includes(":") ? "filesystem filename" : "too large",
+        );
+        expect(classifyAttachment(file, { ...wildcard, allowed_extensions: [".mp4"] })).toBe(
+          "file",
+        );
+      }
+    }
+    for (const [name, mime, category] of [
+      ["README", "text/plain", "text"],
+      ["photo", "image/png", "image"],
+      ["payload.bin", "text/plain", "text"],
+    ] as const) {
+      expect(classifyAttachment(makeFile(name, mime), wildcard)).toBe(category);
+    }
+  });
+});
+
+describe("portable Unicode attachment names", () => {
+  it.each([
+    "family👨‍👩.png",
+    "résumé\u00ad.pdf",
+    "שלום\u200f.txt",
+    "\ufeffnotes.txt",
+    "note\u200e.txt",
+    "a\u200b.txt",
+  ])("preserves harmless format characters in %j", (name) => {
+    const file = makeFile(name, "");
+    expect(validateAttachments([file], policy).accepted).toEqual([file]);
+    expect(file.name).toBe(name);
+  });
+  it("ignores harmless format characters only for extension matching", () => {
+    const video = makeFile("clip.mp4\u200b", "text/plain");
+    expect(classifyAttachment(video, policy)).toBe("file");
+    expect(validateAttachments([video], policy).accepted).toEqual([video]);
+    expect(video.name).toBe("clip.mp4\u200b");
+    for (const control of ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e"]) {
+      expect(
+        validateAttachments([makeFile(`a${control}.txt`, "text/plain")], policy).errors[0],
+      ).toContain("filename");
+    }
+    for (const control of ["\u2066", "\u2067", "\u2068", "\u2069"]) {
+      expect(
+        validateAttachments([makeFile(`a${control}.txt`, "text/plain")], policy).errors[0],
+      ).toContain("filename");
+    }
+    for (const name of ["a.exe\u200b", "a.exe\u00a0", "a.e\u200dxe.txt"]) {
+      expect(
+        validateAttachments([makeFile(name, "text/plain")], { ...policy, allowed_extensions: "*" })
+          .errors[0],
+      ).toContain("denied");
+    }
+  });
+  it("rejects excessive raw padding before filename normalization", () => {
+    const padded = makeFile("clip.mp4" + " ".repeat(200_000), "video/mp4");
+    expect(validateAttachments([padded], policy).errors[0]).toContain("filename");
   });
 });
