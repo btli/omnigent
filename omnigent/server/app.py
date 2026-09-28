@@ -1502,11 +1502,8 @@ def create_app(
         session_title_instructions,
     )
 
-    loaded_server_config = load_server_config()
-    resolved_server_config = loaded_server_config if server_config is None else server_config
-    attachment_policy = filesystem_attachment_policy(
-        {**loaded_server_config, **resolved_server_config}
-    )
+    resolved_server_config = load_server_config() if server_config is None else server_config
+    attachment_policy = filesystem_attachment_policy(resolved_server_config)
     published_attachment_policy = attachment_policy.public_dict()
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
