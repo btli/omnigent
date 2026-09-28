@@ -257,7 +257,7 @@ export function CommandPalette({
   }, [data, debouncedQuery, query, sessionsOnly]);
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const loadError = (sessionsOnly || query === debouncedQuery) && (isError || isFetchNextPageError);
-  const searchTimedOut = !sessionsOnly && Boolean(debouncedQuery) && isAbortTimeout(error);
+  const searchTimedOut = isAbortTimeout(error);
 
   const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
   const placeholder = sessionsOnly
