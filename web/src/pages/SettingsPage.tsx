@@ -840,17 +840,20 @@ const SWIPE_ACTION_LABELS: Record<SwipeAction, string> = {
   none: "None",
 };
 
-/** Swipe-tile colours for the chosen action; None stays neutral. */
+/**
+ * Archive is always blue and Delete always red, whatever the colour palette. These
+ * shades keep AA contrast on every palette's card, hover, open and menu surfaces.
+ */
 const SWIPE_ACTION_TONES: Record<SwipeAction, string | undefined> = {
-  archive: "text-accent-foreground",
-  delete: "text-destructive",
+  archive: "text-blue-700 dark:text-blue-300",
+  delete: "text-red-800 dark:text-red-200",
   none: undefined,
 };
 
-// Dark bg-muted highlights drop these tones below AA, so highlighted text falls back to foreground.
+// Menu items reset highlighted text to foreground; keep the tone on the checked item.
 const SWIPE_ACTION_FOCUS_TONES: Record<SwipeAction, string | undefined> = {
-  archive: "focus:text-accent-foreground dark:focus:text-foreground",
-  delete: "focus:text-destructive dark:focus:text-foreground",
+  archive: "focus:text-blue-700 dark:focus:text-blue-300",
+  delete: "focus:text-red-800 dark:focus:text-red-200",
   none: undefined,
 };
 
@@ -904,16 +907,12 @@ function SwipeActionsControl() {
                   type="button"
                   aria-label={`Swipe ${direction}: ${SWIPE_ACTION_LABELS[action]}`}
                   data-testid={`swipe-action-${direction}`}
-                  className={themeCardClass(open, "group items-center gap-2 p-4")}
+                  className={themeCardClass(open, "items-center gap-2 p-4")}
                 >
                   {iconCardBody(SWIPE_ACTION_ICONS[action], `Swipe ${direction}`, tone)}
                   <span
                     data-testid={`swipe-action-${direction}-label`}
-                    className={cn(
-                      "flex items-center gap-1 text-sm text-muted-foreground",
-                      tone,
-                      tone && "dark:group-hover:text-foreground",
-                    )}
+                    className={cn("flex items-center gap-1 text-sm text-muted-foreground", tone)}
                   >
                     {SWIPE_ACTION_LABELS[action]}
                     <ChevronDownIcon aria-hidden="true" className="size-4 text-muted-foreground" />
