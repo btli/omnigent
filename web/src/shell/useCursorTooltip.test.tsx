@@ -25,22 +25,31 @@ function TransformedRow() {
   );
 }
 
-// jsdom has no layout: fix the viewport and the tooltip's measured box.
+// jsdom has no layout: fix the viewport (the root's client box) and give only
+// the element holding exactly the tooltip text a box, so measuring any other
+// node reads 0x0. Mutate the returned size to simulate a re-wrap.
 function stubLayout(viewport: [number, number], tooltip: [number, number]) {
-  vi.stubGlobal("innerWidth", viewport[0]);
-  vi.stubGlobal("innerHeight", viewport[1]);
-  const [width, height] = tooltip;
-  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
-    width,
-    height,
-    top: 0,
-    left: 0,
-    right: width,
-    bottom: height,
-    x: 0,
-    y: 0,
-    toJSON: () => ({}),
-  } as DOMRect);
+  vi.spyOn(document.documentElement, "clientWidth", "get").mockReturnValue(viewport[0]);
+  vi.spyOn(document.documentElement, "clientHeight", "get").mockReturnValue(viewport[1]);
+  const size = { width: tooltip[0], height: tooltip[1] };
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    const { width, height } =
+      this.textContent === "folder/file.ts" ? size : { width: 0, height: 0 };
+    return {
+      width,
+      height,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: height,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect;
+  });
+  return size;
 }
 
 function hoverAt(clientX: number, clientY: number) {
@@ -111,5 +120,29 @@ describe("useCursorTooltip", () => {
     expect(tooltip).toHaveClass("w-max");
     expect(tooltip).not.toHaveClass("w-fit");
     expect(tooltip).toHaveStyle({ maxWidth: "984px" });
+    // A path wider than the cap has no break points; it must still wrap inside the box.
+    expect(tooltip).toHaveClass("wrap-anywhere");
+  });
+
+  it("measures the viewport without a classic scrollbar", () => {
+    stubLayout([1000, 800], [200, 30]);
+    // A 17px classic scrollbar: the window is wider than the usable viewport.
+    vi.stubGlobal("innerWidth", 1017);
+
+    const tooltip = hoverAt(795, 200);
+
+    expect(tooltip).toHaveStyle({ left: "595px", maxWidth: "984px" });
+  });
+
+  it("re-measures while shown, so a re-wrap moves it off the edge", () => {
+    const size = stubLayout([1000, 800], [200, 30]);
+    const tooltip = hoverAt(700, 200);
+    expect(tooltip).toHaveStyle({ left: "700px" });
+
+    // Same text, bigger box (e.g. after a font loads): the next render must flip.
+    size.width = 400;
+    fireEvent.mouseMove(screen.getByText("file.ts"), { clientX: 701, clientY: 200 });
+
+    expect(tooltip).toHaveStyle({ left: "301px" });
   });
 });
