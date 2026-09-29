@@ -468,12 +468,16 @@ async def test_hosts_api_host_stats_null_for_older_host(db_uri: str) -> None:
     assert single.json()["stats"] is None
 
 
-async def test_hosts_api_keeps_only_last_seen_for_a_disconnected_host(db_uri: str) -> None:
+async def test_hosts_api_keeps_only_last_seen_for_a_disconnected_host(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Verify a host that disconnects after reporting lists offline with its last-seen.
 
     The readings go with the connection; only ``reported_at`` stays, which is
-    what the tooltip's "offline · last seen" header renders.
+    what the tooltip's "offline · last seen" header renders. It comes from the
+    hosts row, so a host seen later through another replica isn't shown as
+    last seen when it left this one.
     """
     app, registry, host_store, _cs = _build_host_api_app(db_uri, _HOST_STATS_ON)
     comm = await _connect_host(app, registry)
@@ -492,9 +496,17 @@ async def test_hosts_api_keeps_only_last_seen_for_a_disconnected_host(db_uri: st
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         host = (await client.get("/v1/hosts")).json()["hosts"][0]
+        assert host["status"] == "offline"
+        assert host["stats"] == {"reported_at": row.updated_at}
 
-    assert host["status"] == "offline"
-    assert host["stats"] == {"reported_at": reported["reported_at"]}
+        # Another replica's tunnel heart-beats the shared row after this one lost the host.
+        later = row.updated_at + 300
+        monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: later)
+        host_store.heartbeat(_HOST_ID)
+        single = (await client.get(f"/v1/hosts/{_HOST_ID}")).json()
+
+    assert single["stats"] == {"reported_at": later}
+    assert later > reported["reported_at"]
 
 
 async def test_hosts_api_omits_host_stats_while_the_feature_is_off(
