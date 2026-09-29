@@ -3730,11 +3730,13 @@ function ConversationMenuItems({
   );
 }
 
+const SESSION_ERROR_EXPLANATION = "Latest message is an error";
+
 function SessionErrorHint() {
   return (
     <p className="mt-1 flex items-center gap-1.5 text-sm text-destructive">
       <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
-      <span>Latest message is an error</span>
+      <span>{SESSION_ERROR_EXPLANATION}</span>
     </p>
   );
 }
@@ -3755,12 +3757,12 @@ function SessionTooltipContent({
     : host?.sandbox_provider
       ? sandboxOptionLabel(host.sandbox_provider)
       : (host?.name ?? conversation.host_id);
-  const workspace = conversation.workspace || null;
-  const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace ?? "");
+  const workspace = conversation.workspace ?? "";
+  const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
   // Runner-owned failure detail the server persists as a label; transcript-only
   // errors have none, so they keep the generic explanation.
   const errorMessage =
-    conversation.labels?.["omnigent.last_task_error_message"] || "Latest message is an error";
+    conversation.labels?.["omnigent.last_task_error_message"] || SESSION_ERROR_EXPLANATION;
   const dot = (className: string) => (
     <span aria-hidden className="flex size-3.5 shrink-0 items-center justify-center">
       <span className={cn("size-2 rounded-full", className)} />
