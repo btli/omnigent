@@ -3791,34 +3791,54 @@ function SessionTooltipContent({
       <span className={cn("size-2 rounded-full", className)} />
     </span>
   );
-  // Labels mirror the row's SessionStateBadge; `unseen` is read state, not
-  // liveness, so it reads as Idle.
+  // Labels mirror the row's SessionStateBadge; `key` feeds `data-state`.
   const status = (() => {
     switch (state?.kind) {
       case "running":
-        return { label: "Working", icon: <RunningDot className="size-3.5" />, tone: "" };
+        return {
+          key: "working",
+          label: "Working",
+          icon: <RunningDot className="size-3.5" />,
+          tone: "",
+        };
       case "starting":
-        return { label: "Starting up", icon: <RunningDot className="size-3.5" />, tone: "" };
+        return {
+          key: "starting",
+          label: "Starting up",
+          icon: <RunningDot className="size-3.5" />,
+          tone: "",
+        };
       case "awaiting":
         return {
+          key: "needs-response",
           label: "Needs response",
           icon: dot("bg-brand-accent"),
           tone: "text-brand-accent",
         };
       case "error":
         return {
+          key: "error",
           label: "Error",
           icon: <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />,
           tone: "text-destructive",
         };
       case "disconnected":
         return {
+          key: "disconnected",
           label: "Host disconnected",
           icon: dot("border border-muted-foreground"),
           tone: "",
         };
-      default:
+      case "unseen":
         return {
+          key: "new-messages",
+          label: "New messages",
+          icon: dot("bg-brand-accent"),
+          tone: "",
+        };
+      case undefined:
+        return {
+          key: "idle",
           label: "Idle",
           icon: <CircleIcon aria-hidden className="size-3.5 shrink-0" />,
           tone: "",
@@ -3882,7 +3902,7 @@ function SessionTooltipContent({
       )}
       <p
         data-testid="session-tooltip-status"
-        data-state={state?.kind ?? "idle"}
+        data-state={status.key}
         className={cn(
           "mt-1 flex items-center gap-1.5 text-sm",
           status.tone || "text-muted-foreground",
