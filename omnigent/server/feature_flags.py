@@ -25,6 +25,7 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
+    HOST_STATS = "host_stats"
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Harnesses settings page with per-harness MCPs, skills, and plugins",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
+        review_by_release="0.18.0",
     ),
 )
 
