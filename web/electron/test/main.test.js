@@ -40,6 +40,7 @@ function loadNavigationHarness({
   registerFallbacks = true,
   databricksMode = "embedded",
   ensureSession = async (_ses, origin) => origin,
+  normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
   oidc,
@@ -213,7 +214,7 @@ function loadNavigationHarness({
     },
     "./url": {
       ...urlHelpers,
-      normalizeUrl: (url) => url,
+      normalizeUrl: normalizeServer,
       expandDatabricksWorkspaceUrl: expandWorkspace,
       fetchServerManifest: async (url) => {
         calls.manifests.push(url);
@@ -398,6 +399,34 @@ function loadNavigationHarness({
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
+
+  it("connects a pasted HTTP workspace URL using HTTPS auth and the Omnigent mount", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ headers: new Headers({ server: "databricks" }) });
+    t.after(() => {
+      globalThis.fetch = originalFetch;
+    });
+    const h = loadNavigationHarness({
+      serverUrl: target,
+      databricksMode: "browser",
+      normalizeServer: urlHelpers.normalizeUrl,
+      expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.ipc.get("omnigent:set-server-url")(
+      { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+      "http://workspace.cloud.databricks.com/omnigent?o=123",
+    );
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
+    assert.equal(h.api.windows.get(h.win).origin, "https://workspace.cloud.databricks.com");
+    const saved = JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    assert.equal(saved.server_url, target);
+    assert.deepEqual(saved.recent_servers, [target]);
+  });
   const tick = () =>
     new Promise((resolve) => {
       setTimeout(resolve, 5);
@@ -448,6 +477,21 @@ describe("Databricks auth mode wiring", () => {
     await h.api.loadServerUrl(h.win, workspace, "/c/deep-linked");
     assert.equal(h.calls.auth[1][2].interactive, false);
     assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
+  });
+
+  it("upgrades a saved HTTP workspace before restoring authentication", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      savedServerUrl: target.replace("https:", "http:"),
+      serverUrl: target,
+      databricksMode: "browser",
+    });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    await tick();
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
   });
 
   it("never opens browser OAuth for the explicit embedded rollback or non-workspace servers", async (t) => {
@@ -860,10 +904,59 @@ describe("managed server preference wiring", () => {
     );
   });
 
+  it("offers the onboarding remote environment only behind the host picker's gate plus arca", () => {
+    assert.match(
+      preloadSource,
+      /getRunnerOptions:\s*\(url\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-runner-options",\s*url\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-runner-options"[\s\S]{0,120}!isSetupPageSender\(event\)[\s\S]{0,200}typeof url === "string" &&\s*databricksInternalFeaturesEnabled\(\) &&\s*isDatabricksManagedServerUrl\(url\);\s*return \{ remote: internal && arca\.resolveArcaPath\(\) !== null, bundledCli: internal \}/,
+    );
+  });
+
+  it("connects the onboarding runner only for the setup page, re-checking the remote gate", () => {
+    assert.match(
+      preloadSource,
+      /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
+    );
+    const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
+    const end = liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"');
+    assert.ok(start >= 0 && end > start, "connect-runner handler not found before copy-setup-text");
+    const handler = liveCode.slice(start, end);
+    assert.match(handler, /^[\s\S]{0,120}!isSetupPageSender\(event\)/);
+    assert.match(handler, /runner !== "local" && runner !== "remote"/);
+    assert.match(handler, /typeof url !== "string"\) throw new TypeError/);
+    // Same target resolution as set-server-url; the remote run dies with the setup window.
+    assert.match(handler, /const target = await resolveConnectTarget\(url\);/);
+    assert.match(
+      handler,
+      /event\.sender\.once\("destroyed", cancel\);\s*const result = await run\.promise;\s*event\.sender\.removeListener\("destroyed", cancel\);/,
+    );
+    assert.match(
+      handler,
+      /if \(!cliCommand\) return \{ ok: false, error: missingHostCliError\(target\) \};/,
+    );
+    // Remote: the window-independent gate is re-checked in main, never trusted from the page.
+    assert.match(
+      handler,
+      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}arca\.startArcaConnect\(target/,
+    );
+    // Local: same CLI choice and sign-in-first order as the host menu's start.
+    assert.match(
+      handler,
+      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+    );
+  });
+
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized,\s*\{\s*signal\s*\}\)/,
+      /function resolveConnectTarget\(url, options\)[\s\S]{0,160}expandDatabricksWorkspaceUrl\(managedTarget \?\? normalizeUrl\(url\), options\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:set-server-url"[\s\S]{0,1200}await resolveConnectTarget\(url, \{ signal \}\)/,
     );
   });
 

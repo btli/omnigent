@@ -3403,8 +3403,7 @@ function registerIpc() {
       // preserve it exactly. The shared expansion is a no-op for paths, while a
       // managed workspace root still gets the normal mount discovery.
       const managedTarget = managedServerUrls().find((candidate) => candidate === url);
-      const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
-      const target = await expandDatabricksWorkspaceUrl(normalized, { signal });
+      const target = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
       signal.throwIfAborted();
 
       // Guard against navigating to (and pinning as trusted) a non-Omnigent site
@@ -3845,6 +3844,8 @@ function registerIpc() {
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
+      // start-local's own reuse test, so "Open" vs "Start Omnigent" matches it.
+      localServerRunning: (await omnigentCli.localServerHealthy()) !== null,
     };
   });
 
@@ -3929,6 +3930,13 @@ function registerIpc() {
       cliInstallInFlight = null;
     });
     return cliInstallInFlight;
+  });
+
+  registerFileReveal({
+    ipcMain,
+    shell,
+    isPinnedOriginSender: isPinnedWorkspaceSender,
+    localHostId: () => omnigentCli.localHostId(),
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
@@ -4082,7 +4090,7 @@ function registerIpc() {
   // light up against arbitrary self-hosted servers. Read fresh per call so
   // applying/removing the profile takes effect without a restart.
   ipcMain.handle("omnigent:get-desktop-features", (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       console.warn("[omnigent] get-desktop-features from untrusted sender dropped");
       return null;
     }
@@ -4103,7 +4111,7 @@ function registerIpc() {
   // a wedged command always settles. No local process outlives the connect:
   // the enrolled host keeps its own outbound tunnel from the Arca box.
   ipcMain.handle("omnigent:arca-connect", async (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
     }
     if (!databricksInternalFeaturesEnabled()) {
