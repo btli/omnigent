@@ -500,8 +500,8 @@ class HostRegistry:
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
         # Last resource snapshot each host piggybacked on a keepalive pong. Keyed
-        # like ``_hosts`` so a host id reused in another workspace never reads it;
-        # kept across a disconnect so an offline host still shows when it reported.
+        # like ``_hosts`` so a host id reused in another workspace never reads it,
+        # and dropped with the connection so no replica serves a stale reading.
         self._host_stats: dict[tuple[int, str], dict[str, float]] = {}
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
@@ -614,6 +614,7 @@ class HostRegistry:
             if current is None or (conn is not None and current is not conn):
                 return False
             removed = self._hosts.pop(key)
+            self._host_stats.pop(key, None)
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
