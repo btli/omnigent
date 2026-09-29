@@ -27,12 +27,14 @@ import {
   ArchiveIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
+  BotIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
   CircleAlertIcon,
+  CircleIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
@@ -159,6 +161,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { useLeftTrimmedPath } from "@/lib/leftTrimmedPath";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
@@ -167,6 +170,7 @@ import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
+import { RunningDot } from "@/components/RunningDot";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
@@ -3626,11 +3630,12 @@ function SessionErrorHint() {
 function SessionTooltipContent({
   conversation,
   hostsById,
-  hasError,
+  state,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
-  hasError: boolean;
+  // The row's own indicator state, so the tooltip never re-derives it.
+  state: SessionState | null;
 }) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
@@ -3638,6 +3643,51 @@ function SessionTooltipContent({
     : host?.sandbox_provider
       ? sandboxOptionLabel(host.sandbox_provider)
       : (host?.name ?? conversation.host_id);
+  const workspace = conversation.workspace || null;
+  const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace ?? "");
+  // Runner-owned failure detail the server persists as a label; transcript-only
+  // errors have none, so they keep the generic explanation.
+  const errorMessage =
+    conversation.labels?.["omnigent.last_task_error_message"] || "Latest message is an error";
+  const dot = (className: string) => (
+    <span aria-hidden className="flex size-3.5 shrink-0 items-center justify-center">
+      <span className={cn("size-2 rounded-full", className)} />
+    </span>
+  );
+  // Labels mirror the row's SessionStateBadge; `unseen` is read state, not
+  // liveness, so it reads as Idle.
+  const status = (() => {
+    switch (state?.kind) {
+      case "running":
+        return { label: "Working", icon: <RunningDot className="size-3.5" />, tone: "" };
+      case "starting":
+        return { label: "Starting up", icon: <RunningDot className="size-3.5" />, tone: "" };
+      case "awaiting":
+        return {
+          label: "Needs response",
+          icon: dot("bg-brand-accent"),
+          tone: "text-brand-accent",
+        };
+      case "error":
+        return {
+          label: "Error",
+          icon: <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />,
+          tone: "text-destructive",
+        };
+      case "disconnected":
+        return {
+          label: "Host disconnected",
+          icon: dot("border border-muted-foreground"),
+          tone: "",
+        };
+      default:
+        return {
+          label: "Idle",
+          icon: <CircleIcon aria-hidden className="size-3.5 shrink-0" />,
+          tone: "",
+        };
+    }
+  })();
 
   return (
     <TooltipContent
@@ -3647,7 +3697,7 @@ function SessionTooltipContent({
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
       // then muted, small-icon metadata lines.
-      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
@@ -3656,6 +3706,27 @@ function SessionTooltipContent({
           {relativeTime(conversation.updated_at * 1000)}
         </span>
       </p>
+      {conversation.agent_name && (
+        <p
+          data-testid="session-tooltip-agent"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <BotIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{conversation.agent_name}</span>
+        </p>
+      )}
+      {workspace && (
+        <p
+          data-testid="session-tooltip-cwd"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <FolderIcon aria-hidden className="size-3.5 shrink-0" />
+          <span ref={trimmedWorkspace.ref} aria-hidden className="truncate">
+            {trimmedWorkspace.text}
+          </span>
+          <span className="sr-only">{workspace}</span>
+        </p>
+      )}
       <p
         data-testid="session-tooltip-location"
         className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
@@ -3672,7 +3743,25 @@ function SessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
-      {hasError && <SessionErrorHint />}
+      <p
+        data-testid="session-tooltip-status"
+        data-state={state?.kind ?? "idle"}
+        className={cn(
+          "mt-1 flex items-center gap-1.5 text-sm",
+          status.tone || "text-muted-foreground",
+        )}
+      >
+        {status.icon}
+        <span className="truncate">{status.label}</span>
+      </p>
+      {state?.kind === "error" && (
+        <p
+          data-testid="session-tooltip-error"
+          className="mt-0.5 line-clamp-3 pl-5 text-sm break-words text-destructive"
+        >
+          {errorMessage}
+        </p>
+      )}
     </TooltipContent>
   );
 }
@@ -4199,7 +4288,7 @@ function ConversationRowImpl({
             <SessionTooltipContent
               conversation={conversation}
               hostsById={hostsById}
-              hasError={sessionState?.kind === "error"}
+              state={sessionState}
             />
           </Tooltip>
         )
@@ -4255,7 +4344,7 @@ function ConversationRowImpl({
           <SessionTooltipContent
             conversation={conversation}
             hostsById={hostsById}
-            hasError={sessionState?.kind === "error"}
+            state={sessionState}
           />
         </Tooltip>
       )}
