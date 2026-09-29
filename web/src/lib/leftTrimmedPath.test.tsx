@@ -72,21 +72,35 @@ describe("useLeftTrimmedPath", () => {
     expect(screen.getByTestId("path")).toHaveTextContent(/^…\/a-very-long-final-folder-name$/);
   });
 
+  // Mounts the measured element only while open, like tooltip content.
+  function LateHarness({ open }: { open: boolean }) {
+    const { ref, text } = useLeftTrimmedPath<HTMLSpanElement>(
+      "/Users/me/omnigent-worktrees/fix-sse",
+    );
+    return open ? (
+      <span data-testid="path" ref={ref}>
+        {text}
+      </span>
+    ) : null;
+  }
+
   it("measures an element that mounts after the hook, like an opening tooltip", () => {
     boxWidth = 240;
-    function LateHarness({ open }: { open: boolean }) {
-      const { ref, text } = useLeftTrimmedPath<HTMLSpanElement>(
-        "/Users/me/omnigent-worktrees/fix-sse",
-      );
-      return open ? (
-        <span data-testid="path" ref={ref}>
-          {text}
-        </span>
-      ) : null;
-    }
     const { rerender } = render(<LateHarness open={false} />);
     rerender(<LateHarness open />);
     expect(screen.getByTestId("path")).toHaveTextContent(/^…\/omnigent-worktrees\/fix-sse$/);
+  });
+
+  it("restarts from the full path when the element remounts with more room", () => {
+    boxWidth = 240;
+    const { rerender } = render(<LateHarness open />);
+    expect(screen.getByTestId("path")).toHaveTextContent(/^…\/omnigent-worktrees\/fix-sse$/);
+    rerender(<LateHarness open={false} />);
+    boxWidth = 400;
+    rerender(<LateHarness open />);
+    expect(screen.getByTestId("path")).toHaveTextContent(
+      /^\/Users\/me\/omnigent-worktrees\/fix-sse$/,
+    );
   });
 
   it("re-measures from the full path when the path changes", () => {
