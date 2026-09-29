@@ -153,7 +153,7 @@ export function TerminalsPanel({
       {isDesktop && open && !fluid && (
         <div
           {...handleProps}
-          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50"
         />
       )}
       <aside
@@ -209,7 +209,7 @@ export function TerminalsPanel({
             <div
               {...columnHandleProps}
               style={{ ...columnHandleProps.style, left: listWidth }}
-              className="absolute inset-y-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+              className="absolute inset-y-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 transition-colors"
             />
           )}
           {/* List panel */}
