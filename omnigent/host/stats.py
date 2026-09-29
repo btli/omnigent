@@ -78,19 +78,20 @@ class HostStatsSampler:
             pong it rides on.
         """
         try:
-            return self._sample()
+            # One disk read at a time, off-loop. The loop is resolved before the
+            # coroutine is created, so an off-loop call leaves none un-awaited.
+            if self._disk_task is None or self._disk_task.done():
+                self._disk_task = asyncio.get_running_loop().create_task(
+                    self._read_disk(), name="host-stats-disk"
+                )
+            now = time.monotonic()
+            cpu = psutil.cpu_percent(interval=None)
+            memory = psutil.virtual_memory()
+            counters = psutil.net_io_counters()
         except (psutil.Error, OSError, RuntimeError):
             # RuntimeError also covers a call made with no running event loop.
             _logger.debug("Host stats sample failed", exc_info=True)
             return None
-
-    def _sample(self) -> JsonObject:
-        """Probe psutil once; see :meth:`sample`."""
-        self._start_disk_read()
-        now = time.monotonic()
-        cpu = psutil.cpu_percent(interval=None)
-        memory = psutil.virtual_memory()
-        counters = psutil.net_io_counters()
         net = (counters.bytes_recv, counters.bytes_sent) if counters is not None else None
         stats: JsonObject = {
             "memory_total_bytes": memory.total,
@@ -108,14 +109,6 @@ class HostStatsSampler:
         if self._disk is not None:
             stats["disk_total_bytes"], stats["disk_free_bytes"] = self._disk
         return stats
-
-    def _start_disk_read(self) -> None:
-        """Refresh the cached disk reading off-loop, one read at a time."""
-        if self._disk_task is None or self._disk_task.done():
-            # Resolve the loop first so an off-loop call raises before a
-            # coroutine is created and left un-awaited.
-            loop = asyncio.get_running_loop()
-            self._disk_task = loop.create_task(self._read_disk(), name="host-stats-disk")
 
     async def _read_disk(self) -> None:
         """Store the latest disk reading for the next sample."""
