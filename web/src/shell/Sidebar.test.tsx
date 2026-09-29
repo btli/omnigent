@@ -1660,12 +1660,26 @@ describe("Sidebar session list", () => {
       expect(within(tooltip).queryByTestId("runner-stats-section")).toBeNull();
     });
 
-    it("treats a snapshot older than 150 s as no stats", async () => {
-      const stale = {
+    it("shows an offline host's last-seen instead of the location line", async () => {
+      // A host that disconnected after reporting: only its last reported_at is left.
+      const offline = {
         ...statsHost,
-        stats: { ...statsHost.stats, reported_at: Date.now() / 1000 - 151 },
+        status: "offline",
+        stats: { reported_at: Date.now() / 1000 - 300 },
       };
-      const tooltip = await hoverStatsTooltip(stale, hostStatsOn);
+      const tooltip = await hoverStatsTooltip(offline, hostStatsOn);
+
+      const section = within(tooltip).getByTestId("runner-stats-section");
+      expect(within(section).getByTestId("runner-stats-header")).toHaveTextContent(
+        /bryan-mbp\s*· offline · last seen 5m ago/,
+      );
+      expect(within(section).queryAllByRole("meter")).toHaveLength(0);
+      expect(within(tooltip).queryByTestId("session-tooltip-location")).toBeNull();
+    });
+
+    it("keeps the plain location line for an online host with no readings", async () => {
+      const online = { ...statsHost, stats: { reported_at: Date.now() / 1000 - 5 } };
+      const tooltip = await hoverStatsTooltip(online, hostStatsOn);
 
       expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
         "bryan-mbp",
