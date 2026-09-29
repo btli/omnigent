@@ -48,8 +48,10 @@ def _reach_revision(engine: sa.Engine, db_uri: str, target_revision: str) -> Non
     # Verify the target revision exists
     try:
         script.get_revision(target_revision)
-    except Exception:
-        raise ValueError(f"Target revision '{target_revision}' not found in migration history")
+    except Exception as err:
+        raise ValueError(
+            f"Target revision '{target_revision}' not found in migration history"
+        ) from err
 
     with engine.begin() as connection:
         config.attributes["connection"] = connection
@@ -75,8 +77,7 @@ def _get_schema_at_revision(db_uri: str, target_revision: str, table_name: str) 
                     command.upgrade(config, target_revision)
                 # Reflect the table from temp engine
                 metadata = sa.MetaData()
-                table = sa.Table(table_name, metadata, autoload_with=temp_engine)
-                return table
+                return sa.Table(table_name, metadata, autoload_with=temp_engine)
             finally:
                 temp_engine.dispose()
     else:
@@ -98,8 +99,7 @@ def _get_schema_at_revision(db_uri: str, target_revision: str, table_name: str) 
 
             # Reflect the table
             metadata = sa.MetaData()
-            table = sa.Table(table_name, metadata, autoload_with=temp_engine)
-            return table
+            return sa.Table(table_name, metadata, autoload_with=temp_engine)
         finally:
             temp_engine.dispose()
 
