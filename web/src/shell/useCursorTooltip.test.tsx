@@ -14,8 +14,8 @@ afterEach(() => {
 
 // Mirrors a virtualized FolderTree row: the wrapper's transform would become
 // the containing block for a fixed tooltip rendered inside it.
-function TransformedRow() {
-  const { handlers, tooltip } = useCursorTooltip("folder/file.ts");
+function TransformedRow({ text = "folder/file.ts" }: { text?: string }) {
+  const { handlers, tooltip } = useCursorTooltip(text);
 
   return (
     <div data-testid="row" style={{ transform: "translateY(600px)" }}>
@@ -144,5 +144,17 @@ describe("useCursorTooltip", () => {
     fireEvent.mouseMove(screen.getByText("file.ts"), { clientX: 701, clientY: 200 });
 
     expect(tooltip).toHaveStyle({ left: "301px" });
+  });
+
+  it("re-measures when the text changes under a still pointer", () => {
+    stubLayout([1000, 800], [200, 30]);
+    const { rerender } = render(<TransformedRow text="a.ts" />);
+    fireEvent.mouseMove(screen.getByText("file.ts"), { clientX: 850, clientY: 200 });
+    expect(screen.getByText("a.ts")).toHaveStyle({ left: "850px" });
+
+    // Only "folder/file.ts" has a box in the stub, so the longer text must flip it.
+    rerender(<TransformedRow text="folder/file.ts" />);
+
+    expect(screen.getByText("folder/file.ts")).toHaveStyle({ left: "650px" });
   });
 });
