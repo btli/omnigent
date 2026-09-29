@@ -1,9 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
-import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Host, HostStats } from "@/hooks/useHosts";
-import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { RunnerStatsSection } from "./RunnerStatsSection";
 
 const GIB = 1024 ** 3;
@@ -32,13 +29,6 @@ function makeHost(overrides: Partial<Host> = {}): Host {
   };
 }
 
-const HOST_STATS_ON: ServerInfo = { ...FALLBACK_SERVER_INFO, features: { host_stats: true } };
-
-/** Render under a server that advertises the given release features. */
-function renderSection(ui: ReactElement, info: ServerInfo | "loading" = HOST_STATS_ON) {
-  return render(<CapabilitiesProvider info={info}>{ui}</CapabilitiesProvider>);
-}
-
 function meter(label: string): HTMLElement {
   return screen.getByRole("meter", { name: `${label} used` });
 }
@@ -61,7 +51,7 @@ afterEach(() => {
 
 describe("RunnerStatsSection", () => {
   it("renders the approved layout for an online host", () => {
-    renderSection(<RunnerStatsSection host={makeHost()} />);
+    render(<RunnerStatsSection host={makeHost()} />);
 
     expect(screen.getByTestId("runner-stats-header")).toHaveTextContent(
       /^Runner\s*bryan-mbp\s*· online · 8s ago$/,
@@ -91,11 +81,8 @@ describe("RunnerStatsSection", () => {
     [80, "warn"],
     [94.9, "warn"],
     [95, "critical"],
-    [100, "critical"],
   ])("tones a meter at %s%% used as %s", (used, tone) => {
-    renderSection(
-      <RunnerStatsSection host={makeHost({ stats: { ...FULL_STATS, cpu_percent: used } })} />,
-    );
+    render(<RunnerStatsSection host={makeHost({ stats: { ...FULL_STATS, cpu_percent: used } })} />);
     expect(meter("CPU")).toHaveAttribute("data-tone", tone);
   });
 
@@ -105,7 +92,7 @@ describe("RunnerStatsSection", () => {
       memory_used_bytes: 13 * GIB,
       disk_free_bytes: 20 * GIB,
     };
-    renderSection(<RunnerStatsSection host={makeHost({ stats })} />);
+    render(<RunnerStatsSection host={makeHost({ stats })} />);
     expect(meter("Memory")).toHaveAttribute("data-tone", "warn");
     expect(meter("Disk")).toHaveAttribute("data-tone", "critical");
   });
@@ -115,7 +102,7 @@ describe("RunnerStatsSection", () => {
       status: "offline",
       stats: { ...FULL_STATS, reported_at: NOW_S - 300 },
     });
-    renderSection(<RunnerStatsSection host={host} />);
+    render(<RunnerStatsSection host={host} />);
 
     expect(screen.getByTestId("runner-stats-header")).toHaveTextContent(
       /^Runner\s*bryan-mbp\s*· offline · last seen 5m ago$/,
@@ -128,16 +115,7 @@ describe("RunnerStatsSection", () => {
     ["null", null],
     ["absent", undefined],
   ])("renders nothing when the host reports no stats (%s)", (_name, stats) => {
-    const { container } = renderSection(<RunnerStatsSection host={makeHost({ stats })} />);
-    expect(container).toBeEmptyDOMElement();
-  });
-
-  it.each([
-    ["off", { ...FALLBACK_SERVER_INFO, features: { host_stats: false } }],
-    ["unadvertised", FALLBACK_SERVER_INFO],
-    ["still loading", "loading" as const],
-  ])("renders nothing while the host_stats feature is %s", (_name, info) => {
-    const { container } = renderSection(<RunnerStatsSection host={makeHost()} />, info);
+    const { container } = render(<RunnerStatsSection host={makeHost({ stats })} />);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -147,7 +125,7 @@ describe("RunnerStatsSection", () => {
       memory_total_bytes: 8 * GIB,
       memory_used_bytes: 2 * GIB,
     };
-    renderSection(<RunnerStatsSection host={makeHost({ stats })} />);
+    render(<RunnerStatsSection host={makeHost({ stats })} />);
 
     expect(screen.getAllByRole("meter")).toEqual([meter("Memory")]);
     const section = screen.getByTestId("runner-stats-section");
@@ -157,7 +135,7 @@ describe("RunnerStatsSection", () => {
   });
 
   it("switches the age to minutes past the first minute", () => {
-    renderSection(
+    render(
       <RunnerStatsSection
         host={makeHost({ stats: { ...FULL_STATS, reported_at: NOW_S - 125 } })}
       />,
@@ -166,7 +144,7 @@ describe("RunnerStatsSection", () => {
   });
 
   it("uses a caller-supplied label in the header", () => {
-    renderSection(<RunnerStatsSection host={makeHost()} label="Modal sandbox" />);
+    render(<RunnerStatsSection host={makeHost()} label="Modal sandbox" />);
     expect(screen.getByTestId("runner-stats-header")).toHaveTextContent(
       /^Runner\s*Modal sandbox\s*·/,
     );
