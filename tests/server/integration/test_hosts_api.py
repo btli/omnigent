@@ -468,6 +468,35 @@ async def test_hosts_api_host_stats_null_for_older_host(db_uri: str) -> None:
     assert single.json()["stats"] is None
 
 
+async def test_hosts_api_keeps_only_last_seen_for_a_disconnected_host(db_uri: str) -> None:
+    """
+    Verify a host that disconnects after reporting lists offline with its last-seen.
+
+    The readings go with the connection; only ``reported_at`` stays, which is
+    what the tooltip's "offline · last seen" header renders.
+    """
+    app, registry, host_store, _cs = _build_host_api_app(db_uri, _HOST_STATS_ON)
+    comm = await _connect_host(app, registry)
+    await _send_pong(comm, registry, {"cpu_percent": 48.0})
+    reported = registry.host_stats(_HOST_ID)
+    assert reported is not None
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    for _ in range(200):
+        row = host_store.get_host(_HOST_ID)
+        if row is not None and row.status == "offline":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("host did not transition to offline within 2s")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        host = (await client.get("/v1/hosts")).json()["hosts"][0]
+
+    assert host["status"] == "offline"
+    assert host["stats"] == {"reported_at": reported["reported_at"]}
+
+
 async def test_hosts_api_omits_host_stats_while_the_feature_is_off(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:

@@ -194,6 +194,13 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
 _EXIT_REPORT_TTL_S = 600.0
 _EXIT_REPORT_MAX_ENTRIES = 1024
 
+# Host readings older than this by the server's clock aren't served; a live host
+# reports on every 30 s keepalive, so this only trips when its pongs stop.
+HOST_STATS_FRESH_S = 150.0
+# How long a disconnected host's "last seen" stays answerable, and how many are kept.
+_OFFLINE_STATS_TTL_S = 24 * 3600.0
+_OFFLINE_STATS_MAX_ENTRIES = 1024
+
 
 @dataclass
 class RunnerExitReport:
@@ -503,6 +510,11 @@ class HostRegistry:
         # like ``_hosts`` so a host id reused in another workspace never reads it,
         # and dropped with the connection so no replica serves a stale reading.
         self._host_stats: dict[tuple[int, str], dict[str, float]] = {}
+        # A disconnected host's last ``reported_at`` (no readings), so the tooltip
+        # can say "last seen"; bounded so ephemeral sandbox ids can't pile up.
+        self._offline_stats: TTLCache[tuple[int, str], float] = TTLCache(
+            maxsize=_OFFLINE_STATS_MAX_ENTRIES, ttl=_OFFLINE_STATS_TTL_S
+        )
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
@@ -614,7 +626,9 @@ class HostRegistry:
             if current is None or (conn is not None and current is not conn):
                 return False
             removed = self._hosts.pop(key)
-            self._host_stats.pop(key, None)
+            snapshot = self._host_stats.pop(key, None)
+            if snapshot is not None:
+                self._offline_stats[key] = snapshot["reported_at"]
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
@@ -770,24 +784,35 @@ class HostRegistry:
         """
         key = (conn.workspace_id, conn.host_id)
         with self._lock:
+            # The host is back, so it no longer needs a "last seen".
+            self._offline_stats.pop(key, None)
             if stats is None:
                 self._host_stats.pop(key, None)
             else:
                 self._host_stats[key] = {**stats, "reported_at": time.time()}
 
     def host_stats(self, host_id: str, workspace_id: int | None = None) -> dict[str, float] | None:
-        """Return the resource snapshot *host_id* last reported to this replica.
+        """Return what *host_id* last reported to this replica, by this server's clock.
 
         :param host_id: Host identifier, in any accepted spelling.
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
         :returns: A copy of the snapshot including ``reported_at`` (epoch
-            seconds), or ``None`` when this replica has none.
+            seconds) while it is at most :data:`HOST_STATS_FRESH_S` old; just
+            ``{"reported_at": ...}`` (its last-seen, no readings) for a host that
+            disconnected after reporting; otherwise ``None``.
         """
-        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        key = (
+            current_workspace_id() if workspace_id is None else workspace_id,
+            _canonical_host_id(host_id),
+        )
         with self._lock:
-            reported = self._host_stats.get((ws_id, _canonical_host_id(host_id)))
-        return dict(reported) if reported is not None else None
+            reported = self._host_stats.get(key)
+            last_seen = self._offline_stats.get(key)
+        if reported is not None:
+            fresh = time.time() - reported["reported_at"] <= HOST_STATS_FRESH_S
+            return dict(reported) if fresh else None
+        return {"reported_at": last_seen} if last_seen is not None else None
 
     def interactive_shells(self, host_id: str) -> list[str] | None:
         """Return the ordered shell inventory last reported by *host_id*."""
