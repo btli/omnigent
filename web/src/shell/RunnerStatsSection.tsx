@@ -6,6 +6,16 @@ import { formatBytes } from "./fileStatusUtils";
 
 const GIB = 1024 ** 3;
 
+// A live host's snapshot is at most one 30 s pong plus one 60 s hosts poll old;
+// anything older is stale (e.g. served by a replica that lost the tunnel).
+const STALE_AFTER_MS = 150_000;
+
+/** Whether *host* has a snapshot fresh enough to show. */
+export function hasFreshStats(host: Host | undefined, nowMs = Date.now()): boolean {
+  const stats = host?.stats;
+  return !!stats && nowMs - stats.reported_at * 1000 <= STALE_AFTER_MS;
+}
+
 // Used-percent thresholds at which a meter turns amber, then red.
 const WARN_PERCENT = 80;
 const CRITICAL_PERCENT = 95;
@@ -57,6 +67,7 @@ function MeterRow({
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.round(clamped)}
+        aria-valuetext={value}
         data-tone={tone}
         className="h-1 w-full overflow-hidden rounded-full bg-muted"
       >
@@ -77,8 +88,8 @@ function MeterRow({
  *
  * Renders only from the `Host` the sidebar's existing hosts query delivered —
  * nothing is fetched on hover. The caller gates on the `host_stats` release
- * feature; a host without a snapshot (older host or server) renders nothing,
- * and an offline host keeps the header but no meters.
+ * feature and {@link hasFreshStats}; a host without a snapshot (older host or
+ * server) renders nothing, and an offline host keeps the header but no meters.
  */
 export function RunnerStatsSection({ host, label = host.name }: { host: Host; label?: string }) {
   const stats = host.stats;
@@ -126,8 +137,16 @@ export function RunnerStatsSection({ host, label = host.name }: { host: Host; la
           Network
         </span>,
         <span key="network" className="col-span-2 flex gap-3 whitespace-nowrap tabular-nums">
-          <span>↓ {formatBytes(rx)}/s</span>
-          <span>↑ {formatBytes(tx)}/s</span>
+          <span>
+            <span aria-hidden>↓ </span>
+            <span className="sr-only">download </span>
+            {formatBytes(rx)}/s
+          </span>
+          <span>
+            <span aria-hidden>↑ </span>
+            <span className="sr-only">upload </span>
+            {formatBytes(tx)}/s
+          </span>
         </span>,
       );
     }
