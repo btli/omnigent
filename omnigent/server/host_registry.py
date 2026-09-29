@@ -12,8 +12,9 @@ request/response traffic. No per-request reassembly queues needed.
 
 The registry also holds what connected hosts *report* about themselves and
 nothing persists — today the per-family gateway-inference map (see
-:mod:`omnigent.gateway_inference`) and interactive-shell inventory. They are
-delivered on the connect handshake, so a replica that has never seen a host
+:mod:`omnigent.gateway_inference`), interactive-shell inventory and the
+resource snapshot carried on keepalive pongs (see :mod:`omnigent.host.stats`).
+They are delivered over the tunnel, so a replica that has never seen a host
 simply knows nothing about them until the host reconnects and re-reports.
 """
 
@@ -406,6 +407,10 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        # Last resource snapshot each host piggybacked on a keepalive pong. Keyed
+        # like ``_hosts`` so a host id reused in another workspace never reads it;
+        # kept across a disconnect so an offline host still shows when it reported.
+        self._host_stats: dict[tuple[int, str], dict[str, float]] = {}
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
@@ -640,6 +645,43 @@ class HostRegistry:
         """
         with self._lock:
             reported = self._gateway_inference.get(_canonical_host_id(host_id))
+        return dict(reported) if reported is not None else None
+
+    def record_host_stats(
+        self,
+        conn: HostConnection,
+        stats: Mapping[str, float] | None,
+    ) -> None:
+        """Store the resource snapshot a host just sent, stamped on receipt.
+
+        ``reported_at`` uses this server's clock, so a snapshot's age never
+        depends on the host's. ``None`` (an older host, or a failed sample)
+        clears the entry so readers show no stats rather than a stale reading.
+
+        :param conn: The connection the pong arrived on.
+        :param stats: Validated snapshot from
+            :func:`omnigent.host.stats.parse_host_stats`, e.g.
+            ``{"cpu_percent": 48.0}``, or ``None``.
+        """
+        key = (conn.workspace_id, conn.host_id)
+        with self._lock:
+            if stats is None:
+                self._host_stats.pop(key, None)
+            else:
+                self._host_stats[key] = {**stats, "reported_at": time.time()}
+
+    def host_stats(self, host_id: str, workspace_id: int | None = None) -> dict[str, float] | None:
+        """Return the resource snapshot *host_id* last reported to this replica.
+
+        :param host_id: Host identifier, in any accepted spelling.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: A copy of the snapshot including ``reported_at`` (epoch
+            seconds), or ``None`` when this replica has none.
+        """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        with self._lock:
+            reported = self._host_stats.get((ws_id, _canonical_host_id(host_id)))
         return dict(reported) if reported is not None else None
 
     def interactive_shells(self, host_id: str) -> list[str] | None:
