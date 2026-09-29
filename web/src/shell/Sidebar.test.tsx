@@ -1370,6 +1370,135 @@ describe("Sidebar session list", () => {
     });
   });
 
+  describe("session tooltip details", () => {
+    async function hoverTooltip(session: Conversation) {
+      mockConversations([session]);
+      renderSidebar();
+      fireEvent.pointerMove(screen.getByRole("link", { name: new RegExp(session.id) }), {
+        pointerType: "mouse",
+      });
+      return screen.findByTestId("session-tooltip-content");
+    }
+
+    it("widens the card while keeping the viewport clamp", async () => {
+      const tooltip = await hoverTooltip(conv("conv_width", "aria"));
+      expect(tooltip).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
+    });
+
+    it("shows the agent name", async () => {
+      const tooltip = await hoverTooltip(conv("conv_agent", "aria"));
+      expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+        /^aria$/,
+      );
+    });
+
+    it("omits the agent line when the agent is unknown", async () => {
+      const tooltip = await hoverTooltip(
+        conv("conv_no_agent", "", { agent_name: null, workspace: "/srv/repo" }),
+      );
+      expect(within(tooltip).getByTestId("session-tooltip-cwd")).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-agent")).toBeNull();
+    });
+
+    it("shows a short working directory in full", async () => {
+      const tooltip = await hoverTooltip(conv("conv_cwd", "aria", { workspace: "/srv/repo" }));
+      const cwd = within(tooltip).getAllByTestId("session-tooltip-cwd")[0];
+      expect(cwd.querySelector("[aria-hidden='true'].truncate")).toHaveTextContent(/^\/srv\/repo$/);
+    });
+
+    it("trims a long working directory from the left, keeping the last folder", async () => {
+      // jsdom has no layout: model an 8px-per-character line in a 120px box.
+      const scrollWidth = vi
+        .spyOn(HTMLElement.prototype, "scrollWidth", "get")
+        .mockImplementation(function (this: HTMLElement) {
+          return (this.textContent?.length ?? 0) * 8;
+        });
+      const clientWidth = vi
+        .spyOn(HTMLElement.prototype, "clientWidth", "get")
+        .mockReturnValue(120);
+      try {
+        const workspace = "/Users/me/omnigent-worktrees/fix-sse";
+        const tooltip = await hoverTooltip(conv("conv_long_cwd", "aria", { workspace }));
+        const cwd = within(tooltip).getAllByTestId("session-tooltip-cwd")[0];
+        await waitFor(() => {
+          expect(cwd.querySelector("[aria-hidden='true'].truncate")).toHaveTextContent(
+            /^…\/fix-sse$/,
+          );
+        });
+        // Assistive tech still gets the untrimmed path.
+        expect(cwd.querySelector(".sr-only")).toHaveTextContent(workspace);
+      } finally {
+        scrollWidth.mockRestore();
+        clientWidth.mockRestore();
+      }
+    });
+
+    it("omits the working-directory line when the workspace is unknown", async () => {
+      const tooltip = await hoverTooltip(conv("conv_no_cwd", "aria", { workspace: null }));
+      expect(within(tooltip).getByTestId("session-tooltip-agent")).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-cwd")).toBeNull();
+    });
+
+    it.each([
+      { name: "Working", partial: { status: "running" as const }, state: "running" },
+      { name: "Idle", partial: { status: "idle" as const }, state: "idle" },
+      { name: "Error", partial: { status: "failed" as const }, state: "error" },
+      {
+        name: "Needs response",
+        partial: { status: "idle" as const, pending_elicitations_count: 1 },
+        state: "awaiting",
+      },
+    ])("shows the $name status as the last line", async ({ name, partial, state }) => {
+      const tooltip = await hoverTooltip(conv(`conv_status_${state}`, "aria", partial));
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(new RegExp(`^${name}$`));
+      expect(status).toHaveAttribute("data-state", state);
+      if (state === "error") {
+        expect(status).toHaveClass("text-destructive");
+        expect(status.nextElementSibling).toBe(
+          within(tooltip).getAllByTestId("session-tooltip-error")[0],
+        );
+      } else {
+        expect(status.nextElementSibling?.getAttribute("data-testid")).not.toBe(
+          "session-tooltip-error",
+        );
+      }
+    });
+
+    it("shows Starting up while the bound session is waking", async () => {
+      useChatStore.setState({ conversationId: "conv_status_starting", status: "streaming" });
+      const tooltip = await hoverTooltip(
+        conv("conv_status_starting", "aria", { status: "failed" }),
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(/^Starting up$/);
+      expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
+    });
+
+    it("renders the persisted error message on its own line below Error", async () => {
+      const message = "Codex exited — 403 budget limit reached for this workspace";
+      const tooltip = await hoverTooltip(
+        conv("conv_error_message", "aria", {
+          status: "failed",
+          labels: { "omnigent.last_task_error_message": message },
+        }),
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      const error = within(tooltip).getAllByTestId("session-tooltip-error")[0];
+      expect(status).toHaveTextContent(/^Error$/);
+      expect(status.nextElementSibling).toBe(error);
+      expect(error).toHaveTextContent(message);
+      expect(error).toHaveClass("text-destructive", "line-clamp-3");
+    });
+
+    it("falls back to the generic error text without a persisted message", async () => {
+      const tooltip = await hoverTooltip(conv("conv_error_fallback", "aria", { status: "failed" }));
+      expect(within(tooltip).getAllByTestId("session-tooltip-error")[0]).toHaveTextContent(
+        /^Latest message is an error$/,
+      );
+    });
+  });
+
   it("shares one hosts observer across multiple ordinary session rows", () => {
     const observerMounted = vi.fn();
     useHostsMock.mockImplementation(() => {
@@ -1607,9 +1736,25 @@ describe("Sidebar failed session indicator", () => {
     it("explains the error through the row's existing hover surface", async () => {
       const content = await openExplanation("error");
       expect(content).toHaveTextContent("Latest message is an error");
-      const hint = content.querySelector("p.text-destructive");
-      expect(hint).toHaveTextContent("Latest message is an error");
-      expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute("aria-hidden", "true");
+      if (surface === "pinned") {
+        const hint = content.querySelector("p.text-destructive");
+        expect(hint).toHaveTextContent("Latest message is an error");
+        expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute(
+          "aria-hidden",
+          "true",
+        );
+      } else {
+        // The session tooltip labels the state "Error" and explains it below.
+        const status = within(content).getAllByTestId("session-tooltip-status")[0];
+        expect(status).toHaveClass("text-destructive");
+        expect(status.querySelector("svg.lucide-circle-alert")).toHaveAttribute(
+          "aria-hidden",
+          "true",
+        );
+        expect(within(content).getAllByTestId("session-tooltip-error")[0]).toHaveTextContent(
+          "Latest message is an error",
+        );
+      }
     });
 
     it.each(["running", "awaiting", "starting"] as const)(
