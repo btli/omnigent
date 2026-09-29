@@ -106,10 +106,8 @@ describe("RunnerStatsSection", () => {
   });
 
   it("shows only the header with last-seen age for an offline host", () => {
-    const host = makeHost({
-      status: "offline",
-      stats: { ...FULL_STATS, reported_at: NOW_S - 300 },
-    });
+    // What the server sends once a host disconnects: its last-seen, no readings.
+    const host = makeHost({ status: "offline", stats: { reported_at: NOW_S - 300 } });
     render(<RunnerStatsSection host={host} />);
 
     expect(screen.getByTestId("runner-stats-header")).toHaveTextContent(
@@ -117,6 +115,13 @@ describe("RunnerStatsSection", () => {
     );
     expect(screen.queryAllByRole("meter")).toHaveLength(0);
     expect(screen.getByTestId("runner-stats-section")).not.toHaveTextContent("Network");
+  });
+
+  it("hides meters for an offline host that still holds readings", () => {
+    // A crashed host is offline before its tunnel times out and drops the readings.
+    render(<RunnerStatsSection host={makeHost({ status: "offline" })} />);
+    expect(screen.getByTestId("runner-stats-header")).toHaveTextContent("· offline · last seen");
+    expect(screen.queryAllByRole("meter")).toHaveLength(0);
   });
 
   it.each([
@@ -149,6 +154,13 @@ describe("RunnerStatsSection", () => {
       />,
     );
     expect(screen.getByTestId("runner-stats-header")).toHaveTextContent("· online · 2m ago");
+  });
+
+  it("clamps the age to 0s when the viewer's clock runs behind the server's", () => {
+    render(
+      <RunnerStatsSection host={makeHost({ stats: { ...FULL_STATS, reported_at: NOW_S + 20 } })} />,
+    );
+    expect(screen.getByTestId("runner-stats-header")).toHaveTextContent("· online · 0s ago");
   });
 
   it("uses a caller-supplied label in the header", () => {

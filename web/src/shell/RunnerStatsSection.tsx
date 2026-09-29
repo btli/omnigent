@@ -6,14 +6,13 @@ import { formatBytes } from "./fileStatusUtils";
 
 const GIB = 1024 ** 3;
 
-// A live host's snapshot is at most one 30 s pong plus one 60 s hosts poll old;
-// anything older is stale (e.g. served by a replica that lost the tunnel).
-const STALE_AFTER_MS = 150_000;
-
-/** Whether *host* has a snapshot fresh enough to show. */
-export function hasFreshStats(host: Host | undefined, nowMs = Date.now()): boolean {
-  const stats = host?.stats;
-  return !!stats && nowMs - stats.reported_at * 1000 <= STALE_AFTER_MS;
+/**
+ * Whether the tooltip shows the runner section: readings, or an offline host's
+ * last-seen. The server only sends readings while fresh by its own clock.
+ */
+export function hasRunnerStats(host: Host | undefined): boolean {
+  if (!host?.stats) return false;
+  return host.status === "offline" || Object.keys(host.stats).some((k) => k !== "reported_at");
 }
 
 // Used-percent thresholds at which a meter turns amber, then red.
@@ -88,8 +87,9 @@ function MeterRow({
  *
  * Renders only from the `Host` the sidebar's existing hosts query delivered —
  * nothing is fetched on hover. The caller gates on the `host_stats` release
- * feature and {@link hasFreshStats}; a host without a snapshot (older host or
- * server) renders nothing, and an offline host keeps the header but no meters.
+ * feature and {@link hasRunnerStats}. A host that disconnected after reporting
+ * arrives with only `reported_at`, and shows "offline · last seen …" with no
+ * meters; a host that never reported (older build) renders nothing.
  */
 export function RunnerStatsSection({ host, label = host.name }: { host: Host; label?: string }) {
   const stats = host.stats;

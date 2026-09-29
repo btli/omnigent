@@ -11,15 +11,16 @@ all, and readers treat absence as "no stats".
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
+import socket
 import time
 from pathlib import Path
 
 import psutil
 
 from omnigent.util.json_types import JsonObject
-from omnigent.util.tunnel_limits import TUNNEL_KEEPALIVE_PING_INTERVAL_S
 
 _logger = logging.getLogger(__name__)
 
@@ -37,8 +38,6 @@ HOST_STATS_KEYS = (
 
 # Byte counts and rates above this (1 EiB) are garbage, not a real machine.
 _MAX_BYTES = 2**60
-# A disk reading this old means the read is hung, so it's dropped, not resent.
-_DISK_MAX_AGE_S = 3 * TUNNEL_KEEPALIVE_PING_INTERVAL_S
 
 
 def _disk_usage() -> tuple[int, int] | None:
@@ -58,18 +57,37 @@ def _disk_usage() -> tuple[int, int] | None:
     return usage.total, usage.free
 
 
-def _net_bytes() -> tuple[int, int]:
-    """Sum ``(received, sent)`` bytes over interfaces that are up, except loopback.
+def _is_loopback(flags: str, addresses: list[str]) -> bool:
+    """Whether an interface is loopback, by its flags or by all-loopback addresses.
+
+    ``flags`` is empty on Windows and on psutil older than 5.9.3, hence the
+    address check.
+    """
+    if "loopback" in flags:
+        return True
+    return bool(addresses) and all(
+        ipaddress.ip_address(address.split("%")[0]).is_loopback for address in addresses
+    )
+
+
+def _net_counters() -> dict[str, tuple[int, int]]:
+    """``(received, sent)`` bytes per interface that is up, except loopback.
 
     Loopback carries the runner's own localhost traffic to the server.
     """
     nics = psutil.net_if_stats()
-    counters = [
-        io
+    addrs = psutil.net_if_addrs()
+    ip_families = (socket.AF_INET, socket.AF_INET6)
+    return {
+        name: (io.bytes_recv, io.bytes_sent)
         for name, io in psutil.net_io_counters(pernic=True).items()
-        if (nic := nics.get(name)) is not None and nic.isup and "loopback" not in nic.flags
-    ]
-    return sum(io.bytes_recv for io in counters), sum(io.bytes_sent for io in counters)
+        if (nic := nics.get(name)) is not None
+        and nic.isup
+        and not _is_loopback(
+            getattr(nic, "flags", ""),
+            [a.address for a in addrs.get(name, ()) if a.family in ip_families],
+        )
+    }
 
 
 class HostStatsSampler:
@@ -84,9 +102,8 @@ class HostStatsSampler:
     def __init__(self) -> None:
         """Start with no baseline; the first sample only primes the deltas."""
         self._sampled_at: float | None = None
-        self._net: tuple[int, int] | None = None
+        self._net: dict[str, tuple[int, int]] | None = None
         self._disk: tuple[int, int] | None = None
-        self._disk_read_at = 0.0
         self._disk_task: asyncio.Task[None] | None = None
         self._failure_logged = False
 
@@ -101,14 +118,15 @@ class HostStatsSampler:
         try:
             # One disk read at a time, off-loop. The loop is resolved before the
             # coroutine is created, so an off-loop call leaves none un-awaited.
-            if self._disk_task is None or self._disk_task.done():
+            disk_pending = self._disk_task is not None and not self._disk_task.done()
+            if not disk_pending:
                 self._disk_task = asyncio.get_running_loop().create_task(
                     self._read_disk(), name="host-stats-disk"
                 )
             now = time.monotonic()
             cpu = psutil.cpu_percent(interval=None)
             memory = psutil.virtual_memory()
-            net = _net_bytes()
+            net = _net_counters()
             stats: JsonObject = {
                 "memory_total_bytes": memory.total,
                 "memory_used_bytes": memory.total - memory.available,
@@ -120,10 +138,15 @@ class HostStatsSampler:
                 stats["cpu_percent"] = cpu
                 elapsed = now - previous_at
                 if elapsed > 0:
-                    # A counter reset (an interface restarting) reads as no traffic.
-                    stats["net_rx_bytes_per_s"] = round(max(0, net[0] - previous_net[0]) / elapsed)
-                    stats["net_tx_bytes_per_s"] = round(max(0, net[1] - previous_net[1]) / elapsed)
-            if self._disk is not None and now - self._disk_read_at <= _DISK_MAX_AGE_S:
+                    # Only interfaces eligible in both samples: one coming back up
+                    # must not re-add its since-boot total. A counter reset reads as 0.
+                    both = net.keys() & previous_net.keys()
+                    rx = sum(max(0, net[n][0] - previous_net[n][0]) for n in both)
+                    tx = sum(max(0, net[n][1] - previous_net[n][1]) for n in both)
+                    stats["net_rx_bytes_per_s"] = round(rx / elapsed)
+                    stats["net_tx_bytes_per_s"] = round(tx / elapsed)
+            # A read still pending since the last sample is hung; its old value isn't resent.
+            if self._disk is not None and not disk_pending:
                 stats["disk_total_bytes"], stats["disk_free_bytes"] = self._disk
             return stats
         except Exception:
@@ -146,7 +169,7 @@ class HostStatsSampler:
             else:
                 self._failure_logged = True
                 _logger.exception("Host disk read failed; pongs will carry no disk stats")
-        self._disk, self._disk_read_at = disk, time.monotonic()
+        self._disk = disk
 
 
 def parse_host_stats(raw: object) -> dict[str, float] | None:

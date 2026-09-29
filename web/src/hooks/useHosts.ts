@@ -48,6 +48,8 @@ export interface Host {
  * A host's resource snapshot. Each reading is optional (the first keepalive
  * after a host starts may lack some); `reported_at` is the server's receive
  * time in epoch seconds, so the snapshot's age never depends on the host clock.
+ * The server sends readings only while fresh by its own clock; a host that
+ * disconnected after reporting keeps just `reported_at`, its last-seen.
  */
 export interface HostStats {
   reported_at: number;
