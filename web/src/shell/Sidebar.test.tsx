@@ -1464,19 +1464,25 @@ describe("Sidebar session list", () => {
     });
 
     it.each([
-      { name: "Working", partial: { status: "running" as const }, state: "running" },
-      { name: "Idle", partial: { status: "idle" as const }, state: "idle" },
-      { name: "Error", partial: { status: "failed" as const }, state: "error" },
+      {
+        name: "Working",
+        partial: { status: "running" as const },
+        state: "running",
+        key: "working",
+      },
+      { name: "Idle", partial: { status: "idle" as const }, state: "idle", key: "idle" },
+      { name: "Error", partial: { status: "failed" as const }, state: "error", key: "error" },
       {
         name: "Needs response",
         partial: { status: "idle" as const, pending_elicitations_count: 1 },
         state: "awaiting",
+        key: "needs-response",
       },
-    ])("shows the $name status as the last line", async ({ name, partial, state }) => {
+    ])("shows the $name status as the last line", async ({ name, partial, state, key }) => {
       const tooltip = await hoverTooltip(conv(`conv_status_${state}`, "aria", partial));
       const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
       expect(status).toHaveTextContent(new RegExp(`^${name}$`));
-      expect(status).toHaveAttribute("data-state", state);
+      expect(status).toHaveAttribute("data-state", key);
       if (state === "error") {
         expect(status).toHaveClass("text-destructive");
         expect(status.nextElementSibling).toBe(
@@ -1486,6 +1492,50 @@ describe("Sidebar session list", () => {
         expect(status.nextElementSibling?.getAttribute("data-testid")).not.toBe(
           "session-tooltip-error",
         );
+      }
+    });
+
+    it("labels an unread session New messages, matching the row's unread dot", async () => {
+      const session = conv("conv_status_unseen", "aria", { status: "idle", updated_at: 200 });
+      seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+      const tooltip = await hoverTooltip(session);
+      const row = screen.getByRole("link", { name: /conv_status_unseen/ }).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "unseen",
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(/^New messages$/);
+      expect(status).toHaveAttribute("data-state", "new-messages");
+    });
+
+    it("shows Host disconnected when the latest item is a runner disconnect", async () => {
+      const fetchPage = vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
+        items: [
+          {
+            id: "disconnect1",
+            response_id: "response1",
+            type: "error",
+            status: "completed",
+            source: "execution",
+            code: "runner_disconnected",
+            message: "Runner disconnected unexpectedly.",
+          },
+        ],
+        hasMore: false,
+      });
+      try {
+        const tooltip = await hoverTooltip(
+          conv("conv_status_disconnected", "aria", { status: "idle" }),
+        );
+        await waitFor(() => {
+          const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+          expect(status).toHaveTextContent(/^Host disconnected$/);
+          expect(status).toHaveAttribute("data-state", "disconnected");
+        });
+        expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
+      } finally {
+        fetchPage.mockRestore();
       }
     });
 
