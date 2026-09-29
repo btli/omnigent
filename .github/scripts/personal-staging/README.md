@@ -151,11 +151,10 @@ download; the default is 90 seconds.
 
 `Personal Production Nightly` (cron `30 10 * * *`, plus `workflow_dispatch`)
 runs the same composer with `--ring production`: fork branch `production` =
-published fork main + every open **non-draft** btli PR plus numeric pins from
-`extras-production.txt`, and no dev tag. Draft status gates the automatic
-stream: `filter_drafts()` runs before the extras union, so a numeric production
-extra bypasses it (both current pins are non-draft). The current bot-owned pins
-also resolve mutable `refs/pull/N/head` refs. Each run mints an immutable,
+published fork main + every open btli PR (drafts included, same stream as
+staging) plus numeric pins from `extras-production.txt`, and no dev tag. Pins
+are only for refs outside that stream (closed or bot-authored PRs) and resolve
+mutable `refs/pull/N/head` refs. Each run mints an immutable,
 canonical `production-YYYYMMDD` tag pin (same rerun/no-op semantics as
 `nightly-*`). Same-name compatibility branches were removed in v0.15.0, and
 homelab's `build-omnigent-production.yml` resolves the immutable tag
