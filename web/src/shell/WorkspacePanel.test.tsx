@@ -1059,7 +1059,7 @@ describe("WorkspacePanel resize handle geometry", () => {
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
     expect(separator.className).toBe(
-      "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+      "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 md:block",
     );
     expect(separator.style.boxSizing).toBe("content-box");
     expect(separator.style.backgroundClip).toBe("content-box");
