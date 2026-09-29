@@ -22,16 +22,20 @@ export function leftTrimmedPathCandidates(path: string): string[] {
  * ref's element, which must clip overflow (e.g. `truncate`). A final folder
  * that still overflows is left to the element's own end-ellipsis. The ref is
  * a callback so an element mounted later (e.g. when a tooltip opens) is
- * measured too.
+ * measured too; a new element or path restarts from the full path.
  */
 export function useLeftTrimmedPath<T extends HTMLElement>(path: string) {
   const [el, ref] = useState<T | null>(null);
   const candidates = useMemo(() => leftTrimmedPathCandidates(path), [path]);
-  const [trim, setTrim] = useState({ path, index: 0 });
-  const index = trim.path === path ? trim.index : 0;
+  const [trim, setTrim] = useState<{ el: T | null; path: string; index: number }>({
+    el,
+    path,
+    index: 0,
+  });
+  const index = trim.el === el && trim.path === path ? trim.index : 0;
   useLayoutEffect(() => {
     if (!el || index >= candidates.length - 1) return;
-    if (el.scrollWidth > el.clientWidth) setTrim({ path, index: index + 1 });
+    if (el.scrollWidth > el.clientWidth) setTrim({ el, path, index: index + 1 });
   }, [el, path, index, candidates]);
   return { ref, text: candidates[index] };
 }
