@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from collections import namedtuple
 from pathlib import Path
 
@@ -16,6 +17,9 @@ from omnigent.host.stats import HostStatsSampler, parse_host_stats
 _Memory = namedtuple("_Memory", ["total", "available"])
 _Net = namedtuple("_Net", ["bytes_recv", "bytes_sent"])
 _Nic = namedtuple("_Nic", ["isup", "flags"])
+# psutil before 5.9.3 has no ``flags``.
+_OldNic = namedtuple("_OldNic", ["isup"])
+_Addr = namedtuple("_Addr", ["family", "address"])
 _Disk = namedtuple("_Disk", ["total", "free"])
 
 _GIB = 1024**3
@@ -30,12 +34,14 @@ class _FakeProbes:
         self.cpu = [0.0, 48.0, 12.5]
         self.net = [{"en0": _Net(1_000, 500)}, {"en0": _Net(61_000, 3_500)}] * 2
         self.nics = {"en0": _UP}
+        self.addrs: dict[str, list[_Addr]] = {}
         self.disk_paths: list[str] = []
         monkeypatch.setattr(stats_module.time, "monotonic", lambda: self.now)
         monkeypatch.setattr(psutil, "cpu_percent", self._cpu_percent)
         monkeypatch.setattr(psutil, "virtual_memory", lambda: _Memory(16 * _GIB, 4 * _GIB))
         monkeypatch.setattr(psutil, "net_io_counters", self._net_io_counters)
         monkeypatch.setattr(psutil, "net_if_stats", lambda: self.nics)
+        monkeypatch.setattr(psutil, "net_if_addrs", lambda: self.addrs)
         monkeypatch.setattr(psutil, "disk_usage", self._disk_usage)
 
     def _cpu_percent(self, interval: float | None = None) -> float:
@@ -131,6 +137,64 @@ async def test_network_skips_loopback_and_down_interfaces(
     await _settle_disk_read(sampler)
 
 
+async def test_interface_flapping_never_spikes_or_zeroes_the_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only interfaces up in both samples count: no drop to 0, no since-boot spike."""
+    probes = _FakeProbes(monkeypatch)
+    down = _Nic(False, "broadcast,multicast")
+    since_boot = _Net(5_000_000_000, 5_000_000_000)
+    sampler = HostStatsSampler()
+    samples = []
+    for nics, counters in [
+        ({"en0": _UP, "en1": _UP}, {"en0": _Net(0, 0), "en1": since_boot}),
+        ({"en0": _UP, "en1": down}, {"en0": _Net(30_000, 3_000), "en1": since_boot}),
+        ({"en0": _UP, "en1": _UP}, {"en0": _Net(60_000, 6_000), "en1": since_boot}),
+    ]:
+        probes.nics, probes.net = nics, [counters]
+        samples.append(sampler.sample())
+        probes.now += 30.0
+
+    rates = [(s["net_rx_bytes_per_s"], s["net_tx_bytes_per_s"]) for s in samples[1:] if s]
+    assert rates == [(1_000, 100), (1_000, 100)]
+    await _settle_disk_read(sampler)
+
+
+async def test_loopback_is_found_by_address_without_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows and psutil < 5.9.3 report no flags; all-loopback addresses still count."""
+    probes = _FakeProbes(monkeypatch)
+    probes.nics = {"Loopback Pseudo-Interface 1": _OldNic(True), "Ethernet": _OldNic(True)}
+    probes.addrs = {
+        "Loopback Pseudo-Interface 1": [
+            _Addr(socket.AF_INET, "127.0.0.1"),
+            _Addr(socket.AF_INET6, "::1"),
+        ],
+        "Ethernet": [
+            _Addr(psutil.AF_LINK, "aa:bb:cc:dd:ee:ff"),
+            _Addr(socket.AF_INET, "10.0.0.5"),
+        ],
+    }
+    idle = _Net(0, 0)
+    probes.net = [
+        {"Loopback Pseudo-Interface 1": idle, "Ethernet": idle},
+        {
+            "Loopback Pseudo-Interface 1": _Net(9_000_000, 9_000_000),
+            "Ethernet": _Net(30_000, 3_000),
+        },
+    ]
+    sampler = HostStatsSampler()
+    sampler.sample()
+    probes.now += 30.0
+
+    second = sampler.sample()
+
+    assert second is not None
+    assert (second["net_rx_bytes_per_s"], second["net_tx_bytes_per_s"]) == (1_000, 100)
+    await _settle_disk_read(sampler)
+
+
 async def test_counter_reset_reads_as_no_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
     """Counters that go backwards (an interface restarted) never yield negative rates."""
     probes = _FakeProbes(monkeypatch)
@@ -202,8 +266,10 @@ async def test_hung_disk_read_never_delays_a_sample(monkeypatch: pytest.MonkeyPa
     await _settle_disk_read(sampler)
 
 
-async def test_disk_reading_from_a_hung_read_goes_stale(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A disk value older than ~3 keepalives is dropped rather than resent as fresh."""
+async def test_no_disk_value_while_the_previous_read_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read still pending at the next sample is hung, so its old value isn't resent."""
     probes = _FakeProbes(monkeypatch)
     sampler = HostStatsSampler()
     sampler.sample()
@@ -216,7 +282,7 @@ async def test_disk_reading_from_a_hung_read_goes_stale(monkeypatch: pytest.Monk
     monkeypatch.setattr(sampler, "_read_disk", hung_read)
     probes.now += 30.0
     recent = sampler.sample()
-    probes.now += 70.0
+    probes.now += 30.0
     stale = sampler.sample()
 
     assert recent is not None

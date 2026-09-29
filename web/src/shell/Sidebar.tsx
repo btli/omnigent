@@ -228,7 +228,7 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ForkSessionDialog } from "./ForkSessionDialog";
-import { RunnerStatsSection, hasFreshStats } from "./RunnerStatsSection";
+import { RunnerStatsSection, hasRunnerStats } from "./RunnerStatsSection";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
@@ -3647,7 +3647,7 @@ function SessionTooltipContent({
       : (host?.name ?? conversation.host_id);
   const serverInfo = useServerInfo();
   // The runner section's header names the host, replacing the location line.
-  const showRunnerStats = hasFreshStats(host) && isFeatureEnabled(serverInfo, "host_stats");
+  const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
   // Runner-owned failure detail the server persists as a label; transcript-only
