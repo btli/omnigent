@@ -2703,9 +2703,9 @@ function SectionHeader({
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders header controls overlaid at the right
-      edge. Those overlays are painted whenever hover isn't available (phones,
-      touch tablets/laptops at any width), so the collapsed badges reserve the
-      full control column there; only at rest on hover-capable desktops do the
+      edge. Section controls are painted whenever hover isn't available, so the
+      collapsed badges reserve the full control column there; project folders
+      paint theirs only with fine hover. At rest on hover-capable desktops the
       badges return to the rows' badge column. */
   hasAction?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
@@ -2779,7 +2779,7 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
+                "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
             )
           : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
@@ -2821,10 +2821,11 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            // Touch project rows have one menu; fine pointers also get a shortcut.
+            // Project actions exist only with fine hover (touch uses the
+            // long-press menu); section headers keep their select/filter slots.
             hasAction
               ? cn(
-                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
+                  icon ? cn(clusterRestMargin, "fine-hover:mr-14") : "mr-14",
                   clusterHoverDesktopMargin,
                 )
               : hasPersistentAction
@@ -4924,8 +4925,9 @@ function ProjectFolderActions({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
+  // Touch devices of any width reach these through the header's long-press menu.
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="hidden items-center gap-0.5 fine-hover:flex">
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -4934,7 +4936,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="text-muted-foreground"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
