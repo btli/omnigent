@@ -116,15 +116,15 @@ async def test_hung_disk_read_never_delays_a_sample(monkeypatch: pytest.MonkeyPa
 
     sampler = HostStatsSampler()
     monkeypatch.setattr(sampler, "_read_disk", hung_read)
-    sampler.sample()
-    await asyncio.sleep(0)
-    probes.now += 30.0
-    second = sampler.sample()
-    probes.now += 30.0
-    sampler.sample()
+    samples = []
+    for _ in range(3):
+        samples.append(sampler.sample())
+        # Yield so any disk read a sample started gets to run and be counted.
+        await asyncio.sleep(0)
+        probes.now += 30.0
 
-    assert second is not None
-    assert "disk_total_bytes" not in second
+    assert samples[1] is not None
+    assert "disk_total_bytes" not in samples[1]
     assert reads == 1
     release.set()
     await _settle_disk_read(sampler)
