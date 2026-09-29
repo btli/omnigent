@@ -1107,7 +1107,7 @@ function WorkspacePanelImpl({
           {...effectiveHandleProps}
           data-workspace-panel-resize-gutter
           className={cn(
-            "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+            "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 md:block",
             pending && "cursor-default hover:bg-transparent active:bg-transparent",
           )}
         />
