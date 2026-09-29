@@ -1279,7 +1279,6 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("10");
   });
 
-
   it("shows and persists the code font weight", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
