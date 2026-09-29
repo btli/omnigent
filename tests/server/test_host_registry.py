@@ -538,6 +538,55 @@ def test_gateway_inference_returns_a_copy() -> None:
     assert registry.gateway_inference(bare) == {"codex": True}
 
 
+def test_host_stats_are_stamped_on_receipt_and_survive_a_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pong's snapshot is held in memory with this server's receive time.
+
+    Kept across a disconnect so an offline host can still say when it last
+    reported; a pong without stats (an older host) clears the entry.
+    """
+    bare = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    registry = HostRegistry()
+    assert registry.host_stats(bare) is None
+    conn = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+
+    monkeypatch.setattr("omnigent.server.host_registry.time.time", lambda: 1_790_000_000.5)
+    registry.record_host_stats(conn, {"cpu_percent": 48.0})
+    expected = {"cpu_percent": 48.0, "reported_at": 1_790_000_000.5}
+    assert registry.host_stats(bare) == expected
+    assert registry.host_stats(f"host_{bare}") == expected
+
+    registry.deregister(bare)
+    assert registry.host_stats(bare) == expected
+
+    registry.record_host_stats(conn, None)
+    assert registry.host_stats(bare) is None
+
+
+def test_host_stats_stay_in_their_workspace() -> None:
+    """A host id reused in another workspace never reads the other's stats."""
+    registry = HostRegistry()
+    host_id = "ffeeddccbbaa99887766554433221100"
+    with workspace_scope(111):
+        conn_a = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    registry.record_host_stats(conn_a, {"cpu_percent": 12.0})
+
+    with workspace_scope(222):
+        assert registry.host_stats(host_id) is None
+    with workspace_scope(111):
+        read = registry.host_stats(host_id)
+    assert read is not None
+    assert read["cpu_percent"] == 12.0
+
+    # The returned snapshot is a copy.
+    read["cpu_percent"] = 99.0
+    assert registry.host_stats(host_id, workspace_id=111) == {
+        "cpu_percent": 12.0,
+        "reported_at": read["reported_at"],
+    }
+
+
 def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     """
     Every ``uuid_to_bytes``-accepted spelling of a host id must key
