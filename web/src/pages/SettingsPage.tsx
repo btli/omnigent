@@ -82,6 +82,7 @@ import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/Appearance
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { FontFamilyCombobox } from "@/components/FontFamilyCombobox";
 import {
   Select,
   SelectContent,
@@ -99,7 +100,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { MOD_KEY } from "@/components/KeyboardShortcut";
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
@@ -117,7 +118,6 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -153,6 +153,7 @@ import {
 import {
   clampCodeFontSizePx,
   CODE_FONT_FAMILY_DEFAULT,
+  CODE_FONT_FAMILY_FALLBACK,
   CODE_FONT_SIZE_DEFAULT,
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
@@ -167,6 +168,11 @@ import {
   writeCodeFontSizePx,
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
+import {
+  applyFixedWidthFontFamily,
+  readFixedWidthFontFamily,
+  writeFixedWidthFontFamily,
+} from "@/lib/fixedWidthFontPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -262,7 +268,6 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
-import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -844,10 +849,12 @@ function AppearanceSection() {
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
+    applyFixedWidthFontFamily("");
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
     writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
+    writeFixedWidthFontFamily("");
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
@@ -858,6 +865,7 @@ function AppearanceSection() {
         for (const key of [
           "omnigent:ui-font-size",
           "omnigent:ui-font-family",
+          "omnigent:fixed-width-font-family",
           "omnigent:code-font-size",
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
@@ -983,6 +991,9 @@ function AppearanceSection() {
             <UiFontSizeControl />
             <div className="mt-4 border-t border-border pt-4">
               <UiFontFamilyControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <FixedWidthFontFamilyControl />
             </div>
           </SettingsGroup>
 
@@ -1368,7 +1379,7 @@ function DeleteWorktreesOnArchiveControl() {
 
 /**
  * Connect / disconnect a Databricks workspace. Once connected, a managed
- * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * sandbox launched by this user reaches the Databricks Unity Gateway (MCP + model
  * serving) as them, using their per-user OAuth token. Databricks is
  * multi-workspace, so the user supplies their workspace URL. The connect action
  * is a full-page redirect to the workspace OAuth consent; on return the callback
@@ -1449,8 +1460,8 @@ function DatabricksIntegrationControl() {
           className="flex-1"
           description={
             status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks Unity Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its Unity Gateway (MCP + model serving) as you."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1542,7 +1553,7 @@ function ComposerSendShortcutControl() {
         className="flex-1"
         description={
           <>
-            <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+            <p>Off: Enter submits and Shift+Enter or {ALT_KEY}+Enter inserts a newline.</p>
             <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
           </>
         }
@@ -1903,47 +1914,62 @@ function UiFontFamilyControl() {
     applyUiFontFamily(next);
   }, []);
 
-  const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Font family</span>
+        <span className="text-sm text-muted-foreground">
+          Interface text font. Pick from the catalog or type any font installed on this device.
+        </span>
+      </div>
+      <FontFamilyCombobox
+        category="sans"
+        value={family}
+        onChange={update}
+        defaultLabel="System default"
+        ariaLabel="UI font family"
+        testId="ui-font-family"
+        previewFallback="var(--font-sans)"
+      />
+    </div>
+  );
+}
+
+/**
+ * Fixed-width (monospace chrome) font family picker. A searchable dropdown over
+ * the catalog's `fixedWidth` role; selecting an option loads the webfont and
+ * applies it live via the --ui-mono-font-family variable, which the `font-mono`
+ * utility reads (see lib/fixedWidthFontPreferences.ts) — file paths, hashes,
+ * inline code chips and log rows across the chrome. Distinct from the code
+ * editor/terminal font below. "Default" falls back to the --font-mono stack; a
+ * custom typed family stays honored.
+ */
+function FixedWidthFontFamilyControl() {
+  const [family, setFamily] = useState(() => readFixedWidthFontFamily());
+
+  const update = useCallback((next: string) => {
+    setFamily(next);
+    writeFixedWidthFontFamily(next);
+    applyFixedWidthFontFamily(next);
+  }, []);
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      {/* Take the remaining width (and let the longer description wrap within
-          this column) so the input stays inline instead of dropping to its own
-          row — matches the font-size row's alignment. */}
-      <SettingsLabel
-        label="Font family"
-        className="flex-1"
-        description="Use any font installed on this device. Leave blank for the system default."
-      />
-      {/* Reset sits left of the input so the input is the rightmost element and
-          its right edge lines up flush with the font-size stepper above.
-          `invisible` (not removed) at the default keeps the row from shifting. */}
-      <div role="group" aria-label="Font family" className="flex shrink-0 items-center gap-2">
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          data-testid="ui-font-family-reset"
-          disabled={isDefault}
-          className={cn("h-9", isDefault && "invisible")}
-          onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
-          componentId="settings.appearance.ui_font_family_reset"
-        >
-          Reset
-        </Button>
-        <Input
-          type="text"
-          aria-label="UI font family"
-          data-testid="ui-font-family-input"
-          placeholder="System default"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="h-9 w-56"
-          value={family}
-          onChange={(e) => update(e.target.value)}
-        />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Fixed width font</span>
+        <span className="text-sm text-muted-foreground">
+          Monospace font for file paths, hashes, and inline code in the interface.
+        </span>
       </div>
+      <FontFamilyCombobox
+        category="fixedWidth"
+        value={family}
+        onChange={update}
+        defaultLabel="Default"
+        ariaLabel="Fixed width font family"
+        testId="fixed-width-font-family"
+        previewFallback="var(--font-mono)"
+      />
     </div>
   );
 }
@@ -2064,44 +2090,23 @@ function UiCodeFontFamilyControl() {
     writeCodeFontFamily(next);
   }, []);
 
-  const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
-
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <SettingsLabel
-        label="Code font family"
-        className="flex-1"
-        description="Font for the code editor and terminal. Leave blank for the default."
-      />
-      {/* Reset sits left of the input so the input's right edge lines up flush
-          with the size stepper above. `invisible` (not removed) at the default
-          keeps the row from shifting. */}
-      <div role="group" aria-label="Code font family" className="flex shrink-0 items-center gap-2">
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          data-testid="code-font-family-reset"
-          disabled={isDefault}
-          className={cn("h-9", isDefault && "invisible")}
-          onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
-          componentId="settings.appearance.code_font_family_reset"
-        >
-          Reset
-        </Button>
-        <Input
-          type="text"
-          aria-label="Code font family"
-          data-testid="code-font-family-input"
-          placeholder="Editor default"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="h-9 w-56"
-          value={family}
-          onChange={(e) => update(e.target.value)}
-        />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Code font family</span>
+        <span className="text-sm text-muted-foreground">
+          Font for the code editor and terminal. Pick from the catalog or type any installed font.
+        </span>
       </div>
+      <FontFamilyCombobox
+        category="code"
+        value={family}
+        onChange={update}
+        defaultLabel="Editor default"
+        ariaLabel="Code font family"
+        testId="code-font-family"
+        previewFallback={CODE_FONT_FAMILY_FALLBACK}
+      />
     </div>
   );
 }
@@ -2718,7 +2723,6 @@ function selectValueToRetentionDays(value: string): number | null {
 }
 
 function ImportSection() {
-  const info = useServerInfo();
   return (
     <Section
       title="Import sessions"
@@ -2730,17 +2734,6 @@ function ImportSection() {
           <ImportSessionsPanel />
         </div>
       </div>
-      {!isFeatureEnabled(info, "harness_settings_ui") && (
-        <div className="mt-8 flex flex-col gap-3">
-          <h2 className="text-ui font-medium">Harness imports</h2>
-          <p className="-mt-2 text-ui text-muted-foreground">
-            See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
-          </p>
-          <div className="rounded-xl border border-border bg-card p-4">
-            <ReviewImportsPanel />
-          </div>
-        </div>
-      )}
     </Section>
   );
 }

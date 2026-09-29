@@ -16,6 +16,7 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
+import { UI_FONT_FAMILY_FALLBACK } from "@/lib/uiFontPreferences";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -25,9 +26,7 @@ const mocks = vi.hoisted(() => ({
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
-  harnessSettingsEnabled: false,
   importSessionsPanel: vi.fn(() => null),
-  reviewImportsPanel: vi.fn(() => null),
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -58,14 +57,10 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { harness_settings_ui: mocks.harnessSettingsEnabled },
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
-}));
-vi.mock("@/components/onboarding/HostImportReview", () => ({
-  ReviewImportsPanel: mocks.reviewImportsPanel,
 }));
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
@@ -234,9 +229,7 @@ beforeEach(() => {
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
-  mocks.harnessSettingsEnabled = false;
   mocks.importSessionsPanel.mockClear();
-  mocks.reviewImportsPanel.mockClear();
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -263,23 +256,13 @@ afterEach(() => {
 });
 
 describe("Import sessions", () => {
-  it.each([true, false])(
-    "shows Harness imports only with Harnesses settings disabled (enabled=%s)",
-    (enabled) => {
-      mocks.harnessSettingsEnabled = enabled;
-      renderPage("/settings/import");
+  it("keeps session imports without the legacy Harness imports section", () => {
+    renderPage("/settings/import");
 
-      expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
-      expect(mocks.importSessionsPanel).toHaveBeenCalled();
-      if (enabled) {
-        expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
-        expect(mocks.reviewImportsPanel).not.toHaveBeenCalled();
-      } else {
-        expect(screen.getByRole("heading", { name: "Harness imports" })).toBeTruthy();
-        expect(mocks.reviewImportsPanel).toHaveBeenCalled();
-      }
-    },
-  );
+    expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
+    expect(mocks.importSessionsPanel).toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
 });
 
 const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
@@ -454,7 +437,9 @@ describe("SettingsPage", () => {
     if (description === null) throw new Error("Missing composer shortcut description");
     expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
     expect(
-      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+      within(description).getByText(
+        /Off: Enter submits and Shift\+Enter or (?:⌥|Alt)\+Enter inserts a newline\./,
+      ),
     ).toBeInTheDocument();
     expect(
       within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
@@ -767,42 +752,133 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
 
-  it("shows the empty font family default and applies + persists a typed name", () => {
+  it("shows the system default and selecting a catalog sans font persists + applies it", () => {
     localStorage.clear();
     document.documentElement.style.removeProperty("--ui-font-family");
     renderPage("/settings/appearance");
-    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
-    // No stored preference → empty input, System-default placeholder, no override.
-    expect(input.value).toBe("");
-    expect(input.placeholder).toBe("System default");
+    const trigger = screen.getByTestId("ui-font-family-trigger");
+    // No stored preference → the trigger shows "System default", no override applied.
+    expect(trigger).toHaveTextContent("System default");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
-    // Reset has nothing to do at the default.
-    expect(screen.getByTestId("ui-font-family-reset")).toBeDisabled();
 
-    fireEvent.change(input, { target: { value: "Inter" } });
-    expect(input.value).toBe("Inter");
+    // Open the dropdown and pick a catalog font.
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("ui-font-family-option-Inter"));
+
     // The choice is persisted so it survives a refresh...
     expect(localStorage.getItem("omnigent:ui-font-family")).toBe(JSON.stringify("Inter"));
     // ...and applied live to the document root, with the system stack appended
     // so an uninstalled/partial name degrades to the default sans, not serif.
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
-      "Inter, var(--font-sans)",
+      `Inter, ${UI_FONT_FAMILY_FALLBACK}`,
     );
-    expect(screen.getByTestId("ui-font-family-reset")).not.toBeDisabled();
+    expect(screen.getByTestId("ui-font-family-trigger")).toHaveTextContent("Inter");
   });
 
-  it("reset restores the system default font family", () => {
-    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Georgia"));
+  it("selecting System default restores the system font family", () => {
+    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Inter"));
     renderPage("/settings/appearance");
-    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
     // The control reflects the stored preference on mount.
-    expect(input.value).toBe("Georgia");
+    expect(screen.getByTestId("ui-font-family-trigger")).toHaveTextContent("Inter");
 
-    fireEvent.click(screen.getByTestId("ui-font-family-reset"));
-    // Reset clears the field, the applied property, and the stored key.
-    expect(input.value).toBe("");
+    fireEvent.click(screen.getByTestId("ui-font-family-trigger"));
+    fireEvent.click(screen.getByTestId("ui-font-family-option-default"));
+
+    // Choosing the default clears the applied property and the stored key.
+    expect(screen.getByTestId("ui-font-family-trigger")).toHaveTextContent("System default");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
+  });
+
+  it("shows the fixed-width font default and selecting a catalog font persists + applies it", () => {
+    localStorage.clear();
+    document.documentElement.style.removeProperty("--ui-mono-font-family");
+    renderPage("/settings/appearance");
+    const trigger = screen.getByTestId("fixed-width-font-family-trigger");
+    expect(trigger).toHaveTextContent("Default");
+    expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe("");
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("fixed-width-font-family-option-IBM Plex Mono"));
+
+    // Persisted under the dedicated fixed-width key and applied to its own CSS var.
+    expect(localStorage.getItem("omnigent:fixed-width-font-family")).toBe(
+      JSON.stringify("IBM Plex Mono"),
+    );
+    expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe(
+      "IBM Plex Mono, var(--font-mono)",
+    );
+    expect(screen.getByTestId("fixed-width-font-family-trigger")).toHaveTextContent(
+      "IBM Plex Mono",
+    );
+  });
+
+  it("keeps the fixed-width chrome font isolated from the code (Monaco/xterm) font", () => {
+    // The fixed-width control drives --ui-mono-font-family (chrome monospace,
+    // read by the `.font-mono` utility); Monaco/xterm read the code-font pref /
+    // --font-mono directly. Setting one role must not touch the other's storage.
+    localStorage.clear();
+    document.documentElement.style.removeProperty("--ui-mono-font-family");
+    renderPage("/settings/appearance");
+
+    // Pick a fixed-width font: it persists to the fixed-width key only — the code
+    // font pref stays untouched, so the editor/terminal font is unaffected.
+    fireEvent.click(screen.getByTestId("fixed-width-font-family-trigger"));
+    fireEvent.click(screen.getByTestId("fixed-width-font-family-option-IBM Plex Mono"));
+    expect(localStorage.getItem("omnigent:fixed-width-font-family")).toBe(
+      JSON.stringify("IBM Plex Mono"),
+    );
+    expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
+
+    // Pick a code font: it persists to the code-font key and leaves the
+    // fixed-width chrome var/key exactly as the fixed-width choice set them.
+    fireEvent.click(screen.getByTestId("code-font-family-trigger"));
+    fireEvent.click(screen.getByTestId("code-font-family-option-Fira Code"));
+    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
+    expect(localStorage.getItem("omnigent:fixed-width-font-family")).toBe(
+      JSON.stringify("IBM Plex Mono"),
+    );
+    expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe(
+      "IBM Plex Mono, var(--font-mono)",
+    );
+  });
+
+  it("shows the code font default and selecting a catalog code font persists it", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const trigger = screen.getByTestId("code-font-family-trigger");
+    // No stored preference → the trigger shows the editor default.
+    expect(trigger).toHaveTextContent("Editor default");
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("code-font-family-option-Fira Code"));
+
+    // The choice is persisted under the code-font family key so it survives a refresh.
+    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
+    expect(screen.getByTestId("code-font-family-trigger")).toHaveTextContent("Fira Code");
+  });
+
+  it("lists Nerd Fonts in the code font dropdown", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    fireEvent.click(screen.getByTestId("code-font-family-trigger"));
+    // A Nerd Font variant is offered for the editor/terminal role.
+    expect(
+      screen.getByTestId("code-font-family-option-JetBrainsMono Nerd Font Mono"),
+    ).toBeInTheDocument();
+  });
+
+  it("selecting Editor default restores the default code font family", () => {
+    localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
+    renderPage("/settings/appearance");
+    // The control reflects the stored preference on mount.
+    expect(screen.getByTestId("code-font-family-trigger")).toHaveTextContent("JetBrains Mono");
+
+    fireEvent.click(screen.getByTestId("code-font-family-trigger"));
+    fireEvent.click(screen.getByTestId("code-font-family-option-default"));
+    // Choosing the default clears the stored key.
+    expect(screen.getByTestId("code-font-family-trigger")).toHaveTextContent("Editor default");
+    expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
   });
 
   it("resets every appearance preference back to product defaults", () => {
@@ -822,14 +898,8 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
-      target: { value: "Inter" },
-    });
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
-    fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
-      target: { value: "Fira Code" },
-    });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
@@ -851,9 +921,7 @@ describe("SettingsPage", () => {
 
     // Fonts are back to their defaults.
     expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
-    expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
-    expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
@@ -982,36 +1050,6 @@ describe("SettingsPage", () => {
     fireEvent.blur(input);
     expect(input.value).toBe("10");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("10");
-  });
-
-  it("shows the empty code font family default and applies + persists a typed name", () => {
-    localStorage.clear();
-    renderPage("/settings/appearance");
-    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
-    // No stored preference → empty input, editor-default placeholder.
-    expect(input.value).toBe("");
-    expect(input.placeholder).toBe("Editor default");
-    // Reset has nothing to do at the default.
-    expect(screen.getByTestId("code-font-family-reset")).toBeDisabled();
-
-    fireEvent.change(input, { target: { value: "Fira Code" } });
-    expect(input.value).toBe("Fira Code");
-    // The choice is persisted under the code-font family key so it survives a refresh.
-    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
-    expect(screen.getByTestId("code-font-family-reset")).not.toBeDisabled();
-  });
-
-  it("reset restores the default code font family", () => {
-    localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
-    renderPage("/settings/appearance");
-    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
-    // The control reflects the stored preference on mount.
-    expect(input.value).toBe("JetBrains Mono");
-
-    fireEvent.click(screen.getByTestId("code-font-family-reset"));
-    // Reset clears the field and the stored key.
-    expect(input.value).toBe("");
-    expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
   });
 
   it("shows and persists the code font weight", () => {
