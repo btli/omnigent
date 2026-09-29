@@ -11707,11 +11707,10 @@ def test_catalog_fingerprint_includes_ambient_gateway_url(
 async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An ambient gateway whose live listing is namespaced filters canonical IDs.
+    """An ambient gateway whose reachable listing is namespaced-only drops bare rows.
 
-    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
-    gateway. With claude_config None, the gateway's own listing (no bare
-    claude-*) is what drops the canonical rows, not the hostname.
+    With claude_config None, the gateway's own listing (no bare claude-*) is
+    what drops the canonical rows, not the hostname; namespaced rows survive.
     """
 
     async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
@@ -11877,6 +11876,14 @@ def _empty_listing_handler(request: httpx.Request) -> httpx.Response:
     [
         pytest.param(_unreachable_handler, "sk-ambient-token", id="unreachable"),
         pytest.param(_empty_listing_handler, "sk-ambient-token", id="empty"),
+        pytest.param(lambda r: httpx.Response(401), "sk-ambient-token", id="http-401"),
+        pytest.param(lambda r: httpx.Response(429), "sk-ambient-token", id="http-429"),
+        pytest.param(lambda r: httpx.Response(500), "sk-ambient-token", id="http-500"),
+        pytest.param(
+            lambda r: httpx.Response(200, text="<html>not json</html>"),
+            "sk-ambient-token",
+            id="non-json-200",
+        ),
         pytest.param(_litellm_models_handler, None, id="no-credential"),
     ],
 )
