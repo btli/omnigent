@@ -610,13 +610,13 @@ def test_gateway_inference_returns_a_copy() -> None:
     assert registry.gateway_inference(bare) == {"codex": True}
 
 
-def test_host_stats_are_stamped_on_receipt_and_survive_a_disconnect(
+def test_host_stats_are_stamped_on_receipt_and_dropped_on_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A pong's snapshot is held in memory with this server's receive time.
 
-    Kept across a disconnect so an offline host can still say when it last
-    reported; a pong without stats (an older host) clears the entry.
+    A pong without stats (an older host) clears it, and a disconnect evicts the
+    entry, so no replica keeps serving a gone host's reading.
     """
     bare = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
     registry = HostRegistry()
@@ -629,11 +629,13 @@ def test_host_stats_are_stamped_on_receipt_and_survive_a_disconnect(
     assert registry.host_stats(bare) == expected
     assert registry.host_stats(f"host_{bare}") == expected
 
-    registry.deregister(bare)
-    assert registry.host_stats(bare) == expected
-
     registry.record_host_stats(conn, None)
     assert registry.host_stats(bare) is None
+
+    registry.record_host_stats(conn, {"cpu_percent": 12.0})
+    registry.deregister(bare)
+    assert registry.host_stats(bare) is None
+    assert registry._host_stats == {}
 
 
 def test_host_stats_stay_in_their_workspace() -> None:
