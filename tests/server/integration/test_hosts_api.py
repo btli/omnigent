@@ -414,9 +414,30 @@ async def _send_pong(
         if registry.host_stats(_HOST_ID) != before:
             return
         await asyncio.sleep(0.01)
+    pytest.fail("the server never recorded the pong's host_stats")
 
 
 _HOST_STATS_ON = FeatureFlags(frozenset({Feature.HOST_STATS}))
+
+
+async def test_oversized_pong_stats_never_tear_down_the_tunnel(db_uri: str) -> None:
+    """
+    Verify a pong with a JSON integer too large for a float is absorbed.
+
+    A parser that raised here would end the receive loop, drop the tunnel and
+    mark a healthy host offline.
+    """
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, _HOST_STATS_ON)
+    comm = await _connect_host(app, registry)
+    await _send_pong(comm, registry, {"cpu_percent": 10**400, "memory_total_bytes": 10**400})
+
+    stats = registry.host_stats(_HOST_ID)
+    assert stats is not None
+    assert stats["cpu_percent"] == 100
+    assert "memory_total_bytes" not in stats
+    # The tunnel is still up: the next pong is still read and recorded.
+    await _send_pong(comm, registry, {"cpu_percent": 7.0})
+    assert registry.get(_HOST_ID) is not None
 
 
 async def test_hosts_api_surfaces_host_stats_from_the_keepalive_pong(db_uri: str) -> None:

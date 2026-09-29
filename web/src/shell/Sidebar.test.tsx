@@ -1683,6 +1683,19 @@ describe("Sidebar session list", () => {
       );
       expect(within(tooltip).queryByTestId("runner-stats-section")).toBeNull();
     });
+
+    it("treats a snapshot older than 150 s as no stats", async () => {
+      const stale = {
+        ...statsHost,
+        stats: { ...statsHost.stats, reported_at: Date.now() / 1000 - 151 },
+      };
+      const tooltip = await hoverStatsTooltip(stale, hostStatsOn);
+
+      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+        "bryan-mbp",
+      );
+      expect(within(tooltip).queryByTestId("runner-stats-section")).toBeNull();
+    });
   });
 });
 

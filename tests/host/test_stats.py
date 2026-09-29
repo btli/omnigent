@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import namedtuple
 from pathlib import Path
 
@@ -14,9 +15,11 @@ from omnigent.host.stats import HostStatsSampler, parse_host_stats
 
 _Memory = namedtuple("_Memory", ["total", "available"])
 _Net = namedtuple("_Net", ["bytes_recv", "bytes_sent"])
+_Nic = namedtuple("_Nic", ["isup", "flags"])
 _Disk = namedtuple("_Disk", ["total", "free"])
 
 _GIB = 1024**3
+_UP = _Nic(True, "up,broadcast,running,multicast")
 
 
 class _FakeProbes:
@@ -25,18 +28,25 @@ class _FakeProbes:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.now = 1000.0
         self.cpu = [0.0, 48.0, 12.5]
-        self.net = [_Net(1_000, 500), _Net(61_000, 3_500)]
+        self.net = [{"en0": _Net(1_000, 500)}, {"en0": _Net(61_000, 3_500)}] * 2
+        self.nics = {"en0": _UP}
         self.disk_paths: list[str] = []
         monkeypatch.setattr(stats_module.time, "monotonic", lambda: self.now)
         monkeypatch.setattr(psutil, "cpu_percent", self._cpu_percent)
         monkeypatch.setattr(psutil, "virtual_memory", lambda: _Memory(16 * _GIB, 4 * _GIB))
-        monkeypatch.setattr(psutil, "net_io_counters", lambda: self.net.pop(0))
+        monkeypatch.setattr(psutil, "net_io_counters", self._net_io_counters)
+        monkeypatch.setattr(psutil, "net_if_stats", lambda: self.nics)
         monkeypatch.setattr(psutil, "disk_usage", self._disk_usage)
 
     def _cpu_percent(self, interval: float | None = None) -> float:
         # A blocking interval would stall the pong; the sampler must never pass one.
         assert interval is None
         return self.cpu.pop(0)
+
+    def _net_io_counters(self, pernic: bool = False) -> dict[str, _Net]:
+        # Per-interface counters, so loopback and down links can be left out.
+        assert pernic
+        return self.net.pop(0)
 
     def _disk_usage(self, path: str) -> _Disk:
         self.disk_paths.append(path)
@@ -87,6 +97,70 @@ async def test_second_sample_reports_cpu_and_network_throughput(
     assert probes.disk_paths[0] == str(tmp_path)
 
 
+async def test_network_skips_loopback_and_down_interfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loopback (the runner's own localhost traffic) and down links aren't host traffic."""
+    probes = _FakeProbes(monkeypatch)
+    probes.nics = {
+        "en0": _UP,
+        "en1": _UP,
+        "lo0": _Nic(True, "up,loopback,running"),
+        "utun4": _Nic(False, "pointopoint,multicast"),
+    }
+    idle = _Net(0, 0)
+    busy = _Net(9_000_000, 9_000_000)
+    probes.net = [
+        {"en0": idle, "en1": idle, "lo0": idle, "utun4": idle, "gone0": idle},
+        {
+            "en0": _Net(30_000, 3_000),
+            "en1": _Net(30_000, 0),
+            "lo0": busy,
+            "utun4": busy,
+            "gone0": busy,
+        },
+    ]
+    sampler = HostStatsSampler()
+    sampler.sample()
+    probes.now += 30.0
+
+    second = sampler.sample()
+
+    assert second is not None
+    assert (second["net_rx_bytes_per_s"], second["net_tx_bytes_per_s"]) == (2_000, 100)
+    await _settle_disk_read(sampler)
+
+
+async def test_counter_reset_reads_as_no_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Counters that go backwards (an interface restarted) never yield negative rates."""
+    probes = _FakeProbes(monkeypatch)
+    probes.net = [{"en0": _Net(10_000, 5_000)}, {"en0": _Net(1_000, 500)}]
+    sampler = HostStatsSampler()
+    sampler.sample()
+    probes.now += 30.0
+
+    second = sampler.sample()
+
+    assert second is not None
+    assert (second["net_rx_bytes_per_s"], second["net_tx_bytes_per_s"]) == (0, 0)
+    await _settle_disk_read(sampler)
+
+
+async def test_zero_elapsed_time_reports_no_rates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two samples on the same clock tick can't divide by zero; rates are just omitted."""
+    _FakeProbes(monkeypatch)
+    sampler = HostStatsSampler()
+    sampler.sample()
+
+    second = sampler.sample()
+
+    assert second is not None
+    assert "cpu_percent" in second
+    assert "net_rx_bytes_per_s" not in second
+    assert "net_tx_bytes_per_s" not in second
+    await _settle_disk_read(sampler)
+
+
 async def test_disk_falls_back_to_home_without_a_workspace_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -104,8 +178,6 @@ async def test_disk_falls_back_to_home_without_a_workspace_root(
 async def test_hung_disk_read_never_delays_a_sample(monkeypatch: pytest.MonkeyPatch) -> None:
     """The disk stat runs off-loop, one at a time, so a dead mount can't stall pongs."""
     probes = _FakeProbes(monkeypatch)
-    probes.cpu.append(7.0)
-    probes.net.append(_Net(61_000, 3_500))
     release = asyncio.Event()
     reads = 0
 
@@ -130,6 +202,51 @@ async def test_hung_disk_read_never_delays_a_sample(monkeypatch: pytest.MonkeyPa
     await _settle_disk_read(sampler)
 
 
+async def test_disk_reading_from_a_hung_read_goes_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A disk value older than ~3 keepalives is dropped rather than resent as fresh."""
+    probes = _FakeProbes(monkeypatch)
+    sampler = HostStatsSampler()
+    sampler.sample()
+    await _settle_disk_read(sampler)
+    release = asyncio.Event()
+
+    async def hung_read() -> None:
+        await release.wait()
+
+    monkeypatch.setattr(sampler, "_read_disk", hung_read)
+    probes.now += 30.0
+    recent = sampler.sample()
+    probes.now += 70.0
+    stale = sampler.sample()
+
+    assert recent is not None
+    assert recent["disk_free_bytes"] == 180 * 10**9
+    assert stale is not None
+    assert "disk_free_bytes" not in stale
+    release.set()
+    await _settle_disk_read(sampler)
+
+
+async def test_unexpected_disk_error_yields_no_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-OSError disk failure is absorbed, not left in an un-awaited task."""
+    probes = _FakeProbes(monkeypatch)
+
+    def broken_disk(path: str) -> None:
+        raise ValueError(f"bad mount table entry for {path}")
+
+    monkeypatch.setattr(psutil, "disk_usage", broken_disk)
+    sampler = HostStatsSampler()
+    sampler.sample()
+    await _settle_disk_read(sampler)
+    probes.now += 30.0
+
+    second = sampler.sample()
+
+    assert second is not None
+    assert "disk_total_bytes" not in second
+    await _settle_disk_read(sampler)
+
+
 async def test_probe_failure_yields_no_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failing probe drops the snapshot instead of failing the pong it rides on."""
     _FakeProbes(monkeypatch)
@@ -141,6 +258,29 @@ async def test_probe_failure_yields_no_snapshot(monkeypatch: pytest.MonkeyPatch)
     sampler = HostStatsSampler()
 
     assert sampler.sample() is None
+    await _settle_disk_read(sampler)
+
+
+async def test_unexpected_sampling_error_is_absorbed_and_logged_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Any exception type is absorbed; only the first failure is logged loudly."""
+    probes = _FakeProbes(monkeypatch)
+
+    def broken() -> None:
+        raise KeyError("swap")
+
+    monkeypatch.setattr(psutil, "virtual_memory", broken)
+    caplog.set_level(logging.DEBUG, logger=stats_module.__name__)
+    sampler = HostStatsSampler()
+
+    first = sampler.sample()
+    probes.now += 30.0
+    second = sampler.sample()
+
+    assert (first, second) == (None, None)
+    levels = [r.levelno for r in caplog.records if r.name == stats_module.__name__]
+    assert levels == [logging.ERROR, logging.DEBUG]
     await _settle_disk_read(sampler)
 
 
@@ -167,6 +307,25 @@ def test_parse_host_stats_keeps_only_valid_known_readings() -> None:
         "memory_total_bytes": 17_179_869_184,
         "net_tx_bytes_per_s": 310.5,
     }
+
+
+def test_parse_host_stats_never_raises_on_oversized_integers() -> None:
+    """JSON integers too big for a float are handled, not raised as OverflowError."""
+    assert parse_host_stats(
+        {"cpu_percent": 10**400, "memory_total_bytes": 10**400, "net_rx_bytes_per_s": -(10**400)}
+    ) == {"cpu_percent": 100}
+
+
+def test_parse_host_stats_rejects_implausible_readings() -> None:
+    """CPU is clamped to 0-100; absurd byte values and part > total pairs are dropped."""
+    assert parse_host_stats({"cpu_percent": 1e308}) == {"cpu_percent": 100}
+    assert parse_host_stats({"cpu_percent": -3}) == {"cpu_percent": 0}
+    assert parse_host_stats({"cpu_percent": float("nan")}) is None
+    assert parse_host_stats({"disk_total_bytes": 2**61, "disk_free_bytes": 10}) == {
+        "disk_free_bytes": 10
+    }
+    assert parse_host_stats({"memory_total_bytes": 8, "memory_used_bytes": 9}) is None
+    assert parse_host_stats({"disk_total_bytes": 8, "disk_free_bytes": 9}) is None
 
 
 @pytest.mark.parametrize("raw", [None, [], "stats", {}, {"hostname": "bryan-mbp"}])

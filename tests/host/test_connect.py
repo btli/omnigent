@@ -2128,6 +2128,25 @@ async def test_keepalive_pong_skips_sampling_without_a_request(
     assert pong == PongFrame(ts=7)
 
 
+async def test_keepalive_pong_survives_an_unexpected_sampling_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any sampling failure still sends the pong, so the server never ages the host out."""
+    host = _make_host_process()
+
+    def _broken() -> None:
+        raise TypeError("unexpected psutil shape")
+
+    monkeypatch.setattr("omnigent.host.stats.psutil.virtual_memory", _broken)
+
+    pong = await _pong_for(host, PingFrame(ts=9, request_host_stats=True))
+
+    assert pong == PongFrame(ts=9)
+    disk_read = host._host_stats._disk_task
+    if disk_read is not None:
+        await disk_read
+
+
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
