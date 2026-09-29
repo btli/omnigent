@@ -351,16 +351,18 @@ function Section({
   title,
   description,
   descriptionClassName,
+  heading: Heading = "h1",
   children,
 }: {
   title: string;
   description?: string;
   descriptionClassName?: string;
+  heading?: "h1" | "h2";
   children: ReactNode;
 }) {
   return (
     <section>
-      <h1 className="text-2xl font-semibold">{title}</h1>
+      <Heading className="text-2xl font-semibold">{title}</Heading>
       {description && (
         <p className={cn("mt-1 text-muted-foreground", descriptionClassName ?? "text-ui")}>
           {description}
@@ -1022,8 +1024,6 @@ function AppearanceSection() {
 
         <TerminalThemeControl />
 
-        <TerminalExtraKeysControl />
-
         <ColorThemeControl />
 
         <TranscriptViewDefaultControl />
@@ -1047,6 +1047,19 @@ function AppearanceSection() {
         <UiCodeFontFamilyControl />
 
         <UiCodeFontWeightControl />
+
+        <div className="mt-4">
+          <Section
+            title="Touch & mobile"
+            heading="h2"
+            description="Settings for phones, tablets and other touch screens."
+            descriptionClassName="text-sm"
+          >
+            <div className="flex flex-col gap-8">
+              <TerminalExtraKeysControl />
+            </div>
+          </Section>
+        </div>
       </div>
 
       <div className="mt-8 flex items-center justify-end gap-2">
