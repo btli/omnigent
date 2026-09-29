@@ -1329,9 +1329,10 @@ def test_branch_pin_transport_failure_blocks_push(env, tmp_path, monkeypatch, ca
     assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
 
 
-def test_production_excludes_drafts(env, tmp_path, monkeypatch, capsys):
-    """isDraft is the production gate: a draft PR never reaches the production
-    composition, while the very same list still fully composes for staging."""
+def test_production_includes_drafts(env, tmp_path, monkeypatch, capsys):
+    """Production composes draft PRs like staging does: draft status is not a
+    promotion gate."""
+    assert not stage_mod.PRODUCTION.exclude_drafts
     ready = {**env.add_pr(3, "ready.txt", "r\n"), "isDraft": False}
     draft = {**env.add_pr(5, "draft.txt", "d\n"), "isDraft": True}
     prs_json = tmp_path / "prs.json"
@@ -1360,30 +1361,10 @@ def test_production_excludes_drafts(env, tmp_path, monkeypatch, capsys):
     )
     assert rc == 0
     report = json.loads(report_path.read_text())
-    assert [p["pr"] for p in report["applied"]] == [3]
-    assert report["skipped"] == []
-    assert "merge PR #5" not in env.fork_log("production")
-    assert "## Personal production nightly" in summary.read_text()
-
-    # same list, staging ring: a draft is composed like any other open PR
-    rc = stage_mod.main(
-        [
-            "stage",
-            "--workdir",
-            str(env.work),
-            "--date",
-            STAMP,
-            "--prs-json",
-            str(prs_json),
-            "--extras",
-            str(no_extras),
-            "--report",
-            str(report_path),
-        ]
-    )
-    assert rc == 0
-    report = json.loads(report_path.read_text())
     assert [p["pr"] for p in report["applied"]] == [3, 5]
+    assert report["skipped"] == []
+    assert "merge PR #5" in env.fork_log("production")
+    assert "## Personal production nightly" in summary.read_text()
     capsys.readouterr()
 
 
@@ -1538,10 +1519,10 @@ def test_production_rejects_staging_only(env, tmp_path, capsys):
     assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
 
 
-def test_production_rejects_missing_isdraft():
+def test_filter_drafts_fails_closed():
     """The draft gate must fail CLOSED: a record whose isDraft is missing or
     non-boolean is indeterminate and must raise (naming the PR), never pass
-    as non-draft into the production composition."""
+    as non-draft into a draft-excluding composition."""
     ok = {"number": 1, "isDraft": False}
     assert stage_mod.filter_drafts([ok, {"number": 2, "isDraft": True}]) == [ok]
     for bad in (
@@ -1560,17 +1541,6 @@ def test_production_ring_has_its_own_extras_manifest():
     assert stage_mod.PRODUCTION.extras_file.name == "extras-production.txt"
     assert stage_mod.STAGING.extras_file.name == "extras.txt"
     assert stage_mod.PRODUCTION.extras_file != stage_mod.STAGING.extras_file
-
-
-def test_production_extra_promotes_a_draft_past_the_gate():
-    """A pin in the production extras manifest force-includes a draft PR:
-    filter_drafts drops it from the open stream, and merge_stream re-adds it
-    as an ``extra`` (composed from refs/pull/N/head) — the manifest, not the
-    draft bit, is the override."""
-    draft = {"number": 3182, "isDraft": True, "headRefName": "b", "headRefOid": "a" * 40}
-    ready = {"number": 5, "isDraft": False, "headRefName": "r", "headRefOid": "b" * 40}
-    stream = stage_mod.merge_stream(stage_mod.filter_drafts([draft, ready]), [3182])
-    assert [(p["number"], p["source"]) for p in stream] == [(5, "open"), (3182, "extra")]
 
 
 def test_production_commit_identity(env):

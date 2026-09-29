@@ -13,9 +13,8 @@ branches were removed in v0.15.0.
 ``staging`` and skips the push entirely when the composition is unchanged.
 The refs ever pushed are ``staging``, the ``nightly-*`` pin, the dev tag,
 and (rescues only) the rescued PR's own fork branch. ``--ring production``
-composes the production ring instead: open
-non-draft PRs plus the ``extras-production.txt`` pins (a listed draft is
-force-promoted past the draft gate), branch ``production`` + immutable
+composes the production ring instead: every open PR (drafts included) plus
+the ``extras-production.txt`` pins, branch ``production`` + immutable
 ``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
 (``--staging-only`` is rejected for it). A production composition
 that touches DB migrations is BLOCKED before any ref moves unless
@@ -113,18 +112,17 @@ STAGING = Ring(
 )
 
 
-# The production ring: fork main + open NON-draft PRs — draft status is
-# the promotion gate — plus the extras-production.txt pins (its own manifest,
-# so nothing staged-only reaches prod by accident; a listed draft is
-# force-promoted past the gate). No dev tag (nothing downstream consumes
-# one), immutable production-YYYYMMDD pins.
+# The production ring: fork main + every open PR, drafts included (same stream
+# as staging), plus the extras-production.txt pins (its own manifest, so
+# nothing staged-only reaches prod by accident). No dev tag (nothing
+# downstream consumes one), immutable production-YYYYMMDD pins.
 PRODUCTION = Ring(
     name="production",
     branch="production",
     merge_subject_prefix="production",
     pin_prefix="production-",
     use_extras=True,
-    exclude_drafts=True,
+    exclude_drafts=False,
     mint_dev_tag=False,
     extras_file=PRODUCTION_EXTRAS_FILE,
     branch_extras=False,
@@ -297,8 +295,7 @@ def own_prs(prs: list[dict]) -> list[dict]:
 
 
 def filter_drafts(prs: list[dict]) -> list[dict]:
-    """Drop draft PRs — the production ring's promotion gate (decision 2:
-    draft status, not a review/CI check, decides readiness). The gate fails
+    """Drop draft PRs for a ring with ``exclude_drafts`` set. The gate fails
     CLOSED: a record whose isDraft is missing or non-boolean is indeterminate
     and raises rather than passing as ready."""
     for p in prs:

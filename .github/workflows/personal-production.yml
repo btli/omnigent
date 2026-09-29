@@ -1,8 +1,8 @@
 # Nightly personal production ring for the btli fork.
 #
-# Composes fork branch `production` = published fork main + every open NON-draft
-# btli PR plus the extras-production.txt pins (its own manifest — a listed
-# draft is force-promoted past the draft gate; no dev tag) and
+# Composes fork branch `production` = published fork main + every open btli PR
+# (drafts included) plus the extras-production.txt pins (its own manifest; no
+# dev tag) and
 # pins an immutable production-YYYYMMDD tag. Homelab resolves the immutable
 # `refs/tags/production-*` ref at 11:10 UTC. Same-name compatibility branches
 # were removed in v0.15.0. After the pin it
@@ -119,7 +119,7 @@ jobs:
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 
-      - name: Compose production from fork main + open non-draft btli PRs
+      - name: Compose production from fork main + open btli PRs (drafts included)
         env:
           GH_TOKEN: ${{ github.token }}
           # Empty on schedule runs; the gate compares it to the candidate sha.
