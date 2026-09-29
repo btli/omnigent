@@ -398,7 +398,9 @@ def create_host_tunnel_router(
                 name=f"host-heartbeat:{host_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, heartbeat_requested, request_host_stats=request_host_stats),
+                _ping_loop(
+                    ws, conn, host_id, heartbeat_requested, request_host_stats=request_host_stats
+                ),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -1062,7 +1064,7 @@ async def _ping_loop(
     host_id: str,
     heartbeat_requested: asyncio.Event,
     *,
-    request_host_stats: bool = False,
+    request_host_stats: bool,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
