@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import json
 import logging
 import os
@@ -550,11 +549,14 @@ def _gateway_claude_listing(
                 params={"return_wildcard_routes": "true"},
                 headers=headers,
             )
-    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError):
+    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        # The error text carries the request URL (userinfo, query tokens): log none of it.
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
         _logger.debug(
-            "claude gateway model listing failed for %s",
-            listing_provider.detail or listing_provider.base_url,
-            exc_info=True,
+            "claude gateway model listing failed for %s: %s (HTTP status %s)",
+            listing_provider.detail or listing_provider.kind,
+            type(exc).__name__,
+            status,
         )
         return (None, ())
     ids = [entry.id for entry in listing.models]
@@ -1464,12 +1466,15 @@ async def claude_model_catalog(
         listing_provider = _ambient_listing_provider()
     gateway_serves_canonical: bool | None = None
     gateway_concrete_ids: tuple[str, ...] = ()
-    if listing_provider is not None:
-        listing = functools.partial(_gateway_claude_listing, listing_provider)
-        if claude_config is None:
-            # Claude Code sends its custom headers (e.g. a LiteLLM key) here too.
-            listing = functools.partial(listing, headers=_ambient_custom_headers())
-        gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(listing)
+    if listing_provider is not None and claude_config is None:
+        # Claude Code sends its custom headers (e.g. a LiteLLM key) to the ambient host too.
+        gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
+            _gateway_claude_listing, listing_provider, headers=_ambient_custom_headers()
+        )
+    elif listing_provider is not None:
+        gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
+            _gateway_claude_listing, listing_provider
+        )
     if gateway_serves_canonical is True:
         _non_canonical = False
     elif gateway_serves_canonical is False:
