@@ -1,7 +1,5 @@
 import type { ReactNode } from "react";
 import type { Host } from "@/hooks/useHosts";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import { relativeTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "./fileStatusUtils";
@@ -78,18 +76,15 @@ function MeterRow({
  * (filled by the used fraction) and current network throughput.
  *
  * Renders only from the `Host` the sidebar's existing hosts query delivered —
- * nothing is fetched on hover. Nothing renders while the `host_stats` release
- * feature is off or for a host without a snapshot (older host or server); an
- * offline host keeps the header but no meters.
+ * nothing is fetched on hover. The caller gates on the `host_stats` release
+ * feature; a host without a snapshot (older host or server) renders nothing,
+ * and an offline host keeps the header but no meters.
  */
 export function RunnerStatsSection({ host, label = host.name }: { host: Host; label?: string }) {
-  const enabled = isFeatureEnabled(useServerInfo(), "host_stats");
   const stats = host.stats;
-  if (!enabled || !stats) return null;
+  if (!stats) return null;
   const online = host.status === "online";
-  const age = Number.isFinite(stats.reported_at)
-    ? snapshotAge(stats.reported_at, Date.now())
-    : null;
+  const age = snapshotAge(stats.reported_at, Date.now());
 
   const rows: ReactNode[] = [];
   if (online) {
@@ -150,8 +145,7 @@ export function RunnerStatsSection({ host, label = host.name }: { host: Host; la
         <span className="shrink-0 text-[10px] font-medium tracking-wide uppercase">Runner</span>
         <span className="truncate text-popover-foreground">{label}</span>
         <span className="shrink-0">
-          · {online ? "online" : "offline"}
-          {age && (online ? ` · ${age}` : ` · last seen ${age}`)}
+          · {online ? "online" : "offline"} · {online ? age : `last seen ${age}`}
         </span>
       </p>
       {rows.length > 0 && (
