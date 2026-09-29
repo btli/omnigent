@@ -72,8 +72,16 @@ describe("RunnerStatsSection", () => {
     expect(fillPercent("Disk")).toBeCloseTo(63.16, 1);
     expect(fillPercent("CPU")).toBe(48);
     expect(section).toHaveTextContent("182 GB free / 494 GB");
-    expect(section).toHaveTextContent("↓ 2.4 MB/s");
-    expect(section).toHaveTextContent("↑ 310 KB/s");
+    // Assistive tech hears each meter's visible value and words, not arrows.
+    expect(meter("CPU")).toHaveAttribute("aria-valuetext", "48%");
+    expect(meter("Memory")).toHaveAttribute("aria-valuetext", "11.2 / 16 GB");
+    expect(meter("Disk")).toHaveAttribute("aria-valuetext", "182 GB free / 494 GB");
+    expect(section).toHaveTextContent("↓ download 2.4 MB/s");
+    expect(section).toHaveTextContent("↑ upload 310 KB/s");
+    expect(screen.getByText("↓")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByText("↑")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByText("download")).toHaveClass("sr-only");
+    expect(screen.getByText("upload")).toHaveClass("sr-only");
   });
 
   it.each([
