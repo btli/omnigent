@@ -216,6 +216,7 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+_AMBIENT_GATEWAY_LISTING_TIMEOUT_S = 10.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
 #: revalidation retries them later). Startup dominates each run and
@@ -498,6 +499,13 @@ def _ambient_listing_provider() -> model_catalog.ResolvedModelProvider | None:
         or None,
         detail="ambient ANTHROPIC_BASE_URL",
     )
+
+
+def _ambient_env_is_databricks_gateway() -> bool:
+    """Whether the ambient ``ANTHROPIC_BASE_URL`` names a Databricks AI Gateway."""
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    return is_databricks_ai_gateway_url(os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, ""))
 
 
 def _ambient_custom_headers() -> dict[str, str]:
@@ -1445,7 +1453,10 @@ async def claude_model_catalog(
     Rows come from the harness's own enumeration alone (no configured/static
     merge). Servability filtering matches the listing composition: on a
     non-canonical endpoint, aliases resolving to bare Anthropic ids are
-    dropped unless the provider explicitly declares them routable. The
+    dropped unless the provider explicitly declares them routable. With no
+    config, an ambient ``ANTHROPIC_BASE_URL`` gateway is asked what it serves;
+    an unreadable listing keeps the CLI's rows, except on a Databricks AI
+    Gateway, whose namespaced ids reject bare Anthropic spellings. The
     default marker is what a Default launch of this config
     actually runs: the config's own launch pin when the provider resolves
     one (those launches pass ``--model`` explicitly), else the enumeration
@@ -1469,7 +1480,8 @@ async def claude_model_catalog(
     # True (a bare ``claude-*`` is listed → keep the canonical rows), False (a
     # reachable listing with none → authoritatively namespaced, e.g. OpenRouter
     # → drop), or None (unreachable/empty/no credential → fail OPEN, keep the
-    # probe rows rather than blank the picker on a blip). Fetched off-thread.
+    # probe rows rather than blank the picker on a blip, except on Databricks gateway).
+    # Fetched off-thread.
     if claude_config is not None:
         listing_provider = claude_config.listing_provider
     else:
@@ -1492,11 +1504,18 @@ async def claude_model_catalog(
     else:
         # No listing provider, or the listing was undetermined: only a configured
         # endpoint without one falls back to the hostname heuristic; an
-        # undetermined listing keeps the probe rows (the fail-open path).
+        # undetermined listing keeps the probe rows (the fail-open path), except on
+        # a Databricks AI Gateway, which always serves namespaced ids.
         _non_canonical = (
             listing_provider is None
             and claude_config is not None
             and not _serves_canonical_anthropic_ids(claude_config)
+        ) or (
+            # For ambient gateways: fail open unless it's a Databricks AI Gateway.
+            gateway_serves_canonical is None
+            and claude_config is None
+            and listing_provider is not None
+            and _ambient_env_is_databricks_gateway()
         )
     if _non_canonical:
         rows = [
