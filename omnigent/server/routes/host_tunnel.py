@@ -963,7 +963,7 @@ async def _ping_loop(
     host_id: str,
     host_store: HostStore,
     *,
-    request_host_stats: bool = False,
+    request_host_stats: bool,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
