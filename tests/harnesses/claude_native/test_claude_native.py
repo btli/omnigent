@@ -66,6 +66,18 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ambient_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the shell's Anthropic endpoint env from reaching a real gateway listing."""
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     bridge_root = tmp_path / "claude-native"
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
@@ -10810,6 +10822,30 @@ def test_gateway_claude_listing_empty_is_undetermined() -> None:
     assert (serves, concrete) == (None, ())
 
 
+def test_gateway_claude_listing_failure_log_omits_url_and_credentials(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed listing logs its HTTP status, never the URL or its userinfo."""
+    from omnigent.models.model_catalog import ResolvedModelProvider
+
+    provider = ResolvedModelProvider(
+        kind="gateway",
+        family="anthropic",
+        base_url="http://user:SECRETPW@litellm.local",
+        api_key="sk-test",
+        detail="ambient ANTHROPIC_BASE_URL",
+    )
+    transport = httpx.MockTransport(lambda request: httpx.Response(401))
+    with caplog.at_level(logging.DEBUG, logger=claude_native._logger.name):
+        serves, _ = claude_native._gateway_claude_listing(provider, transport=transport)
+
+    assert serves is None
+    assert caplog.records
+    assert "401" in caplog.text
+    assert "SECRETPW" not in caplog.text
+    assert "litellm.local" not in caplog.text
+
+
 def test_gateway_claude_listing_is_case_sensitive() -> None:
     """A differently-cased id doesn't prove the lowercase claude-* rows work."""
     transport = _models_transport(["CLAUDE-SONNET-5", "openai/gpt-5"])
@@ -11812,13 +11848,16 @@ async def test_claude_model_catalog_keeps_rows_when_ambient_listing_undetermined
     _ambient_litellm_env(monkeypatch)
     if auth_token is None:
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
-    _route_gateway_listing(monkeypatch, handler)
+    seen = _route_gateway_listing(monkeypatch, handler)
 
     rows = await claude_native.claude_model_catalog(None)
 
     assert rows is not None
     assert [row["id"] for row in rows] == ["opus[1m]", "sonnet", "haiku"]
     assert rows[0]["isDefault"] is True
+    if auth_token is None:
+        # No credential: undetermined without sending an unauthenticated request.
+        assert seen == []
 
 
 async def test_claude_model_catalog_drops_rows_when_ambient_gateway_is_namespaced(
