@@ -664,6 +664,7 @@ def create_hosts_router(
     :returns: A FastAPI router with host endpoints.
     """
     flags = feature_flags or resolve_feature_flags()
+    host_stats_enabled = flags.enabled(Feature.HOST_STATS)
     router = APIRouter()
 
     @router.get("/hosts")
@@ -676,8 +677,11 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``configured_harnesses``, ``gateway_inference`` (``None`` when
+            no connected host has reported it to this replica), and — only
+            with the ``host_stats`` release feature on — ``stats`` (the host's
+            last keepalive resource snapshot, ``None`` when none reached this
+            replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -702,27 +706,30 @@ def create_hosts_router(
             # A stored "online" is only trusted if the host was seen
             # recently: a crashed host never runs set_offline and would
             # otherwise show as online forever in the picker.
-            result.append(
-                {
-                    "host_id": host.host_id,
-                    "name": host.name,
-                    "owner": host.user_id,
-                    "status": "online" if host_is_live(host, now=now) else "offline",
-                    # Non-None marks a server-managed sandbox host (e.g.
-                    # "modal"). Clients use it to hide sandbox-backed
-                    # hosts from manual host pickers — they are launch
-                    # targets the server creates on demand, not
-                    # user-connectable machines.
-                    "sandbox_provider": host.sandbox_provider,
-                    "configured_harnesses": host.configured_harnesses,
-                    # Held in memory from the host's connect handshake, not the
-                    # hosts row. ``None`` means this replica has no report yet —
-                    # emitted as-is so a client can tell "unknown" from "not
-                    # gateway-backed".
-                    "gateway_inference": host_registry.gateway_inference(host.host_id),
-                    "interactive_shells": host_registry.interactive_shells(host.host_id),
-                }
-            )
+            entry: dict[str, Any] = {
+                "host_id": host.host_id,
+                "name": host.name,
+                "owner": host.user_id,
+                "status": "online" if host_is_live(host, now=now) else "offline",
+                # Non-None marks a server-managed sandbox host (e.g.
+                # "modal"). Clients use it to hide sandbox-backed
+                # hosts from manual host pickers — they are launch
+                # targets the server creates on demand, not
+                # user-connectable machines.
+                "sandbox_provider": host.sandbox_provider,
+                "configured_harnesses": host.configured_harnesses,
+                # Held in memory from the host's connect handshake, not the
+                # hosts row. ``None`` means this replica has no report yet —
+                # emitted as-is so a client can tell "unknown" from "not
+                # gateway-backed".
+                "gateway_inference": host_registry.gateway_inference(host.host_id),
+                "interactive_shells": host_registry.interactive_shells(host.host_id),
+            }
+            if host_stats_enabled:
+                # In-memory keepalive snapshot (see omnigent.host.stats);
+                # ``None`` from older hosts or before the first pong.
+                entry["stats"] = host_registry.host_stats(host.host_id)
+            result.append(entry)
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")
@@ -751,7 +758,7 @@ def create_hosts_router(
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
-        return {
+        detail: dict[str, Any] = {
             "host_id": host.host_id,
             "name": host.name,
             "owner": host.user_id,
@@ -766,6 +773,9 @@ def create_hosts_router(
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
         }
+        if host_stats_enabled:
+            detail["stats"] = host_registry.host_stats(host.host_id)
+        return detail
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(
