@@ -677,8 +677,13 @@ def create_hosts_router(
         stats = host_registry.host_stats(host.host_id)
         if stats is not None and stats.keys() == {"reported_at"}:
             # This replica's placeholder only proves the host reported stats; the
-            # hosts row's updated_at is its last-seen across every replica.
-            stats = {"reported_at": host.updated_at}
+            # hosts row's updated_at is its last-seen across every replica. Sandbox
+            # bookkeeping (relaunch, token revoke) also bumps it, so there the
+            # earlier of the two is the honest last-seen.
+            last_seen = host.updated_at
+            if host.sandbox_provider:
+                last_seen = min(last_seen, stats["reported_at"])
+            stats = {"reported_at": last_seen}
         return {"stats": stats}
 
     @router.get("/hosts")
@@ -696,9 +701,10 @@ def create_hosts_router(
             with the ``host_stats`` release feature on — ``stats``: the latest
             keepalive readings plus ``reported_at`` (epoch seconds) while at
             most 150 s old by this server's clock; only ``{"reported_at": ...}``
-            (the hosts row's last-seen) for a host that went offline after
-            reporting stats to this replica; otherwise ``None``, e.g. for a host
-            that never reported stats or one this replica never heard from.
+            (the hosts row's last-seen, or for a sandbox host no later than its
+            last report) for a host that went offline after reporting stats to
+            this replica; otherwise ``None``, e.g. for a host that never
+            reported stats or one this replica never heard from.
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
