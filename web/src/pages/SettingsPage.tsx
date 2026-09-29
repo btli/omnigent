@@ -1126,7 +1126,9 @@ function AppearanceSection() {
             description="Settings for phones, tablets and other touch screens."
             descriptionClassName="text-sm"
           >
-            <SwipeActionsControl />
+            <div className="flex flex-col gap-8">
+              <SwipeActionsControl />
+            </div>
           </Section>
         </div>
       </div>
