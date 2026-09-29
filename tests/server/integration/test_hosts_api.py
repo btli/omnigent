@@ -528,6 +528,49 @@ async def test_hosts_api_keeps_only_last_seen_for_a_disconnected_host(
     assert later > reported["reported_at"]
 
 
+async def test_sandbox_last_seen_ignores_bookkeeping_bumps(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Verify sandbox bookkeeping doesn't make an offline sandbox host look recently seen.
+
+    Relaunch cleanup (``revoke_launch_token``) touches the row's ``updated_at``
+    without the host being heard from, so the earlier placeholder time wins.
+    """
+    app, registry, host_store, _cs = _build_host_api_app(db_uri, _HOST_STATS_ON)
+    host_id = "c9a8862c405a01143b4373e2b155b02a"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="sandbox-host",
+        user_id="local",
+        token="launch-token-secret",
+        provider="modal",
+        sandbox_id="sb-12345",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    fake_ws = type(
+        "FakeWS", (), {"send_text": lambda self, d: None, "receive_text": lambda self: ""}
+    )()
+    hello = HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="sandbox-host")
+    conn = registry.register(host_id, fake_ws, hello, owner="local")
+    registry.record_host_stats(conn, {"cpu_percent": 12.0})
+    reported = registry.host_stats(host_id)
+    assert reported is not None
+    registry.deregister(host_id, conn=conn)
+
+    # A failed relaunch an hour later revokes the token, bumping updated_at.
+    monkeypatch.setattr(
+        "omnigent.stores.host_store.now_epoch", lambda: int(reported["reported_at"]) + 3600
+    )
+    host_store.revoke_launch_token(host_id)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        single = (await client.get(f"/v1/hosts/{host_id}")).json()
+
+    assert single["sandbox_provider"] == "modal"
+    assert single["stats"] == {"reported_at": reported["reported_at"]}
+
+
 async def test_hosts_api_omits_host_stats_while_the_feature_is_off(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
