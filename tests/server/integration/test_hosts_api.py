@@ -21,7 +21,9 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     encode_host_frame,
 )
+from omnigent.runner.transports.ws_tunnel.frames import PongFrame, encode_frame
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -99,6 +101,7 @@ def host_api_app(
 
 def _build_host_api_app(
     db_uri: str,
+    feature_flags: FeatureFlags | None = None,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """Build one replica's app over *db_uri*.
 
@@ -107,6 +110,8 @@ def _build_host_api_app(
     an empty registry.
 
     :param db_uri: SQLite URI from the shared fixture.
+    :param feature_flags: Release features for both host routers; ``None``
+        resolves ``OMNIGENT_FEATURES`` (all off in tests).
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
     registry = HostRegistry()
@@ -115,11 +120,11 @@ def _build_host_api_app(
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(
-        create_host_tunnel_router(registry, host_store),
+        create_host_tunnel_router(registry, host_store, feature_flags=feature_flags),
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(registry, host_store, conv_store, feature_flags=feature_flags),
         prefix="/v1",
     )
 
@@ -394,6 +399,93 @@ async def test_hosts_api_gateway_inference_null_for_older_host(
     assert listing.json()["hosts"][0]["gateway_inference"] is None
     assert single.status_code == 200
     assert single.json()["gateway_inference"] is None
+
+
+async def _send_pong(
+    comm: ApplicationCommunicator,
+    registry: HostRegistry,
+    host_stats: dict[str, object] | None,
+) -> None:
+    """Send one keepalive pong over the tunnel and wait for the server to read it."""
+    before = registry.host_stats(_HOST_ID)
+    frame = PongFrame(ts=int(time.time() * 1000), host_stats=host_stats)
+    await comm.send_input({"type": "websocket.receive", "text": encode_frame(frame)})
+    for _ in range(200):
+        if registry.host_stats(_HOST_ID) != before:
+            return
+        await asyncio.sleep(0.01)
+
+
+_HOST_STATS_ON = FeatureFlags(frozenset({Feature.HOST_STATS}))
+
+
+async def test_hosts_api_surfaces_host_stats_from_the_keepalive_pong(db_uri: str) -> None:
+    """
+    Verify the snapshot a host piggybacks on its pong reaches both host routes.
+
+    The sidebar renders stats only from the hosts list it already fetches, so the
+    snapshot must survive pong → tunnel → registry → route, with malformed
+    values dropped and the server's receive time attached for the age label.
+    """
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, _HOST_STATS_ON)
+    comm = await _connect_host(app, registry)
+    await _send_pong(
+        comm,
+        registry,
+        {"cpu_percent": 48.0, "memory_total_bytes": 17_179_869_184, "disk_free_bytes": "?"},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    stats = listing.json()["hosts"][0]["stats"]
+    assert stats.keys() == {"cpu_percent", "memory_total_bytes", "reported_at"}
+    assert stats["cpu_percent"] == 48.0
+    assert stats["memory_total_bytes"] == 17_179_869_184
+    assert time.time() - stats["reported_at"] < 60
+    assert single.json()["stats"] == stats
+
+
+async def test_hosts_api_host_stats_null_for_older_host(db_uri: str) -> None:
+    """
+    Verify a host whose pongs carry no snapshot lists with ``stats`` null.
+
+    Null is the contract the web keys on to hide the stats section entirely.
+    """
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, _HOST_STATS_ON)
+    comm = await _connect_host(app, registry)
+    await _send_pong(comm, registry, {"cpu_percent": 5.0})
+    await _send_pong(comm, registry, None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["stats"] is None
+    assert single.json()["stats"] is None
+
+
+async def test_hosts_api_omits_host_stats_while_the_feature_is_off(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify ``host_stats`` off keeps stats out of both host routes entirely.
+
+    Even a snapshot the registry holds (a host that sends one unasked) must not
+    reach clients, so the web never renders the section.
+    """
+    app, registry, _hs, _cs = host_api_app
+    comm = await _connect_host(app, registry)
+    await _send_pong(comm, registry, {"cpu_percent": 48.0})
+    assert registry.host_stats(_HOST_ID) is not None
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert "stats" not in listing.json()["hosts"][0]
+    assert "stats" not in single.json()
 
 
 async def test_gateway_inference_reconverges_after_a_server_restart(
