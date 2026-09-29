@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 import time
 from pathlib import Path
@@ -20,6 +19,7 @@ from pathlib import Path
 import psutil
 
 from omnigent.util.json_types import JsonObject
+from omnigent.util.tunnel_limits import TUNNEL_KEEPALIVE_PING_INTERVAL_S
 
 _logger = logging.getLogger(__name__)
 
@@ -34,6 +34,11 @@ HOST_STATS_KEYS = (
     "net_rx_bytes_per_s",
     "net_tx_bytes_per_s",
 )
+
+# Byte counts and rates above this (1 EiB) are garbage, not a real machine.
+_MAX_BYTES = 2**60
+# A disk reading this old means the read is hung, so it's dropped, not resent.
+_DISK_MAX_AGE_S = 3 * TUNNEL_KEEPALIVE_PING_INTERVAL_S
 
 
 def _disk_usage() -> tuple[int, int] | None:
@@ -53,6 +58,20 @@ def _disk_usage() -> tuple[int, int] | None:
     return usage.total, usage.free
 
 
+def _net_bytes() -> tuple[int, int]:
+    """Sum ``(received, sent)`` bytes over interfaces that are up, except loopback.
+
+    Loopback carries the runner's own localhost traffic to the server.
+    """
+    nics = psutil.net_if_stats()
+    counters = [
+        io
+        for name, io in psutil.net_io_counters(pernic=True).items()
+        if (nic := nics.get(name)) is not None and nic.isup and "loopback" not in nic.flags
+    ]
+    return sum(io.bytes_recv for io in counters), sum(io.bytes_sent for io in counters)
+
+
 class HostStatsSampler:
     """Cheap, non-blocking sampler for the keepalive pong.
 
@@ -67,7 +86,9 @@ class HostStatsSampler:
         self._sampled_at: float | None = None
         self._net: tuple[int, int] | None = None
         self._disk: tuple[int, int] | None = None
+        self._disk_read_at = 0.0
         self._disk_task: asyncio.Task[None] | None = None
+        self._failure_logged = False
 
     def sample(self) -> JsonObject | None:
         """Return the current snapshot without blocking.
@@ -87,53 +108,76 @@ class HostStatsSampler:
             now = time.monotonic()
             cpu = psutil.cpu_percent(interval=None)
             memory = psutil.virtual_memory()
-            counters = psutil.net_io_counters()
-        except (psutil.Error, OSError, RuntimeError):
-            # RuntimeError also covers a call made with no running event loop.
-            _logger.debug("Host stats sample failed", exc_info=True)
+            net = _net_bytes()
+            stats: JsonObject = {
+                "memory_total_bytes": memory.total,
+                "memory_used_bytes": memory.total - memory.available,
+            }
+            previous_at, previous_net = self._sampled_at, self._net
+            self._sampled_at, self._net = now, net
+            if previous_at is not None and previous_net is not None:
+                # psutil's first non-blocking reading has no baseline and is meaningless.
+                stats["cpu_percent"] = cpu
+                elapsed = now - previous_at
+                if elapsed > 0:
+                    # A counter reset (an interface restarting) reads as no traffic.
+                    stats["net_rx_bytes_per_s"] = round(max(0, net[0] - previous_net[0]) / elapsed)
+                    stats["net_tx_bytes_per_s"] = round(max(0, net[1] - previous_net[1]) / elapsed)
+            if self._disk is not None and now - self._disk_read_at <= _DISK_MAX_AGE_S:
+                stats["disk_total_bytes"], stats["disk_free_bytes"] = self._disk
+            return stats
+        except Exception:
+            # Never cost the pong: report the first failure loudly, then quietly.
+            if self._failure_logged:
+                _logger.debug("Host stats sample failed", exc_info=True)
+            else:
+                self._failure_logged = True
+                _logger.exception("Host stats sample failed; pongs will carry no stats")
             return None
-        net = (counters.bytes_recv, counters.bytes_sent) if counters is not None else None
-        stats: JsonObject = {
-            "memory_total_bytes": memory.total,
-            "memory_used_bytes": memory.total - memory.available,
-        }
-        previous_at, previous_net = self._sampled_at, self._net
-        self._sampled_at, self._net = now, net
-        if previous_at is not None:
-            # psutil's first non-blocking reading has no baseline and is meaningless.
-            stats["cpu_percent"] = cpu
-            elapsed = now - previous_at
-            if net is not None and previous_net is not None and elapsed > 0:
-                stats["net_rx_bytes_per_s"] = round(max(0, net[0] - previous_net[0]) / elapsed)
-                stats["net_tx_bytes_per_s"] = round(max(0, net[1] - previous_net[1]) / elapsed)
-        if self._disk is not None:
-            stats["disk_total_bytes"], stats["disk_free_bytes"] = self._disk
-        return stats
 
     async def _read_disk(self) -> None:
-        """Store the latest disk reading for the next sample."""
-        self._disk = await asyncio.to_thread(_disk_usage)
+        """Cache the latest disk reading for later samples; a failed read caches none."""
+        try:
+            disk = await asyncio.to_thread(_disk_usage)
+        except Exception:
+            disk = None
+            if self._failure_logged:
+                _logger.debug("Host disk read failed", exc_info=True)
+            else:
+                self._failure_logged = True
+                _logger.exception("Host disk read failed; pongs will carry no disk stats")
+        self._disk, self._disk_read_at = disk, time.monotonic()
 
 
 def parse_host_stats(raw: object) -> dict[str, float] | None:
-    """Validate a wire snapshot from a host.
+    """Validate a wire snapshot from a host; never raises.
 
     Tolerant like the other host-reported fields: a malformed value drops only
-    that key, and a snapshot with nothing usable reads as "no stats".
+    that key, and a snapshot with nothing usable reads as "no stats". CPU is
+    clamped to 0-100. Byte values above 1 EiB, and a used or free size larger
+    than its total, are dropped as implausible.
 
     :param raw: The pong's ``host_stats`` value, e.g.
         ``{"cpu_percent": 48.0, "memory_total_bytes": 17179869184}``.
-    :returns: The known keys whose values are finite non-negative numbers, or
-        ``None`` when *raw* is absent, not an object, or has none of them.
+    :returns: The known keys with plausible readings, or ``None`` when *raw* is
+        absent, not an object, or has none of them.
     """
     if not isinstance(raw, dict):
         return None
-    stats: dict[str, float] = {
-        key: value
-        for key in HOST_STATS_KEYS
-        if isinstance(value := raw.get(key), int | float)
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
-    }
+    stats: dict[str, float] = {}
+    for key in HOST_STATS_KEYS:
+        value = raw.get(key)
+        # Comparisons, not float(), so an oversized JSON integer can't raise.
+        if isinstance(value, bool) or not isinstance(value, int | float) or value != value:
+            continue
+        if key == "cpu_percent":
+            stats[key] = min(max(value, 0), 100)
+        elif 0 <= value <= _MAX_BYTES:
+            stats[key] = value
+    for part, total in (
+        ("memory_used_bytes", "memory_total_bytes"),
+        ("disk_free_bytes", "disk_total_bytes"),
+    ):
+        if part in stats and total in stats and stats[part] > stats[total]:
+            del stats[part], stats[total]
     return stats or None
