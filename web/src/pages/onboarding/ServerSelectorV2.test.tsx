@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./ServerSelectorV2";
 
@@ -73,7 +73,9 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
     expect(getRunnerOptions).not.toHaveBeenCalled();
   });
 
@@ -154,7 +156,9 @@ describe("ServerSelectorV2", () => {
     );
     expect(await screen.findByText("Omnigent server")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function)),
+    );
     expect(onStartLocal).not.toHaveBeenCalled();
   });
 
@@ -199,7 +203,7 @@ describe("ServerSelectorV2", () => {
         />,
       );
       fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-      await waitFor(() => expect(onConnect).toHaveBeenCalledWith(url));
+      await waitFor(() => expect(onConnect).toHaveBeenCalledWith(url, expect.any(Function)));
       expect(onStartLocal).not.toHaveBeenCalled();
     },
   );
@@ -282,7 +286,9 @@ describe("ServerSelectorV2", () => {
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
     expect(runner).toHaveTextContent("My laptop");
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
+    );
   });
 
   it("a failed runner lookup still opens the runner step, laptop only", async () => {
@@ -343,7 +349,9 @@ describe("ServerSelectorV2", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
     fireEvent.click(await screen.findByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
     unmount();
 
     render(
@@ -368,8 +376,15 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("button", { name: /(install|open) omnigent/i }));
   }
 
-  it("a remote runner connects first, then opens the server, with no local install", async () => {
-    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+  it("a remote runner connects first, streaming its output, then opens the server, with no local install", async () => {
+    let finishRunner: (v: { ok: boolean }) => void = () => {};
+    let emit: (line: string) => void = () => {};
+    const onConnectRunner = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishRunner = resolve;
+        }),
+    );
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
     await installFromRunnerStep({
@@ -377,12 +392,149 @@ describe("ServerSelectorV2", () => {
       onInstallCli,
       onConnectRunner,
       onConnect,
+      onRunnerLog: (cb) => {
+        emit = cb;
+        return () => {};
+      },
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
     expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
-    expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote");
+    await waitFor(() =>
+      expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote"),
+    );
+    act(() => emit("$ remote host --server https://team.example.com/"));
+    expect(
+      await screen.findByText("$ remote host --server https://team.example.com/"),
+    ).toBeInTheDocument();
+    expect(onConnect).not.toHaveBeenCalled();
+    finishRunner({ ok: true });
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
     expect(onInstallCli).not.toHaveBeenCalled();
+  });
+
+  it("a cancelled connect in the terminal fails with Retry instead of reading ready", async () => {
+    await installFromRunnerStep({
+      installed: true,
+      onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
+      onConnect: vi.fn().mockResolvedValue({ cancelled: true }),
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+    });
+    expect(await screen.findByText("Connection cancelled.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(screen.queryByText(/server ready/i)).not.toBeInTheDocument();
+  });
+
+  // A connect held in browser sign-in until `finish` settles it.
+  function pendingSignIn() {
+    let finish: (r: { cancelled?: boolean }) => void = () => {};
+    const onConnect = vi.fn(
+      (_url: string, onPhase?: (phase: "connecting" | "authenticating") => void) =>
+        new Promise<{ cancelled?: boolean }>((resolve) => {
+          onPhase?.("authenticating");
+          finish = resolve;
+        }),
+    );
+    return { onConnect, finish: (r: { cancelled?: boolean }) => finish(r) };
+  }
+
+  function renderRecents(over: Partial<ServerSelectorV2Setup>) {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: true,
+          recentServers: ["https://team.example.com/"],
+          ...over,
+        })}
+      />,
+    );
+    return screen.getByRole("button", { name: /open omnigent/i });
+  }
+
+  it("a direct connect shows its sign-in phase and Cancelling…, then goes idle", async () => {
+    const { onConnect, finish } = pendingSignIn();
+    let confirm: (cancelled: boolean) => void = () => {};
+    const onCancelConnect = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          confirm = resolve;
+        }),
+    );
+    const open = renderRecents({ onConnect, onCancelConnect });
+    fireEvent.click(open);
+    expect(await screen.findByText(/finish signing in in your browser/i)).toBeInTheDocument();
+    expect(open).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancelConnect).toHaveBeenCalled();
+    expect(screen.getByText("Cancelling…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+    await act(async () => confirm(true));
+    act(() => finish({ cancelled: true }));
+    await waitFor(() => expect(screen.queryByText("Cancelling…")).not.toBeInTheDocument());
+    expect(open).not.toHaveAttribute("aria-busy");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("a Cancel the shell refuses restores the phase and says why", async () => {
+    const { onConnect } = pendingSignIn();
+    const open = renderRecents({ onConnect, onCancelConnect: vi.fn().mockResolvedValue(false) });
+    fireEvent.click(open);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/still finishing/i);
+    expect(screen.getByText(/finish signing in in your browser/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(open).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("a second join from the MDM dropdown can't start or hide the first's progress", async () => {
+    const { onConnect, finish } = pendingSignIn();
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: true,
+          connectedBefore: true,
+          managedServers: ["https://team.example.com/"],
+          onConnect,
+          onCancelConnect: vi.fn(),
+        })}
+      />,
+    );
+    openPresetDropdown();
+    const input = await screen.findByRole("textbox", { name: "Server URL" });
+    fireEvent.change(input, { target: { value: "https://other.example.com" } });
+    // Both Enters land before the dropdown's close renders.
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(onConnect).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Server URL" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(/finish signing in in your browser/i)).toBeInTheDocument();
+    act(() => finish({ cancelled: true }));
+    await waitFor(() =>
+      expect(screen.queryByText(/finish signing in in your browser/i)).not.toBeInTheDocument(),
+    );
+  });
+
+  it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {
+    const grant = "The server will be able to run agents on this laptop.";
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    // Arca is the default: no laptop grant to explain.
+    fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
+    expect(screen.queryByText(grant)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "My laptop" }));
+    expect(screen.getByText(grant)).toBeInTheDocument();
   });
 
   it("the laptop skips the install when its host CLI is bundled", async () => {
