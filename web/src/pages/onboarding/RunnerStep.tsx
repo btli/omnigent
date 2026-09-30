@@ -11,7 +11,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 import {
+  ConnectStatus,
   InstallActionButton,
   OnboardingBackButton,
   OnboardingHeading,
@@ -24,6 +26,8 @@ export function RunnerStep({
   remoteAvailable,
   installed,
   error,
+  connection = null,
+  onCancelConnect,
   onBack,
   onInstall,
 }: {
@@ -33,6 +37,9 @@ export function RunnerStep({
   installed?: boolean;
   /** A connect error to show above the actions. */
   error?: string;
+  /** Progress of an in-flight direct connect (null when idle). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
   onBack: () => void;
   onInstall: (runner: Runner) => void;
 }) {
@@ -59,6 +66,12 @@ export function RunnerStep({
           </SelectItem>
         </SelectContent>
       </Select>
+      {runner === "local" && (
+        // Onboarding connects this laptop without the host-enrollment prompt, so say what it grants.
+        <p className="mt-2 text-center text-sm text-muted-foreground">
+          The server will be able to run agents on this laptop.
+        </p>
+      )}
 
       <p className="mx-auto mt-4 max-w-sm flex-1 text-center text-base text-muted-foreground">
         Automatically carry over your existing setup. Share sessions with your teammates. Use from
@@ -72,9 +85,15 @@ export function RunnerStep({
         </div>
       )}
 
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
       <OnboardingRail>
-        <OnboardingBackButton onClick={onBack} />
-        <InstallActionButton installed={installed} onClick={() => onInstall(runner)} />
+        <OnboardingBackButton onClick={onBack} disabled={connection !== null} />
+        <InstallActionButton
+          installed={installed}
+          loading={connection !== null}
+          onClick={() => onInstall(runner)}
+        />
       </OnboardingRail>
     </div>
   );
