@@ -18,6 +18,3 @@
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 #
-# Every open btli PR (drafts included) is composed automatically; pin only
-# refs outside that stream.
-4438  # closed pollux/server-disconnect-attribution (closed upstream unmerged; still carried)
