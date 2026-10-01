@@ -3515,10 +3515,12 @@ async def _persist_external_acp_subagent_start(
         if adopted is None:
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, adopted.id, parent_conv.agent_id, conversation_store
+        )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -3562,10 +3564,11 @@ def _find_subagent_child_by_title(
         after = page.last_id
 
 
-def _publish_session_created(
+async def _publish_session_created(
     parent_id: str,
     child_session_id: str,
     agent_id: str | None,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Emit ``session.created`` on the parent's stream for a child session.
@@ -3580,6 +3583,7 @@ def _publish_session_created(
     :param agent_id: Agent id stamped on the child (the parent's
         agent), e.g. ``"ag_abc123"``. ``None`` only for legacy parents
         without one.
+    :param conversation_store: Store for the durable parent-chat activity link.
     """
     event = SessionCreatedEvent(
         type="session.created",
@@ -3589,6 +3593,25 @@ def _publish_session_created(
         parent_session_id=parent_id,
     )
     session_stream.publish(parent_id, event.model_dump())
+    # Native-harness sub-agents are minted outside the general create path's
+    # ``session_created`` logger, so emit the join key here. Log the child
+    # explicitly without rebinding the parent relay's request scope.
+    # ``creation_kind="child"`` matches the general path's classification (these
+    # always have a parent) so both signals agree across every creation path.
+    _logger.info(
+        "Sub-agent session created",
+        extra=debug_event(
+            "session_created",
+            session_id=child_session_id,
+            parent_session_id=parent_id,
+            creation_kind="child",
+        ),
+    )
+    from omnigent.server.subagent_activity import record_subagent_activity
+
+    await record_subagent_activity(
+        child_session_id, "delegated", conversation_store, parent_id=parent_id
+    )
 
 
 async def _persist_external_subagent_start(
@@ -3683,6 +3706,11 @@ async def _persist_external_subagent_start(
         subagent_id,
     )
     if existing is not None:
+        from omnigent.server.subagent_activity import record_subagent_activity
+
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
 
     # Title format mirrors omnigent-spawned children
@@ -3741,10 +3769,12 @@ async def _persist_external_subagent_start(
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, adopted.id, parent_conv.agent_id, conversation_store
+        )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -3840,10 +3870,12 @@ async def _create_and_publish_antigravity_child(
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
         # harmless extra cache invalidation.
-        _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, existing.id, parent_conv.agent_id, conversation_store
+        )
         return existing.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -4121,11 +4153,13 @@ async def _create_and_publish_codex_child(
             # this child — emit it now. In the concurrent-race case the
             # winner also published; the duplicate is a harmless extra
             # cache invalidation.
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            await _publish_session_created(
+                parent_id, existing.id, parent_conv.agent_id, conversation_store
+            )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -4221,11 +4255,13 @@ async def _create_and_publish_devin_child(
             )
         if existing is not None:
             await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            await _publish_session_created(
+                parent_id, existing.id, parent_conv.agent_id, conversation_store
+            )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -7060,6 +7096,8 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
+        data = data.model_copy(update={"user_authored": True})
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
@@ -10191,7 +10229,7 @@ async def _authorize_bundled_parent_and_inherit_runner(
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
-) -> str | None:
+) -> tuple[Conversation | None, str | None]:
     """
     Authorize a bundled create's parent link and resolve runner affinity.
 
@@ -10211,8 +10249,8 @@ async def _authorize_bundled_parent_and_inherit_runner(
     :param conversation_store: Store for the parent-conversation read.
     :param runner_router: Router for the runner-ownership check;
         ``None`` skips it.
-    :returns: The inherited runner id, or ``None`` when the parent has
-        no runner binding or ownership disallows inheritance.
+    :returns: The authorized parent and inherited runner id. The runner id
+        is ``None`` when absent or ownership disallows inheritance.
     :raises OmnigentError: 403/404 when the caller may not access the
         parent session.
     """
@@ -10228,13 +10266,13 @@ async def _authorize_bundled_parent_and_inherit_runner(
         parent_session_id,
     )
     if parent_conv is None:
-        return None
+        return None, None
     inherited_runner_id = parent_conv.runner_id
     if inherited_runner_id is not None and user_id is not None and runner_router is not None:
         runner_owner = runner_router.runner_owner(inherited_runner_id)
         if runner_owner is not None and runner_owner != user_id:
-            return None
-    return inherited_runner_id
+            return parent_conv, None
+    return parent_conv, inherited_runner_id
 
 
 async def _notify_runner_of_bundled_child(
