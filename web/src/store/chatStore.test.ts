@@ -7461,6 +7461,73 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    const teamContent = [
+      {
+        type: "input_text" as const,
+        text: '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
+      },
+    ];
+    it.each([
+      {},
+      { createdBy: "alice@example.com" },
+      { userAuthored: true },
+      { clearedPendingId: "xml" },
+    ])("requires human provenance before acknowledging a team-shaped prompt: %j", (authorship) => {
+      const pending = [{ tempId: "xml", content: teamContent }];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_xml",
+        itemType: "message",
+        ...authorship,
+        data: { role: "user", content: teamContent, user_authored: "userAuthored" in authorship },
+      });
+      const human = Object.keys(authorship).length > 0;
+      expect(useChatStore.getState().pendingUserMessages).toEqual(human ? [] : pending);
+      expect(useChatStore.getState().blocks).toMatchObject(
+        human
+          ? [
+              {
+                type: "user_message",
+                ctx: { itemId: "msg_xml" },
+                stableKey: "xml",
+                content: teamContent,
+              },
+            ]
+          : [],
+      );
+    });
+
+    it.each([false, true])(
+      "keeps unrelated input queued with named acknowledgement = %s",
+      (named) => {
+        const unrelated = {
+          tempId: "other",
+          content: [{ type: "input_text" as const, text: "Still queued" }],
+        };
+        useChatStore.setState({
+          blocks: [],
+          pendingUserMessages: [
+            unrelated,
+            ...(named ? [{ tempId: "xml", content: teamContent }] : []),
+          ],
+        });
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "msg_xml",
+          itemType: "message",
+          ...(named ? { clearedPendingId: "xml" } : {}),
+          data: { role: "user", content: teamContent, user_authored: true },
+        };
+        handleSessionEvent(event);
+        handleSessionEvent(event);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
+        expect(useChatStore.getState().blocks).toMatchObject([
+          { type: "user_message", ctx: { itemId: "msg_xml" }, content: teamContent },
+        ]);
+      },
+    );
+
     it("is a no-op for non-message item types (e.g. function_call_output from other client)", () => {
       const existingBlocks: AnyBlock[] = [];
       useChatStore.setState({ blocks: existingBlocks, pendingUserMessages: [] });
@@ -14274,10 +14341,11 @@ describe("chatStore — policy deny renders once", () => {
 
 describe("chatStore — client-side message queue", () => {
   it.each([
-    ...["codex-native", "claude-sdk"].flatMap((harness) =>
+    ...["codex-native", "claude-sdk", "pi-native"].flatMap((harness) =>
       ["foreground", "background", "evicted", "stranded"].map((mode) => [harness, mode]),
     ),
     ["claude-sdk", "steered"],
+    ["pi-native", "steered"],
   ])(
     "queues %s compact as a control and holds the next message until idle (%s)",
     async (harness, mode) => {
@@ -14358,7 +14426,7 @@ describe("chatStore — client-side message queue", () => {
       }
       await tick();
       expect(posts()).toEqual([{ type: "compact", data: {} }]);
-      if (harness === "claude-sdk") expect(toastError).not.toHaveBeenCalled();
+      if (harness !== "codex-native") expect(toastError).not.toHaveBeenCalled();
       if (mode !== "steered") {
         expect(conversationRegistry.peek(id)!.getState().sendLatchedAt).toBeGreaterThanOrEqual(
           beforeFlush,
@@ -14392,6 +14460,71 @@ describe("chatStore — client-side message queue", () => {
       expect(posts().map((p) => p.type)).toEqual(["compact", "message"]);
       expect(posts()[1].data.content).toEqual([{ type: "input_text", text: "after compact" }]);
       expect(useChatStore.getState().queuedMessages).toEqual([]);
+    },
+  );
+
+  it.each(
+    ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
+      [false, true].map((background) => [terminal, background] as const),
+    ),
+  )(
+    "settles old Pi %s (background: %s) without ending a real turn",
+    async (terminal, background) => {
+      const id = "conv_legacy_pi";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+      useChatStore.setState({ sessionHarness: "pi-native" });
+      await useChatStore.getState().send("/compact", "agent_xyz");
+      useChatStore.getState().enqueueMessage("after compact");
+      const entry = conversationRegistry.peek(id)!;
+      if (background) {
+        seedSession("conv_other", []);
+        await useChatStore.getState().switchTo("conv_other");
+        seedConversationsCache([conv(id, "idle"), conv("conv_other", "idle")]);
+      }
+      const event =
+        terminal === "pi_compact_unavailable"
+          ? {
+              type: "error" as const,
+              source: "execution",
+              toolName: null,
+              error: { code: terminal, message: "Unavailable" },
+            }
+          : terminal === "compaction_completed"
+            ? { type: "compaction_completed" as const, totalTokens: null }
+            : { type: "compaction_failed" as const };
+      const latch = entry.getState().sendLatchedAt;
+      // A real turn or pending prompt must not be settled by this fallback.
+      for (const state of [
+        { sessionStatus: "running" as const, activeResponse: null },
+        {
+          sessionStatus: "idle" as const,
+          activeResponse: { responseId: "real", state: "streaming" as const, error: null },
+        },
+        {
+          sessionStatus: "idle" as const,
+          activeResponse: null,
+          pendingUserMessages: [
+            { tempId: "pending_real", content: [{ type: "input_text" as const, text: "normal" }] },
+          ],
+        },
+      ]) {
+        entry.setState(state);
+        handleSessionEvent(event, id);
+        expect(entry.getState().status).toBe("streaming");
+        expect(entry.getState().sendLatchedAt).toBe(latch);
+      }
+      entry.setState({ sessionStatus: "idle", activeResponse: null, pendingUserMessages: [] });
+      handleSessionEvent(event, id);
+      expect(entry.getState().status).toBe("idle");
+      expect(entry.getState().sendLatchedAt).toBeNull();
+      if (!background) useChatStore.getState().maybeFlushQueuedHead();
+      await tick();
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/v1/sessions/${id}/events`,
+        expect.objectContaining({ body: expect.stringContaining("after compact") }),
+      );
     },
   );
 

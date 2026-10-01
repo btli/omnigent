@@ -145,7 +145,11 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
+import {
+  isClaudeAgentMessageContent,
+  isSystemUserContent,
+  taskNotificationMarkerContent,
+} from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
@@ -1912,7 +1916,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0) return;
-    // SDK buffers compact with the rest of the batch; Codex needs an idle turn.
+    // SDK buffers compact; Pi interrupts and Codex requires idle.
+    // Drain their prefix first so compaction cannot interrupt those messages.
     const compactIndex =
       setterForState(conversationId)?.sessionHarness === "claude-sdk"
         ? -1
@@ -2018,7 +2023,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
-      if (local?.sessionHarness === "codex-native" || local?.sessionHarness === "claude-sdk") {
+      if (
+        local?.sessionHarness === "codex-native" ||
+        local?.sessionHarness === "claude-sdk" ||
+        local?.sessionHarness === "pi-native"
+      ) {
         if (local.sessionStatus === "running") continue;
         if (local.status === "streaming") {
           if (!sendLatchIsStranded(local)) continue;
@@ -3210,7 +3219,7 @@ function isCompactControl(
   files?: File[],
 ): boolean {
   return (
-    (harness === "codex-native" || harness === "claude-sdk") &&
+    (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
     !files?.length &&
     text.trim() === "/compact"
   );
@@ -3218,7 +3227,7 @@ function isCompactControl(
 
 function rejectBusyCompact(conversationId: string | null): boolean {
   const state = conversationId === null ? undefined : setterForState(conversationId);
-  if (state?.sessionHarness === "claude-sdk") return false;
+  if (state?.sessionHarness === "claude-sdk" || state?.sessionHarness === "pi-native") return false;
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
@@ -6182,6 +6191,10 @@ export async function pumpStreamEvents(
   }
 }
 
+function isHumanAuthoredInput(event: SessionInputConsumedEvent): boolean {
+  return Boolean(event.createdBy || event.data.user_authored === true || event.clearedPendingId);
+}
+
 /**
  * Extract a typed `MessageContentBlock[]` from a cross-client
  * `session.input.consumed` event whose payload is a user message.
@@ -6199,6 +6212,7 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
       "type" in b &&
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
   );
+  if (event.isMeta !== true && isHumanAuthoredInput(event)) return content;
   // A Claude background-task wake is hidden context (`is_meta`) that still
   // has to start a new turn on screen: render it as a system marker. Every
   // other meta message (injected skill text) stays hidden.
@@ -6482,6 +6496,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     applyToConversation(patch);
   };
 
+  const settleLegacyPiCompact = (): void => {
+    if (sourceConversationId === null) return;
+    const s = setterForState(sourceConversationId);
+    // Older Pi extensions finish compaction without running/idle events.
+    // Only settle the synthetic control latch, never a prompt or a real turn.
+    if (
+      s?.sessionHarness !== "pi-native" ||
+      s.status !== "streaming" ||
+      s.sendLatchedAt === null ||
+      s.sessionStatus === "running" ||
+      s.activeResponse !== null ||
+      s.pendingUserMessages.length > 0
+    )
+      return;
+    applyToConversation({ status: "idle", sendLatchedAt: null });
+    useChatStore.getState().flushBackgroundQueues();
+  };
+
   switch (event.type) {
     case "response_completed":
     case "response_failed":
@@ -6594,6 +6626,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "error":
+      if (event.error.code === "pi_compact_unavailable") settleLegacyPiCompact();
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
       // already shows the true model). The error block itself renders
@@ -6694,6 +6727,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       queryClient?.invalidateQueries({ queryKey: terminalsQueryKey(event.conversationId) });
       return;
     case "compaction_completed":
+      settleLegacyPiCompact();
       // Update the context-ring immediately with the post-compaction token
       // estimate so the ring reflects the reduced context without waiting
       // for the next LLM response.completed event.
@@ -6702,6 +6736,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     case "compaction_failed":
+      settleLegacyPiCompact();
       // Compaction failed — history is unchanged. Remove every
       // compaction_loading block so the "Compacting…" shimmer disappears
       // without leaving a marker: a long compaction re-announces progress,
@@ -6985,6 +7020,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
+      if (
+        !isHumanAuthoredInput(event) &&
+        isClaudeAgentMessageContent(userContentFromEvent(event) ?? [])
+      ) {
+        return;
+      }
       // Promote the matching optimistic bubble into committed history.
       // Three ways to find it, in order of precision:
       //   1. By id — the server tells us which pending-input entry this
@@ -7003,6 +7044,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
       applyToConversation((s) => {
+        const eventContent = userContentFromEvent(event);
+        const pendingHead = s.pendingUserMessages[0];
+        // Bare envelopes typed in the terminal must not consume unrelated web input.
+        const unmatchedEnvelope =
+          eventContent !== null &&
+          isClaudeAgentMessageContent(eventContent) &&
+          (!pendingHead || contentKeyOf(pendingHead.content) !== contentKeyOf(eventContent));
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -7025,8 +7073,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // by user]` record) is synthesized by the CLI, owns no pending entry,
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
-          const eventContent = userContentFromEvent(event);
-          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
+          if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
+            return {};
+          }
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
             return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
@@ -7069,8 +7118,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    `[System: …]` notice DOES have a pending entry, but the server
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback.
-        const eventContent = userContentFromEvent(event);
         const head =
+          unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
             ? undefined
