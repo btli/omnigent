@@ -1104,7 +1104,12 @@ function AssistantBubble({
                   tooltip="Fork from here"
                   size="icon-xxs"
                   data-testid="fork-from-response"
-                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                  onClick={() =>
+                    forkDialog.openForkDialog({
+                      sourceSessionId: scopedConversationId ?? undefined,
+                      upToResponseId: bubble.responseId,
+                    })
+                  }
                   componentId="chat.message.fork"
                 >
                   <SplitIcon size={14} />
