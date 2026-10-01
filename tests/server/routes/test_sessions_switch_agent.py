@@ -988,6 +988,8 @@ async def test_switch_400_unloadable_target_bundle(monkeypatch: pytest.MonkeyPat
 @pytest.mark.parametrize(
     "filename,target_harness,old_runtime,expected_status",
     [
+        ("clip.mp4", "claude-sdk", False, 400),
+        ("clip.mp4", "codex-native", True, 409),
         ("sample.zip", "openai-agents", False, 400),
         ("sample.docx", "claude-sdk", False, 400),
         ("sample.sqlite", "pi-native", False, 400),
@@ -1021,7 +1023,14 @@ def test_switch_checks_attachment_history_before_mutation(
     target = _BUILTIN_CODEX
     agent_store = _AgentStore({_CURRENT.id: _CURRENT, target.id: target})
     file_store = _AttachmentFileStore(
-        StoredFile(id=file_id, created_at=1, filename=filename, bytes=4, session_id=source.id)
+        StoredFile(
+            id=file_id,
+            created_at=1,
+            filename=filename,
+            bytes=4,
+            session_id=source.id,
+            source_metadata={"delivery": "filesystem"} if filename == "clip.mp4" else None,
+        )
     )
     monkeypatch.setattr(
         sessions_mod,
