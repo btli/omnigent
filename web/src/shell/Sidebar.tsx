@@ -3791,7 +3791,7 @@ function SessionTooltipContent({
       side="right"
       align="start"
       sideOffset={8}
-      className="flex w-72 flex-col gap-1.5"
+      className="flex w-72 max-w-[calc(100vw-2rem)] flex-col gap-1.5"
       data-testid="pinned-project-flyout"
     >
       {details}
