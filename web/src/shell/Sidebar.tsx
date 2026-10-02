@@ -33,8 +33,6 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
-  CircleAlertIcon,
-  CircleIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
@@ -3732,24 +3730,19 @@ function ConversationMenuItems({
 
 const SESSION_ERROR_EXPLANATION = "Latest message is an error";
 
-function SessionErrorHint() {
-  return (
-    <p className="mt-1 flex items-center gap-1.5 text-sm text-destructive">
-      <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
-      <span>{SESSION_ERROR_EXPLANATION}</span>
-    </p>
-  );
-}
-
 function SessionTooltipContent({
   conversation,
   hostsById,
   state,
+  pinnedProject,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   // The row's own indicator state, so the tooltip never re-derives it.
   state: SessionState | null;
+  // Set for a pinned, project-owned row, which lifts out of its project folder:
+  // its root is a HoverCard, and the card restores the project cue.
+  pinnedProject: { name: string; icon: string | null } | null;
 }) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
@@ -3763,9 +3756,16 @@ function SessionTooltipContent({
   // errors have none, so they keep the generic explanation.
   const errorMessage =
     conversation.labels?.["omnigent.last_task_error_message"] || SESSION_ERROR_EXPLANATION;
+  // One filled dot per state, coloured by theme tokens; forced-colors mode
+  // drops author backgrounds, so the dot falls back to the system text colour.
   const dot = (className: string) => (
     <span aria-hidden className="flex size-3.5 shrink-0 items-center justify-center">
-      <span className={cn("size-2 rounded-full", className)} />
+      <span
+        className={cn(
+          "size-2 rounded-full forced-colors:bg-[CanvasText] forced-colors:forced-color-adjust-none",
+          className,
+        )}
+      />
     </span>
   );
   // Labels mirror the row's SessionStateBadge; `key` feeds `data-state`.
@@ -3796,14 +3796,14 @@ function SessionTooltipContent({
         return {
           key: "error",
           label: "Error",
-          icon: <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />,
+          icon: dot("bg-destructive"),
           tone: "text-destructive",
         };
       case "disconnected":
         return {
           key: "disconnected",
           label: "Host disconnected",
-          icon: dot("border border-muted-foreground"),
+          icon: dot("bg-muted-foreground"),
           tone: "",
         };
       case "unseen":
@@ -3817,22 +3817,15 @@ function SessionTooltipContent({
         return {
           key: "idle",
           label: "Idle",
-          icon: <CircleIcon aria-hidden className="size-3.5 shrink-0" />,
+          // The card paints bg-popover, so Idle dims that surface's own text token.
+          icon: dot("bg-popover-foreground/70"),
           tone: "",
         };
     }
   })();
 
-  return (
-    <TooltipContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      data-testid="session-tooltip-content"
-      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
-      // then muted, small-icon metadata lines.
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
-    >
+  const details = (
+    <>
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
         <span className="font-normal text-muted-foreground">
@@ -3840,6 +3833,12 @@ function SessionTooltipContent({
           {relativeTime(conversation.updated_at * 1000)}
         </span>
       </p>
+      {pinnedProject && (
+        <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+          <ProjectRowIcon icon={pinnedProject.icon} />
+          <span className="truncate">{pinnedProject.name}</span>
+        </p>
+      )}
       {conversation.agent_name && (
         <p
           data-testid="session-tooltip-agent"
@@ -3870,7 +3869,7 @@ function SessionTooltipContent({
       </p>
       {conversation.git_branch && (
         <p
-          data-testid="session-tooltip-branch"
+          data-testid={pinnedProject ? "pinned-project-flyout-branch" : "session-tooltip-branch"}
           className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
           <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
@@ -3896,6 +3895,30 @@ function SessionTooltipContent({
           {errorMessage}
         </p>
       )}
+    </>
+  );
+
+  return pinnedProject ? (
+    <HoverCardContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      className="flex w-72 flex-col gap-1.5"
+      data-testid="pinned-project-flyout"
+    >
+      {details}
+    </HoverCardContent>
+  ) : (
+    <TooltipContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      data-testid="session-tooltip-content"
+      // Match the HoverCard look pinned rows use: title, then muted,
+      // small-icon metadata lines.
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+    >
+      {details}
     </TooltipContent>
   );
 }
@@ -4300,6 +4323,19 @@ function ConversationRowImpl({
     runArchive,
   };
 
+  // One hover card for every row variant; pinned, project-owned rows render it
+  // inside their HoverCard, all others inside a Tooltip.
+  const sessionTooltip = (
+    <SessionTooltipContent
+      conversation={conversation}
+      hostsById={hostsById}
+      state={sessionState}
+      pinnedProject={
+        projectFlyoutName ? { name: projectFlyoutName, icon: projectFlyoutIcon } : null
+      }
+    />
+  );
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -4441,24 +4477,14 @@ function ConversationRowImpl({
         projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
             <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            <PinnedProjectFlyoutContent
-              title={conversation.title ?? conversation.id}
-              projectName={projectFlyoutName}
-              projectIcon={projectFlyoutIcon}
-              gitBranch={gitBranch}
-              hasError={sessionState?.kind === "error"}
-            />
+            {sessionTooltip}
           </HoverCard>
         ) : isMobile ? (
           rowLink
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent
-              conversation={conversation}
-              hostsById={hostsById}
-              state={sessionState}
-            />
+            {sessionTooltip}
           </Tooltip>
         )
       ) : projectFlyoutName ? (
@@ -4475,13 +4501,7 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-            projectIcon={projectFlyoutIcon}
-            gitBranch={gitBranch}
-            hasError={sessionState?.kind === "error"}
-          />
+          {sessionTooltip}
         </HoverCard>
       ) : isMobile ? (
         <ContextMenu>
@@ -4510,11 +4530,7 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent
-            conversation={conversation}
-            hostsById={hostsById}
-            state={sessionState}
-          />
+          {sessionTooltip}
         </Tooltip>
       )}
       {selectionMode ? (
@@ -4938,58 +4954,6 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     conversationRenderEqual(prev.conversation, next.conversation)
   );
 });
-
-/**
- * Hover flyout body for a pinned, project-owned conversation row.
- *
- * Pinning lifts a session out of its project folder into the flat "Pinned"
- * section, dropping the visual project cue the folder provided. Hovering the
- * row surfaces it again: the session title, project name, and optional branch.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
- */
-function PinnedProjectFlyoutContent({
-  title,
-  projectName,
-  projectIcon,
-  gitBranch,
-  hasError,
-}: {
-  title: string;
-  projectName: string;
-  projectIcon: string | null;
-  gitBranch: string | null;
-  hasError: boolean;
-}) {
-  return (
-    <HoverCardContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      className="w-64"
-      data-testid="pinned-project-flyout"
-    >
-      {/* Titles have no length cap (server + rename input are unbounded), so
-          clamp to 3 wrapped lines to keep the card tidy — full text stays in
-          the DOM. */}
-      <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
-      <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <ProjectRowIcon icon={projectIcon} />
-        <span className="truncate">{projectName}</span>
-      </p>
-      {gitBranch && (
-        <p
-          data-testid="pinned-project-flyout-branch"
-          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-        >
-          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{gitBranch}</span>
-        </p>
-      )}
-      {hasError && <SessionErrorHint />}
-    </HoverCardContent>
-  );
-}
 
 function ProjectFolderActions({
   projectName,
