@@ -1602,6 +1602,7 @@ describe("Sidebar session list", () => {
       renderSidebar();
       fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_details/ }));
       const flyout = await screen.findByTestId("pinned-project-flyout");
+      expect(flyout).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
       expect(within(flyout).getByText("Customer X")).toBeInTheDocument();
       expect(within(flyout).getByTestId("session-tooltip-agent")).toHaveTextContent(/^aria$/);
       expect(within(flyout).getByTestId("session-tooltip-cwd")).toHaveTextContent("/srv/repo");
