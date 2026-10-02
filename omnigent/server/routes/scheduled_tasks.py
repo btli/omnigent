@@ -49,6 +49,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.scheduled.name_template import NameTemplateError, validate_name_template
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.session_orchestration import require_owned_session
@@ -268,6 +269,14 @@ def _run_to_response(
         "viewer_last_seen": viewer_last_seen,
         "viewer_unread": viewer_unread,
     }
+
+
+def _validate_name_template_or_400(name: str) -> None:
+    """Raise a 400 for invalid date placeholders in a task name."""
+    try:
+        validate_name_template(name)
+    except NameTemplateError as exc:
+        raise OmnigentError(f"invalid name template: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 async def _validate_rrule_or_400(rrule: str) -> None:
@@ -569,6 +578,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        _validate_name_template_or_400(body.name)
         await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
@@ -848,6 +858,8 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        if body.name is not None and body.name != existing.name:
+            _validate_name_template_or_400(body.name)
         if body.rrule is not None:
             await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
