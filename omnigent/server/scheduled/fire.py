@@ -823,7 +823,6 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
 
 async def _create_session(deps: FireDeps, task: ScheduledTask, scheduled_at: int) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
-    title = task.name
     try:
         title = render_session_name(task.name, scheduled_at, task.timezone)
         if len(title) > 768:
