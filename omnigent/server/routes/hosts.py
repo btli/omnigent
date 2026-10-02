@@ -619,11 +619,11 @@ def create_hosts_router(
         stats = host_registry.host_stats(host.host_id)
         if stats is not None and stats.keys() == {"reported_at"}:
             # This replica's placeholder only proves the host reported stats; the
-            # hosts row's updated_at is its last-seen across every replica. Sandbox
-            # bookkeeping (relaunch, token revoke) also bumps it, so there the
-            # earlier of the two is the honest last-seen.
+            # hosts row's updated_at is its last-seen across every replica.
             last_seen = host.updated_at
             if host.sandbox_provider:
+                # Relaunch and token bookkeeping also bump a sandbox's row, so use the
+                # earlier time. It can lag on a replica the sandbox reported to earlier.
                 last_seen = min(last_seen, stats["reported_at"])
             stats = {"reported_at": last_seen}
         return {"stats": stats}
