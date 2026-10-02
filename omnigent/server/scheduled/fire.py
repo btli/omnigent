@@ -73,6 +73,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
@@ -493,7 +494,7 @@ async def _run_fire_for_task(
 
         try:
             effective = await _own_task_agent(deps, effective)
-            conv = await _create_session(deps, effective)
+            conv = await _create_session(deps, effective, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
             await _record_run(
@@ -879,12 +880,21 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     )
 
 
-async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+async def _create_session(deps: FireDeps, task: ScheduledTask, scheduled_at: int) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
+    title = task.name
+    try:
+        title = render_session_name(task.name, scheduled_at, task.timezone)
+        if len(title) > 768:
+            raise ValueError("rendered name exceeds 768 Unicode code points")
+    except Exception as exc:
+        title = task.name
+        _logger.exception("scheduled fire: task %s name renderer traceback", task.id)
+        _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
-        title=task.name,
+        title=title,
         host_id=task.host_id,
         workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
