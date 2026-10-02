@@ -18,3 +18,4 @@
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 #
+8761  # hzub feat(web): Harnesses settings page (introduces the harnesses feature flag)

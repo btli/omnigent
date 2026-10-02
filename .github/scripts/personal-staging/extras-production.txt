@@ -6,3 +6,4 @@
 # is only for refs outside that stream (a closed PR still carried, or a
 # bot-authored PR). Bot-authored pins are never covered by the open-PR stream;
 # remove them once merged upstream, or replace them when superseded.
+8761  # hzub feat(web): Harnesses settings page (introduces the harnesses feature flag)
