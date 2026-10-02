@@ -67,7 +67,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.scheduled.name_template import NameTemplateError, render_session_name
+from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.schemas import SessionEventInput
 
 _logger = logging.getLogger(__name__)
@@ -826,9 +826,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask, scheduled_at: int
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     try:
         title = render_session_name(task.name, scheduled_at, task.timezone)
-        if len(title) > 768:
-            raise ValueError("rendered name exceeds 768 Unicode code points")
-    except (NameTemplateError, ZoneInfoNotFoundError, ValueError) as exc:
+    except (ValueError, ZoneInfoNotFoundError) as exc:
         title = task.name
         _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     except Exception as exc:
