@@ -551,11 +551,14 @@
   overflow: hidden;
   opacity: 0;
   transform: translateX(12px);
+  pointer-events: none;
+}
+
+.workspace-panel-motion[data-animate-visibility] {
   transition:
     width 300ms ease-in-out,
     opacity 300ms ease-in-out,
     transform 300ms ease-in-out;
-  pointer-events: none;
 }
 
 .workspace-panel-motion[data-state="open"] {
@@ -568,12 +571,16 @@
   transition: none;
 }
 
+[data-workspace-panel-animate] .chat-header {
+  transition: right 300ms ease-in-out;
+}
+
 [data-workspace-panel-resizing] .chat-header {
   transition: none;
 }
 
 @starting-style {
-  .workspace-panel-motion[data-state="open"] {
+  .workspace-panel-motion[data-state="open"][data-animate-visibility] {
     width: 0 !important;
     opacity: 0;
     transform: translateX(12px);
@@ -1210,6 +1217,18 @@ aside[aria-label="Workspace"][data-maximized] {
     background: var(--selection-background);
     color: var(--selection-foreground);
   }
+}
+
+/* User-controlled fixed-width (monospace chrome) font family. The `font-mono`
+ * utility inlines the literal `--font-mono` stack (Tailwind v4 `@theme inline`),
+ * so a runtime `--font-mono` override is a no-op; this unlayered rule — winning
+ * over the layered utility — swaps in `--ui-mono-font-family` when the Appearance
+ * setting sets it on documentElement (see lib/fixedWidthFontPreferences.ts), and
+ * falls back to the app mono stack when unset. Scoped to the `font-mono` utility
+ * only, so Monaco/xterm (which read `var(--font-mono)` directly) keep the code
+ * font, not this chrome one. */
+.font-mono {
+  font-family: var(--ui-mono-font-family, var(--font-mono));
 }
 
 /* Desktop-only typography mapping. Tailwind text utilities read these tokens,
