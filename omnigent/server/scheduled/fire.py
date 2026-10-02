@@ -53,6 +53,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfoNotFoundError
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
@@ -67,7 +68,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.scheduled.name_template import render_session_name
+from omnigent.server.scheduled.name_template import NameTemplateError, render_session_name
 from omnigent.server.schemas import SessionEventInput
 
 _logger = logging.getLogger(__name__)
@@ -852,10 +853,12 @@ async def _create_session(deps: FireDeps, task: ScheduledTask, scheduled_at: int
         title = render_session_name(task.name, scheduled_at, task.timezone)
         if len(title) > 768:
             raise ValueError("rendered name exceeds 768 Unicode code points")
+    except (NameTemplateError, ZoneInfoNotFoundError, ValueError) as exc:
+        title = task.name
+        _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     except Exception as exc:
         title = task.name
-        _logger.exception("scheduled fire: task %s name renderer traceback", task.id)
-        _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
+        _logger.exception("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
