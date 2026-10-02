@@ -1422,6 +1422,18 @@ describe("Sidebar session list", () => {
   });
 
   describe("session tooltip details", () => {
+    // Every non-spinner state draws one filled, token-coloured dot that falls
+    // back to the system text colour in forced-colors mode.
+    const HARD_CODED_COLOR =
+      /#[0-9a-f]{3,8}|rgba?\(|oklch\(|hsla?\(|-(?:gray|zinc|slate|neutral|stone|red|pink|rose|blue|green|white|black)(?:-\d|\b)/i;
+    function expectStatusDot(status: HTMLElement, token: string) {
+      expect(status.querySelector("svg")).toBeNull();
+      const dot = status.querySelector("span[aria-hidden] > span.rounded-full");
+      expect(dot).toHaveClass("size-2", token, "forced-colors:bg-[CanvasText]");
+      expect(dot?.className).not.toMatch(/\bborder\b/);
+      expect(dot?.className).not.toMatch(HARD_CODED_COLOR);
+    }
+
     async function hoverTooltip(session: Conversation) {
       mockConversations([session]);
       renderSidebar();
@@ -1559,6 +1571,7 @@ describe("Sidebar session list", () => {
           const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
           expect(status).toHaveTextContent(/^Host disconnected$/);
           expect(status).toHaveAttribute("data-state", "disconnected");
+          expectStatusDot(status, "bg-muted-foreground");
         });
         expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
       } finally {
@@ -1597,6 +1610,71 @@ describe("Sidebar session list", () => {
       expect(within(tooltip).getAllByTestId("session-tooltip-error")[0]).toHaveTextContent(
         /^Latest message is an error$/,
       );
+    });
+
+    it.each([
+      { state: "idle", partial: {}, token: "bg-popover-foreground/70" },
+      {
+        state: "needs-response",
+        partial: { pending_elicitations_count: 1 },
+        token: "bg-brand-accent",
+      },
+      { state: "error", partial: { status: "failed" as const }, token: "bg-destructive" },
+    ])("draws $state as a theme-token dot", async ({ state, partial, token }) => {
+      const tooltip = await hoverTooltip(conv(`conv_dot_${state}`, "aria", partial));
+      const status = within(tooltip).getByTestId("session-tooltip-status");
+      expect(status).toHaveAttribute("data-state", state);
+      expectStatusDot(status, token);
+    });
+
+    it("draws New messages as a brand-accent dot like the row's unread dot", async () => {
+      const session = conv("conv_dot_unseen", "aria", { status: "idle", updated_at: 200 });
+      seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+      const tooltip = await hoverTooltip(session);
+      expectStatusDot(within(tooltip).getByTestId("session-tooltip-status"), "bg-brand-accent");
+    });
+
+    it("keeps the spinner for Working", async () => {
+      const tooltip = await hoverTooltip(conv("conv_dot_working", "aria", { status: "running" }));
+      const status = within(tooltip).getByTestId("session-tooltip-status");
+      expect(within(status).getByTestId("running-dot")).toHaveClass("animate-spin");
+    });
+
+    it("shows the same details on a pinned, project-owned session", async () => {
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_details"]);
+      mockConversations([
+        conv("conv_pinned_details", "aria", {
+          status: "running",
+          workspace: "/srv/repo",
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar();
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_details/ }));
+      const flyout = await screen.findByTestId("pinned-project-flyout");
+      expect(within(flyout).getByText("Customer X")).toBeInTheDocument();
+      expect(within(flyout).getByTestId("session-tooltip-agent")).toHaveTextContent(/^aria$/);
+      expect(within(flyout).getByTestId("session-tooltip-cwd")).toHaveTextContent("/srv/repo");
+      expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Working$/);
+    });
+
+    it("hides unknown lines on a pinned session instead of filling them in", async () => {
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_sparse"]);
+      mockConversations([
+        conv("conv_pinned_sparse", "", {
+          agent_name: null,
+          workspace: null,
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar();
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_sparse/ }));
+      const flyout = await screen.findByTestId("pinned-project-flyout");
+      expect(within(flyout).queryByTestId("session-tooltip-agent")).toBeNull();
+      expect(within(flyout).queryByTestId("session-tooltip-cwd")).toBeNull();
+      expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Idle$/);
     });
   });
 
@@ -1836,26 +1914,13 @@ describe("Sidebar failed session indicator", () => {
 
     it("explains the error through the row's existing hover surface", async () => {
       const content = await openExplanation("error");
-      expect(content).toHaveTextContent("Latest message is an error");
-      if (surface === "pinned") {
-        const hint = content.querySelector("p.text-destructive");
-        expect(hint).toHaveTextContent("Latest message is an error");
-        expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute(
-          "aria-hidden",
-          "true",
-        );
-      } else {
-        // The session tooltip labels the state "Error" and explains it below.
-        const status = within(content).getAllByTestId("session-tooltip-status")[0];
-        expect(status).toHaveClass("text-destructive");
-        expect(status.querySelector("svg.lucide-circle-alert")).toHaveAttribute(
-          "aria-hidden",
-          "true",
-        );
-        expect(within(content).getAllByTestId("session-tooltip-error")[0]).toHaveTextContent(
-          "Latest message is an error",
-        );
-      }
+      // Both surfaces label the state "Error" and explain it on the line below.
+      const status = within(content).getByTestId("session-tooltip-status");
+      expect(status).toHaveTextContent(/^Error$/);
+      expect(status).toHaveClass("text-destructive");
+      expect(status.querySelector("span.rounded-full")).toHaveClass("bg-destructive");
+      expect(status.nextElementSibling).toBe(within(content).getByTestId("session-tooltip-error"));
+      expect(status.nextElementSibling).toHaveTextContent("Latest message is an error");
     });
 
     it.each(["running", "awaiting", "starting"] as const)(
