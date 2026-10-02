@@ -2736,6 +2736,27 @@ describe("Sidebar session list", () => {
       expect(tooltip.lastElementChild).toBe(section);
     });
 
+    it("moves the host line into the runner section on a pinned, project-owned row", async () => {
+      useHostsMock.mockReturnValue({ data: [statsHost] });
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_stats"]);
+      mockConversations([
+        conv("conv_pinned_stats", "Codex", {
+          host_id: "host_stats",
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar(true, "/", undefined, hostStatsOn);
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_stats/ }));
+      const flyout = await screen.findByTestId("session-tooltip-content");
+
+      const section = within(flyout).getByTestId("runner-stats-section");
+      expect(within(section).getByTestId("runner-stats-header")).toHaveTextContent("bryan-mbp");
+      expect(within(section).getByRole("meter", { name: "CPU used" })).toBeInTheDocument();
+      expect(within(flyout).queryByTestId("session-tooltip-location")).toBeNull();
+      expect(flyout.lastElementChild).toBe(section);
+    });
+
     it("keeps the plain location line while the feature is off", async () => {
       const tooltip = await hoverStatsTooltip(statsHost);
 
