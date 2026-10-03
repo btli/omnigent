@@ -25,6 +25,7 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     HARNESSES = "harnesses"
     HOST_STATS = "host_stats"
+    MOBILE_PUSH = "mobile_push"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,13 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.MOBILE_PUSH,
+        description="Opt-in FCM notifications for white-label mobile builds",
+        owner="server",
+        review_by_release="0.15.0",
+        frontend_visible=False,
+    ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
         description="Web Usage page with cost timeline and breakdowns",
