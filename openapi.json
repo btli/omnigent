@@ -1516,9 +1516,9 @@
       "DeviceRegistration": {
         "properties": {
           "fcm_token": {
-            "maxLength": 4096,
+            "maxLength": 1024,
             "minLength": 1,
-            "pattern": "^\\S+$",
+            "pattern": "^[A-Za-z0-9:_-]+$",
             "title": "Fcm Token",
             "type": "string"
           },
