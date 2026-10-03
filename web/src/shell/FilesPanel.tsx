@@ -45,6 +45,8 @@ import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { useScrollRestore } from "./useScrollRestore";
+import { FileInfoDialog } from "./FileInfoDialog";
+import type { FileRowInfo } from "./FileRowActions";
 
 interface FilesPanelProps {
   conversationId?: string;
@@ -289,6 +291,12 @@ export function FilesPanel({
   const [debouncedTreeExclude, setDebouncedTreeExclude] = useState("");
   const [showSearchFilters, setShowSearchFilters] = useState(false);
   const [directoryRefreshToken, setDirectoryRefreshToken] = useState(0);
+  const [fileInfo, setFileInfo] = useState<FileRowInfo | null>(null);
+  const [fileInfoReturnFocus, setFileInfoReturnFocus] = useState<HTMLElement | null>(null);
+  const openFileInfo = useCallback((info: FileRowInfo, returnFocus: HTMLElement | null) => {
+    setFileInfo(info);
+    setFileInfoReturnFocus(returnFocus);
+  }, []);
   const [refreshingFiles, setRefreshingFiles] = useState(false);
   // The drawer (onClose) adds an X close button to the header. Both the drawer
   // and the inline rail (frameless) fill their parent's height and drop the
@@ -689,6 +697,7 @@ export function FilesPanel({
             sort={changedSort}
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
+            onOpenInfo={openFileInfo}
           />
         )}
         {!showAsleepHint && !flatView && (
@@ -723,9 +732,17 @@ export function FilesPanel({
             onExitSearch={exitTreeSearch}
             scrollParentRef={scrollRef}
             refreshToken={directoryRefreshToken}
+            onOpenInfo={openFileInfo}
           />
         )}
       </section>
+      <FileInfoDialog
+        info={fileInfo}
+        onOpenChange={(open) => {
+          if (!open) setFileInfo(null);
+        }}
+        returnFocus={fileInfoReturnFocus}
+      />
     </div>
   );
 }
