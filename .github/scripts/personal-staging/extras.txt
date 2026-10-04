@@ -19,4 +19,3 @@
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 branch:fix/staging-alembic-merge-mobile-push  # joins #8883's mp1b2c3d4e5f with the ring head; drop with #8883 (needs it composed)
 #
-8761  # hzub feat(web): Harnesses settings page (introduces the harnesses feature flag)
