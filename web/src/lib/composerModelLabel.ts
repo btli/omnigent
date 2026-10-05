@@ -6,6 +6,8 @@
 // the harness config controls, and the store can all depend on one source of
 // truth without a circular import.
 
+import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fusionModelLabel, isFusionModelUid } from "@/lib/devinFusion";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -42,6 +44,35 @@ export function defaultModelLabel(options: readonly NativeModelLabelFields[]): s
 export function compactModelTriggerLabel(value: string): string {
   const withoutDefault = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
   return withoutDefault.replace(/\s*\((\d+(?:\.\d+)?[KMG]) context\)/gi, " $1");
+}
+
+export function composerModelChipLabel({
+  modelSummary,
+  modelLabelLoading = false,
+  nativeDisplayName,
+  harnessLabel,
+  session,
+  showEffort = supportsEffortControl(session),
+  effort = null,
+  routingOn = false,
+}: {
+  modelSummary?: string | null;
+  modelLabelLoading?: boolean;
+  nativeDisplayName?: string | null;
+  harnessLabel?: string | null;
+  session?: Parameters<typeof supportsEffortControl>[0];
+  showEffort?: boolean;
+  effort?: string | null;
+  routingOn?: boolean;
+}): { label: string; effortLabel: string | null } {
+  return {
+    label: routingOn
+      ? SMART_ROUTING_LABEL
+      : modelLabelLoading
+        ? ""
+        : compactModelTriggerLabel(modelSummary ?? nativeDisplayName ?? harnessLabel ?? "Session"),
+    effortLabel: showEffort && !routingOn ? formatStatusEffortLabel(effort) : null,
+  };
 }
 
 export function formatStatusModelLabel(

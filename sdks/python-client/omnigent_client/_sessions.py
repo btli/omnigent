@@ -290,6 +290,8 @@ class SessionListItem:
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    llm_model: str | None = None
+    harness_override: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
@@ -317,6 +319,8 @@ class SessionListItem:
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
             host_id=raw.get("host_id"),
+            llm_model=raw.get("llm_model"),
+            harness_override=raw.get("harness_override"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),

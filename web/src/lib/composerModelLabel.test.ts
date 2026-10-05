@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   compactModelTriggerLabel,
+  composerModelChipLabel,
   defaultModelLabel,
   formatModelEffortStatusLabel,
   formatStatusEffortLabel,
@@ -9,6 +10,50 @@ import {
   nativeModelLabel,
   normalizeEffortLabel,
 } from "@/lib/composerModelLabel";
+
+describe("composer chip labels", () => {
+  const nativeSession = { labels: { "omnigent.wrapper": "claude-code-native-ui" } };
+  it.each([
+    ["Default (Opus 5.5 (1M context))", "Opus 5.5 1M"],
+    [null, "Claude Code"],
+  ])("shares the native label and effort for %s", (modelSummary, expected) => {
+    expect(
+      composerModelChipLabel({
+        modelSummary,
+        nativeDisplayName: "Claude Code",
+        session: nativeSession,
+        effort: "medium",
+      }),
+    ).toEqual({ label: expected, effortLabel: "Medium" });
+  });
+  it("uses the harness then Session fallback", () => {
+    expect(composerModelChipLabel({ harnessLabel: "Aria · Claude SDK" }).label).toBe(
+      "Aria · Claude SDK",
+    );
+    expect(composerModelChipLabel({}).label).toBe("Session");
+  });
+  it("does not show effort for unsupported sessions", () => {
+    expect(
+      composerModelChipLabel({
+        session: { labels: { "omnigent.wrapper": "cursor-native-ui" } },
+        effort: "high",
+      }).effortLabel,
+    ).toBeNull();
+  });
+  it("preserves the composer's loading and smart-routing states", () => {
+    expect(
+      composerModelChipLabel({ modelLabelLoading: true, nativeDisplayName: "Claude Code" }).label,
+    ).toBe("");
+    expect(
+      composerModelChipLabel({
+        routingOn: true,
+        modelLabelLoading: true,
+        session: nativeSession,
+        effort: "high",
+      }),
+    ).toEqual({ label: "Smart Routing", effortLabel: null });
+  });
+});
 
 describe("catalog model labels", () => {
   it.each([
