@@ -807,10 +807,10 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    // Focus opens the HoverCard (onFocus is one of its open triggers); the
+    // Focus opens the Tooltip (onFocus is one of its open triggers); the
     // content is portalled, so query the whole document after the open delay.
     fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
-    const flyout = await screen.findByTestId("pinned-project-flyout");
+    const flyout = await screen.findByTestId("session-tooltip-content");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     const flyoutTitle = within(flyout).getByText("My Session");
     expect(flyoutTitle).toBeInTheDocument();
@@ -818,7 +818,7 @@ describe("pinned row project flyout", () => {
     // class, which resolves to the same text-ui step as Appearance content.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
     expect(flyoutTitle).not.toHaveClass("text-ui");
-    expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
+    expect(within(flyout).getByTestId("session-tooltip-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );
   });
@@ -836,7 +836,7 @@ describe("pinned row project flyout", () => {
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
     fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
-    const flyout = await screen.findByTestId("pinned-project-flyout");
+    const flyout = await screen.findByTestId("session-tooltip-content");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     // The emoji renders via ProjectRowIcon (data-testid project-icon), replacing
     // the folder svg the fallback would otherwise draw.
@@ -855,7 +855,7 @@ describe("pinned row project flyout", () => {
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
     fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
-    const flyout = await screen.findByTestId("pinned-project-flyout");
+    const flyout = await screen.findByTestId("session-tooltip-content");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     // No emoji span; the project line leads with the folder svg fallback.
     expect(within(flyout).queryByTestId("project-icon")).toBeNull();
@@ -863,9 +863,7 @@ describe("pinned row project flyout", () => {
     expect(projectLine.querySelector("svg")).not.toBeNull();
   });
 
-  it("renders no project flyout for a pinned row with no project", () => {
-    // No project label → nothing to surface, so the row keeps its plain native
-    // title tooltip and never mounts a hover-card trigger.
+  it("uses the shared tooltip without a project line for a pinned row with no project", async () => {
     mocks.pinnedStore.set(["conv_1"]);
     mockConversations([{ ...CONV, labels: {} }]);
     renderSidebar();
@@ -874,12 +872,13 @@ describe("pinned row project flyout", () => {
     const row = screen.getByRole("link", { name: /My Session/ });
     expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
     fireEvent.focus(row);
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    expect(within(tooltip).queryByTestId("session-tooltip-project")).toBeNull();
   });
 
   it("disables the flyout on a mobile viewport, keeping the native title", () => {
     // Mobile has no real hover, so the flyout is gated off there: a tap that
-    // navigates must not also open (and strand) a HoverCard over the chat. The
+    // navigates must not also open (and strand) a Tooltip over the chat. The
     // row falls back to the plain link path — no hover-card trigger, native
     // title restored — even though it IS pinned + project-owned.
     mocks.isMobile = true;
@@ -894,7 +893,7 @@ describe("pinned row project flyout", () => {
     expect(row).toHaveAttribute("title", "My Session");
     // Focusing the row opens nothing — the flyout never mounts on mobile.
     fireEvent.focus(row);
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+    expect(screen.queryByTestId("session-tooltip-content")).toBeNull();
   });
 });
 
