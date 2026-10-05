@@ -31,10 +31,8 @@ function VideoPlayer({ conversationId, path }: { conversationId: string; path: s
         objectUrl = URL.createObjectURL(blob);
         setSource(objectUrl);
       },
-      (error: unknown) => {
-        const aborted =
-          (error instanceof Error || error instanceof DOMException) && error.name === "AbortError";
-        if (!disposed && !aborted) setFailed(true);
+      () => {
+        if (!disposed) setFailed(true);
       },
     );
     return () => {
