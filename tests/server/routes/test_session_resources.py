@@ -3539,6 +3539,38 @@ async def test_filesystem_download_proxy_ranges(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content_range", [None, "items */10", "bytes 1-2/10"])
+async def test_filesystem_download_proxy_rejects_unmarked_416(
+    client: httpx.AsyncClient,
+    content_range: str | None,
+) -> None:
+    """An unmarked runner 416 follows the existing non-download error handling."""
+    from fastapi import Response
+
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def serve(request: Request) -> Response:
+        assert request.headers["range"] == "bytes=10-"
+        headers = {
+            "Content-Disposition": 'attachment; filename="big.bin"',
+            "Accept-Ranges": "bytes",
+        }
+        if content_range is not None:
+            headers["Content-Range"] = content_range
+        return Response(b"not a range response", status_code=416, headers=headers)
+
+    async with _runner_app_client(runner):
+        response = await client.get(_DOWNLOAD_URL, headers={"Range": "bytes=10-"})
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "runner download failed"}
+    assert "content-range" not in response.headers
+    assert "content-disposition" not in response.headers
+    assert "accept-ranges" not in response.headers
+
+
+@pytest.mark.asyncio
 async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
