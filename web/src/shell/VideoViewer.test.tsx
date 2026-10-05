@@ -123,14 +123,17 @@ describe("VideoViewer", () => {
       expect(screen.getByText("Loading video…")).toBeInTheDocument();
     }
   });
-  it("ignores an AbortError without showing the error state", async () => {
+  it("shows the error state for an AbortError not caused by cleanup", async () => {
     vi.mocked(usesDirectFileDownload).mockReturnValue(false);
     vi.mocked(fetchWorkspaceFileBlob).mockRejectedValue(new DOMException("Aborted", "AbortError"));
 
     await act(async () => render(<VideoViewer conversationId="sess" path="clip.webm" />));
 
-    expect(screen.queryByText("This video can't be played here.")).not.toBeInTheDocument();
-    expect(screen.getByText("Loading video…")).toBeInTheDocument();
+    expect(vi.mocked(fetchWorkspaceFileBlob).mock.calls[0]?.[2]?.aborted).toBe(false);
+    expect(screen.getByText("This video can't be played here.")).toBeInTheDocument();
+    expect(screen.queryByText("Loading video…")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess", "clip.webm");
   });
   it("shows the toolbar failure toast when fallback Download rejects", async () => {
     vi.mocked(downloadWorkspaceFile).mockRejectedValue(new Error("offline"));
