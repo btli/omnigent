@@ -15,7 +15,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { AUTO_HARNESS_ID } from "@/lib/agentLabels";
+import { AUTO_HARNESS_ID, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -1804,6 +1804,80 @@ describe("Sidebar session list", () => {
       );
       expect(catalogCalls).toHaveLength(1);
       expect(String(catalogCalls[0][0])).toContain("/harnesses/claude-native/model-options");
+    });
+
+    it("shows unresolved Smart Routing for a non-native auto harness", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_polly",
+          name: "polly",
+          display_name: "Polly",
+          harness: "pi",
+          description: null,
+          skills: [],
+        },
+      ];
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      const tooltip = await hoverTooltip(
+        conv("polly_auto", "polly", {
+          agent_id: "ag_polly",
+          host_id: "host_model",
+          harness_override: AUTO_HARNESS_ID,
+          llm_model: "model",
+          reasoning_effort: "medium",
+        }),
+      );
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(agentLine).toHaveTextContent(new RegExp(`^${SMART_ROUTING_LABEL}$`));
+      expect(agentLine.querySelector("[data-harness-icon]")).toBeNull();
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+    });
+
+    it("updates an open non-native routing tooltip when auto resolves to a concrete harness", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_polly",
+          name: "polly",
+          display_name: "Polly",
+          harness: "pi",
+          description: null,
+          skills: [],
+        },
+      ];
+      const session = conv("polly_routed", "polly", {
+        agent_id: "ag_polly",
+        harness_override: AUTO_HARNESS_ID,
+        reasoning_effort: "medium",
+        updated_at: 100,
+      });
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: session.id }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(agentLine).toHaveTextContent(new RegExp(`^${SMART_ROUTING_LABEL}$`));
+
+      mockConversations([{ ...session, harness_override: "codex" }]);
+      rerender(tree());
+
+      await waitFor(() => expect(agentLine).toHaveTextContent(/^Polly · Codex$/));
     });
 
     it("uses the resolved harness for the icon, effort and model catalog key", async () => {
