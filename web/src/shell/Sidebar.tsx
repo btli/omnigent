@@ -3737,8 +3737,6 @@ function ConversationMenuItems({
   );
 }
 
-const SESSION_ERROR_EXPLANATION = "Latest message is an error";
-
 interface SessionTooltipProps {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
@@ -3797,12 +3795,12 @@ function SessionTooltipDetails({
     conversation.host_id ?? null,
     nativeAgent?.harness ?? harness ?? "",
     catalogEnabled,
-    { poll: false, once: true },
+    { once: true },
   );
   const harnessLabel = harness ? BRAIN_HARNESS_LABELS[harness] : null;
   const { label: agentLabel, effortLabel } = composerModelChipLabel({
     modelSummary:
-      nativeAgent && catalogEnabled && models?.length
+      catalogEnabled && models?.length
         ? formatStatusModelLabel(conversation.llm_model ?? null, models)
         : null,
     nativeDisplayName: nativeAgent?.displayName,
@@ -3827,7 +3825,7 @@ function SessionTooltipDetails({
   // Runner-owned failure detail the server persists as a label; transcript-only
   // errors have none, so they keep the generic explanation.
   const errorMessage =
-    conversation.labels?.["omnigent.last_task_error_message"] || SESSION_ERROR_EXPLANATION;
+    conversation.labels?.["omnigent.last_task_error_message"] || "Latest message is an error";
   // One filled dot per state, coloured by theme tokens; forced-colors mode
   // drops author backgrounds, so the dot falls back to the system text colour.
   const dot = (className: string) => (
@@ -3844,16 +3842,10 @@ function SessionTooltipDetails({
   const status = (() => {
     switch (state?.kind) {
       case "running":
-        return {
-          key: "working",
-          label: "Working",
-          icon: <RunningDot className="size-3.5" />,
-          tone: "",
-        };
       case "starting":
         return {
-          key: "starting",
-          label: "Starting up",
+          key: state.kind === "running" ? "working" : "starting",
+          label: state.kind === "running" ? "Working" : "Starting up",
           icon: <RunningDot className="size-3.5" />,
           tone: "",
         };
