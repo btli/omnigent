@@ -29,6 +29,8 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
+// Label-less sessions inherit their wrapper from the harness; sub-agent
+// children own no input surface, so they must not inherit it.
 export function effectiveWrapperLabel(
   conv:
     | {
@@ -60,6 +62,7 @@ export function effortLevelsForConv(
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
+    // Devin encodes effort in model variants, whose available rungs differ per model.
     case "devin-native-ui":
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);

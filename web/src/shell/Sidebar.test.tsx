@@ -1515,17 +1515,168 @@ describe("Sidebar session list", () => {
         );
         fireEvent.blur(screen.getByRole("link", { name: "native_one" }));
         await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+        if (failed) {
+          fetchSpy.mockImplementation(
+            async () =>
+              new Response(
+                JSON.stringify({
+                  models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+                }),
+              ),
+          );
+        }
         vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
         fireEvent.focus(screen.getByRole("link", { name: "native_two" }));
         const second = await screen.findByTestId("session-tooltip-content");
-        expect(within(second).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
-          failed ? /^Claude Code Medium$/ : /^Opus 5.5 1M Medium$/,
+        await waitFor(() =>
+          expect(within(second).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+            /^Opus 5.5 1M Medium$/,
+          ),
         );
-        expect(calls()).toHaveLength(1);
+        expect(calls()).toHaveLength(failed ? 2 : 1);
         fetchSpy.mockRestore();
         vi.mocked(Date.now).mockRestore();
       },
     );
+
+    it.each<{
+      field: keyof Conversation;
+      initial: Partial<Conversation>;
+      update: Partial<Conversation>;
+      testId: string;
+      before: string;
+      after: string;
+    }>([
+      {
+        field: "agent_id",
+        initial: { agent_id: "ag_old" },
+        update: { agent_id: "ag_new" },
+        testId: "session-tooltip-agent",
+        before: "Old agent · Claude SDK",
+        after: "New agent · Claude SDK",
+      },
+      {
+        field: "agent_name",
+        initial: { agent_name: "old-agent" },
+        update: { agent_name: "new-agent" },
+        testId: "session-tooltip-agent",
+        before: "old-agent",
+        after: "new-agent",
+      },
+      {
+        field: "workspace",
+        initial: { workspace: "/old/workspace" },
+        update: { workspace: "/new/workspace" },
+        testId: "session-tooltip-cwd",
+        before: "/old/workspace",
+        after: "/new/workspace",
+      },
+      {
+        field: "llm_model",
+        initial: { agent_name: "claude-native-ui", llm_model: "opus[1m]" },
+        update: { llm_model: "sonnet" },
+        testId: "session-tooltip-agent",
+        before: "Opus 5.5 1M Medium",
+        after: "Sonnet Medium",
+      },
+      {
+        field: "harness_override",
+        initial: { agent_name: "claude-native-ui" },
+        update: { harness_override: "cursor-native" },
+        testId: "session-tooltip-agent",
+        before: "Claude Code Medium",
+        after: "Cursor",
+      },
+      {
+        field: "reasoning_effort",
+        initial: { agent_name: "claude-native-ui", reasoning_effort: "medium" },
+        update: { reasoning_effort: "high" },
+        testId: "session-tooltip-agent",
+        before: "Claude Code Medium",
+        after: "Claude Code High",
+      },
+      {
+        field: "host_online",
+        initial: { agent_name: "claude-native-ui", llm_model: "opus[1m]", host_online: true },
+        update: { host_online: false },
+        testId: "session-tooltip-agent",
+        before: "Opus 5.5 1M Medium",
+        after: "Claude Code Medium",
+      },
+    ])("refreshes an open tooltip after a metadata-only $field update", async (testCase) => {
+      agentsRef.current = [
+        {
+          id: "ag_old",
+          name: "old-known",
+          display_name: "Old agent",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+        {
+          id: "ag_new",
+          name: "new-known",
+          display_name: "New agent",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      vi.spyOn(identity, "authenticatedFetch").mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              models: [
+                { id: "opus[1m]", displayName: "Opus 5.5 (1M context)" },
+                { id: "sonnet", displayName: "Sonnet" },
+              ],
+            }),
+          ),
+      );
+      const session = conv("metadata_row", "unknown-agent", {
+        host_id: "host_model",
+        reasoning_effort: "medium",
+        labels:
+          testCase.initial.agent_name === "claude-native-ui"
+            ? { "omnigent.wrapper": "claude-code-native-ui" }
+            : {},
+        updated_at: 100,
+        ...testCase.initial,
+      });
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: "metadata_row" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      await waitFor(() =>
+        expect(within(tooltip).getAllByTestId(testCase.testId)[0]).toHaveTextContent(
+          testCase.before,
+        ),
+      );
+
+      mockConversations([{ ...session, ...testCase.update }]);
+      rerender(tree());
+
+      await waitFor(() =>
+        expect(within(tooltip).getAllByTestId(testCase.testId)[0]).toHaveTextContent(
+          testCase.after,
+        ),
+      );
+    });
 
     it.each([false, true])(
       "uses the native fallback without probing an offline host or old server (offline=%s)",
