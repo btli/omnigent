@@ -15,6 +15,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { AUTO_HARNESS_ID } from "@/lib/agentLabels";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -1735,6 +1736,88 @@ describe("Sidebar session list", () => {
       expect(
         fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
       ).toHaveLength(0);
+    });
+
+    it("resolves same-named custom agents only by their bound id", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_deploy_old",
+          name: "deploy-bot",
+          display_name: "Deploy Bot",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+        {
+          id: "ag_deploy_new",
+          name: "deploy-bot",
+          display_name: "Deploy Bot",
+          harness: "codex",
+          description: null,
+          skills: [],
+        },
+      ];
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      mockConversations([
+        conv("deploy_old", "deploy-bot", { agent_id: "ag_deploy_old" }),
+        conv("deploy_new", "deploy-bot", { agent_id: "ag_deploy_new" }),
+        conv("deploy_missing", "deploy-bot", {
+          agent_id: "ag_deploy_missing",
+          llm_model: "opus[1m]",
+          reasoning_effort: "high",
+        }),
+      ]);
+      renderSidebar();
+      async function checkRow(title: string, expected: string) {
+        const row = screen.getByRole("link", { name: title });
+        fireEvent.focus(row);
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expected}$`));
+        if (title === "deploy_missing") {
+          expect(agentLine.querySelector(".lucide-bot")).not.toBeNull();
+          expect(agentLine.querySelector("img")).toBeNull();
+        }
+        fireEvent.blur(row);
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+      }
+      await checkRow("deploy_old", "Deploy Bot · Claude SDK");
+      await checkRow("deploy_new", "Deploy Bot · Codex");
+      await checkRow("deploy_missing", "deploy-bot");
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+    });
+
+    it("keeps the native wrapper icon, model and effort for an auto harness override", async () => {
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch").mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+            }),
+          ),
+      );
+      const tooltip = await hoverTooltip(
+        conv("native_auto", "claude-native-ui", {
+          host_id: "host_model",
+          harness_override: AUTO_HARNESS_ID,
+          llm_model: "opus[1m]",
+          reasoning_effort: "medium",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        }),
+      );
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      await waitFor(() => expect(agentLine).toHaveTextContent(/^Opus 5.5 1M Medium$/));
+      expect(agentLine.querySelector("[data-harness-icon='claude']")).not.toBeNull();
+      const catalogCalls = fetchSpy.mock.calls.filter(([url]) =>
+        String(url).includes("/model-options"),
+      );
+      expect(catalogCalls).toHaveLength(1);
+      expect(String(catalogCalls[0][0])).toContain("/harnesses/claude-native/model-options");
     });
 
     it("uses the resolved harness for the icon, effort and model catalog key", async () => {

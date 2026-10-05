@@ -1,7 +1,7 @@
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { composerModelChipLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { AUTO_HARNESS_ID, BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForSession,
   nativeCodingAgentForAvailableAgent,
@@ -3794,15 +3794,14 @@ function SessionTooltipDetails({
       ? sandboxOptionLabel(host.sandbox_provider)
       : (host?.name ?? conversation.host_id);
   const { data: agents = [] } = useAvailableAgents();
-  const agent =
-    agents.find((candidate) => candidate.id === conversation.agent_id) ??
-    agents.find((candidate) => candidate.name === conversation.agent_name);
+  const agent = agents.find((candidate) => candidate.id === conversation.agent_id);
   const declaredNativeAgent =
     nativeCodingAgentForSession(conversation) ??
     nativeCodingAgentForAvailableAgent(agent) ??
     nativeCodingAgentForAgentName(conversation.agent_name);
-  const harness =
-    conversation.harness_override ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
+  const harnessOverride =
+    conversation.harness_override === AUTO_HARNESS_ID ? null : conversation.harness_override;
+  const harness = harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
   const nativeAgent = nativeCodingAgentForHarness(harness);
   const iconAgent = nativeAgent
     ? { name: nativeAgent.agentName, harness }
@@ -3835,7 +3834,7 @@ function SessionTooltipDetails({
           harness,
           labels: {
             ...conversation.labels,
-            ...(conversation.harness_override != null && {
+            ...(harnessOverride != null && {
               "omnigent.wrapper": nativeAgent?.wrapperLabel ?? null,
             }),
           },
