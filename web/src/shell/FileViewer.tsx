@@ -1190,6 +1190,7 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
+  // Find and diff toggles share the settings menu; Download stays visible.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
