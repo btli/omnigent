@@ -80,6 +80,9 @@ _logger = logging.getLogger("omnigent.runner.app")
 
 
 def _parse_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Return inclusive ``(start, end)``; ``None`` ignores the header (200).
+
+    :raises ValueError: If the range is unsatisfiable (416)."""
     if value is None:
         return None
     match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", value)

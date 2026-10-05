@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { withBasePath } from "@/lib/basePath";
 import {
@@ -21,20 +22,24 @@ function VideoPlayer({ conversationId, path }: { conversationId: string; path: s
 
   useEffect(() => {
     if (direct) return;
+    const controller = new AbortController();
     let disposed = false;
     let objectUrl: string | undefined;
-    void fetchWorkspaceFileBlob(conversationId, path).then(
+    void fetchWorkspaceFileBlob(conversationId, path, controller.signal).then(
       (blob) => {
         if (disposed) return;
         objectUrl = URL.createObjectURL(blob);
         setSource(objectUrl);
       },
-      () => {
-        if (!disposed) setFailed(true);
+      (error: unknown) => {
+        const aborted =
+          (error instanceof Error || error instanceof DOMException) && error.name === "AbortError";
+        if (!disposed && !aborted) setFailed(true);
       },
     );
     return () => {
       disposed = true;
+      controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [conversationId, path, direct]);
@@ -47,7 +52,9 @@ function VideoPlayer({ conversationId, path }: { conversationId: string; path: s
           <Button
             variant="outline"
             onClick={() => {
-              void downloadWorkspaceFile(conversationId, path).catch(() => {});
+              void downloadWorkspaceFile(conversationId, path).catch(() =>
+                toast.error("Download failed"),
+              );
             }}
           >
             Download
