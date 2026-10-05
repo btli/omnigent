@@ -5,7 +5,7 @@ sidebar *row* type, but not the hover flyout that surfaces a pinned session's
 originating project — the card is portalled and only mounts on hover, so a
 restyle of it (surface, title clamp, project line, session details) sails
 through that gate. This baseline fills the gap: hover a pinned, project-owned
-row and capture the ``SessionTooltipContent`` card it renders in a HoverCard.
+row and capture the ``SessionTooltipContent`` card it renders in a Tooltip.
 
 Same gate, renderer, and update flow as the other snapshots — see ``README.md``.
 
@@ -133,7 +133,7 @@ def test_pinned_project_flyout_matches_baseline(
     """Hovering a pinned, project-owned row opens a flyout that renders
     pixel-identical to the committed baseline.
 
-    Covers ``SessionTooltipContent`` in its pinned HoverCard (clamped title,
+    Covers ``SessionTooltipContent`` in its pinned Tooltip (clamped title,
     project line, location and status) that the populated-sidebar baseline
     can't reach because it only mounts on hover.
 
@@ -188,7 +188,7 @@ def test_pinned_project_flyout_matches_baseline(
 
     # Hover the row to open the project flyout, then wait for the portalled card.
     row.hover()
-    flyout = page.get_by_test_id("pinned-project-flyout")
+    flyout = page.get_by_test_id("session-tooltip-content")
     expect(flyout).to_be_visible(timeout=30_000)
     expect(flyout.get_by_text(_PROJECT, exact=True)).to_be_visible()
 
