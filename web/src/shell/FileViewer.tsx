@@ -108,6 +108,7 @@ import {
   isModelFile,
   isNotebookPath,
   isPdfFile,
+  isVideoFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
@@ -403,7 +404,7 @@ function FileViewerBody({
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
-  const fileQuery = useFileContent(conversationId, path);
+  const fileQuery = useFileContent(conversationId, path, !isVideoFile(path));
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -682,7 +683,6 @@ function FileViewerBody({
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
-  const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -692,6 +692,9 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  const isVideo = isVideoFile(path, fileQuery.data?.content_type);
+  const isPreviewable =
+    !isVideo && (lang === "markdown" || lang === "html" || isNotebookPath(path));
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
   // Monaco — mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
@@ -700,6 +703,7 @@ function FileViewerBody({
     !isImage &&
     !isPdf &&
     !isModel &&
+    !isVideo &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
@@ -877,7 +881,13 @@ function FileViewerBody({
   // would swallow the browser's find-in-page with no find widget to show.
   const isMonacoFindSurface =
     diffViewActive ||
-    (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
+    (lang !== "markdown" &&
+      viewMode !== "preview" &&
+      !isImage &&
+      !isPdf &&
+      !isModel &&
+      !isVideo &&
+      !isBinary);
   // Cmd+F must open find-in-file only while the file viewer is the surface the
   // user is working in. The viewer stays mounted beside the chat, so `open`
   // alone can't tell them apart, and reading `document.activeElement` at
@@ -1038,7 +1048,7 @@ function FileViewerBody({
     menu?: ToolbarOption[];
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && viewMode !== "diff") {
+  if (!isVideo && lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
     // Editor (default), the rendered Preview, and raw Source. Switching away
     // from the editor must guard unsaved edits; the read-only preview/source
@@ -1101,7 +1111,7 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
+  } else if (!isVideo && (lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
     // HTML and notebooks have no rich-text editor — a single toggle flips
     // preview ↔ source.
     toolbarActions.push({
@@ -1124,7 +1134,7 @@ function FileViewerBody({
   // HTML artifacts can be popped out into their own browser tab for full-window
   // viewing. The artifact still runs in the same sandboxed, opaque-origin iframe
   // as the in-app preview (isolated from the host app) — just full-screen.
-  if (lang === "html" && fileQuery.data && viewMode !== "diff") {
+  if (!isVideo && lang === "html" && fileQuery.data && viewMode !== "diff") {
     toolbarActions.push({
       key: "open-new-tab",
       label: "Open in new tab",
@@ -1180,12 +1190,6 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // A single "⋯" menu folds the view controls that were previously separate
-  // top-level icons: Find in file and Download (all views), plus the diff-only
-  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
-  // diff-settings menu. The toggles keep the menu open; actions close it as they
-  // hand off.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1202,16 +1206,6 @@ function FileViewerBody({
       icon: <FolderOpenIcon className="size-4" />,
       active: false,
       onSelect: () => revealInFileManager(revealTarget),
-    });
-  }
-  if (!isDeletedFile && fileQuery.data) {
-    settingsMenu.push({
-      key: "download",
-      label: "Download file",
-      tooltip: "Download",
-      icon: <DownloadIcon className="size-4" />,
-      active: false,
-      onSelect: downloadFile,
     });
   }
   if (viewMode === "diff") {
@@ -1270,6 +1264,7 @@ function FileViewerBody({
     // path-aware title reserve). Each shifts the constants the effect reads.
     [
       toolbarActions.map((a) => a.key).join(","),
+      `download:${!isDeletedFile}`,
       `back:${!frameless || mobileOverlay}`,
       `chip:${saveStatus !== "idle"}`,
       `nav:${showNavButtons}`,
@@ -1504,6 +1499,24 @@ function FileViewerBody({
               then a single "⋯" menu with the same options. The offscreen clone
               below measures the full row's natural width. */}
           <div className="flex items-center justify-end gap-1">
+            {!isDeletedFile && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Download file"
+                      onClick={downloadFile}
+                    >
+                      <DownloadIcon className="size-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Download file</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             {toolbarCollapsed ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -1593,6 +1606,11 @@ function FileViewerBody({
             className="pointer-events-none absolute left-[-9999px] top-0 flex flex-nowrap items-center gap-1"
           >
             {renderActionButtons(false)}
+            {!isDeletedFile && (
+              <Button type="button" variant="ghost" size="icon-sm" tabIndex={-1}>
+                <DownloadIcon className="size-4" />
+              </Button>
+            )}
           </div>
           <span
             ref={toolbarPathMeasureRef}
