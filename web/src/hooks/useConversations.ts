@@ -1795,7 +1795,7 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     pending_elicitations_count: session.pendingElicitations?.length,
     runner_online: session.runnerOnline,
     host_online: session.hostOnline,
-    llm_model: session.llmModel,
+    llm_model: session.llmModel ?? session.modelOverride,
     reasoning_effort: session.reasoningEffort,
     harness_override: session.harness ?? null,
     parent_session_id: session.parentSessionId,
