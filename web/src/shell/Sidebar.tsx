@@ -1,9 +1,9 @@
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { composerModelChipLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
-import { AUTO_HARNESS_ID, BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { AUTO_HARNESS_ID, BRAIN_HARNESS_LABELS, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import {
-  nativeCodingAgentForSession,
+  nativeCodingAgentForWrapper,
   nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForAgentName,
   nativeCodingAgentForHarness,
@@ -3687,12 +3687,13 @@ function SessionTooltipDetails({
       : (host?.name ?? conversation.host_id);
   const { data: agents = [] } = useAvailableAgents();
   const agent = agents.find((candidate) => candidate.id === conversation.agent_id);
+  const nativePaneAgent = nativeCodingAgentForWrapper(conversation.labels?.["omnigent.wrapper"]);
   const declaredNativeAgent =
-    nativeCodingAgentForSession(conversation) ??
+    nativePaneAgent ??
     nativeCodingAgentForAvailableAgent(agent) ??
     nativeCodingAgentForAgentName(conversation.agent_name);
   const harnessOverride =
-    conversation.harness_override === AUTO_HARNESS_ID && declaredNativeAgent
+    conversation.harness_override === AUTO_HARNESS_ID && nativePaneAgent
       ? null
       : conversation.harness_override;
   const harness = harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
@@ -3700,7 +3701,7 @@ function SessionTooltipDetails({
   const iconAgent = nativeAgent
     ? { name: nativeAgent.agentName, harness }
     : agent
-      ? { name: agent.name, harness }
+      ? { name: agent.name, harness: harness === AUTO_HARNESS_ID ? agent.harness : harness }
       : null;
   const catalogEnabled =
     nativeAgent !== undefined &&
@@ -3713,16 +3714,22 @@ function SessionTooltipDetails({
     catalogEnabled,
     { once: true },
   );
-  const harnessLabel = harness ? BRAIN_HARNESS_LABELS[harness] : null;
+  const harnessLabel =
+    harness === AUTO_HARNESS_ID
+      ? SMART_ROUTING_LABEL
+      : harness
+        ? BRAIN_HARNESS_LABELS[harness]
+        : null;
   const { label: agentLabel, effortLabel } = composerModelChipLabel({
     modelSummary:
       catalogEnabled && models?.length
         ? formatStatusModelLabel(conversation.llm_model ?? null, models)
         : null,
     nativeDisplayName: nativeAgent?.displayName,
-    harnessLabel: agent
-      ? [agent.display_name, harnessLabel].filter(Boolean).join(" · ")
-      : conversation.agent_name,
+    harnessLabel:
+      agent || harness === AUTO_HARNESS_ID
+        ? [agent?.display_name ?? conversation.agent_name, harnessLabel].filter(Boolean).join(" · ")
+        : conversation.agent_name,
     session: iconAgent
       ? {
           harness,
@@ -3737,7 +3744,6 @@ function SessionTooltipDetails({
     model: conversation.llm_model ?? null,
     modelOptions: catalogEnabled ? models : [],
     effort: conversation.reasoning_effort,
-    routingOn: harness === AUTO_HARNESS_ID,
   });
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
