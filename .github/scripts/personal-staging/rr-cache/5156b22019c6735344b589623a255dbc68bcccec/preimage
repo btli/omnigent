@@ -1,0 +1,342 @@
+"""E2E: 3D model files render through the FileViewer's <ModelViewer>.
+
+A file the FileViewer classifies as a model (STL / 3MF / OBJ, via the shared
+``getModelFormat`` resolver) must render as an interactive WebGL preview — a
+``<canvas>`` under the ``aria-label="3D preview of …"`` host — not as
+syntax-highlighted source nor the binary placeholder.
+
+We seed ASCII STL and OBJ fixtures because the filesystem PUT endpoint can only
+seed text (``str.encode(encoding)`` — base64 is not a text codec), and both
+ASCII formats are valid UTF-8 that round-trips through that path. STL is routed
+by its MIME type (``mimetypes.guess_type('x.stl')`` →
+``application/vnd.ms-pki.stl``, a recognized model type); OBJ has no model MIME
+(``application/x-tgif``) so it exercises the extension fallback. Seeded via the
+filesystem PUT endpoint (no agent run).
+"""
+
+from __future__ import annotations
+
+<<<<<<<
+import io
+import json
+=======
+import math
+>>>>>>>
+import re
+from collections.abc import Iterator
+
+import httpx
+import pytest
+from PIL import Image
+from playwright.sync_api import Locator, Page, expect
+
+# ---------------------------------------------------------------------------
+# Test fixtures — tiny, valid single-triangle models
+# ---------------------------------------------------------------------------
+
+# Minimal ASCII STL: one triangle, so the mesh has finite, non-degenerate
+# bounds and clears the viewer's ``hasRenderableBounds`` guard.
+_ASCII_STL = """\
+solid tri
+  facet normal 0 0 1
+    outer loop
+      vertex 0 0 0
+      vertex 1 0 0
+      vertex 0 1 0
+    endloop
+  endfacet
+endsolid tri
+"""
+
+# Minimal OBJ: three vertices and a face, likewise finite and drawable.
+_OBJ_CONTENT = """\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+"""
+
+# Each case: (file_path, content). STL routes by MIME, OBJ by extension.
+_MODELS = {
+    "stl": ("part.stl", _ASCII_STL),
+    "obj": ("mesh.obj", _OBJ_CONTENT),
+}
+
+
+def _large_ascii_stl(min_bytes: int = 9 * 1024 * 1024 + 512 * 1024) -> str:
+    """An ASCII STL height field just under the 10 MiB read cap, large enough
+    that the viewer's decode, parse and scene build take a visible while."""
+    side = max(4, math.isqrt(min_bytes // 150) + 1)
+
+    def height(a: float, b: float) -> float:
+        return math.sin(a * 0.4) * math.cos(b * 0.4) * 6.0
+
+    parts = ["solid plate\n"]
+    size = len(parts[0])
+    i = 0
+    while size < min_bytes:
+        gx, gy = i % side, i // side
+        facet = (
+            "  facet normal 0 0 1\n    outer loop\n"
+            f"      vertex {gx:.3f} {gy:.3f} {height(gx, gy):.3f}\n"
+            f"      vertex {gx + 1:.3f} {gy:.3f} {height(gx + 1, gy):.3f}\n"
+            f"      vertex {gx:.3f} {gy + 1:.3f} {height(gx, gy + 1):.3f}\n"
+            "    endloop\n  endfacet\n"
+        )
+        parts.append(facet)
+        size += len(facet)
+        i += 1
+    parts.append("endsolid plate\n")
+    return "".join(parts)
+
+
+# Installed before the SPA boots. Records the loading label shown when the
+# preview host first mounts, and the first status announcement made before the
+# canvas exists (the status region mounts empty so screen readers announce it).
+_LOAD_PROBE_JS = """
+(() => {
+  const probe = { labelAtHostMount: undefined, statusBeforeCanvas: undefined };
+  window.__modelLoadProbe = probe;
+  const check = () => {
+    const host = document.querySelector('[aria-label^="3D preview of"]');
+    if (!host || !host.parentElement) return;
+    if (probe.labelAtHostMount === undefined) {
+      const text = host.parentElement.textContent || "";
+      probe.labelAtHostMount = text.includes("Preparing model…") ? "Preparing model…" : text;
+    }
+    const status = host.parentElement.querySelector('[role="status"]');
+    if (probe.statusBeforeCanvas === undefined && status && status.textContent) {
+      probe.statusBeforeCanvas = host.querySelector("canvas") ? null : status.textContent;
+    }
+  };
+  new MutationObserver(check).observe(document, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+  check();
+})();
+"""
+
+
+# ---------------------------------------------------------------------------
+# Fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def seeded_model_session(
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[str, str, str]]:
+    """Seed a model file and yield ``(base_url, session_id, path)``.
+
+    :param seeded_session: Runner-bound (base_url, session_id) pair.
+    :param request: Carries the ``(path, content)`` case via ``indirect``;
+        ``content`` may be a callable so large fixtures are built on demand.
+    :returns: ``(base_url, session_id, file_path)`` for the test body.
+    """
+    base_url, session_id = seeded_session
+    file_path, content = request.param
+    if callable(content):
+        content = content()
+    file_url = (
+        f"{base_url}/v1/sessions/{session_id}"
+        f"/resources/environments/default/filesystem/{file_path}"
+    )
+    resp = httpx.put(
+        file_url,
+        json={"content": content, "encoding": "utf-8"},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    yield (base_url, session_id, file_path)
+
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+
+def _open_model_preview(page: Page, base_url: str, session_id: str, file_path: str) -> Locator:
+    """Open ``file_path`` in the Explore file viewer and return its rendered canvas."""
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(file_path)}\b"))
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+
+    # Two FileViewer instances mount with the same test id (mobile push-panel and
+    # the desktop rail); match the visible one. The canvas host carries the filename
+    # aria-label, and the error overlay would surface a parse or WebGL failure.
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    preview = file_viewer.locator(f'[aria-label="3D preview of {file_path}"]')
+    canvas = preview.locator("canvas")
+    expect(canvas).to_be_visible(timeout=15_000)
+    expect(file_viewer.get_by_text("Unable to render 3D model")).to_have_count(0)
+    # The pane animates open and the resize observer then re-fits the canvas,
+    # which resets its buffer; wait for the box to settle, then two frames so
+    # the render loop has cleared it again (a fresh WebGL canvas is transparent).
+    # Bounded so a layout that never settles fails with its last box instead of hanging.
+    canvas.evaluate(
+        """el => new Promise((resolve, reject) => {
+            let last = el.getBoundingClientRect();
+            let frames = 0;
+            const tick = () => {
+                const box = el.getBoundingClientRect();
+                const same = ["x", "y", "width", "height"].every(k => box[k] === last[k]);
+                last = box;
+                if (same) requestAnimationFrame(() => requestAnimationFrame(resolve));
+                else if (++frames >= 120)
+                    reject(new Error("canvas box never settled: " + JSON.stringify(box)));
+                else requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+        })"""
+    )
+    return canvas
+
+
+@pytest.mark.parametrize(
+    "seeded_model_session",
+    list(_MODELS.values()),
+    ids=list(_MODELS),
+    indirect=True,
+)
+def test_model_file_renders_as_3d_preview(
+    page: Page,
+    seeded_model_session: tuple[str, str, str],
+) -> None:
+    """A model file renders as a WebGL preview, not source or the placeholder."""
+    base_url, session_id, file_path = seeded_model_session
+    _open_model_preview(page, base_url, session_id, file_path)
+
+    # It did NOT fall through to the binary placeholder or a source/editor view.
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(file_viewer.get_by_text("Preview not available for binary files")).to_have_count(0)
+    expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
+
+
+<<<<<<<
+# ---------------------------------------------------------------------------
+# Canvas background follows the active theme
+# ---------------------------------------------------------------------------
+
+# Each case seeds the persisted Appearance preferences the Settings controls
+# write. The custom case uses a saturated tint: the Custom derivation blends the
+# tint most of the way toward white, so a near-white tint gives a pure-white pane.
+_CUSTOM_THEME = {
+    "basePalette": "omni",
+    "accent": "#11171c",
+    "darkAccent": "#e8ecf0",
+    "tint": "#d9a441",
+    "darkTint": "#0e1013",
+    "contrast": 50,
+    "translucentSidebar": False,
+}
+_THEMES: dict[str, tuple[str, dict[str, str]]] = {
+    "gruvbox-light": ("light", {"omnigent:ui-theme-palette": json.dumps("gruvbox")}),
+    "gruvbox-dark": ("dark", {"omnigent:ui-theme-palette": json.dumps("gruvbox")}),
+    "custom-light": (
+        "light",
+        {
+            "omnigent:ui-theme-palette": json.dumps("custom"),
+            "omnigent:custom-theme": json.dumps(_CUSTOM_THEME),
+        },
+    ),
+    "default-dark": ("dark", {}),
+}
+
+# The clear colours the viewer used to paint per mode. A pane equal to one
+# cannot tell a transparent canvas from the old opaque fill, so each case's
+# themed pane must differ from it.
+_LEGACY_CLEAR_COLORS = {"light": (255, 255, 255), "dark": (14, 16, 19)}
+
+# Per-channel slack for the canvas/pane match; the pane gradient varies by a level or two.
+_TOLERANCE = 2
+
+
+def _apply_theme_preferences(page: Page, mode: str, extra: dict[str, str]) -> None:
+    """Seed the Appearance localStorage keys the Settings controls write before the
+    SPA boots."""
+    store = {"web-theme": mode, **extra}
+    page.add_init_script(
+        ";".join(
+            f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})" for k, v in store.items()
+        )
+    )
+
+
+def _pixels_across_top_edge(
+    page: Page, canvas: Locator
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return ``(pane, canvas)`` RGB sampled 2px above and 2px inside the canvas's top
+    edge, clearing the pane's 1px toolbar border."""
+    box = canvas.bounding_box()
+    assert box is not None
+    x = round(box["x"] + box["width"] / 2)
+    top = round(box["y"])
+    # CSS-px scale, so the bounding box maps onto pixels at any device scale factor.
+    image = Image.open(io.BytesIO(page.screenshot(scale="css"))).convert("RGB")
+    return image.getpixel((x, top - 2)), image.getpixel((x, top + 2))
+
+
+@pytest.mark.parametrize("seeded_model_session", [_MODELS["stl"]], ids=["stl"], indirect=True)
+@pytest.mark.parametrize("mode, extra", list(_THEMES.values()), ids=list(_THEMES))
+def test_model_preview_canvas_matches_pane_background(
+    page: Page,
+    seeded_model_session: tuple[str, str, str],
+    mode: str,
+    extra: dict[str, str],
+) -> None:
+    """The 3D preview canvas blends with the themed file pane instead of showing a box."""
+    base_url, session_id, file_path = seeded_model_session
+    _apply_theme_preferences(page, mode, extra)
+    canvas = _open_model_preview(page, base_url, session_id, file_path)
+
+    assert page.evaluate("document.documentElement.classList.contains('dark')") == (mode == "dark")
+    pane, canvas_pixel = _pixels_across_top_edge(page, canvas)
+    legacy = _LEGACY_CLEAR_COLORS[mode]
+    assert max(abs(p - o) for p, o in zip(pane, legacy, strict=True)) > _TOLERANCE, (
+        f"pane rgb{pane} is within tolerance of the viewer's old clear colour, "
+        "so this case cannot detect a regression"
+    )
+
+    assert all(abs(p - c) <= _TOLERANCE for p, c in zip(pane, canvas_pixel, strict=True)), (
+        f"3D preview canvas rgb{canvas_pixel} does not match the pane rgb{pane} above it"
+    )
+=======
+@pytest.mark.parametrize(
+    "seeded_model_session",
+    [("big.stl", _large_ascii_stl)],
+    ids=["large-stl"],
+    indirect=True,
+)
+def test_large_model_shows_loading_status_until_it_renders(
+    page: Page,
+    seeded_model_session: tuple[str, str, str],
+) -> None:
+    """The pane shows a loading status from mount until the model is drawn."""
+    base_url, session_id, file_path = seeded_model_session
+    page.add_init_script(_LOAD_PROBE_JS)
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+
+    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(file_path)}\b"))
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    preview = file_viewer.locator(f'[aria-label="3D preview of {file_path}"]')
+    expect(preview).to_be_visible(timeout=30_000)
+    expect(preview.locator("canvas")).to_be_visible(timeout=120_000)
+
+    # The probe records the label at host mount and the first announcement,
+    # both before the canvas was built: DOM presence and timing, not paint.
+    probe = page.evaluate("() => window.__modelLoadProbe")
+    assert probe["labelAtHostMount"] == "Preparing model…", probe
+    assert probe["statusBeforeCanvas"] == "Preparing model…", probe
+
+    # And it is gone once the model is on screen.
+    expect(file_viewer.get_by_text("Preparing model…")).to_have_count(0)
+    expect(file_viewer.get_by_role("status")).to_have_text("")
+    expect(file_viewer.get_by_text("Unable to render 3D model")).to_have_count(0)
+>>>>>>>

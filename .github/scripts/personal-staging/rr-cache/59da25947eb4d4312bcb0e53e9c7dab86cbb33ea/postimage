@@ -2,6 +2,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Profiler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse, WorkspaceFileDownloadProgress } from "@/hooks/useFileContent";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
 //
@@ -73,12 +74,15 @@ let pendingGltfLoad: (() => void) | null = null;
 interface RendererRecord {
   disposed: boolean;
   contextLost: boolean;
+  labelAtFirstRender?: boolean;
   // Constructor `alpha` and the last clear alpha: together they decide whether
   // the canvas paints its own background or lets the pane show through.
   alpha?: boolean;
   clearAlpha?: number;
 }
 let lastRenderer: RendererRecord | null = null;
+// The scene's `background`, which three.js paints over the clear color when set.
+let lastScene: { background: unknown } | null = null;
 
 // The mesh's material, exposed so theme tests can assert its color. Set when
 // the STL loader runs (the only format that builds its own material).
@@ -149,10 +153,19 @@ vi.mock("three/examples/jsm/loaders/GLTFLoader.js", () => ({
 // The real module stays for `fileContentToBlob`; only the uncapped-byte fetch
 // is stubbed so large-model tests control it without a network.
 const fetchWorkspaceFileBytesMock = vi.hoisted(() => vi.fn());
-vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  fetchWorkspaceFileBytes: fetchWorkspaceFileBytesMock,
-}));
+// Holds the envelope byte read open so a test can sit mid-load before the parse.
+const blobBehavior = vi.hoisted(() => ({ pending: false }));
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return {
+    ...actual,
+    fetchWorkspaceFileBytes: fetchWorkspaceFileBytesMock,
+    fileContentToBlob: (data: FileContentResponse) =>
+      blobBehavior.pending
+        ? Object.assign(new Blob(), { arrayBuffer: () => new Promise<ArrayBuffer>(() => {}) })
+        : actual.fileContentToBlob(data),
+  };
+});
 
 vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
   OrbitControls: class {
@@ -219,7 +232,13 @@ vi.mock("three", () => {
     setClearColor(_color: number, alpha = 1) {
       this.record.clearAlpha = alpha;
     }
-    render() {}
+    setClearAlpha(alpha: number) {
+      this.record.clearAlpha = alpha;
+    }
+    render() {
+      // Whether the loading label was still in the DOM when the first frame drew.
+      this.record.labelAtFirstRender ??= document.body.textContent?.includes("Preparing model…");
+    }
     dispose() {
       this.record.disposed = true;
     }
@@ -227,7 +246,24 @@ vi.mock("three", () => {
       this.record.contextLost = true;
     }
   }
+  class Color {
+    hex: unknown;
+    constructor(hex?: unknown) {
+      this.hex = hex;
+    }
+  }
   class Scene {
+    // Shared with the test so a scene background is observable after the build.
+    record: { background: unknown } = { background: null };
+    constructor() {
+      lastScene = this.record;
+    }
+    get background() {
+      return this.record.background;
+    }
+    set background(value: unknown) {
+      this.record.background = value;
+    }
     add() {}
     remove() {}
   }
@@ -244,6 +280,7 @@ vi.mock("three", () => {
     Box3,
     PerspectiveCamera,
     WebGLRenderer,
+    Color,
     Scene,
     Mesh,
     MeshStandardMaterial: class {
@@ -329,6 +366,13 @@ function scheduleFrame(callback: FrameRequestCallback): number {
   return id;
 }
 
+// Resolves on the next macrotask, after any pending zero-delay timers.
+function nextTask(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
@@ -340,9 +384,11 @@ beforeEach(() => {
   parseCalls.length = 0;
   pendingGltfLoad = null;
   lastRenderer = null;
+  lastScene = null;
   lastMaterial = null;
   themeState.resolvedTheme = "light";
   fetchWorkspaceFileBytesMock.mockReset();
+  blobBehavior.pending = false;
   fetchWorkspaceFileBytesMock.mockResolvedValue(new ArrayBuffer(8));
   vi.stubGlobal("requestAnimationFrame", scheduleFrame);
   vi.stubGlobal("cancelAnimationFrame", (id: number) => {
@@ -366,19 +412,25 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// Whether the canvas paints an opaque clear color (three.js defaults to opaque
-// unless the renderer is created with `alpha: true`).
+// Whether the canvas paints its own background: an opaque clear color (three.js
+// defaults to opaque unless created with `alpha: true`) or a scene background.
 function paintsOwnBackground(record: RendererRecord | null): boolean {
   if (!record) return true;
-  return !record.alpha || (record.clearAlpha ?? 0) > 0;
+  return !record.alpha || (record.clearAlpha ?? 0) > 0 || lastScene?.background != null;
 }
 
-// `bg-*` classes on the canvas host and its ModelViewer wrappers, which would
-// cover the pane's theme background.
-function backgroundClassesAbove(host: HTMLElement): string[] {
+// `bg-*` classes and inline or computed backgrounds on anything ModelViewer
+// renders (canvas, host, wrappers, siblings), which would cover the pane.
+function backgroundsPainted(): string[] {
   const found: string[] = [];
-  for (let el: HTMLElement | null = host; el && el !== document.body; el = el.parentElement) {
-    found.push(...Array.from(el.classList).filter((c) => c.startsWith("bg-")));
+  for (const el of document.body.querySelectorAll<HTMLElement>("*")) {
+    // Variant and important forms too (`dark:bg-…`, `!bg-…`); jsdom applies no Tailwind.
+    found.push(...Array.from(el.classList).filter((c) => /(^|:)!?bg-/.test(c)));
+    // Inline values jsdom can't resolve (e.g. `var(--background)`) never reach the computed color.
+    const inline = el.style.background || el.style.backgroundColor || el.style.backgroundImage;
+    if (inline) found.push(inline);
+    const color = getComputedStyle(el).backgroundColor;
+    if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") found.push(color);
   }
   return found;
 }
@@ -514,6 +566,10 @@ describe("ModelViewer error states", () => {
 
     expect(await screen.findByText(/256 MiB preview limit/)).toBeDefined();
     expect(screen.queryByText(/truncated by the server/)).toBeNull();
+    // Let the delayed status-region fill run before checking that nothing is announced.
+    await act(nextTask);
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(screen.queryByText(/Downloading model/)).toBeNull();
   });
 
   it("explains that glTF files with relative dependencies are not previewable", async () => {
@@ -661,9 +717,32 @@ describe("ModelViewer loading state", () => {
     return frames;
   }
 
+  it("keeps the preparing status while the file bytes are still being read", async () => {
+    blobBehavior.pending = true;
+    render(
+      <ModelViewer data={makeData({ path: "big.stl" })} path="big.stl" conversationId="conv_1" />,
+    );
+
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
+    expect(screen.getByLabelText("3D preview of big.stl").querySelector("canvas")).toBeNull();
+    expect(screen.queryByText(/Unable to render 3D model/)).toBeNull();
+    expect(parseCalls).toEqual([]);
+  });
+
+  it("keeps the loading label up until the first frame is drawn", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(lastRenderer?.labelAtFirstRender).toBe(true);
+    await waitFor(() => expect(screen.queryByText("Preparing model…")).toBeNull());
+    expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
+  });
+
   it("shows a preparing status from mount and clears it once the model renders", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
-    expect(screen.getByText("Preparing model…")).toBeDefined();
+    expect(screen.getByText("Preparing model…").parentElement?.querySelectorAll("p")).toHaveLength(
+      1,
+    );
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
 
     await waitFor(() => expect(lastRenderer).not.toBeNull());
@@ -679,13 +758,11 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.getByText("Preparing model…")).toBeDefined();
 
-    await act(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(resolve, 0);
-        }),
-    );
+    await act(nextTask);
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
+    expect(
+      screen.getByText("Preparing model…", { selector: '[aria-hidden="true"]' }),
+    ).toBeDefined();
   });
 
   it("shows determinate download progress when the total size is known", async () => {
@@ -702,16 +779,48 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByText("50% · 512 KB of 1.0 MB")).toBeDefined();
   });
 
-  it("shows indeterminate download progress when the total size is unknown", async () => {
+  it("shows the progress bar from 0% through 100% of the declared size", async () => {
     const downloads = holdDownloads();
     render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
 
+    act(() => downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: 1024 * 1024 }));
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("0");
+
+    act(() => downloads[0].onProgress?.({ receivedBytes: 1024 * 1024, totalBytes: 1024 * 1024 }));
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("100");
+    expect(screen.getByText("100% · 1.0 MB of 1.0 MB")).toBeDefined();
+  });
+
+  it("shows indeterminate download progress when the total size is unknown", async () => {
+    const downloads = holdDownloads();
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+    act(() => downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: null }));
+    expect(screen.queryByText(/received/)).toBeNull();
+
     act(() => downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: null }));
 
     expect(screen.getByRole("status").textContent).toBe("Downloading model…");
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByText("2.0 MB received")).toBeDefined();
+  });
+
+  it("falls back to received bytes when more arrives than the declared size", async () => {
+    const downloads = holdDownloads();
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+
+    act(() =>
+      downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: 1024 * 1024 }),
+    );
+
     expect(screen.queryByRole("progressbar")).toBeNull();
     expect(screen.getByText("2.0 MB received")).toBeDefined();
   });
@@ -802,6 +911,30 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByText("75% · 768 KB of 1.0 MB")).toBeDefined();
   });
 
+  it("re-renders only when the received byte count shown changes for an unknown size", async () => {
+    const downloads = holdDownloads();
+    let commits = 0;
+    render(
+      <Profiler id="viewer" onRender={() => (commits += 1)}>
+        <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />
+      </Profiler>,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+    const before = commits;
+
+    // 100 chunks (20 MiB to 20 MiB + 9.9 KB) that all read "20 MB received".
+    for (let i = 0; i < 100; i += 1) {
+      act(() =>
+        downloads[0].onProgress?.({ receivedBytes: 20 * 1024 * 1024 + i * 100, totalBytes: null }),
+      );
+    }
+    expect(commits - before).toBe(1);
+
+    act(() => downloads[0].onProgress?.({ receivedBytes: 21 * 1024 * 1024, totalBytes: null }));
+    expect(commits - before).toBe(2);
+    expect(screen.getByText("21 MB received")).toBeDefined();
+  });
+
   it("replaces the loading state with the error overlay on failure", async () => {
     behavior.mode = "throw";
     const frames = holdFrames();
@@ -829,12 +962,7 @@ describe("ModelViewer loading state", () => {
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
 
     // Let the delayed status-region fill run before checking it stayed empty.
-    await act(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(resolve, 0);
-        }),
-    );
+    await act(nextTask);
     expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.queryByText(/Preparing model/)).toBeNull();
     expect(parseCalls).toEqual([]);
@@ -856,6 +984,23 @@ describe("ModelViewer loading state", () => {
     expect(screen.queryByRole("status")).toBeNull();
     expect(screen.queryByText(/model…/)).toBeNull();
     expect(parseCalls).toEqual([]);
+  });
+
+  it("skips the parse when unmounted during the pre-parse paint wait", async () => {
+    const frames = holdFrames();
+    const { unmount } = render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(frames).toHaveLength(1));
+
+    unmount();
+    await act(async () => {
+      frames.splice(0).forEach((frame) => frame(performance.now()));
+      await nextTask();
+    });
+
+    expect(parseCalls).toEqual([]);
+    expect(lastRenderer).toBeNull();
   });
 
   it("ignores progress and bytes from a superseded download", async () => {
@@ -908,6 +1053,7 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
     expect(screen.queryByText(/Unable to render 3D model/)).toBeNull();
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(parseCalls).toEqual(["stl", "stl"]);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
   });
 });
 
@@ -1077,7 +1223,7 @@ describe("ModelViewer theme awareness", () => {
     // The canvas is transparent and no wrapper paints its own background, so
     // the pane's theme token shows through; the STL material tracks the theme.
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
-    expect(backgroundClassesAbove(screen.getByLabelText(/3D preview of/))).toEqual([]);
+    expect(backgroundsPainted()).toEqual([]);
     expect(lastMaterial?.color).toBe(light.stlMaterial);
   });
 
@@ -1086,6 +1232,7 @@ describe("ModelViewer theme awareness", () => {
     render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
+    expect(backgroundsPainted()).toEqual([]);
     expect(lastMaterial?.color).toBe(dark.stlMaterial);
     // Dark theme brightens the lights so the mesh stays legible.
     expect(dark.ambientIntensity).toBeGreaterThan(light.ambientIntensity);
@@ -1108,16 +1255,11 @@ describe("ModelViewer theme awareness", () => {
     // Toggle to dark and re-render with the SAME data/path — the scene must
     // recolor in place rather than rebuild (same renderer, no extra parse).
     themeState.resolvedTheme = "dark";
-<<<<<<<
-    rerender(<ModelViewer data={stableData} path="part.stl" />);
+    rerender(<ModelViewer data={stableData} path="part.stl" conversationId="conv_1" />);
     await waitFor(() => expect(lastMaterial?.color).toBe(dark.stlMaterial));
     // The toggle must not paint an opaque per-mode color over the pane.
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
-=======
-    rerender(<ModelViewer data={stableData} path="part.stl" conversationId="conv_1" />);
-    await waitFor(() => expect(lastRenderer?.clearColor).toBe(dark.background));
-    expect(lastMaterial?.color).toBe(dark.stlMaterial);
->>>>>>>
+    expect(backgroundsPainted()).toEqual([]);
     expect(lastRenderer).toBe(rendererBefore);
     expect(parseCalls.length).toBe(parsesBefore);
   });
