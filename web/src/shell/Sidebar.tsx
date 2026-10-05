@@ -4917,19 +4917,23 @@ function ConversationRowImpl({
   );
 }
 
-// The `conversation` fields the row renders. The comparator below compares
-// these (not object identity), so a live-updates merge that only touches an
-// unrendered field (e.g. an updated_at bump) doesn't re-render the row.
-// Keep in sync with the row + its helpers (conversationDisplayLabel,
-// getSessionState, isOwnedByViewer, isSessionStoppable).
+// Compare the row and tooltip's rendered fields by value so metadata-only
+// updates refresh an open tooltip without re-rendering for unrelated fields.
 const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "id",
   "title",
+  "agent_id",
+  "agent_name",
+  "workspace",
+  "llm_model",
+  "harness_override",
+  "reasoning_effort",
   "archived",
   "status",
   "updated_at",
   "git_branch",
   "host_id",
+  "host_online",
   "runner_id",
   "project_id",
   "owner",
