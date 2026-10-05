@@ -3828,6 +3828,8 @@ function SessionTooltipDetails({
           },
         }
       : null,
+    model: conversation.llm_model ?? null,
+    modelOptions: catalogEnabled ? models : [],
     effort: conversation.reasoning_effort,
   });
   const workspace = conversation.workspace ?? "";
