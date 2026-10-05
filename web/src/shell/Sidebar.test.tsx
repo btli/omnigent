@@ -1644,6 +1644,52 @@ describe("Sidebar session list", () => {
       ).toHaveLength(2);
     });
 
+    it.each([false, true])(
+      "uses the Codex model effort ladder after opening (hasEffort=%s)",
+      async (hasEffort) => {
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+        });
+        let resolveCatalog!: (response: Response) => void;
+        const catalog = new Promise<Response>((resolve) => {
+          resolveCatalog = resolve;
+        });
+        vi.spyOn(identity, "authenticatedFetch").mockImplementation((url) =>
+          String(url).includes("/model-options")
+            ? catalog
+            : Promise.resolve(new Response(JSON.stringify({ data: [] }))),
+        );
+        const tooltip = await hoverTooltip(
+          conv("codex_effort", "codex-native-ui", {
+            host_id: "host_model",
+            llm_model: "model",
+            reasoning_effort: "medium",
+            labels: { "omnigent.wrapper": "codex-native-ui" },
+          }),
+        );
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(/^Codex$/);
+        await act(async () =>
+          resolveCatalog(
+            new Response(
+              JSON.stringify({
+                models: [
+                  {
+                    id: "model",
+                    displayName: "Codex model",
+                    supportedReasoningEfforts: hasEffort ? [{ reasoningEffort: "medium" }] : [],
+                  },
+                ],
+              }),
+            ),
+          ),
+        );
+        await waitFor(() =>
+          expect(agentLine).toHaveTextContent(hasEffort ? /^Codex model Medium$/ : /^Codex model$/),
+        );
+      },
+    );
+
     it("shows a known non-native agent and harness without a model catalog", async () => {
       agentsRef.current = [
         {

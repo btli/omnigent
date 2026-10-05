@@ -40,6 +40,30 @@ describe("composer chip labels", () => {
       }).effortLabel,
     ).toBeNull();
   });
+  it.each(["codex-native-ui", "devin-native-ui"])(
+    "uses the per-model effort ladder for %s",
+    (wrapper) => {
+      const inputs = {
+        session: { labels: { "omnigent.wrapper": wrapper } },
+        model: "model",
+        effort: "medium",
+      };
+      expect(composerModelChipLabel(inputs).effortLabel).toBeNull();
+      expect(
+        composerModelChipLabel({
+          ...inputs,
+          modelOptions: [{ id: "model", supportedReasoningEfforts: [] }],
+        }).effortLabel,
+      ).toBeNull();
+      const modelOptions = [
+        { id: "model", supportedReasoningEfforts: [{ reasoningEffort: "medium" }] },
+      ];
+      expect(composerModelChipLabel({ ...inputs, modelOptions }).effortLabel).toBe("Medium");
+      expect(
+        composerModelChipLabel({ ...inputs, model: null, modelOptions }).effortLabel,
+      ).toBeNull();
+    },
+  );
   it("preserves the composer's loading and smart-routing states", () => {
     expect(
       composerModelChipLabel({ modelLabelLoading: true, nativeDisplayName: "Claude Code" }).label,
