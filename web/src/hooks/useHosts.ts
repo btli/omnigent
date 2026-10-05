@@ -125,10 +125,10 @@ export function useHostModelOptions(
   hostId: string | null,
   harness: string,
   enabled = true,
-  { poll = true }: { poll?: boolean } = {},
+  { poll = true, once = false }: { poll?: boolean; once?: boolean } = {},
 ) {
   const queryClient = useQueryClient();
-  const canRefresh = enabled && hostId !== null && poll;
+  const canRefresh = enabled && hostId !== null && poll && !once;
   const pollerKey = JSON.stringify([hostId, harness]);
   // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
@@ -152,13 +152,14 @@ export function useHostModelOptions(
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.
-    staleTime: 15_000,
+    staleTime: once ? Infinity : 15_000,
+    ...(once && { gcTime: Infinity, refetchOnMount: false, retryOnMount: false }),
     refetchInterval: canRefresh ? 15_000 : false,
-    ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
+    ...((!poll || once) && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
     // Retry boot-probe races while any picker uses this catalog. Persistent
     // failures surface after bounded backoff (~22 s).
     retry: (failureCount) =>
-      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+      !once && (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
   const previouslyRefreshing = useRef(canRefresh);
