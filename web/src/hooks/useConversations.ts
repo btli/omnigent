@@ -1781,6 +1781,7 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     labels: session.labels ?? {},
     permission_level: session.permissionLevel,
     agent_id: session.agentId,
+    harness_override: session.harness ?? null,
     archived: session.archived,
   };
 }

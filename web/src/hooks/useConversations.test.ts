@@ -7,7 +7,7 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
-import { ApiError } from "@/lib/sessionsApi";
+import { ApiError, getSession } from "@/lib/sessionsApi";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
@@ -1531,6 +1531,37 @@ describe("useTogglePinnedConversation cache patching", () => {
     // blank time field until the pinned query refetched.
     expect(row.updated_at).toBe(150);
     expect(row.labels?.[PINNED_LABEL_KEY]).toBe("1721760000000");
+  });
+
+  it("keeps the resolved detail harness when pinning outside the list window", async () => {
+    const wire = {
+      id: "conv_detail_only",
+      agent_id: "ag_aria",
+      agent_name: "aria",
+      status: "idle",
+      created_at: 100,
+      title: "Detail-only session",
+      harness: "codex",
+      labels: {},
+    };
+    fetchMock.mockResolvedValueOnce(mockResponse(wire));
+    const session = await getSession(wire.id);
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["session", wire.id], session);
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...wire, labels: { [PINNED_LABEL_KEY]: "1721760000000" } }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: wire.id, pinned: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned?.conversations).toEqual([
+      expect.objectContaining({ id: wire.id, agent_id: wire.agent_id, harness_override: "codex" }),
+    ]);
   });
 
   it("removes the row from the pinned cache on unpin", async () => {
