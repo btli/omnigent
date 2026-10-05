@@ -36,6 +36,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.name_template import NameTemplateError, validate_name_template
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -201,6 +202,14 @@ def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
         "finished_at": run.finished_at,
         "error_code": run.error_code,
     }
+
+
+def _validate_name_template_or_400(name: str) -> None:
+    """Raise a 400 for invalid date placeholders in a task name."""
+    try:
+        validate_name_template(name)
+    except NameTemplateError as exc:
+        raise OmnigentError(f"invalid name template: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 def _validate_rrule_or_400(rrule: str) -> None:
@@ -400,6 +409,7 @@ def create_scheduled_tasks_router(
         project_id = None
         if body.project_id:
             project_id = await _resolve_requested_project(body.project_id, _project_owner(owner))
+        _validate_name_template_or_400(body.name)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
@@ -608,6 +618,8 @@ def create_scheduled_tasks_router(
                     "omit the field to leave membership unchanged",
                     code=ErrorCode.INVALID_INPUT,
                 )
+        if body.name is not None and body.name != existing.name:
+            _validate_name_template_or_400(body.name)
         if body.rrule is not None:
             _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
