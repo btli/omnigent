@@ -1831,7 +1831,7 @@ describe("Sidebar session list", () => {
         }),
       );
       const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
-      expect(agentLine).toHaveTextContent(new RegExp(`^${SMART_ROUTING_LABEL}$`));
+      expect(agentLine).toHaveTextContent(new RegExp(`^Polly · ${SMART_ROUTING_LABEL}$`));
       expect(agentLine.querySelector("[data-harness-icon]")).toBeNull();
       expect(
         fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
@@ -1872,13 +1872,59 @@ describe("Sidebar session list", () => {
       fireEvent.focus(screen.getByRole("link", { name: session.id }));
       const tooltip = await screen.findByTestId("session-tooltip-content");
       const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
-      expect(agentLine).toHaveTextContent(new RegExp(`^${SMART_ROUTING_LABEL}$`));
+      expect(agentLine).toHaveTextContent(new RegExp(`^Polly · ${SMART_ROUTING_LABEL}$`));
 
       mockConversations([{ ...session, harness_override: "codex" }]);
       rerender(tree());
 
       await waitFor(() => expect(agentLine).toHaveTextContent(/^Polly · Codex$/));
     });
+
+    it.each([
+      ["an agent-declared native harness", "custom-native", "Custom Native", true],
+      ["only a canonical native agent name", "claude-native-ui", "claude-native-ui", false],
+    ] as const)(
+      "keeps auto unresolved with %s but no wrapper label",
+      async (_evidence, name, displayName, declaredHarness) => {
+        agentsRef.current = declaredHarness
+          ? [
+              {
+                id: "ag_native",
+                name,
+                display_name: displayName,
+                harness: "claude-native",
+                description: null,
+                skills: [],
+              },
+            ]
+          : [];
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+        });
+        const fetchSpy = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
+        const tooltip = await hoverTooltip(
+          conv("native_without_wrapper", name, {
+            agent_id: "ag_native",
+            host_id: "host_model",
+            harness_override: AUTO_HARNESS_ID,
+            llm_model: "opus[1m]",
+            reasoning_effort: "medium",
+          }),
+        );
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(
+          new RegExp(`^${displayName} · ${SMART_ROUTING_LABEL}$`),
+        );
+        expect(
+          agentLine.querySelector(declaredHarness ? "[data-harness-icon='claude']" : ".lucide-bot"),
+        ).not.toBeNull();
+        expect(
+          fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+        ).toHaveLength(0);
+      },
+    );
 
     it("uses the resolved harness for the icon, effort and model catalog key", async () => {
       agentsRef.current = [
