@@ -153,13 +153,13 @@ export function useHostModelOptions(
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.
     staleTime: once ? Infinity : 15_000,
-    ...(once && { gcTime: Infinity, refetchOnMount: false, retryOnMount: false }),
+    ...(once && { refetchOnMount: false }),
     refetchInterval: canRefresh ? 15_000 : false,
     ...((!poll || once) && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
     // Retry boot-probe races while any picker uses this catalog. Persistent
     // failures surface after bounded backoff (~22 s).
     retry: (failureCount) =>
-      !once && (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
   const previouslyRefreshing = useRef(canRefresh);
