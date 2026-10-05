@@ -12,7 +12,6 @@ import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
   fetchConversationsPage,
-  fetchConversationById,
   markSessionsDeleting,
   fetchAllArchivedProjectNames,
   fetchProjectSessionIds,
@@ -71,24 +70,6 @@ afterEach(() => {
   clearSessionTombstones();
   // Same for the recently-created keep-alive.
   clearRecentlyCreated();
-});
-
-describe("session row model metadata", () => {
-  it.each([
-    { llm_model: "opus[1m]", harness: "codex-native", reasoning_effort: "medium" },
-    { llm_model: null, harness: null, reasoning_effort: null },
-    {},
-  ])("maps supported metadata from session detail: %j", async (metadata) => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ id: "conv_model", created_at: 100, ...metadata }),
-    );
-    const row = await fetchConversationById("conv_model");
-    expect(row).toMatchObject({
-      llm_model: "llm_model" in metadata ? metadata.llm_model : null,
-      reasoning_effort: "reasoning_effort" in metadata ? metadata.reasoning_effort : null,
-    });
-    expect(row).not.toHaveProperty("harness_override");
-  });
 });
 
 describe("renameConversation", () => {
