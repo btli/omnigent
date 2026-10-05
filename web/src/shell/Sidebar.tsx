@@ -1,3 +1,13 @@
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { composerModelChipLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import {
+  nativeCodingAgentForSession,
+  nativeCodingAgentForAvailableAgent,
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
@@ -123,7 +133,6 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -162,7 +171,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
@@ -3753,26 +3762,89 @@ function ConversationMenuItems({
 
 const SESSION_ERROR_EXPLANATION = "Latest message is an error";
 
-function SessionTooltipContent({
+interface SessionTooltipProps {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+  state: SessionState | null;
+  pinnedProject: { name: string; icon: string | null } | null;
+}
+
+function SessionTooltipContent(props: SessionTooltipProps) {
+  return (
+    <TooltipContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      data-testid="session-tooltip-content"
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+    >
+      <SessionTooltipDetails {...props} />
+    </TooltipContent>
+  );
+}
+
+function SessionTooltipDetails({
   conversation,
   hostsById,
   state,
   pinnedProject,
-}: {
-  conversation: Conversation;
-  hostsById: ReadonlyMap<string, Host>;
-  // The row's own indicator state, so the tooltip never re-derives it.
-  state: SessionState | null;
-  // Set for a pinned, project-owned row, which lifts out of its project folder:
-  // its root is a HoverCard, and the card restores the project cue.
-  pinnedProject: { name: string; icon: string | null } | null;
-}) {
+}: SessionTooltipProps) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
     ? "Local machine"
     : host?.sandbox_provider
       ? sandboxOptionLabel(host.sandbox_provider)
       : (host?.name ?? conversation.host_id);
+  const { data: agents = [] } = useAvailableAgents();
+  const agent =
+    agents.find((candidate) => candidate.id === conversation.agent_id) ??
+    agents.find((candidate) => candidate.name === conversation.agent_name);
+  const declaredNativeAgent =
+    nativeCodingAgentForSession(conversation) ??
+    nativeCodingAgentForAvailableAgent(agent) ??
+    nativeCodingAgentForAgentName(conversation.agent_name);
+  const harness =
+    conversation.harness_override ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
+  const nativeAgent = nativeCodingAgentForHarness(harness);
+  const iconAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness }
+    : agent
+      ? { name: agent.name, harness }
+      : null;
+  const catalogEnabled =
+    nativeAgent !== undefined &&
+    !!conversation.llm_model &&
+    host?.status === "online" &&
+    conversation.host_online !== false;
+  const { data: models } = useHostModelOptions(
+    conversation.host_id ?? null,
+    nativeAgent?.harness ?? harness ?? "",
+    catalogEnabled,
+    { poll: false, once: true },
+  );
+  const harnessLabel = harness ? BRAIN_HARNESS_LABELS[harness] : null;
+  const { label: agentLabel, effortLabel } = composerModelChipLabel({
+    modelSummary:
+      nativeAgent && catalogEnabled && models?.length
+        ? formatStatusModelLabel(conversation.llm_model ?? null, models)
+        : null,
+    nativeDisplayName: nativeAgent?.displayName,
+    harnessLabel: agent
+      ? [agent.display_name, harnessLabel].filter(Boolean).join(" · ")
+      : conversation.agent_name,
+    session: iconAgent
+      ? {
+          harness,
+          labels: {
+            ...conversation.labels,
+            ...(conversation.harness_override != null && {
+              "omnigent.wrapper": nativeAgent?.wrapperLabel ?? null,
+            }),
+          },
+        }
+      : null,
+    effort: conversation.reasoning_effort,
+  });
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
   // Runner-owned failure detail the server persists as a label; transcript-only
@@ -3847,7 +3919,7 @@ function SessionTooltipContent({
     }
   })();
 
-  const details = (
+  return (
     <>
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
@@ -3857,7 +3929,10 @@ function SessionTooltipContent({
         </span>
       </p>
       {pinnedProject && (
-        <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+        <p
+          data-testid="session-tooltip-project"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
           <ProjectRowIcon icon={pinnedProject.icon} />
           <span className="truncate">{pinnedProject.name}</span>
         </p>
@@ -3867,8 +3942,12 @@ function SessionTooltipContent({
           data-testid="session-tooltip-agent"
           className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
-          <BotIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{conversation.agent_name}</span>
+          {iconAgent ? (
+            <ComposerAgentIcon agent={iconAgent} className="size-3.5" />
+          ) : (
+            <BotIcon aria-hidden className="size-3.5 shrink-0" />
+          )}
+          <span className="truncate">{[agentLabel, effortLabel].filter(Boolean).join(" ")}</span>
         </p>
       )}
       {workspace && (
@@ -3892,7 +3971,7 @@ function SessionTooltipContent({
       </p>
       {conversation.git_branch && (
         <p
-          data-testid={pinnedProject ? "pinned-project-flyout-branch" : "session-tooltip-branch"}
+          data-testid="session-tooltip-branch"
           className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
           <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
@@ -3919,30 +3998,6 @@ function SessionTooltipContent({
         </p>
       )}
     </>
-  );
-
-  return pinnedProject ? (
-    <HoverCardContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      className="flex w-72 max-w-[calc(100vw-2rem)] flex-col gap-1.5"
-      data-testid="pinned-project-flyout"
-    >
-      {details}
-    </HoverCardContent>
-  ) : (
-    <TooltipContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      data-testid="session-tooltip-content"
-      // Match the HoverCard look pinned rows use: title, then muted,
-      // small-icon metadata lines.
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
-    >
-      {details}
-    </TooltipContent>
   );
 }
 
@@ -3985,9 +4040,6 @@ function ConversationRowImpl({
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
   const isProvisionalRow = conversation.provisional === true;
-  // Mobile has no real hover, so a tap that navigates would also trip the
-  // project flyout's HoverCard and leave it lingering over the chat. Gate the
-  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
@@ -4073,19 +4125,8 @@ function ConversationRowImpl({
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
-  // Pinned sessions are lifted OUT of their project folder into the flat
-  // "Pinned" section, so the row no longer shows which project it belongs to.
-  // For those rows only, surface the project in a hover flyout. Non-pinned
-  // rows already sit inside their project folder, so they don't need it.
-  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
-  // and leave it overlaying the chat after navigation. Forcing null there
-  // routes the row through the plain ContextMenu/link path and restores the
-  // native `title` tooltip.
-  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
-  // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the flyout falls back to the folder glyph for those.
   const projectIconsById = useContext(ProjectIconsContext);
-  const projectFlyoutIcon =
+  const projectIcon =
     conversation.project_id != null
       ? (projectIconsById.get(conversation.project_id) ?? null)
       : null;
@@ -4346,15 +4387,13 @@ function ConversationRowImpl({
     runArchive,
   };
 
-  // One hover card for every row variant; pinned, project-owned rows render it
-  // inside their HoverCard, all others inside a Tooltip.
   const sessionTooltip = (
     <SessionTooltipContent
       conversation={conversation}
       hostsById={hostsById}
       state={sessionState}
       pinnedProject={
-        projectFlyoutName ? { name: projectFlyoutName, icon: projectFlyoutIcon } : null
+        isPinned && currentProject ? { name: currentProject, icon: projectIcon } : null
       }
     />
   );
@@ -4491,18 +4530,9 @@ function ConversationRowImpl({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+          merges its handler onto the Link, preserving left-click / double-click. */}
       {selectionMode ? (
-        projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            {sessionTooltip}
-          </HoverCard>
-        ) : isMobile ? (
+        isMobile ? (
           rowLink
         ) : (
           <Tooltip>
@@ -4510,22 +4540,6 @@ function ConversationRowImpl({
             {sessionTooltip}
           </Tooltip>
         )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          {sessionTooltip}
-        </HoverCard>
       ) : isMobile ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
