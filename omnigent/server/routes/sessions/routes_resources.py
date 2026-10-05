@@ -414,9 +414,10 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
-        if resp.status_code == 416 or (
-            resp.status_code in (200, 206) and "content-disposition" in resp.headers
-        ):
+        if (
+            resp.status_code == 416
+            and resp.headers.get("content-range", "").startswith("bytes */")
+        ) or (resp.status_code in (200, 206) and "content-disposition" in resp.headers):
             skip_gzip(request)
             forwarded = {
                 name: resp.headers[name]
