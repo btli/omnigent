@@ -3702,7 +3702,7 @@ function SessionTooltipDetails({
   const iconAgent = nativeAgent
     ? { name: nativeAgent.agentName, harness }
     : agent
-      ? { name: agent.name, harness: harness === AUTO_HARNESS_ID ? agent.harness : harness }
+      ? { name: agent.name, harness }
       : null;
   const catalogEnabled =
     nativeAgent !== undefined &&
