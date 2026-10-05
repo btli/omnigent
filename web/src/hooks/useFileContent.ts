@@ -147,16 +147,25 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
   triggerBrowserDownload(await fetchWorkspaceFileBlob(conversationId, path), filename);
 }
 
+/** Build the uncapped download URL for a workspace-relative or host-absolute file. */
 export function workspaceFileDownloadUrl(conversationId: string, path: string): string {
   return workspaceFileUrl(conversationId, path, { download: "true" });
 }
 
+/** Use direct downloads where navigation can authenticate without a blob fetch. */
 export function usesDirectFileDownload(): boolean {
   return !isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell();
 }
 
-export async function fetchWorkspaceFileBlob(conversationId: string, path: string): Promise<Blob> {
-  const response = await authenticatedFetch(workspaceFileDownloadUrl(conversationId, path));
+/** Fetch a complete workspace file as an authenticated blob, optionally abortable. */
+export async function fetchWorkspaceFileBlob(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const response = await authenticatedFetch(workspaceFileDownloadUrl(conversationId, path), {
+    signal,
+  });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.blob();
 }

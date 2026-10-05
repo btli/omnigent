@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { VideoViewer } from "./VideoViewer";
 import {
   downloadWorkspaceFile,
@@ -14,12 +15,14 @@ vi.mock("@/hooks/useFileContent", () => ({
   fetchWorkspaceFileBlob: vi.fn(),
   downloadWorkspaceFile: vi.fn(),
 }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
 beforeEach(() => {
   vi.mocked(usesDirectFileDownload).mockReturnValue(true);
   vi.mocked(fetchWorkspaceFileBlob).mockReset();
   vi.mocked(downloadWorkspaceFile).mockReset();
   vi.mocked(downloadWorkspaceFile).mockResolvedValue(undefined);
+  vi.mocked(toast.error).mockClear();
   window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
   vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:video"), revokeObjectURL: vi.fn() });
 });
@@ -51,7 +54,11 @@ describe("VideoViewer", () => {
     expect(screen.getByText("Loading video…")).toBeInTheDocument();
     await act(async () => finish(new Blob(["video"])));
     expect(container.querySelector("video")).toHaveAttribute("src", "blob:video");
-    expect(fetchWorkspaceFileBlob).toHaveBeenCalledWith("sess", "clip.webm");
+    expect(fetchWorkspaceFileBlob).toHaveBeenCalledWith(
+      "sess",
+      "clip.webm",
+      expect.any(AbortSignal),
+    );
     unmount();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:video");
   });
@@ -61,7 +68,13 @@ describe("VideoViewer", () => {
     const { rerender } = render(<VideoViewer conversationId="sess" path="first.webm" />);
     await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(1));
     rerender(<VideoViewer conversationId="sess" path="next.webm" />);
-    await waitFor(() => expect(fetchWorkspaceFileBlob).toHaveBeenCalledWith("sess", "next.webm"));
+    await waitFor(() =>
+      expect(fetchWorkspaceFileBlob).toHaveBeenCalledWith(
+        "sess",
+        "next.webm",
+        expect.any(AbortSignal),
+      ),
+    );
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:video");
   });
   it("does not create an object URL after an unmounted fetch completes", async () => {
@@ -76,6 +89,57 @@ describe("VideoViewer", () => {
     unmount();
     await act(async () => finish(new Blob(["video"])));
     expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
+  it.each(["unmount", "path change"])("aborts an in-flight blob fetch on %s", async (change) => {
+    vi.mocked(usesDirectFileDownload).mockReturnValue(false);
+    const signals: (AbortSignal | undefined)[] = [];
+    vi.mocked(fetchWorkspaceFileBlob).mockImplementation(
+      (_conversationId, _path, signal) =>
+        new Promise((_resolve, reject) => {
+          signals.push(signal);
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            {
+              once: true,
+            },
+          );
+        }),
+    );
+    const { rerender, unmount } = render(<VideoViewer conversationId="sess" path="first.webm" />);
+    const originalSignal = signals[0];
+    expect(originalSignal).toBeInstanceOf(AbortSignal);
+    expect(originalSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      if (change === "unmount") unmount();
+      else rerender(<VideoViewer conversationId="sess" path="next.webm" />);
+    });
+
+    expect(originalSignal?.aborted).toBe(true);
+    expect(screen.queryByText("This video can't be played here.")).not.toBeInTheDocument();
+    if (change === "path change") {
+      expect(signals[1]?.aborted).toBe(false);
+      expect(screen.getByText("Loading video…")).toBeInTheDocument();
+    }
+  });
+  it("ignores an AbortError without showing the error state", async () => {
+    vi.mocked(usesDirectFileDownload).mockReturnValue(false);
+    vi.mocked(fetchWorkspaceFileBlob).mockRejectedValue(new DOMException("Aborted", "AbortError"));
+
+    await act(async () => render(<VideoViewer conversationId="sess" path="clip.webm" />));
+
+    expect(screen.queryByText("This video can't be played here.")).not.toBeInTheDocument();
+    expect(screen.getByText("Loading video…")).toBeInTheDocument();
+  });
+  it("shows the toolbar failure toast when fallback Download rejects", async () => {
+    vi.mocked(downloadWorkspaceFile).mockRejectedValue(new Error("offline"));
+    const { container } = render(<VideoViewer conversationId="sess" path="bad.mov" />);
+    fireEvent.error(container.querySelector("video")!);
+
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Download failed"));
   });
   it.each(["media", "fetch"])("offers a working Download after a %s error", async (failure) => {
     vi.mocked(usesDirectFileDownload).mockReturnValue(failure === "media");
