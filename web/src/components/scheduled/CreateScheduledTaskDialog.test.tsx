@@ -23,7 +23,6 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import { SCHEDULED_TASK_SUGGESTIONS } from "./suggestions";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
@@ -297,35 +296,17 @@ describe("CreateScheduledTaskDialog validation", () => {
 });
 
 describe("CreateScheduledTaskDialog prefill (seed-on-open + reset)", () => {
-  it("shows the session name template placeholder and help", () => {
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
-    expect(screen.getByTestId("task-name-input")).toHaveAttribute(
-      "placeholder",
-      "Open PR Rebase - {{YYYY-MM-DD}}",
-    );
-    expect(
-      screen.getByText(
-        "Add {{YYYY-MM-DD}} or {{MMM DD}} to put each run's date in its session name.",
-      ),
-    ).toBeVisible();
-  });
+  it("highlights template spans while keeping the Name input value unchanged", () => {
+    const name = "Test Automation {{MMM DD}}";
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName={name} />);
 
-  it.each([
-    ["follow-up-monitor", "Follow-up monitor - {{ddd, MMM DD}}"],
-    ["pr-sweep", "PR sweep - {{YYYY-MM-DD}}"],
-    ["news-digest", "News digest - {{MMM DD}}"],
-  ])("prefills the %s suggestion's templated name", (id, expectedName) => {
-    const suggestion = SCHEDULED_TASK_SUGGESTIONS.find((entry) => entry.id === id)!;
-    render(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        initialName={suggestion.prefill.name}
-        initialPrompt={suggestion.prefill.prompt}
-      />,
-    );
-    expect(screen.getByTestId("task-name-input")).toHaveValue(expectedName);
-    expect(screen.getByTestId("task-prompt-input")).toHaveValue(suggestion.prefill.prompt);
+    const input = screen.getByTestId("task-name-input");
+    const overlay = screen.getByTestId("task-name-template-overlay");
+    const highlight = overlay.querySelector("mark[data-template-placeholder]");
+    expect(input).toHaveValue(name);
+    expect(highlight).toHaveTextContent("{{MMM DD}}");
+    expect(highlight?.previousSibling?.textContent).toBe("Test Automation ");
+    expect(overlay).toHaveTextContent(name);
   });
 
   it("seeds Name + Prompt from initialName/initialPrompt when opened", () => {
