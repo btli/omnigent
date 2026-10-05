@@ -40,6 +40,7 @@ import pytest
 from omnigent_client._errors import OmnigentError
 from omnigent_client._sessions import (
     Session,
+    SessionListItem,
     SessionsNamespace,
 )
 
@@ -51,6 +52,29 @@ from omnigent.server.schemas import (
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"llm_model": "opus[1m]", "harness_override": "codex"},
+        {"llm_model": None, "harness_override": None},
+        {},
+    ],
+)
+def test_list_item_model(metadata: dict[str, str | None]) -> None:
+    item = SessionListItem.from_dict(
+        {
+            "id": "conv_model",
+            "agent_id": "ag_model",
+            "status": "idle",
+            "created_at": 100,
+            "updated_at": 200,
+            **metadata,
+        }
+    )
+    assert item.llm_model == metadata.get("llm_model")
+    assert item.harness_override == metadata.get("harness_override")
 
 
 def _make_namespace(
