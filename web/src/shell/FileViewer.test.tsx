@@ -196,17 +196,19 @@ import type { ChangedSort } from "./FlatFileList";
 const useCommentsMock = vi.mocked(useComments);
 
 describe("FileViewer video and download toolbar", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
   it.each(["file1.py", "clip.mp4", "photo.png", "document.pdf", "part.stl", "data.bin"])(
     "offers a working visible Download for %s",
     (path) => {
-      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
       renderViewer({ open: true, path });
       fireEvent.click(screen.getByRole("button", { name: "Download file" }));
       expect(downloadWorkspaceFile).toHaveBeenCalledWith("conv_1", path);
     },
   );
   it("skips JSON and suppresses diff and edit for video", async () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     await vi.mocked(useWorkspaceChangedFiles).withImplementation(
       () =>
         ({ data: { data: [{ path: "clip.mov", status: "modified" }] } }) as ReturnType<
@@ -224,7 +226,6 @@ describe("FileViewer video and download toolbar", () => {
     );
   });
   it("does not offer Download for a deleted file", async () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     await vi.mocked(useWorkspaceChangedFiles).withImplementation(
       () =>
         ({ data: { data: [{ path: "gone.mp4", status: "deleted" }] } }) as ReturnType<
@@ -237,7 +238,6 @@ describe("FileViewer video and download toolbar", () => {
     );
   });
   it("does not offer edit mode for MIME-identified video with a Markdown extension", async () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     await vi.mocked(useFileContent).withImplementation(
       () =>
         ({ data: { content: "", content_type: "video/mp4" } }) as ReturnType<typeof useFileContent>,
