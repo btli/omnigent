@@ -7,6 +7,7 @@ import dataclasses
 import logging
 import mimetypes
 import os
+import re
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
@@ -76,6 +77,29 @@ if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+
+def _parse_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", value)
+    if match is None or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        start = int(first) if first else None
+        end = int(last) if last else None
+    except ValueError:
+        return None
+    if start is None:
+        if end == 0 or size == 0:
+            raise ValueError("unsatisfiable byte range")
+        return max(0, size - (end or 0)), size - 1
+    if end is not None and end < start:
+        return None
+    if start >= size:
+        raise ValueError("unsatisfiable byte range")
+    return start, min(end, size - 1) if end is not None else size - 1
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -1380,6 +1404,7 @@ def register_resource_routes(
         "/{environment_id}/filesystem/{relative_path:path}"
     )
     async def read_or_list_environment_path(
+        request: Request,
         session_id: str,
         environment_id: str,
         relative_path: str,
@@ -1391,7 +1416,9 @@ def register_resource_routes(
     ) -> Response:
         await _require_os_env(session_id)
         if download:
-            return await _fs_download(session_id, environment_id, relative_path)
+            return await _fs_download(
+                session_id, environment_id, relative_path, request.headers.get("range")
+            )
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -1546,7 +1573,8 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         path: str,
-    ) -> StreamingResponse:
+        range_header: str | None = None,
+    ) -> Response:
         """Serve a file's complete bytes as an attachment.
 
         The read path inlines content in a JSON envelope, so it caps at
@@ -1568,12 +1596,24 @@ def register_resource_routes(
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+        try:
+            byte_range = _parse_byte_range(range_header, size)
+        except ValueError:
+            fobj.close()
+            return Response(
+                status_code=416,
+                headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
+            )
+        start, end = byte_range if byte_range is not None else (0, size - 1)
+        length = end - start + 1
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
             # underneath the download cannot overrun the response.
-            remaining = size
+            remaining = length
             try:
+                if start:
+                    await asyncio.to_thread(fobj.seek, start)
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
@@ -1595,9 +1635,16 @@ def register_resource_routes(
         )
         return StreamingResponse(
             _chunks(),
+            status_code=206 if byte_range is not None else 200,
             media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
             headers={
-                "Content-Length": str(size),
+                "Content-Length": str(length),
+                "Accept-Ranges": "bytes",
+                **(
+                    {"Content-Range": f"bytes {start}-{end}/{size}"}
+                    if byte_range is not None
+                    else {}
+                ),
                 "Content-Disposition": disposition,
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",
