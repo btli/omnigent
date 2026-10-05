@@ -498,7 +498,6 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
     llm_model: wire.llm_model ?? null,
-    harness_override: wire.harness_override ?? null,
     reasoning_effort: wire.reasoning_effort ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
