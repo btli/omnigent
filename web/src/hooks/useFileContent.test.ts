@@ -20,7 +20,9 @@ const isIOSShell = vi.fn(() => false);
 const isAndroidShell = vi.fn(() => false);
 
 vi.mock("@/lib/host", () => ({ isDatabricksWorkspace: () => isDatabricksWorkspace() }));
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   isIOSShell: () => isIOSShell(),
   isAndroidShell: () => isAndroidShell(),
@@ -82,7 +84,7 @@ describe("downloadWorkspaceFile base-path handling", () => {
 
     await downloadWorkspaceFile("sess_abc", "src/main.py");
 
-    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL);
+    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: undefined });
   });
 });
 
@@ -113,7 +115,17 @@ describe("raw file helpers", () => {
     const blob = new Blob(["complete"]);
     authenticatedFetch.mockResolvedValue({ ok: true, blob: async () => blob });
     expect(await fetchWorkspaceFileBlob("sess_abc", "src/main.py")).toBe(blob);
-    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL);
+    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: undefined });
+  });
+  it("forwards the optional abort signal to authenticatedFetch", async () => {
+    const controller = new AbortController();
+    const blob = new Blob(["video"]);
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: async () => blob });
+
+    await expect(
+      fetchWorkspaceFileBlob("sess_abc", "src/main.py", controller.signal),
+    ).resolves.toBe(blob);
+    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: controller.signal });
   });
   it("rejects a failed raw download", async () => {
     authenticatedFetch.mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" });
