@@ -3800,7 +3800,9 @@ function SessionTooltipDetails({
     nativeCodingAgentForAvailableAgent(agent) ??
     nativeCodingAgentForAgentName(conversation.agent_name);
   const harnessOverride =
-    conversation.harness_override === AUTO_HARNESS_ID ? null : conversation.harness_override;
+    conversation.harness_override === AUTO_HARNESS_ID && declaredNativeAgent
+      ? null
+      : conversation.harness_override;
   const harness = harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
   const nativeAgent = nativeCodingAgentForHarness(harness);
   const iconAgent = nativeAgent
@@ -3843,6 +3845,7 @@ function SessionTooltipDetails({
     model: conversation.llm_model ?? null,
     modelOptions: catalogEnabled ? models : [],
     effort: conversation.reasoning_effort,
+    routingOn: harness === AUTO_HARNESS_ID,
   });
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
