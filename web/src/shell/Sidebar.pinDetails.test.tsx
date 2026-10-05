@@ -169,4 +169,106 @@ describe("header-pinned detail-only session tooltip", () => {
       client.clear();
     },
   );
+
+  it("shows a cached native model override before any model is reported or list reconciles", async () => {
+    const wire = {
+      id: "conv_override",
+      agent_id: "ag_native",
+      agent_name: "claude-native-ui",
+      title: "Override-only session",
+      created_at: 100,
+      status: "running",
+      harness: "claude-native",
+      llm_model: null,
+      model_override: "opus[1m]",
+      reasoning_effort: "medium",
+      host_id: "host_detail",
+      host_online: true,
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+    };
+    let resolvePatch!: (response: Response) => void;
+    const patch = new Promise<Response>((resolve) => {
+      resolvePatch = resolve;
+    });
+    const fetchSpy = vi.spyOn(identity, "authenticatedFetch").mockImplementation((url, init) => {
+      if (init?.method === "PATCH") return patch;
+      if (String(url).includes("/model-options")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+            }),
+          ),
+        );
+      }
+      return Promise.resolve(new Response(JSON.stringify(wire)));
+    });
+    const session = await getSession(wire.id);
+    expect(session.llmModel).toBeNull();
+    expect(session.modelOverride).toBe(wire.model_override);
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    client.setQueryData(["session", session.id], session);
+    client.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations: [], filterHonored: true });
+    render(
+      <QueryClientProvider client={client}>
+        <SidebarDataProvider>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[`/c/${session.id}`]}>
+                <Sidebar open onClose={vi.fn()} />
+                <HeaderConversationMenu
+                  conversation={{
+                    id: session.id,
+                    object: "conversation",
+                    title: session.title,
+                    labels: {},
+                    created_at: session.createdAt,
+                    updated_at: session.createdAt,
+                    permission_level: session.permissionLevel,
+                  }}
+                  currentProject={null}
+                  canShare={false}
+                  canFork={false}
+                  onShare={vi.fn()}
+                  onFork={vi.fn()}
+                />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(screen.getByTestId("header-pin-conversation"));
+    fireEvent.focus(await screen.findByRole("link", { name: session.title! }));
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    await waitFor(() =>
+      expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+        /^Opus 5.5 1M Medium$/,
+      ),
+    );
+    expect(
+      fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+    ).toHaveLength(1);
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).startsWith("/v1/sessions?"))).toBe(
+      false,
+    );
+    expect(client.getQueriesData({ queryKey: ["conversations"] })).toHaveLength(0);
+    await act(async () =>
+      resolvePatch(
+        new Response(
+          JSON.stringify({ ...wire, labels: { ...wire.labels, "omnigent.pinned": "123" } }),
+        ),
+      ),
+    );
+    client.clear();
+  });
 });
