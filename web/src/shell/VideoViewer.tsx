@@ -47,7 +47,7 @@ function VideoPlayer({ conversationId, path }: { conversationId: string; path: s
           <Button
             variant="outline"
             onClick={() => {
-              void downloadWorkspaceFile(conversationId, path).catch(() => setFailed(true));
+              void downloadWorkspaceFile(conversationId, path).catch(() => {});
             }}
           >
             Download
