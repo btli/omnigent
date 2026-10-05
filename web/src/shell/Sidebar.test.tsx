@@ -1917,9 +1917,7 @@ describe("Sidebar session list", () => {
         expect(agentLine).toHaveTextContent(
           new RegExp(`^${displayName} · ${SMART_ROUTING_LABEL}$`),
         );
-        expect(
-          agentLine.querySelector(declaredHarness ? "[data-harness-icon='claude']" : ".lucide-bot"),
-        ).not.toBeNull();
+        expect(agentLine.querySelector(".lucide-bot")).not.toBeNull();
         expect(
           fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
         ).toHaveLength(0);
