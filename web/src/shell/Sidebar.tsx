@@ -4917,8 +4917,9 @@ function ConversationRowImpl({
   );
 }
 
-// Compare the row and tooltip's rendered fields by value so metadata-only
-// updates refresh an open tooltip without re-rendering for unrelated fields.
+// Compare rendered fields by value. Keep in sync with the row + its helpers:
+// conversationDisplayLabel, getSessionState, isOwnedByViewer,
+// isSessionStoppable, SessionTooltipDetails.
 const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "id",
   "title",
