@@ -17,6 +17,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import type * as HostsModule from "@/hooks/useHosts";
 import {
   markConversationSeen,
   resetReadStateForTests,
@@ -74,12 +76,9 @@ const {
   useHostsMock: vi.fn(),
 }));
 
-vi.mock("@/hooks/useHosts", () => ({
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostsModule>()),
   useHosts: useHostsMock,
-  // The project-settings dialog (mounted by Sidebar rows) resolves model
-  // options through this hook; no test here opens it, so an empty catalog is
-  // enough to keep the module contract satisfied.
-  useHostModelOptions: () => ({ data: [] }),
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -158,7 +157,15 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import * as identity from "@/lib/identity";
+
+const agentsRef = vi.hoisted(() => ({
+  current: [] as AvailableAgent[],
+}));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({ data: agentsRef.current }),
+}));
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -268,6 +275,7 @@ function closeProjectsMenu() {
 }
 
 beforeEach(() => {
+  agentsRef.current = [];
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -294,7 +302,10 @@ beforeEach(() => {
 function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 const TEST_EXTENSION: ExtensionCatalogItem = {
   object: "extension",
@@ -1353,7 +1364,7 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       const tooltip = screen.getByTestId("session-tooltip-content");
       expect(tooltip).toHaveTextContent(title);
-      // The tooltip mirrors the pinned-project flyout's compact HoverCard look
+      // The tooltip mirrors the pinned-project flyout's compact Tooltip look
       // (bg-popover surface), not the old wide card.
       expect(tooltip.className).toContain("bg-popover");
       expect(tooltip.className).not.toContain("bg-card-solid");
@@ -1434,11 +1445,227 @@ describe("Sidebar session list", () => {
       expect(tooltip).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
     });
 
-    it("shows the agent name", async () => {
-      const tooltip = await hoverTooltip(conv("conv_agent", "aria"));
+    it.each([false, true])(
+      "loads native composer metadata only on open, once across rows (failed=%s)",
+      async (failed) => {
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+        });
+        let resolveCatalog!: (response: Response) => void;
+        const catalog = new Promise<Response>((resolve) => {
+          resolveCatalog = resolve;
+        });
+        const fetchSpy = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation((url) =>
+            String(url).includes("/model-options")
+              ? catalog
+              : Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 })),
+          );
+        const row = (id: string) =>
+          conv(id, "claude-native-ui", {
+            host_id: "host_model",
+            llm_model: "opus[1m]",
+            reasoning_effort: "medium",
+            labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          });
+        mockConversations([row("native_one"), row("native_two")]);
+        renderSidebar();
+        const calls = () =>
+          fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options"));
+        expect(calls()).toHaveLength(0);
+        fireEvent.focus(screen.getByRole("link", { name: "native_one" }));
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(/^Claude Code Medium$/);
+        expect(agentLine.querySelector("img")).toHaveAttribute("src", claudeCodeLogo);
+        await waitFor(() => expect(calls()).toHaveLength(1));
+        await act(async () =>
+          resolveCatalog(
+            new Response(
+              JSON.stringify(
+                failed
+                  ? { detail: "offline" }
+                  : {
+                      models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+                    },
+              ),
+              { status: failed ? 503 : 200 },
+            ),
+          ),
+        );
+        await waitFor(() =>
+          expect(agentLine).toHaveTextContent(
+            failed ? /^Claude Code Medium$/ : /^Opus 5.5 1M Medium$/,
+          ),
+        );
+        fireEvent.blur(screen.getByRole("link", { name: "native_one" }));
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+        vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+        fireEvent.focus(screen.getByRole("link", { name: "native_two" }));
+        const second = await screen.findByTestId("session-tooltip-content");
+        expect(within(second).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          failed ? /^Claude Code Medium$/ : /^Opus 5.5 1M Medium$/,
+        );
+        expect(calls()).toHaveLength(1);
+        fetchSpy.mockRestore();
+        vi.mocked(Date.now).mockRestore();
+      },
+    );
+
+    it.each([false, true])(
+      "uses the native fallback without probing an offline host or old server (offline=%s)",
+      async (offline) => {
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: offline ? "offline" : "online" }],
+        });
+        const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+        const tooltip = await hoverTooltip(
+          conv("native_fallback", "claude-native-ui", {
+            host_id: "host_model",
+            llm_model: offline ? "opus" : undefined,
+            reasoning_effort: "medium",
+            labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          }),
+        );
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          /^Claude Code Medium$/,
+        );
+        expect(
+          fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+        ).toHaveLength(0);
+        fetchSpy.mockRestore();
+      },
+    );
+
+    it("resolves per-session harness overrides for two rows of the same agent", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_aria",
+          name: "aria",
+          display_name: "Aria",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      mockConversations([
+        conv("sdk_default", "aria", { agent_id: "ag_aria" }),
+        conv("sdk_override", "aria", { agent_id: "ag_aria", harness_override: "codex" }),
+      ]);
+      renderSidebar();
+      async function checkRow(title: string, expected: string) {
+        const row = screen.getByRole("link", { name: title });
+        fireEvent.focus(row);
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          expected,
+        );
+        fireEvent.blur(row);
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+      }
+      await checkRow("sdk_default", "Aria · Claude SDK");
+      await checkRow("sdk_override", "Aria · Codex");
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+    });
+
+    it("uses the resolved harness for the icon, effort and model catalog key", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_native",
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+          description: null,
+          skills: [],
+        },
+      ];
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
+      const row = (id: string, harness: string) =>
+        conv(id, "claude-native-ui", {
+          agent_id: "ag_native",
+          host_id: "host_model",
+          llm_model: "model",
+          reasoning_effort: "medium",
+          harness_override: harness,
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        });
+      mockConversations([
+        row("native_claude", "claude-native"),
+        row("native_cursor", "cursor-native"),
+      ]);
+      renderSidebar();
+      async function checkRow(title: string, expected: string, harness: string) {
+        const link = screen.getByRole("link", { name: title });
+        fireEvent.focus(link);
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expected}$`));
+        const source = agentLine.querySelector("img")?.getAttribute("src");
+        expect(source).toBeTruthy();
+        await waitFor(() =>
+          expect(
+            fetchSpy.mock.calls.some(([url]) =>
+              String(url).includes(`/harnesses/${harness}/model-options`),
+            ),
+          ).toBe(true),
+        );
+        fireEvent.blur(link);
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+        return source;
+      }
+      const claudeSource = await checkRow("native_claude", "Claude Code Medium", "claude-native");
+      const cursorSource = await checkRow("native_cursor", "Cursor", "cursor-native");
+      expect(claudeSource).not.toBe(cursorSource);
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(2);
+    });
+
+    it("shows a known non-native agent and harness without a model catalog", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_aria",
+          name: "aria",
+          display_name: "Aria",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      const tooltip = await hoverTooltip(
+        conv("conv_known", "aria", { agent_id: "ag_aria", reasoning_effort: "high" }),
+      );
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(agentLine).toHaveTextContent(/^Aria · Claude SDK$/);
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+      fetchSpy.mockRestore();
+    });
+
+    it("shows the unknown agent name without effort or model", async () => {
+      const tooltip = await hoverTooltip(
+        conv("conv_agent", "aria", {
+          llm_model: "opus[1m]",
+          reasoning_effort: "high",
+        }),
+      );
       expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
         /^aria$/,
       );
+      expect(
+        within(tooltip).getAllByTestId("session-tooltip-agent")[0].querySelector(".lucide-bot"),
+      ).not.toBeNull();
     });
 
     it("omits the agent line when the agent is unknown", async () => {
@@ -1638,7 +1865,7 @@ describe("Sidebar session list", () => {
       ]);
       renderSidebar();
       fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_details/ }));
-      const flyout = await screen.findByTestId("pinned-project-flyout");
+      const flyout = await screen.findByTestId("session-tooltip-content");
       expect(flyout).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
       expect(within(flyout).getByText("Customer X")).toBeInTheDocument();
       expect(within(flyout).getByTestId("session-tooltip-agent")).toHaveTextContent(/^aria$/);
@@ -1658,7 +1885,7 @@ describe("Sidebar session list", () => {
       ]);
       renderSidebar();
       fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_sparse/ }));
-      const flyout = await screen.findByTestId("pinned-project-flyout");
+      const flyout = await screen.findByTestId("session-tooltip-content");
       expect(within(flyout).queryByTestId("session-tooltip-agent")).toBeNull();
       expect(within(flyout).queryByTestId("session-tooltip-cwd")).toBeNull();
       expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Idle$/);
@@ -1896,7 +2123,7 @@ describe("Sidebar failed session indicator", () => {
       );
       if (pinned) fireEvent.focus(row);
       else fireEvent.pointerMove(row, { pointerType: "mouse" });
-      return screen.findByTestId(pinned ? "pinned-project-flyout" : "session-tooltip-content");
+      return screen.findByTestId("session-tooltip-content");
     }
 
     it("explains the error through the row's existing hover surface", async () => {
@@ -1922,6 +2149,7 @@ describe("Sidebar failed session indicator", () => {
 
 describe("Sidebar idle latest-message error", () => {
   beforeEach(() => {
+    agentsRef.current = [];
     vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
       items: [
         {

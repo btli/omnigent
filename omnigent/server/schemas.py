@@ -2806,6 +2806,8 @@ class SessionListItem(BaseModel):
     host_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
+    llm_model: str | None = None
+    harness_override: str | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
     owner: str | None = None

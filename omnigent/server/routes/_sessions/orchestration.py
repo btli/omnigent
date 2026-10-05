@@ -1164,6 +1164,8 @@ def _build_session_list_item(
         labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
+        llm_model=concrete_reported_model(conv.reported_model) or conv.model_override,
+        harness_override=conv.harness_override,
         reasoning_effort=conv.reasoning_effort,
         permission_level=level,
         owner=owner,

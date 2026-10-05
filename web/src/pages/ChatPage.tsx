@@ -234,7 +234,7 @@ import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import {
-  compactModelTriggerLabel,
+  composerModelChipLabel,
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
@@ -4696,14 +4696,15 @@ function SessionHarnessPicker({
     showModels,
     showEffort,
   });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
-  const label = routingOn
-    ? SMART_ROUTING_LABEL
-    : modelLabelLoading
-      ? ""
-      : compactModelTriggerLabel(
-          modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
-        );
+  const { label, effortLabel } = composerModelChipLabel({
+    modelSummary,
+    modelLabelLoading,
+    nativeDisplayName: nativeAgent?.displayName,
+    harnessLabel,
+    showEffort,
+    effort: selectedEffort,
+    routingOn,
+  });
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
