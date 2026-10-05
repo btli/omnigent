@@ -12,7 +12,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -22,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
+import { TemplateNameInput } from "@/components/scheduled/TemplateNameInput";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
@@ -410,7 +410,7 @@ export function CreateScheduledTaskDialog({
         >
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="task-name">Name</Label>
-            <Input
+            <TemplateNameInput
               id="task-name"
               value={name}
               placeholder="Open PR Rebase - {{YYYY-MM-DD}}"
@@ -418,9 +418,6 @@ export function CreateScheduledTaskDialog({
               className="text-ui"
               onChange={(e) => setName(e.target.value)}
             />
-            <p className="text-sm text-muted-foreground">
-              {"Add {{YYYY-MM-DD}} or {{MMM DD}} to put each run's date in its session name."}
-            </p>
           </div>
 
           <div className="flex flex-col gap-1.5">
