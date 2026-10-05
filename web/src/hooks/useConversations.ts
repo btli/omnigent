@@ -497,8 +497,6 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     workspace: wire.workspace ?? null,
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
-    llm_model: wire.llm_model ?? null,
-    reasoning_effort: wire.reasoning_effort ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
@@ -1781,7 +1779,24 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     labels: session.labels ?? {},
     permission_level: session.permissionLevel,
     agent_id: session.agentId,
+    agent_name: session.agentName,
+    runner_id: session.runnerId,
+    host_id: session.hostId,
+    workspace: session.workspace,
+    git_branch: session.gitBranch,
+    status:
+      session.status === "waiting"
+        ? "running"
+        : session.status === "launching"
+          ? undefined
+          : session.status,
+    pending_elicitations_count: session.pendingElicitations?.length,
+    runner_online: session.runnerOnline,
+    host_online: session.hostOnline,
+    llm_model: session.llmModel,
+    reasoning_effort: session.reasoningEffort,
     harness_override: session.harness ?? null,
+    parent_session_id: session.parentSessionId,
     archived: session.archived,
   };
 }
