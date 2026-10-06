@@ -8,7 +8,22 @@ from alembic import command
 from alembic.script import ScriptDirectory
 
 from omnigent.db import ConversationBase, OmnigentBase
+from omnigent.db.cockroachdb import _crdb_revisions_are_supported
 from omnigent.db.utils import _build_alembic_config, _initialize_or_verify_schema, _run_migrations
+
+
+@pytest.mark.parametrize(
+    ("revisions", "supported"),
+    [
+        (("a5363b7c9d2e", "gf1b2c3d4e5f"), True),
+        (("a5363b7c9d2e",), False),
+        (("ga1b2c3d4e5f",), False),
+    ],
+)
+def test_crdb_baseline_applies_to_combined_branches(revisions, supported) -> None:
+    config = _build_alembic_config("sqlite://")
+    head = ScriptDirectory.from_config(config).get_current_head()
+    assert _crdb_revisions_are_supported("sqlite://", revisions, head) is supported
 
 
 def test_bootstrap_metadata_preserves_migrated_tables(tmp_path: Path) -> None:
