@@ -1,6 +1,10 @@
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { composerModelChipLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
+import {
+  buildComposerSessionDescriptor,
+  composerModelChipLabel,
+  formatStatusModelLabel,
+} from "@/lib/composerModelLabel";
 import { AUTO_HARNESS_ID, BRAIN_HARNESS_LABELS, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForWrapper,
@@ -3839,15 +3843,7 @@ function SessionTooltipDetails({
         ? [agent?.display_name ?? conversation.agent_name, harnessLabel].filter(Boolean).join(" · ")
         : conversation.agent_name,
     session: iconAgent
-      ? {
-          harness,
-          labels: {
-            ...conversation.labels,
-            ...(harnessOverride != null && {
-              "omnigent.wrapper": nativeAgent?.wrapperLabel ?? null,
-            }),
-          },
-        }
+      ? buildComposerSessionDescriptor(harness, conversation.labels, conversation.parent_session_id)
       : null,
     model: conversation.llm_model ?? null,
     modelOptions: catalogEnabled ? models : [],
