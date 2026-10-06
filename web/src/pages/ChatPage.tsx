@@ -237,6 +237,7 @@ import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import {
+  buildComposerSessionDescriptor,
   composerModelChipLabel,
   effectiveWrapperLabel,
   effortLevelsForConv,
@@ -1016,12 +1017,12 @@ export function ChatPage() {
   // stable identity across the switch's re-render burst.
   const capabilitySource = useMemo(() => {
     if (activeSession)
-      return {
-        labels: activeSession.labels ?? {},
-        harness: activeSession.harness,
-        inferenceConfigured: activeSession.inferenceConfigured,
-        parentSessionId: activeSession.parentSessionId ?? null,
-      };
+      return buildComposerSessionDescriptor(
+        activeSession.harness,
+        activeSession.labels,
+        activeSession.parentSessionId,
+        activeSession.inferenceConfigured,
+      );
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
@@ -1032,13 +1033,9 @@ export function ChatPage() {
       const seededLabels: Record<string, string | null> = nativeAgent
         ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel }
         : {};
-      return {
-        labels: seededLabels,
-        harness: composerSessionHarness,
-        parentSessionId: null,
-      };
+      return buildComposerSessionDescriptor(composerSessionHarness, seededLabels);
     }
-    return { labels: activeConv?.labels ?? {}, harness: null, parentSessionId: null };
+    return buildComposerSessionDescriptor(null, activeConv?.labels);
   }, [
     activeSession,
     activeConv,
