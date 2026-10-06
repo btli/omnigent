@@ -30,9 +30,10 @@ implements them separately, so a fix for one harness does not reach the others.
   CLI disconnect, a runner going offline, and a browser stream reconnect.
 
 - `launch-settings`: Settings → Harnesses → a configured Claude or Codex →
-  Settings (or its card's gear). Shows the selected host's binary, source, and
-  configured argument count, read-only. Argument and environment values stay
-  on the host. Workspace config can override these host defaults. Behind
+  Settings (or its card's gear). One Startup configuration block shows Command,
+  Environment, and Arguments, unmasked and read-only, with the selected host's source.
+  Env wrappers are split into these fields, without a duplicate raw invocation.
+  Session and workspace config can add to or override these host defaults. Behind
   `harness_settings_ui`; other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
@@ -41,6 +42,10 @@ implements them separately, so a fix for one harness does not reach the others.
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
+- `harness-settings-navigation`: with `harness_settings_ui` enabled, the import
+  review modal's See more opens Harnesses and dismisses the modal. Settings →
+  Import sessions keeps session imports but hides Harness imports. With the flag
+  off, the modal has no See more and Harness imports remains available.
 
 ## How to get to it (user POV)
 
@@ -58,6 +63,11 @@ list or plugin. Requires `harness_settings_ui`.
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion; requires `harness_settings_ui`.
+
+**Harness settings navigation:** the import review modal shown for a newly
+connected or requested host → See more opens Settings → Harnesses. With the
+flag off, Settings → Import sessions → Harness imports → Review imports reopens
+the review modal instead.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -99,14 +109,29 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 **Launch settings (own environment):** enable `harness_settings_ui`, connect a
 host with Claude/Codex configured, and put a command and two args under
 `harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.
-Open each harness through both its gear and card → Settings. Check the binary,
-source, count of two (no values), and credential. Select a second host on the
+Open each harness through both its gear and card → Settings. Check one Startup
+configuration block with Command, Environment, and Arguments, plus source and
+credential. Repeat with `command: /usr/bin/env`
+and args containing environment assignments before the wrapped command. Check
+full override values, empty values, inheritance and `-i`/`-u` behavior. Values
+must appear only once; no Configured invocation panel. Unknown env options must
+keep the raw Command and Arguments and show an interpretation warning.
+These are host defaults, not a running session's full command or environment.
+Select a second host on the
 grid and repeat. An older host shows an update message; an older server hides
 the extra fields. Resolver and raw-tunnel checks:
 `tests/host/test_harness_startup.py`,
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
 Cross-harness journeys:
+
+- **`harness-settings-navigation`:** run
+  `web/src/components/onboarding/ImportContextModal.test.tsx` and
+  `web/src/pages/SettingsPage.test.tsx`. In an isolated instance, connect a new
+  host, then click See more beside Confirm. Check that the modal closes and
+  Harnesses opens. Open Import sessions and check that only session imports
+  remain. Repeat with `harness_settings_ui` off: no See more, and Harness
+  imports can still reopen the modal.
 
 - **`needs-auth`:**
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
