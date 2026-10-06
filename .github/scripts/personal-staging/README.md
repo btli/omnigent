@@ -166,6 +166,15 @@ rings can never cancel each other.
 
 ### Migration gate
 
+Both rings validate the complete migration graph before publishing, including
+hourly staging refreshes. Missing parents, duplicate revisions, cycles, and
+multiple heads block publication. Staging also preserves every migration from
+its previous branch tip. Fork main retains the migration files shipped by
+either ring, even after their feature PRs close; the published mobile-push
+join is now shared by both rings rather than carried as a staging branch pin.
+Fresh databases and upgrades from historical production and staging revisions
+are covered by `tests/db/test_ring_migration_history.py`.
+
 Published migration files are immutable. Before considering backup approval,
 the composer rejects any edit, deletion, or rename under the migrations path
 relative to the previous production pin. This is a hard failure that approval
