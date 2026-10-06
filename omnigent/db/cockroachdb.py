@@ -276,6 +276,7 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     from omnigent.db.utils import (
         _build_alembic_config,
         _get_current_db_revision,
+        _get_current_db_revisions,
         _get_head_db_revision,
         _run_migrations,
         _verify_db_revision_is_supported,
@@ -284,11 +285,12 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     version = _crdb_server_version(engine)
     _verify_crdb_read_committed(engine, version)
     head = _get_head_db_revision(db_uri)
-    current = _get_current_db_revision(engine)
+    revisions = _get_current_db_revisions(engine)
+    current = revisions[0] if len(revisions) == 1 else revisions
     tables = set(inspect(engine).get_table_names())
     expected = set(OmnigentBase.metadata.tables) | set(ConversationBase.metadata.tables)
 
-    if current is None:
+    if not revisions:
         _start_or_resume_crdb_bootstrap(engine, version, tables, expected, head)
         with query_name_scope("omnigent.database.bootstrap_cockroachdb"):
             with engine.connect() as connection:
@@ -319,13 +321,14 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
             _finish_crdb_bootstrap(engine, version)
         return
 
-    _verify_db_revision_is_supported(db_uri, current, head)
-    if not _crdb_revision_is_supported(db_uri, current, head):
-        raise RuntimeError(
-            f"CockroachDB schema revision {current!r} predates Omnigent's CRDB "
-            f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
-        )
-    if current != head:
+    for revision in revisions:
+        _verify_db_revision_is_supported(db_uri, revision, head)
+        if not _crdb_revision_is_supported(db_uri, revision, head):
+            raise RuntimeError(
+                f"CockroachDB schema revision {revision!r} predates Omnigent's CRDB "
+                f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
+            )
+    if revisions != (head,):
         _logger.warning(
             "CockroachDB schema is out of date (found revision %r, expected %r); "
             "attempting automatic migration.",
