@@ -68,9 +68,12 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     <div data-testid="side-chat-pane-stub">{childId}</div>
   ),
 }));
+vi.mock("@/lib/breakpoints", async (importOriginal) => ({
+  ...(await importOriginal<typeof BreakpointsModule>()),
+  isMobileViewport: vi.fn(() => false),
+}));
 vi.mock("./Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
-  isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./GithubPanel", () => ({
   GithubPanel: () => <div data-testid="github-panel">Pull request details</div>,
@@ -92,7 +95,8 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { AppShell } from "./AppShell";
-import { isMobileViewport } from "./Sidebar";
+import type * as BreakpointsModule from "@/lib/breakpoints";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { useGithubInfo } from "@/hooks/useGithub";
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
