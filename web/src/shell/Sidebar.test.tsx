@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+vi.mock("@/components/icons/ClaudeIcon", () => ({
+  ClaudeIcon: () => <svg data-testid="claude-glyph" />,
+}));
+vi.mock("@/components/icons/CodexIcon", () => ({
+  CodexIcon: () => <svg data-testid="codex-glyph" />,
+}));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -16,6 +22,7 @@ import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { AUTO_HARNESS_ID, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { buildComposerSessionDescriptor, composerModelChipLabel } from "@/lib/composerModelLabel";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -1924,13 +1931,85 @@ describe("Sidebar session list", () => {
       },
     );
 
-    it("uses the resolved harness for the icon and catalog while preserving actual wrapper effort", async () => {
+    it("refreshes an open tooltip after a parent-only metadata update", async () => {
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const modelOptions = [
+        {
+          id: "codex-model",
+          displayName: "Codex model",
+          supportedReasoningEfforts: [],
+        },
+      ];
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation(async () => new Response(JSON.stringify({ models: modelOptions })));
+      const session = conv("parent_metadata", "codex-native-ui", {
+        host_id: "host_model",
+        llm_model: "codex-model",
+        reasoning_effort: "medium",
+        parent_session_id: null,
+        labels: {},
+        updated_at: 100,
+      });
+      const childSession = { ...session, parent_session_id: "parent_session" };
+      function expectedAgentLine(row: Conversation) {
+        const { label, effortLabel } = composerModelChipLabel({
+          session: buildComposerSessionDescriptor(
+            "codex-native",
+            row.labels,
+            row.parent_session_id,
+          ),
+          model: row.llm_model,
+          modelOptions,
+          modelSummary: "Codex model",
+          effort: row.reasoning_effort,
+        });
+        return [label, effortLabel].filter(Boolean).join(" ");
+      }
+      expect(expectedAgentLine(session)).toBe("Codex model");
+      expect(expectedAgentLine(childSession)).toBe("Codex model Medium");
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const onClose = vi.fn();
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={onClose} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const view = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: session.id }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      await waitFor(() =>
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expectedAgentLine(session)}$`)),
+      );
+      mockConversations([childSession]);
+      view.rerender(tree());
+      expect(childSession.updated_at).toBe(session.updated_at);
+      await waitFor(() =>
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expectedAgentLine(childSession)}$`)),
+      );
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(1);
+      client.clear();
+    });
+
+    it("uses reachable brain-harness overrides for labels, icons and catalog keys", async () => {
       agentsRef.current = [
         {
-          id: "ag_native",
-          name: "claude-native-ui",
-          display_name: "Claude Code",
-          harness: "claude-native",
+          id: "ag_aria",
+          name: "aria",
+          display_name: "Aria",
+          harness: "claude-sdk",
           description: null,
           skills: [],
         },
@@ -1942,44 +2021,48 @@ describe("Sidebar session list", () => {
         .spyOn(identity, "authenticatedFetch")
         .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
       const row = (id: string, harness: string) =>
-        conv(id, "claude-native-ui", {
-          agent_id: "ag_native",
+        conv(id, "aria", {
+          agent_id: "ag_aria",
           host_id: "host_model",
           llm_model: "model",
           reasoning_effort: "medium",
           harness_override: harness,
-          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          labels: {},
         });
-      mockConversations([
-        row("native_claude", "claude-native"),
-        row("native_cursor", "cursor-native"),
-      ]);
-      renderSidebar();
-      async function checkRow(title: string, expected: string, harness: string) {
+      mockConversations([row("brain_claude", "claude-sdk"), row("brain_codex", "codex")]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>,
+      );
+      async function checkRow(title: string, expected: string, harness: string, glyph: string) {
         const link = screen.getByRole("link", { name: title });
         fireEvent.focus(link);
         const tooltip = await screen.findByTestId("session-tooltip-content");
         const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
         expect(agentLine).toHaveTextContent(new RegExp(`^${expected}$`));
-        const source = agentLine.querySelector("img")?.getAttribute("src");
-        expect(source).toBeTruthy();
-        await waitFor(() =>
-          expect(
-            fetchSpy.mock.calls.some(([url]) =>
-              String(url).includes(`/harnesses/${harness}/model-options`),
-            ),
-          ).toBe(true),
-        );
+        expect(within(agentLine).getByTestId(glyph)).toBeInTheDocument();
+        const queryKey = ["host-model-options", "host_model", harness];
+        expect(client.getQueryCache().find({ queryKey, exact: true })?.queryKey).toEqual(queryKey);
         fireEvent.blur(link);
         await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
-        return source;
       }
-      const claudeSource = await checkRow("native_claude", "Claude Code Medium", "claude-native");
-      const cursorSource = await checkRow("native_cursor", "Cursor Medium", "cursor-native");
-      expect(claudeSource).not.toBe(cursorSource);
+      await checkRow("brain_claude", "Aria · Claude SDK", "claude-sdk", "claude-glyph");
+      await checkRow("brain_codex", "Aria · Codex", "codex", "codex-glyph");
+      expect(
+        client.getQueryCache().findAll({ queryKey: ["host-model-options", "host_model"] }),
+      ).toHaveLength(2);
       expect(
         fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
-      ).toHaveLength(2);
+      ).toHaveLength(0);
+      client.clear();
     });
 
     it.each([false, true])(
