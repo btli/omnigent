@@ -650,6 +650,81 @@ class SqlDeviceGrant(OmnigentBase):
     )
 
 
+class SqlMobilePushDevice(OmnigentBase):
+    __tablename__ = "mobile_push_devices"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    installation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    platform: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    fcm_token: Mapped[str] = mapped_column(String(1024), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "token_hash", name="uq_mobile_push_device_token"),
+        Index(
+            "ix_mobile_push_devices_user",
+            "workspace_id",
+            "user_id",
+            "expires_at",
+            "installation_id",
+        ),
+        Index("ix_mobile_push_devices_expiry", "expires_at", "workspace_id", "installation_id"),
+        CheckConstraint("platform IN (1, 2)", name="ck_mobile_push_platform"),
+    )
+
+
+class SqlMobilePushOutbox(OmnigentBase):
+    __tablename__ = "mobile_push_outbox"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    installation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    device_generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    not_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    lease_until: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delivered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "user_id",
+            "installation_id",
+            "device_generation",
+            "kind",
+            name="uq_mobile_push_outbox_intent",
+        ),
+        Index(
+            "ix_mobile_push_outbox_due",
+            "workspace_id",
+            "delivered",
+            "not_before",
+            "lease_until",
+            "id",
+        ),
+        Index("ix_mobile_push_outbox_expiry", "expires_at", "workspace_id", "id"),
+        Index("ix_mobile_push_outbox_device", "workspace_id", "installation_id", "id"),
+        Index("ix_mobile_push_outbox_user", "workspace_id", "user_id", "id"),
+        Index("ix_mobile_push_outbox_tenants", "delivered", "workspace_id", "id"),
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_mobile_push_kind"),
+    )
+
+
 class SqlSessionPermission(OmnigentBase):
     """
     SQLAlchemy model for the ``session_permissions`` table.
@@ -1618,6 +1693,8 @@ class SqlScheduledTask(OmnigentBase):
     # sandbox is provisioned/adopted under a deterministic id at fire time, so
     # there is nothing to pin here).
     host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Organizational membership only. No DB foreign key (Rule R032).
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
@@ -1640,6 +1717,14 @@ class SqlScheduledTask(OmnigentBase):
             "ix_scheduled_tasks_user_scope",
             "workspace_id",
             "user_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_scheduled_tasks_project_id",
+            "workspace_id",
+            "user_id",
+            "project_id",
             "created_at",
             "id",
         ),

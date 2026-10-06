@@ -585,9 +585,9 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
-    current = _get_current_db_revision(engine)
     head = _get_head_db_revision(db_uri)
-    _verify_db_revision_is_supported(db_uri, current, head)
+    for current in _get_current_db_revisions(engine):
+        _verify_db_revision_is_supported(db_uri, current, head)
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
@@ -692,6 +692,17 @@ def run_migrations_with_retry(
             engine.dispose()
 
 
+def _get_current_db_revisions(engine: Engine) -> tuple[str, ...]:
+    """Include every branch of a database awaiting an Alembic merge."""
+    from alembic.runtime.migration import MigrationContext
+
+    with query_name_scope("omnigent.database.select_current_revision"):
+        if "alembic_version" not in inspect(engine).get_table_names():
+            return ()
+        with engine.connect() as connection:
+            return MigrationContext.configure(connection).get_current_heads()
+
+
 def _get_current_db_revision(engine: Engine) -> str | None:
     """
     Return the database's current Alembic revision, or ``None``.
@@ -794,14 +805,16 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         return
 
     head = _get_head_db_revision(db_uri)
-    current = _get_current_db_revision(engine)
-    _verify_db_revision_is_supported(db_uri, current, head)
+    revisions = _get_current_db_revisions(engine)
+    for revision in revisions:
+        _verify_db_revision_is_supported(db_uri, revision, head)
+    current = revisions[0] if len(revisions) == 1 else revisions
 
-    if current is None:
+    if not revisions:
         _run_migrations(engine, db_uri)
         return
 
-    if current != head:
+    if revisions != (head,):
         _logger.warning(
             "Omnigent database schema is out of date "
             "(found revision %r, expected %r); attempting automatic migration.",

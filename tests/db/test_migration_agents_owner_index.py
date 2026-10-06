@@ -99,10 +99,16 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
             conn.execute(sa.text("CREATE TABLE other.t (x int)"))
             conn.execute(sa.text(f"CREATE INDEX {_INDEX} ON other.t (x)"))
             conn.execute(sa.text(invalidate), {"i": f"other.{_INDEX}"})
-        _run_migrations(sa.create_engine(uri), uri)
+        config = _build_alembic_config(uri)
+        command.upgrade(config, "ll1a2b3c4d5e")
         with setup.connect() as conn:
+            conn.execute(
+                sa.text(
+                    f"CREATE INDEX {_INDEX} ON agents "
+                    "(workspace_id, kind, created_by, created_at, id)"
+                )
+            )
             conn.execute(sa.text(invalidate), {"i": f"public.{_INDEX}"})
-            conn.execute(sa.text("UPDATE alembic_version SET version_num = 'll1a2b3c4d5e'"))
         _run_migrations(sa.create_engine(uri), uri)
         with setup.connect() as conn:
             assert _pg_index_valid(conn, "public") is True

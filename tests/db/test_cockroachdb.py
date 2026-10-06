@@ -16,6 +16,7 @@ from omnigent.db.cockroachdb import (
 from omnigent.db.utils import (
     _build_alembic_config,
     _get_current_db_revision,
+    _get_current_db_revisions,
     _get_head_db_revision,
     _initialize_or_verify_schema,
     get_or_create_engine,
@@ -69,7 +70,7 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
         command.downgrade(config, CRDB_BASELINE_REVISION)
         connection.commit()
 
-    assert _get_current_db_revision(engine) == CRDB_BASELINE_REVISION
+    assert CRDB_BASELINE_REVISION in _get_current_db_revisions(engine)
 
     _initialize_or_verify_schema(engine, db_uri)
 
@@ -149,7 +150,7 @@ def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None
             _initialize_or_verify_schema(engine, db_uri)
     finally:
         event.remove(engine, "before_cursor_execute", interrupt_backfill)
-    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert "hh1b2c3d4e5f" in _get_current_db_revisions(engine)
     assert "account_generation" in {c["name"] for c in inspect(engine).get_columns("users")}
 
     _initialize_or_verify_schema(engine, db_uri)

@@ -7,7 +7,73 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.script import ScriptDirectory
 
-from omnigent.db.utils import _build_alembic_config
+from omnigent.db import ConversationBase, OmnigentBase
+from omnigent.db.utils import _build_alembic_config, _initialize_or_verify_schema, _run_migrations
+
+
+def test_bootstrap_metadata_preserves_migrated_tables(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    engine = sa.create_engine(uri)
+    try:
+        command.upgrade(_build_alembic_config(uri), "head")
+        actual = sa.inspect(engine)
+        models = {
+            table.name: set(table.columns.keys())
+            for metadata in (OmnigentBase.metadata, ConversationBase.metadata)
+            for table in metadata.sorted_tables
+        }
+        for table in actual.get_table_names():
+            if table != "alembic_version":
+                assert {column["name"] for column in actual.get_columns(table)} <= models.get(
+                    table, set()
+                ), table
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("upgrade", [_initialize_or_verify_schema, _run_migrations])
+def test_resume_published_branches(tmp_path: Path, upgrade) -> None:
+    uri = f"sqlite:///{tmp_path / 'branches.db'}"
+    engine = sa.create_engine(uri)
+    config = _build_alembic_config(uri)
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "f5b9e1a3d2c4")
+            command.upgrade(config, "mp1b2c3d4e5f")
+            assert (
+                len(connection.execute(sa.text("SELECT version_num FROM alembic_version")).all())
+                == 2
+            )
+        upgrade(engine, uri)
+        with engine.connect() as connection:
+            assert connection.execute(
+                sa.text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == (ScriptDirectory.from_config(config).get_current_head())
+    finally:
+        engine.dispose()
+
+
+def test_unknown_branch_prevents_any_migration(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'future.db'}"
+    engine = sa.create_engine(uri)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("CREATE TABLE alembic_version (version_num TEXT PRIMARY KEY)")
+            )
+            connection.execute(
+                sa.text("INSERT INTO alembic_version VALUES ('5e92355b0960'), ('future')")
+            )
+        with pytest.raises(RuntimeError, match="newer"):
+            _initialize_or_verify_schema(engine, uri)
+        with engine.connect() as connection:
+            assert set(
+                connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()
+            ) == {"5e92355b0960", "future"}
+            assert sa.inspect(connection).get_table_names() == ["alembic_version"]
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize(
