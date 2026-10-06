@@ -29,6 +29,20 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
+export function buildComposerSessionDescriptor(
+  harness: string | null | undefined,
+  labels: Record<string, string | null> | null | undefined,
+  parentSessionId: string | null | undefined = null,
+  inferenceConfigured?: boolean,
+) {
+  return {
+    harness,
+    labels: labels ?? {},
+    parentSessionId: parentSessionId ?? null,
+    inferenceConfigured,
+  };
+}
+
 // Label-less sessions inherit their wrapper from the harness; sub-agent
 // children own no input surface, so they must not inherit it.
 export function effectiveWrapperLabel(
