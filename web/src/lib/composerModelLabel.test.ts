@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildComposerSessionDescriptor,
   compactModelTriggerLabel,
   composerModelChipLabel,
   defaultModelLabel,
@@ -10,6 +11,38 @@ import {
   nativeModelLabel,
   normalizeEffortLabel,
 } from "@/lib/composerModelLabel";
+
+describe("composer session descriptors", () => {
+  it("preserves the resolved harness, actual wrapper and session metadata without mutation", () => {
+    const labels = Object.freeze({ "omnigent.wrapper": "claude-code-native-ui", custom: "value" });
+    const descriptor = buildComposerSessionDescriptor("devin-native", labels, "parent", true);
+    expect(descriptor).toEqual({
+      harness: "devin-native",
+      labels,
+      parentSessionId: "parent",
+      inferenceConfigured: true,
+    });
+    expect(descriptor.labels).toBe(labels);
+    expect(labels).toEqual({ "omnigent.wrapper": "claude-code-native-ui", custom: "value" });
+  });
+
+  it.each([
+    ["devin-native", null],
+    ["codex-native", "High"],
+  ] as const)("never synthesizes wrapper evidence for label-less %s", (harness, effortLabel) => {
+    const descriptor = buildComposerSessionDescriptor(harness, null);
+    expect(descriptor.labels).toEqual({});
+    expect(descriptor.harness).toBe(harness);
+    expect(
+      composerModelChipLabel({
+        session: descriptor,
+        model: "model",
+        modelOptions: [{ id: "model", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }],
+        effort: "high",
+      }).effortLabel,
+    ).toBe(effortLabel);
+  });
+});
 
 describe("composer chip labels", () => {
   const nativeSession = { labels: { "omnigent.wrapper": "claude-code-native-ui" } };
