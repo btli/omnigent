@@ -1,3 +1,13 @@
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { composerModelChipLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
+import { AUTO_HARNESS_ID, BRAIN_HARNESS_LABELS, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import {
+  nativeCodingAgentForWrapper,
+  nativeCodingAgentForAvailableAgent,
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
@@ -117,7 +127,6 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -155,7 +164,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
@@ -165,6 +174,7 @@ import { useLeftTrimmedPath } from "@/lib/leftTrimmedPath";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -240,6 +250,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
+import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 
 export { isMobileViewport };
 
@@ -292,6 +303,7 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
+const NEW_SESSION_KEYS = [MOD_KEY, ALT_KEY, "N"] as const;
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1095,7 +1107,7 @@ function SidebarImpl({
                   // transparent 1px border so the icon lands exactly on that
                   // column, flush with the Inbox row and folder rows.
                   SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal",
+                  "group/new-session w-full justify-start border-0 font-normal",
                   SIDEBAR_HOVER_HIGHLIGHT,
                   isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
@@ -1108,6 +1120,7 @@ function SidebarImpl({
                 <Link
                   to="/"
                   componentId="sidebar.new_chat"
+                  aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+N`}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
@@ -1122,6 +1135,10 @@ function SidebarImpl({
                     )}
                   />
                   New session
+                  <CompactShortcutKeys
+                    keys={NEW_SESSION_KEYS}
+                    className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
+                  />
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -2490,25 +2507,52 @@ function ConversationList({
                         // switching scope just exits selection. Only the
                         // "select" entry point hides, being already active.
                         !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
+                          <div className="flex items-center gap-0.5">
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  asChild
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="New session"
+                                  data-testid="sessions-new-session"
+                                  className="text-muted-foreground"
+                                >
+                                  <Link
+                                    to="/"
+                                    componentId="sidebar.sessions_new_chat"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      onActiveTabChange("mine");
+                                      onRowClick(event);
+                                    }}
+                                  >
+                                    <MessageCirclePlusIcon className="size-3.5" />
+                                  </Link>
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">New session</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          </div>
                         ) : undefined
                       }
                       persistentHeaderAction={
@@ -3332,7 +3376,6 @@ function ConversationMenuItems({
   onMarkRead,
   onProjectAssigned,
   moveToProject,
-  stopSession,
   setShareOpen,
   setForkOpen,
   setIsEditing,
@@ -3363,7 +3406,6 @@ function ConversationMenuItems({
   onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
-  stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
@@ -3580,14 +3622,7 @@ function ConversationMenuItems({
           <C.Item
             data-testid="stop-conversation"
             variant="destructive"
-            onSelect={() => {
-              // Clear any prior failure so a stale "couldn't stop"
-              // message doesn't greet the next attempt. Must happen
-              // here: Radix only fires the Dialog's onOpenChange for
-              // Radix-initiated changes, not this programmatic open.
-              stopSession.reset();
-              setStopOpen(true);
-            }}
+            onSelect={() => setStopOpen(true)}
           >
             <CircleStopIcon className="size-3.5" />
             Stop session
@@ -3665,34 +3700,105 @@ function ConversationMenuItems({
   );
 }
 
-const SESSION_ERROR_EXPLANATION = "Latest message is an error";
+interface SessionTooltipProps {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+  state: SessionState | null;
+  pinnedProject: { name: string; icon: string | null } | null;
+}
 
-function SessionTooltipContent({
+function SessionTooltipContent(props: SessionTooltipProps) {
+  return (
+    <TooltipContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      data-testid="session-tooltip-content"
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+    >
+      <SessionTooltipDetails {...props} />
+    </TooltipContent>
+  );
+}
+
+function SessionTooltipDetails({
   conversation,
   hostsById,
   state,
   pinnedProject,
-}: {
-  conversation: Conversation;
-  hostsById: ReadonlyMap<string, Host>;
-  // The row's own indicator state, so the tooltip never re-derives it.
-  state: SessionState | null;
-  // Set for a pinned, project-owned row, which lifts out of its project folder:
-  // its root is a HoverCard, and the card restores the project cue.
-  pinnedProject: { name: string; icon: string | null } | null;
-}) {
+}: SessionTooltipProps) {
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
     ? "Local machine"
     : host?.sandbox_provider
       ? sandboxOptionLabel(host.sandbox_provider)
       : (host?.name ?? conversation.host_id);
+  const { data: agents = [] } = useAvailableAgents();
+  const agent = agents.find((candidate) => candidate.id === conversation.agent_id);
+  const nativePaneAgent = nativeCodingAgentForWrapper(conversation.labels?.["omnigent.wrapper"]);
+  const declaredNativeAgent =
+    nativePaneAgent ??
+    nativeCodingAgentForAvailableAgent(agent) ??
+    nativeCodingAgentForAgentName(conversation.agent_name);
+  const harnessOverride =
+    conversation.harness_override === AUTO_HARNESS_ID && nativePaneAgent
+      ? null
+      : conversation.harness_override;
+  const harness = harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
+  const nativeAgent = nativeCodingAgentForHarness(harness);
+  const iconAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness }
+    : agent
+      ? { name: agent.name, harness }
+      : null;
+  const catalogEnabled =
+    nativeAgent !== undefined &&
+    !!conversation.llm_model &&
+    host?.status === "online" &&
+    conversation.host_online !== false;
+  const { data: models } = useHostModelOptions(
+    conversation.host_id ?? null,
+    nativeAgent?.harness ?? harness ?? "",
+    catalogEnabled,
+    { once: true },
+  );
+  const harnessLabel =
+    harness === AUTO_HARNESS_ID
+      ? SMART_ROUTING_LABEL
+      : harness
+        ? BRAIN_HARNESS_LABELS[harness]
+        : null;
+  const { label: agentLabel, effortLabel } = composerModelChipLabel({
+    modelSummary:
+      catalogEnabled && models?.length
+        ? formatStatusModelLabel(conversation.llm_model ?? null, models)
+        : null,
+    nativeDisplayName: nativeAgent?.displayName,
+    harnessLabel:
+      agent || harness === AUTO_HARNESS_ID
+        ? [agent?.display_name ?? conversation.agent_name, harnessLabel].filter(Boolean).join(" · ")
+        : conversation.agent_name,
+    session: iconAgent
+      ? {
+          harness,
+          labels: {
+            ...conversation.labels,
+            ...(harnessOverride != null && {
+              "omnigent.wrapper": nativeAgent?.wrapperLabel ?? null,
+            }),
+          },
+        }
+      : null,
+    model: conversation.llm_model ?? null,
+    modelOptions: catalogEnabled ? models : [],
+    effort: conversation.reasoning_effort,
+  });
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
   // Runner-owned failure detail the server persists as a label; transcript-only
   // errors have none, so they keep the generic explanation.
   const errorMessage =
-    conversation.labels?.["omnigent.last_task_error_message"] || SESSION_ERROR_EXPLANATION;
+    conversation.labels?.["omnigent.last_task_error_message"] || "Latest message is an error";
   // One filled dot per state, coloured by theme tokens; forced-colors mode
   // drops author backgrounds, so the dot falls back to the system text colour.
   const dot = (className: string) => (
@@ -3709,16 +3815,10 @@ function SessionTooltipContent({
   const status = (() => {
     switch (state?.kind) {
       case "running":
-        return {
-          key: "working",
-          label: "Working",
-          icon: <RunningDot className="size-3.5" />,
-          tone: "",
-        };
       case "starting":
         return {
-          key: "starting",
-          label: "Starting up",
+          key: state.kind === "running" ? "working" : "starting",
+          label: state.kind === "running" ? "Working" : "Starting up",
           icon: <RunningDot className="size-3.5" />,
           tone: "",
         };
@@ -3761,7 +3861,7 @@ function SessionTooltipContent({
     }
   })();
 
-  const details = (
+  return (
     <>
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
@@ -3771,7 +3871,10 @@ function SessionTooltipContent({
         </span>
       </p>
       {pinnedProject && (
-        <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+        <p
+          data-testid="session-tooltip-project"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
           <ProjectRowIcon icon={pinnedProject.icon} />
           <span className="truncate">{pinnedProject.name}</span>
         </p>
@@ -3781,8 +3884,12 @@ function SessionTooltipContent({
           data-testid="session-tooltip-agent"
           className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
-          <BotIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{conversation.agent_name}</span>
+          {iconAgent ? (
+            <ComposerAgentIcon agent={iconAgent} className="size-3.5" />
+          ) : (
+            <BotIcon aria-hidden className="size-3.5 shrink-0" />
+          )}
+          <span className="truncate">{[agentLabel, effortLabel].filter(Boolean).join(" ")}</span>
         </p>
       )}
       {workspace && (
@@ -3806,7 +3913,7 @@ function SessionTooltipContent({
       </p>
       {conversation.git_branch && (
         <p
-          data-testid={pinnedProject ? "pinned-project-flyout-branch" : "session-tooltip-branch"}
+          data-testid="session-tooltip-branch"
           className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
           <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
@@ -3833,30 +3940,6 @@ function SessionTooltipContent({
         </p>
       )}
     </>
-  );
-
-  return pinnedProject ? (
-    <HoverCardContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      className="flex w-72 max-w-[calc(100vw-2rem)] flex-col gap-1.5"
-      data-testid="pinned-project-flyout"
-    >
-      {details}
-    </HoverCardContent>
-  ) : (
-    <TooltipContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      data-testid="session-tooltip-content"
-      // Match the HoverCard look pinned rows use: title, then muted,
-      // small-icon metadata lines.
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
-    >
-      {details}
-    </TooltipContent>
   );
 }
 
@@ -3895,9 +3978,6 @@ function ConversationRowImpl({
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
   const isProvisionalRow = conversation.provisional === true;
-  // Mobile has no real hover, so a tap that navigates would also trip the
-  // project flyout's HoverCard and leave it lingering over the chat. Gate the
-  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
@@ -3911,6 +3991,7 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -3982,19 +4063,8 @@ function ConversationRowImpl({
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
-  // Pinned sessions are lifted OUT of their project folder into the flat
-  // "Pinned" section, so the row no longer shows which project it belongs to.
-  // For those rows only, surface the project in a hover flyout. Non-pinned
-  // rows already sit inside their project folder, so they don't need it.
-  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
-  // and leave it overlaying the chat after navigation. Forcing null there
-  // routes the row through the plain ContextMenu/link path and restores the
-  // native `title` tooltip.
-  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
-  // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the flyout falls back to the folder glyph for those.
   const projectIconsById = useContext(ProjectIconsContext);
-  const projectFlyoutIcon =
+  const projectIcon =
     conversation.project_id != null
       ? (projectIconsById.get(conversation.project_id) ?? null)
       : null;
@@ -4228,7 +4298,16 @@ function ConversationRowImpl({
   }
 
   function runArchive() {
-    const nextArchived = !isArchived;
+    if (isArchived) {
+      runUnarchive();
+      return;
+    }
+    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+      archiveNow(deleteWorktreeIds.has(conversation.id)),
+    );
+  }
+
+  function archiveNow(deleteWorktree: boolean) {
     // The archive PATCH sends only the flag: the server stops the session (and
     // tears down a host-spawned runner) in the background once it's committed.
     // A client stop too would race that one against the same runner, and the
@@ -4241,15 +4320,20 @@ function ConversationRowImpl({
     // synchronously — not in an onSuccess callback that fires a round-trip
     // later with a stale `isActive`, which used to jump the user off whatever
     // session they'd switched to meanwhile. Mirrors confirmDelete.
-    if (nextArchived && isActive) navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: nextArchived });
+    if (isActive) navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: the optimistic overlay unmounts this row on the next
     // frame, and per-call mutate callbacks don't fire once their observer
     // unmounts. A failed archive reconciles the row back with its own error
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
-    if (nextArchived) showArchiveUndoToast(queryClient, [conversation], navigate);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
+  }
+
+  function runUnarchive() {
+    const nextArchived = !isArchived;
+    archive.mutate({ id: conversation.id, archived: nextArchived });
   }
 
   function confirmLeave() {
@@ -4296,7 +4380,6 @@ function ConversationRowImpl({
     onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
-    stopSession,
     setShareOpen,
     setForkOpen,
     setIsEditing,
@@ -4306,15 +4389,13 @@ function ConversationRowImpl({
     runArchive,
   };
 
-  // One hover card for every row variant; pinned, project-owned rows render it
-  // inside their HoverCard, all others inside a Tooltip.
   const sessionTooltip = (
     <SessionTooltipContent
       conversation={conversation}
       hostsById={hostsById}
       state={sessionState}
       pinnedProject={
-        projectFlyoutName ? { name: projectFlyoutName, icon: projectFlyoutIcon } : null
+        isPinned && currentProject ? { name: currentProject, icon: projectIcon } : null
       }
     />
   );
@@ -4554,6 +4635,7 @@ function ConversationRowImpl({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
+<<<<<<<
           merges its handler onto the Link, preserving left-click / double-click.
           Pinned, project-owned rows nest a HoverCardTrigger around the Link so
           hovering surfaces the project flyout — the trigger sits innermost so
@@ -4585,10 +4667,6 @@ function ConversationRowImpl({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-<<<<<<<
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            {sessionTooltip}
-=======
             {renderContextMenu(<HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>)}
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
@@ -4597,16 +4675,11 @@ function ConversationRowImpl({
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
             />
->>>>>>>
           </HoverCard>
         ) : isMobile ? (
           renderContextMenu(rowLink)
         ) : (
           <Tooltip>
-<<<<<<<
-            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            {sessionTooltip}
-=======
             {renderContextMenu(
               <div className="w-full">
                 <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
@@ -4617,7 +4690,6 @@ function ConversationRowImpl({
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
             />
->>>>>>>
           </Tooltip>
         )}
         {selectionMode ? (
@@ -4674,37 +4746,6 @@ function ConversationRowImpl({
         {!selectionMode && (
           <ContextMenu>
             <ContextMenuTrigger asChild>
-<<<<<<<
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          {sessionTooltip}
-        </HoverCard>
-      ) : isMobile ? (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      ) : (
-        <Tooltip>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <div className="w-full">
-                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-=======
               <div
                 data-testid="conversation-row-controls"
                 className={cn(
@@ -4814,6 +4855,34 @@ function ConversationRowImpl({
                     />
                   </DropdownMenuContent>
                 </DropdownMenu>
+=======
+          merges its handler onto the Link, preserving left-click / double-click. */}
+      {selectionMode ? (
+        isMobile ? (
+          rowLink
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+            {sessionTooltip}
+          </Tooltip>
+        )
+      ) : isMobile ? (
+        <ContextMenu>
+          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+          <ContextMenuContent className="min-w-44">
+            <ConversationMenuItems
+              components={contextBundle}
+              setMenuOpen={() => {}}
+              {...menuItemProps}
+            />
+          </ContextMenuContent>
+        </ContextMenu>
+      ) : (
+        <Tooltip>
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <div className="w-full">
+                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
 >>>>>>>
               </div>
             </ContextMenuTrigger>
@@ -5121,6 +5190,7 @@ function ConversationRowImpl({
           </DialogContent>
         )}
       </Dialog>
+      {archiveWorktreePrompt.dialog}
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
         {leaveOpen && (
           <DialogContent
@@ -5175,32 +5245,26 @@ function ConversationRowImpl({
                 and stops its runner. The conversation and its history are kept.
               </DialogDescription>
             </DialogHeader>
-            {stopSession.isError && (
-              <p className="text-ui text-destructive" role="alert">
-                Couldn't stop the session
-                {stopSession.error instanceof Error && stopSession.error.message
-                  ? `: ${stopSession.error.message}`
-                  : " — it may still be running"}
-                . Try again in a moment.
-              </p>
-            )}
             <DialogFooter>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setStopOpen(false)}
-                disabled={stopSession.isPending}
-              >
+              <Button type="button" variant="ghost" onClick={() => setStopOpen(false)}>
                 Cancel
               </Button>
               <Button
                 type="button"
                 variant="destructive"
                 data-testid="stop-session-confirm"
-                onClick={() =>
-                  stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
-                }
-                loading={stopSession.isPending}
+                onClick={() => {
+                  // Close now and stop in the background — keeping the modal open
+                  // for the whole kill blocks the rest of the sidebar. A failure
+                  // surfaces as a toast since the dialog is already gone.
+                  setStopOpen(false);
+                  stopSession.mutate(conversation.id, {
+                    onError: (err) => {
+                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                      showToast(`Couldn't stop the session${detail}`);
+                    },
+                  });
+                }}
                 componentId="sidebar.conversation.stop"
               >
                 Stop session
@@ -5213,19 +5277,24 @@ function ConversationRowImpl({
   );
 }
 
-// The `conversation` fields the row renders. The comparator below compares
-// these (not object identity), so a live-updates merge that only touches an
-// unrendered field (e.g. an updated_at bump) doesn't re-render the row.
-// Keep in sync with the row + its helpers (conversationDisplayLabel,
-// getSessionState, isOwnedByViewer, isSessionStoppable).
+// Compare rendered fields by value. Keep in sync with the row + its helpers:
+// conversationDisplayLabel, getSessionState, isOwnedByViewer,
+// isSessionStoppable, SessionTooltipDetails.
 const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "id",
   "title",
+  "agent_id",
+  "agent_name",
+  "workspace",
+  "llm_model",
+  "harness_override",
+  "reasoning_effort",
   "archived",
   "status",
   "updated_at",
   "git_branch",
   "host_id",
+  "host_online",
   "runner_id",
   "project_id",
   "owner",
@@ -5410,6 +5479,7 @@ function useProjectFolderMenu(
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  const renameInputRef = useRef<HTMLInputElement>(null);
   // The icon staged in the rename modal, committed only on Confirm:
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
@@ -5456,6 +5526,11 @@ function useProjectFolderMenu(
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent
           onClick={(e) => e.stopPropagation()}
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            renameInputRef.current?.focus();
+            renameInputRef.current?.select();
+          }}
           // emoji-mart preventDefaults the pointer event, so Radix's own
           // outside-dismissal never fires for clicks elsewhere in the modal.
           // Catch them in the capture phase and close the picker ourselves,
@@ -5595,6 +5670,7 @@ function useProjectFolderMenu(
                 </PopoverContent>
               </Popover>
               <input
+                ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
@@ -5956,6 +6032,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
   const { data: projects = [] } = useProjects();
@@ -6076,20 +6153,26 @@ function BulkActionBar({
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
+    const toArchive = nonArchivedSelected;
+    archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
+      archiveNow(toArchive, deleteWorktreeIds),
+    );
+  }
+
+  function archiveNow(toArchive: Conversation[], deleteWorktreeIds: ReadonlySet<string>) {
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
     // flips their cached `archived` flag in onMutate), so this bar unmounts
     // with the selection. Navigate and deselect NOW rather than in a
     // mutate-level callback — a callback on the unmounted observer never fires,
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
-    if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
-      navigate("/", { replace: true });
+    if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
+    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, nonArchivedSelected, navigate);
+    showArchiveUndoToast(queryClient, toArchive, navigate);
   }
 
   function handleUnarchive() {
@@ -6114,6 +6197,7 @@ function BulkActionBar({
 
   return (
     <>
+      {archiveWorktreePrompt.dialog}
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
         <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>
