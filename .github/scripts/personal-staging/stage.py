@@ -27,6 +27,7 @@ be bypassed with --prs-json (how the tests stay offline).
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import json
 import os
@@ -990,6 +991,77 @@ MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
 CANDIDATE_REF_PREFIX = "refs/personal-staging/candidates/"
 
 
+def assert_migration_graph(cwd: str | Path, candidate_sha: str) -> None:
+    """Check literal Alembic metadata without importing untrusted candidate code."""
+    paths = git(cwd, "ls-tree", "-r", "--name-only", candidate_sha, MIGRATIONS_PATH_PREFIX)
+    graph: dict[str, tuple[str, ...]] = {}
+    parents: set[str] = set()
+    for path in paths.stdout.splitlines():
+        if not path.endswith(".py") or path.endswith("/__init__.py"):
+            continue
+        values = {}
+        try:
+            tree = ast.parse(git(cwd, "show", f"{candidate_sha}:{path}").stdout)
+            for node in tree.body:
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                    if isinstance(node, ast.AnnAssign)
+                    else []
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in {
+                        "revision",
+                        "down_revision",
+                        "depends_on",
+                    }:
+                        values[target.id] = ast.literal_eval(node.value)
+            revision = values["revision"]
+            if not isinstance(revision, str) or not revision:
+                raise ValueError("revision must be a nonempty string")
+            links = []
+            for field in ("down_revision", "depends_on"):
+                value = values.get(field)
+                refs = () if value is None else (value,) if isinstance(value, str) else value
+                if not isinstance(refs, (tuple, list)) or any(
+                    not isinstance(ref, str) or not ref for ref in refs
+                ):
+                    raise ValueError(f"invalid {field}")
+                if field == "down_revision":
+                    parents.update(refs)
+                links.extend(refs)
+        except (SyntaxError, ValueError, TypeError, KeyError) as error:
+            raise StageError(f"invalid migration revision metadata in {path}: {error}") from error
+        if revision in graph:
+            raise StageError(f"duplicate migration revision: {revision}")
+        graph[revision] = tuple(links)
+    if not graph:
+        return
+    missing = {parent for links in graph.values() for parent in links} - graph.keys()
+    if missing:
+        raise StageError(f"migration graph has missing parents: {', '.join(sorted(missing))}")
+    visited: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(revision: str) -> None:
+        if revision in visiting:
+            raise StageError(f"migration graph has a cycle at {revision}")
+        if revision in visited:
+            return
+        visiting.add(revision)
+        for parent in graph[revision]:
+            visit(parent)
+        visiting.remove(revision)
+        visited.add(revision)
+
+    for revision in graph:
+        visit(revision)
+    heads = graph.keys() - parents
+    if len(heads) != 1:
+        raise StageError(f"migration graph must have one head; found heads: {sorted(heads)}")
+
+
 def assert_migration_history(
     cwd: str | Path, candidate_sha: str, prev_pin_sha: str | None
 ) -> None:
@@ -1152,6 +1224,7 @@ def publish_candidate(
             f"{candidate_ref} holds {observed}, not the verified candidate {staging_sha}; "
             "refusing to publish"
         )
+    assert_migration_graph(cwd, staging_sha)
     base_fields = {
         key: report[key] for key in ("base_sha", "upstream_sha", "entry_zero") if key in report
     }
@@ -1236,6 +1309,16 @@ def stage(
     if ring == PRODUCTION:
         assert_production_identity(cwd, staging_sha, base_sha, applied)
 
+    prev_pin_sha = (
+        latest_pin_sha(cwd, fork, ring)
+        if ring == PRODUCTION
+        else remote_ref(cwd, fork, f"refs/heads/{ring.branch}") or None
+    )
+    if prev_pin_sha:
+        git(cwd, "fetch", fork, prev_pin_sha)
+    assert_migration_history(cwd, staging_sha, prev_pin_sha)
+    assert_migration_graph(cwd, staging_sha)
+
     if staging_only:
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
         # Composition is byte-reproducible, so an identical remote sha means
@@ -1298,10 +1381,6 @@ def stage(
     # composition mints a different sha and blocks again.
     gate: dict | None = None
     if ring.pin_prefix == "production-":
-        prev_pin_sha = latest_pin_sha(cwd, fork, ring)
-        if prev_pin_sha:
-            git(cwd, "fetch", fork, prev_pin_sha)
-        assert_migration_history(cwd, staging_sha, prev_pin_sha)
         gate = {
             "blocked": False,
             "candidate": staging_sha,

@@ -28,6 +28,7 @@ def git(cwd, *args, check=True):
 
 
 def commit_file(repo: Path, name: str, content: str, msg: str) -> str:
+    (repo / name).parent.mkdir(parents=True, exist_ok=True)
     (repo / name).write_text(content)
     git(repo, "add", name)
     git(repo, "commit", "--no-verify", "-m", msg)
@@ -1669,7 +1670,9 @@ def test_migration_touched_on_add(env):
     """A composition whose upstream..candidate diff adds a migration file is
     schema-changing — caught even with no previous pin to compare against."""
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    pr = env.add_pr(
+        3, f"{MIGRATIONS_DIR}/0001_add.py", "revision = 'first'\ndown_revision = None\n"
+    )
     report = env.run([pr], ring=stage_mod.PRODUCTION)
     assert (
         stage_mod.migration_touched(env.work, report["staging_sha"], report["base_sha"], None)
@@ -1682,7 +1685,9 @@ def test_migration_touched_on_removal(env):
     schema-changing even though upstream..candidate is clean — the second
     diff leg exists precisely for this."""
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    mig = env.add_pr(4, f"{MIGRATIONS_DIR}/0002_drop.py", "rev\n")
+    mig = env.add_pr(
+        4, f"{MIGRATIONS_DIR}/0002_drop.py", "revision = 'first'\ndown_revision = None\n"
+    )
     prev = env.run([mig], ring=stage_mod.PRODUCTION)
 
     other = env.add_pr(5, "plain.txt", "p\n")
@@ -1728,7 +1733,9 @@ def test_production_migration_gate_blocks_push(env):
     nightly stops before its atomic push, so NOTHING lands on the fork, and
     the report says exactly which sha to approve."""
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    pr = env.add_pr(
+        3, f"{MIGRATIONS_DIR}/0001_add.py", "revision = 'first'\ndown_revision = None\n"
+    )
     report = env.run([pr], ring=stage_mod.PRODUCTION)
 
     assert report["pushed"] is False
@@ -1750,7 +1757,9 @@ def test_production_migration_gate_approval_publishes(env):
     """The operator re-dispatch carries the exact candidate sha; composition
     is byte-reproducible, so the approved rerun mints that sha and pushes."""
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    pr = env.add_pr(4, f"{MIGRATIONS_DIR}/0002_add.py", "rev\n")
+    pr = env.add_pr(
+        4, f"{MIGRATIONS_DIR}/0002_add.py", "revision = 'first'\ndown_revision = None\n"
+    )
     blocked = env.run([pr], ring=stage_mod.PRODUCTION)
     assert blocked["migration_gate"]["blocked"] is True
 
@@ -1789,7 +1798,7 @@ def test_production_migration_gate_clean_composes(env):
 def test_published_migration_cannot_be_rewritten_even_with_approval(env, remove):
     path = f"{MIGRATIONS_DIR}/merge.py"
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    old = "revision = 'merge'\ndown_revision = ('project', 'gg')\n"
+    old = "revision = 'merge'\ndown_revision = None\n# gg\n"
     pr = env.add_pr(4, path, old)
     blocked = env.run([pr], ring=stage_mod.PRODUCTION)
     published = env.run([pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"])
@@ -1798,7 +1807,7 @@ def test_published_migration_cannot_be_rewritten_even_with_approval(env, remove)
     if remove:
         prs = []
     else:
-        prs = [env.advance_pr(4, path, old.replace("'gg'", "'gh'"))]
+        prs = [env.advance_pr(4, path, old.replace("# gg", "# gh"))]
     with pytest.raises(stage_mod.StageError, match="published migration history changed"):
         env.run(prs, ring=stage_mod.PRODUCTION)
     candidate = git(env.work, "rev-parse", "HEAD").stdout.strip()
@@ -1818,7 +1827,7 @@ def test_published_merge_can_be_extended_with_a_new_revision(env):
     pr = env.advance_pr(
         4,
         f"{MIGRATIONS_DIR}/new_merge.py",
-        "revision = 'new_merge'\ndown_revision = ('merge', 'gh')\n",
+        "revision = 'new_merge'\ndown_revision = 'merge'\n",
     )
     blocked = env.run([pr], ring=stage_mod.PRODUCTION)
     assert blocked["migration_gate"]["blocked"] is True
@@ -2330,7 +2339,9 @@ def test_migration_gate_checks_new_main_once_then_previous_pin(env, pushes):
     pr = env.add_pr(3, "three.txt", "three\n")
     previous = env.run([pr], ring=stage_mod.PRODUCTION)
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    base = env.add_fork_branch("fork-main", f"{MIGRATIONS_DIR}/fork.py", "fork\n")
+    base = env.add_fork_branch(
+        "fork-main", f"{MIGRATIONS_DIR}/fork.py", "revision = 'fork'\ndown_revision = None\n"
+    )
     git(env.seed, "push", str(env.fork), "fork-main:main")
     pushes.clear()
     blocked = env.run([], ring=stage_mod.PRODUCTION)
@@ -2585,7 +2596,9 @@ def test_publish_candidate_refuses_a_migration_blocked_candidate(env):
     two nothing to publish — and a report that claims otherwise is refused on
     the recorded gate decision."""
     (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
-    pr = env.add_pr(1, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    pr = env.add_pr(
+        1, f"{MIGRATIONS_DIR}/0001_add.py", "revision = 'first'\ndown_revision = None\n"
+    )
     blocked = env.run([pr], ring=stage_mod.PRODUCTION, publish=False)
     assert blocked["migration_gate"]["blocked"] is True
 

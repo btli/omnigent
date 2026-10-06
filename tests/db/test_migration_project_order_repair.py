@@ -42,8 +42,8 @@ def test_upgrade_preserves_projects_and_order_preferences(tmp_path: Path, state:
                     sa.text("UPDATE users SET project_order = :value WHERE id = 'owner'"),
                     {"value": b"existing preference bytes"},
                 )
-            command.upgrade(config, "head")
-            command.upgrade(config, "head")
+            command.upgrade(config, "d29f3a8b5c01")
+            command.upgrade(config, "d29f3a8b5c01")
             column = next(
                 c
                 for c in sa.inspect(connection).get_columns("users")
