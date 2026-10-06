@@ -1114,6 +1114,63 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("routes a skill whose name contains spaces, with and without args", () => {
+    // SKILL.md frontmatter names may carry spaces and parentheses; the
+    // catalog's full name must match, not just the first token.
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    // Menu completion leaves "/<name> " in the composer; Enter must submit it.
+    fireEvent.change(ta, { target: { value: `/${name} ` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "");
+
+    fireEvent.change(ta, { target: { value: `/${name} rewrite this paragraph` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenLastCalledWith(name, "rewrite this paragraph");
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("routes a known skill whose first word is not command-shaped", () => {
+    // The catalog match outranks the "/name" shape guard, so "Node.js" works.
+    const name = "Node.js Best Practices";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Idiomatic Node.js." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: `/${name} for this module` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "for this module");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("prefers a multi-word skill over a built-in matching only its first word", () => {
+    const name = "Help Desk";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Triage a support request." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: `/${name} summarize` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "summarize");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it("routes a known skill whose args carry slashes (paths, URLs)", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
@@ -2374,8 +2431,11 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-settings")).toBeNull();
     expect(trailing.firstElementChild).toContainElement(harnessPicker);
     expect(actions.children).toHaveLength(3);
-    expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
+    expect(workspace).toHaveClass("mx-3", "h-7", "md:h-[37px]", "rounded-t-2xl");
+    expect(textarea().closest("form")).toHaveClass(
+      "px-6",
+      "pb-[max(20px,env(safe-area-inset-bottom))]",
+    );
     // A normal working directory has no empty worktree affordance.
     expect(within(workspace).queryByTestId("composer-git-branch")).toBeNull();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
@@ -3292,6 +3352,29 @@ describe("Composer slash-command highlight overlay", () => {
     expect(overlayText()).toBe(COMMAND_PROMPT);
     expect(textarea()).toHaveClass("text-ui");
     expect(screen.getByTestId("composer-highlight-overlay")).toHaveClass("text-ui");
+  });
+
+  it("tints the full name of a skill with spaces, leaving args default", () => {
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} rewrite this` } });
+    expect(tintedText()).toBe(`/${name}`);
+    expect(overlayText()).toBe(`/${name} rewrite this`);
+  });
+
+  it("tints a known skill whose first word is not command-shaped", () => {
+    const name = "Node.js Best Practices";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Idiomatic Node.js." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} here` } });
+    expect(tintedText()).toBe(`/${name}`);
   });
 
   it("renders no overlay for plain prose", () => {
