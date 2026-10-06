@@ -109,9 +109,9 @@ def _prepare_crdb_schema_transaction(connection: Any, version: Version) -> None:
     connection.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
 
 
-def _crdb_revision_is_supported(db_uri: str, current: str, head: str) -> bool:
-    """Return whether *current* is on the supported CRDB migration segment."""
-    if current == head:
+def _crdb_revisions_are_supported(db_uri: str, current: tuple[str, ...], head: str) -> bool:
+    """The applied branches together must include the CRDB baseline."""
+    if head in current:
         return True
     from alembic.script import ScriptDirectory
 
@@ -120,7 +120,8 @@ def _crdb_revision_is_supported(db_uri: str, current: str, head: str) -> bool:
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
     revisions = script.iterate_revisions(head, CRDB_BASELINE_REVISION)
-    return current in {revision.revision for revision in revisions} | {CRDB_BASELINE_REVISION}
+    supported = {revision.revision for revision in revisions} | {CRDB_BASELINE_REVISION}
+    return bool(set(current) & supported)
 
 
 def _start_or_resume_crdb_bootstrap(
@@ -323,11 +324,11 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
 
     for revision in revisions:
         _verify_db_revision_is_supported(db_uri, revision, head)
-        if not _crdb_revision_is_supported(db_uri, revision, head):
-            raise RuntimeError(
-                f"CockroachDB schema revision {revision!r} predates Omnigent's CRDB "
-                f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
-            )
+    if not _crdb_revisions_are_supported(db_uri, revisions, head):
+        raise RuntimeError(
+            f"CockroachDB schema revision {current!r} predates Omnigent's CRDB "
+            f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
+        )
     if revisions != (head,):
         _logger.warning(
             "CockroachDB schema is out of date (found revision %r, expected %r); "

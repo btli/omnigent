@@ -72,7 +72,11 @@ def test_account_revocation_migration_preserves_identity_and_grants(tmp_path: Pa
 
 @pytest.mark.parametrize("column", ["account_generation", "deleted_at"])
 def test_mysql_account_migration_resumes_after_committed_column(db_uri, column):
-    from omnigent.db.utils import _get_current_db_revision, _initialize_or_verify_schema
+    from omnigent.db.utils import (
+        _get_current_db_revision,
+        _get_current_db_revisions,
+        _initialize_or_verify_schema,
+    )
     from omnigent.server.accounts_store import SqlAlchemyAccountStore
     from omnigent.server.device_grant_store import DeviceGrantStore
 
@@ -106,7 +110,7 @@ def test_mysql_account_migration_resumes_after_committed_column(db_uri, column):
         assert str(exc.value.__cause__) == "injected interruption after committed column"
     finally:
         sa.event.remove(engine, "after_cursor_execute", interrupt)
-    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert "hh1b2c3d4e5f" in _get_current_db_revisions(engine)
     assert column in {c["name"] for c in sa.inspect(engine).get_columns("users")}
     _initialize_or_verify_schema(engine, db_uri)
     account = accounts.get_user("migration-user")
