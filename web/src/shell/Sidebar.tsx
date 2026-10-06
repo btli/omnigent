@@ -4280,6 +4280,11 @@ function ConversationRowImpl({
     showArchiveUndoToast(queryClient, [conversation], navigate);
   }
 
+  function runUnarchive() {
+    const nextArchived = !isArchived;
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+  }
+
   function confirmLeave() {
     // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
     // gated on the row NOT being owned by the viewer, which is only decidable
