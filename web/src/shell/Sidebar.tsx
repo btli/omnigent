@@ -4959,6 +4959,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "llm_model",
   "harness_override",
   "reasoning_effort",
+  "parent_session_id",
   "archived",
   "status",
   "updated_at",
