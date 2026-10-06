@@ -1924,7 +1924,7 @@ describe("Sidebar session list", () => {
       },
     );
 
-    it("uses the resolved harness for the icon, effort and model catalog key", async () => {
+    it("uses the resolved harness for the icon and catalog while preserving actual wrapper effort", async () => {
       agentsRef.current = [
         {
           id: "ag_native",
@@ -1975,7 +1975,7 @@ describe("Sidebar session list", () => {
         return source;
       }
       const claudeSource = await checkRow("native_claude", "Claude Code Medium", "claude-native");
-      const cursorSource = await checkRow("native_cursor", "Cursor", "cursor-native");
+      const cursorSource = await checkRow("native_cursor", "Cursor Medium", "cursor-native");
       expect(claudeSource).not.toBe(cursorSource);
       expect(
         fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),

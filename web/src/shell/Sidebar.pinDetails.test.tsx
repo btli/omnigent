@@ -13,9 +13,12 @@ import * as identity from "@/lib/identity";
 import { getSession } from "@/lib/sessionsApi";
 import { clearOptimisticTitles } from "@/lib/optimisticTitles";
 import { clearSessionDrafts } from "@/lib/sessionDrafts";
+import { buildComposerSessionDescriptor, composerModelChipLabel } from "@/lib/composerModelLabel";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+
+const listRows = vi.hoisted(() => ({ current: [] as ConversationsModule.Conversation[] }));
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
@@ -24,7 +27,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
   return {
     ...actual,
     ...conversationHooksMock(),
-    useConversations: () => conversationPage([]),
+    useConversations: () => conversationPage(listRows.current),
     usePinnedConversations: actual.usePinnedConversations,
     useTogglePinnedConversation: actual.useTogglePinnedConversation,
   };
@@ -39,6 +42,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: () => ({ data
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 beforeEach(() => {
+  listRows.current = [];
   localStorage.clear();
   resetReadStateForTests();
   clearSessionDrafts();
@@ -170,7 +174,7 @@ describe("header-pinned detail-only session tooltip", () => {
     },
   );
 
-  it("shows a cached native model override before any model is reported or list reconciles", async () => {
+  it("shows a cached model override instead of the spec model before reporting or reconciliation", async () => {
     const wire = {
       id: "conv_override",
       agent_id: "ag_native",
@@ -179,7 +183,7 @@ describe("header-pinned detail-only session tooltip", () => {
       created_at: 100,
       status: "running",
       harness: "claude-native",
-      llm_model: null,
+      llm_model: "spec-model",
       model_override: "opus[1m]",
       reasoning_effort: "medium",
       host_id: "host_detail",
@@ -204,7 +208,7 @@ describe("header-pinned detail-only session tooltip", () => {
       return Promise.resolve(new Response(JSON.stringify(wire)));
     });
     const session = await getSession(wire.id);
-    expect(session.llmModel).toBeNull();
+    expect(session.llmModel).toBe(wire.llm_model);
     expect(session.modelOverride).toBe(wire.model_override);
     const client = new QueryClient({
       defaultOptions: {
@@ -268,6 +272,158 @@ describe("header-pinned detail-only session tooltip", () => {
           JSON.stringify({ ...wire, labels: { ...wire.labels, "omnigent.pinned": "123" } }),
         ),
       ),
+    );
+    client.clear();
+  });
+
+  it("matches the composer and normal list row effort for a label-less detail-only Devin pin", async () => {
+    const wire = {
+      id: "conv_devin_detail",
+      agent_id: "ag_devin",
+      agent_name: "devin-native-ui",
+      title: "Detail-only Devin",
+      created_at: 100,
+      status: "running",
+      harness: "devin-native",
+      llm_model: "devin-model",
+      reasoning_effort: "high",
+      host_id: "host_detail",
+      host_online: true,
+      labels: {},
+    };
+    const modelOptions = [
+      {
+        id: "devin-model",
+        displayName: "Devin model",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      },
+    ];
+    let resolvePatch!: (response: Response) => void;
+    const patch = new Promise<Response>((resolve) => {
+      resolvePatch = resolve;
+    });
+    const fetchSpy = vi.spyOn(identity, "authenticatedFetch").mockImplementation((url, init) => {
+      if (init?.method === "PATCH") return patch;
+      if (String(url).includes("/model-options")) {
+        return Promise.resolve(new Response(JSON.stringify({ models: modelOptions })));
+      }
+      return Promise.resolve(new Response(JSON.stringify(wire)));
+    });
+    const session = await getSession(wire.id);
+    const normalRow: ConversationsModule.Conversation = {
+      id: "conv_devin_list",
+      object: "conversation",
+      title: "Listed Devin",
+      created_at: 100,
+      updated_at: 100,
+      labels: {},
+      permission_level: null,
+      agent_id: wire.agent_id,
+      agent_name: wire.agent_name,
+      host_id: wire.host_id,
+      host_online: true,
+      harness_override: null,
+      llm_model: wire.llm_model,
+      reasoning_effort: wire.reasoning_effort,
+      status: "running",
+    };
+    listRows.current = [normalRow];
+    const chipInputs = {
+      modelSummary: "Devin model",
+      nativeDisplayName: "Devin",
+      model: session.llmModel,
+      modelOptions,
+      effort: session.reasoningEffort,
+    };
+    const composerChip = composerModelChipLabel({
+      ...chipInputs,
+      session: buildComposerSessionDescriptor(
+        session.harness,
+        session.labels,
+        session.parentSessionId,
+        session.inferenceConfigured,
+      ),
+    });
+    const listChip = composerModelChipLabel({
+      ...chipInputs,
+      session: buildComposerSessionDescriptor(
+        "devin-native",
+        normalRow.labels,
+        normalRow.parent_session_id,
+      ),
+    });
+    expect(composerChip).toEqual({ label: "Devin model", effortLabel: null });
+    expect(listChip).toEqual(composerChip);
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    client.setQueryData(["session", session.id], session);
+    client.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations: [], filterHonored: true });
+    render(
+      <QueryClientProvider client={client}>
+        <SidebarDataProvider>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[`/c/${session.id}`]}>
+                <Sidebar open onClose={vi.fn()} />
+                <HeaderConversationMenu
+                  conversation={{
+                    id: session.id,
+                    object: "conversation",
+                    title: session.title,
+                    labels: {},
+                    created_at: session.createdAt,
+                    updated_at: session.createdAt,
+                    permission_level: session.permissionLevel,
+                  }}
+                  currentProject={null}
+                  canShare={false}
+                  canFork={false}
+                  onShare={vi.fn()}
+                  onFork={vi.fn()}
+                />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.focus(screen.getByRole("link", { name: normalRow.title! }));
+    const listedTooltip = await screen.findByTestId("session-tooltip-content");
+    await waitFor(() =>
+      expect(
+        within(listedTooltip).getAllByTestId("session-tooltip-agent")[0].querySelector("span"),
+      ).toHaveTextContent(/^Devin model$/),
+    );
+    fireEvent.blur(screen.getByRole("link", { name: normalRow.title! }));
+    await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+    fireEvent.pointerDown(screen.getByTestId("header-conversation-actions"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(screen.getByTestId("header-pin-conversation"));
+    fireEvent.focus(await screen.findByRole("link", { name: session.title! }));
+    const pinnedTooltip = await screen.findByTestId("session-tooltip-content");
+    expect(
+      within(pinnedTooltip).getAllByTestId("session-tooltip-agent")[0].querySelector("span"),
+    ).toHaveTextContent(/^Devin model$/);
+    const pinnedRow = client
+      .getQueryData<ConversationsModule.PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.find((row) => row.id === session.id);
+    expect(pinnedRow?.labels["omnigent.wrapper"]).toBeUndefined();
+    expect(pinnedRow?.harness_override).toBe(session.harness);
+    expect(
+      fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+    ).toHaveLength(1);
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).startsWith("/v1/sessions?"))).toBe(
+      false,
+    );
+    expect(client.getQueriesData({ queryKey: ["conversations"] })).toHaveLength(0);
+    await act(async () =>
+      resolvePatch(new Response(JSON.stringify({ ...wire, labels: { "omnigent.pinned": "123" } }))),
     );
     client.clear();
   });
