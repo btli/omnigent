@@ -1898,7 +1898,11 @@ describe("touch swipe actions", () => {
 
     // Archiving is a single PATCH — the server stops the runner once the flag
     // commits, so a client-side stop would race it (see runArchive).
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.stopSession.mutate).not.toHaveBeenCalled();
     // Archive never routes through delete.
@@ -1929,7 +1933,11 @@ describe("touch swipe actions", () => {
     }
 
     pointerEventAt("pointerUp", li, { clientX: 10, clientY: 100 }, 1_500);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
     expect(screen.queryByText("Delete conversation?")).toBeNull();
     expect(within(li).queryByTestId("conversation-swipe-reveal")).toBeNull();
     requestFrame.mockRestore();
@@ -2100,13 +2108,21 @@ describe("touch swipe actions", () => {
     const firstRender = renderSidebar();
 
     swipeRow(90);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
 
     mocks.archive.mutate.mockClear();
     firstRender.unmount();
     renderSidebar();
     swipeRow(-90);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
   });
 
   it("keeps the action captured when the gesture began if Settings changes mid-swipe", () => {
@@ -2488,7 +2504,11 @@ describe("touch swipe actions", () => {
       if (action === "delete") {
         expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
       } else {
-        expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+        expect(mocks.archive.mutate).toHaveBeenCalledWith({
+          id: "conv_1",
+          archived: true,
+          deleteWorktree: false,
+        });
       }
     },
   );
