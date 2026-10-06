@@ -156,7 +156,6 @@ export {
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   SessionSharedContext,
-  UserMessageNavConnected,
   WORKING_MESSAGES,
   WorkingIndicator,
   bubbleKey,
@@ -204,6 +203,7 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  matchSlashCommandInvocation,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -334,15 +334,19 @@ export function isSubagentRoutingEligible(
 const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
 
 /**
- * Split a command or skill draft for the composer highlight overlay.
- * Returns null for prose and file paths such as `/etc/hosts`.
+ * Split a command or skill draft for the composer highlight overlay. The token
+ * is a known `commands` entry's full name (it may contain spaces or punctuation),
+ * else the first `/command`-shaped word. Null for prose and paths like `/etc/hosts`.
  */
 export function splitSlashCommand(
   value: string,
+  commands: Iterable<string> = [],
 ): { before: string; token: string; after: string } | null {
-  const m = SLASH_COMMAND_SPLIT_RE.exec(value);
-  if (!m) return null;
-  const [, before, token] = m;
+  const token =
+    matchSlashCommandInvocation(value, commands)?.command ??
+    SLASH_COMMAND_SPLIT_RE.exec(value)?.[2];
+  if (token === undefined) return null;
+  const before = /^\s*/.exec(value)?.[0] ?? "";
   return { before, token, after: value.slice(before.length + token.length) };
 }
 
@@ -2791,6 +2795,7 @@ function ComposerImpl(
       supportsModelReset,
     ],
   );
+  const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
@@ -2808,7 +2813,7 @@ function ComposerImpl(
     draft.quotes.length === 0 &&
     files.length === 0 &&
     hasCommandPrefix &&
-    splitSlashCommand(value) !== null;
+    splitSlashCommand(value, slashCommandNames) !== null;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3337,25 +3342,34 @@ function ComposerImpl(
       );
     };
 
-    // Slash command path: the first token must read as "/name" (the shared
-    // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
-    // match, while args after the name may carry paths or URLs, e.g.
-    // "/review-pr https://github.com/...").
-    // Commands don't mix with file attachments — require no files. Built-ins
-    // run locally; a known skill routes through ``onSendSlashCommand`` (a
-    // ``slash_command`` event) when that's wired — i.e. in-process sessions.
-    // Anything else (unknown command, or a skill on a native-terminal
-    // session where ``onSendSlashCommand`` is undefined) falls through to the
-    // plaintext send path below.
+    // Slash command path: text that reads as "/name ..." (not a file path) or
+    // invokes a known catalog skill by its full name, with no attachments.
+    // Built-ins run locally; anything unhandled falls through to plaintext.
+    const skill = onSendSlashCommand
+      ? matchSlashCommandInvocation(trimmed, slashCommandNames)
+      : null;
     if (
       draft.quotes.length === 0 &&
-      isSlashCommandText(trimmed) &&
+      (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
       mentionedItems.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
+      const sendSkill = (match: { command: string; args: string }) => {
+        appendEntry(trimmed);
+        onSendSlashCommand?.(match.command.slice(1), match.args);
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+      };
+      // A multi-word catalog skill outranks a built-in that matches only its
+      // first word: "/Help Desk summarize" invokes the skill, not /help.
+      if (skill !== null && skill.command !== parts[0]) {
+        sendSkill(skill);
+        return;
+      }
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
       // vendor TUI, which the web UI can't render — the session just blocks. Open
@@ -3395,20 +3409,11 @@ function ComposerImpl(
         openGenericSideChat(trimmed.slice(cmd.length).trim());
         return;
       }
-      // Known skill on an in-process session: send a `slash_command` event
-      // (the REPL's wire shape) so the server resolves the skill and
-      // injects its instructions, instead of the agent seeing the literal
-      // "/name" text. `parts[0]` keeps the original case for the server's
-      // exact-name lookup. `onSendSlashCommand` is undefined for
-      // native-terminal sessions, so those fall through to the plaintext
-      // path below and the vendor TUI loads the skill itself.
-      if (onSendSlashCommand && parts[0] in slashCommands) {
-        const skillArgs = trimmed.slice(parts[0].length).trim();
-        appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
-        dirtyRef.current = true;
-        setValue("");
-        setCommandError(null);
+      // Known skill on an in-process session: send a `slash_command` event so
+      // the server resolves it. Native-terminal sessions have no
+      // `onSendSlashCommand`; their vendor TUI loads the skill from plaintext.
+      if (skill !== null) {
+        sendSkill(skill);
         return;
       }
     }
@@ -3594,7 +3599,7 @@ function ComposerImpl(
   return (
     <form
       onSubmit={handleSubmit}
-      className="chat-composer-form relative px-4 pb-[max(20px,env(safe-area-inset-bottom))] md:px-6"
+      className="chat-composer-form relative px-6 pb-[max(20px,env(safe-area-inset-bottom))]"
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -3849,7 +3854,7 @@ function ComposerImpl(
               className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
             >
               {(() => {
-                const split = splitSlashCommand(value);
+                const split = splitSlashCommand(value, slashCommandNames);
                 if (!split) return value;
                 return (
                   <>
