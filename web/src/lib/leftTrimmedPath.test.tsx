@@ -66,6 +66,28 @@ describe("useLeftTrimmedPath", () => {
     expect(screen.getByTestId("path")).toHaveTextContent(/^…\/omnigent-worktrees\/fix-sse$/);
   });
 
+  it.each([80, 120])("trims a %i-segment path in one layout pass", (segmentCount) => {
+    boxWidth = 240;
+    const segments = Array.from(
+      { length: segmentCount },
+      (_, index) => `folder-${String(index).padStart(3, "0")}`,
+    );
+    let renderCount = 0;
+    function DeepHarness() {
+      renderCount += 1;
+      const { ref, text } = useLeftTrimmedPath<HTMLSpanElement>(`/${segments.join("/")}`);
+      return (
+        <span data-testid="path" ref={ref}>
+          {text}
+        </span>
+      );
+    }
+    expect(() => render(<DeepHarness />)).not.toThrow();
+    expect(screen.getByTestId("path").textContent).toBe(`…/${segments.slice(-2).join("/")}`);
+    expect(renderCount).toBeLessThanOrEqual(3);
+    expect(screen.getAllByTestId("path")).toHaveLength(1);
+  });
+
   it("stops at the final folder even when it still overflows", () => {
     boxWidth = 40;
     render(<Harness path="/Users/me/a-very-long-final-folder-name" />);
