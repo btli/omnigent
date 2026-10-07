@@ -26,7 +26,18 @@ import { fusionModelLabel, isFusionModelUid } from "@/lib/devinFusion";
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
-// Native routing also needs a router source that can serve the host family.
+/**
+ * Whether the session's own model can be routed per turn.
+ *
+ * SDK/bundle agent sessions need only the deployment flag. Native Claude
+ * Code / Codex panes ARE routable per turn — the server injects the routed
+ * pick via ``/model`` when ``cost_control_mode_override`` is on, the same
+ * apparatus the create-time gear arms — but only when a router can answer
+ * for their family (the server rejects a routing-on create otherwise): the
+ * external AI-Gateway router needs the family's inference gateway-backed on
+ * the session's host, and the built-in judge covers the rest. An absent
+ * host row reads as backed, mirroring {@link hostBacksHarnessWithGateway}.
+ */
 export function isCostRoutingEligible(
   serverInfo: ServerInfo | "loading",
   // Only the fields the guards below read, so a temp/optimistic session can be
