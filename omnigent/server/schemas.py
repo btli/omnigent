@@ -2808,6 +2808,9 @@ class SessionListItem(BaseModel):
     host_online: bool | None = None
     llm_model: str | None = None
     harness_override: str | None = None
+    # Omitted for nonchildren/overrides; present null means the child could not resolve.
+    child_harness: str | None = None
+    cost_control_mode_override: str | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
     owner: str | None = None

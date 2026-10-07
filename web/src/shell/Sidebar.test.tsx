@@ -1524,10 +1524,10 @@ describe("Sidebar session list", () => {
         const second = await screen.findByTestId("session-tooltip-content");
         await waitFor(() =>
           expect(within(second).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
-            /^Opus 5.5 1M Medium$/,
+            failed ? /^Claude Code Medium$/ : /^Opus 5.5 1M Medium$/,
           ),
         );
-        expect(calls()).toHaveLength(failed ? 2 : 1);
+        expect(calls()).toHaveLength(1);
         fetchSpy.mockRestore();
         vi.mocked(Date.now).mockRestore();
       },
@@ -1781,6 +1781,171 @@ describe("Sidebar session list", () => {
         fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
       ).toHaveLength(0);
     });
+
+    it.each([
+      ["codex-native", "Codex High", true],
+      ["codex", "Bundle · Codex", false],
+      [null, "bundle", false],
+      [undefined, "Bundle · Claude SDK", false],
+    ] as const)(
+      "uses the server child harness %s without inheriting the bundle",
+      async (harness, expected, catalog) => {
+        agentsRef.current = [
+          {
+            id: "ag_bundle",
+            name: "bundle",
+            display_name: "Bundle",
+            harness: "claude-sdk",
+            description: null,
+            skills: [],
+          },
+        ];
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_child", name: "Laptop", status: "online" }],
+        });
+        const fetchSpy = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
+        const tooltip = await hoverTooltip(
+          conv("child_row", "bundle", {
+            agent_id: "ag_bundle",
+            parent_session_id: "parent",
+            host_id: "host_child",
+            llm_model: "model",
+            reasoning_effort: "high",
+            ...(harness === undefined ? {} : { child_harness: harness }),
+          }),
+        );
+        const line = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(line).toHaveTextContent(new RegExp(`^${expected}$`));
+        const descriptor = buildComposerSessionDescriptor(harness ?? "claude-sdk", {}, "parent");
+        expect(composerModelChipLabel({ session: descriptor, effort: "high" }).effortLabel).toBe(
+          harness === "codex-native" ? "High" : null,
+        );
+        if (harness === null) {
+          expect(line.querySelector(".lucide-bot")).not.toBeNull();
+          expect(line.querySelector("img")).toBeNull();
+        }
+        if (harness === "codex-native")
+          expect(line.querySelector("[data-harness-icon='codex']")).not.toBeNull();
+        await waitFor(() =>
+          expect(
+            fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+          ).toHaveLength(catalog ? 1 : 0),
+        );
+        if (catalog)
+          expect(
+            String(fetchSpy.mock.calls.find(([url]) => String(url).includes("/model-options"))![0]),
+          ).toContain("/harnesses/codex-native/model-options");
+      },
+    );
+
+    it("updates routing parity on a mode-only change without querying the catalog", async () => {
+      const info = {
+        ...FALLBACK_SERVER_INFO,
+        smart_routing_enabled: true,
+        smart_routing_sources: { external: true, oss: false },
+      };
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_routing", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation(
+          async () =>
+            new Response(JSON.stringify({ models: [{ id: "opus", displayName: "Opus" }] })),
+        );
+      const session = conv("routing_row", "claude-native-ui", {
+        host_id: "host_routing",
+        llm_model: "opus",
+        reasoning_effort: "high",
+        cost_control_mode_override: "on",
+        updated_at: 100,
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      });
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <CapabilitiesProvider info={info}>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                </MemoryRouter>
+              </TooltipProvider>
+            </CapabilitiesProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: "routing_row" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+        /^Smart Routing$/,
+      );
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+      mockConversations([{ ...session, cost_control_mode_override: "off" }]);
+      rerender(tree());
+      await waitFor(() =>
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          /^Opus High$/,
+        ),
+      );
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(1);
+    });
+
+    it.each(["codex", undefined] as const)(
+      "refreshes an open child tooltip after a %s harness-only metadata update",
+      async (initialHarness) => {
+        agentsRef.current = [
+          {
+            id: "ag_bundle",
+            name: "bundle",
+            display_name: "Bundle",
+            harness: "claude-sdk",
+            description: null,
+            skills: [],
+          },
+        ];
+        const session = conv("child_metadata", "bundle", {
+          agent_id: "ag_bundle",
+          parent_session_id: "parent",
+          ...(initialHarness === undefined ? {} : { child_harness: initialHarness }),
+          updated_at: 100,
+        });
+        mockConversations([session]);
+        const client = new QueryClient();
+        const tree = () => (
+          <QueryClientProvider client={client}>
+            <SidebarDataProvider>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                </MemoryRouter>
+              </TooltipProvider>
+            </SidebarDataProvider>
+          </QueryClientProvider>
+        );
+        const { rerender } = render(tree());
+        fireEvent.focus(screen.getByRole("link", { name: "child_metadata" }));
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          initialHarness === undefined ? /^Bundle · Claude SDK$/ : /^Bundle · Codex$/,
+        );
+        mockConversations([{ ...session, child_harness: undefined }]);
+        rerender(tree());
+        await waitFor(() =>
+          expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+            /^bundle$/,
+          ),
+        );
+      },
+    );
 
     it("keeps the native wrapper icon, model and effort for an auto harness override", async () => {
       useHostsMock.mockReturnValue({
@@ -2352,6 +2517,19 @@ describe("Sidebar session list", () => {
       expect(within(flyout).getByTestId("session-tooltip-agent")).toHaveTextContent(/^aria$/);
       expect(within(flyout).getByTestId("session-tooltip-cwd")).toHaveTextContent("/srv/repo");
       expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Working$/);
+    });
+
+    it("hides the project line on an unpinned row inside a project folder", async () => {
+      projectsMock.push("Customer X");
+      mockConversations([
+        conv("project_unpinned", "aria", { labels: { omni_project: "Customer X" } }),
+      ]);
+      renderSidebar();
+      fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      fireEvent.focus(screen.getByRole("link", { name: "project_unpinned" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      expect(within(tooltip).queryByTestId("session-tooltip-project")).toBeNull();
+      expect(tooltip).toHaveTextContent("project_unpinned");
     });
 
     it("hides unknown lines on a pinned session instead of filling them in", async () => {

@@ -1096,6 +1096,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    child_harnesses: Mapping[str, str | None] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1112,7 +1113,7 @@ def _build_session_list_item(
         non-``None`` ``agent_id`` (i.e. be a session, not a plain
         conversation) — the caller filters these out beforehand.
     :param agent_names_by_id: Map from agent id to display name, as
-        returned by ``agent_store.get_names()``,
+        prepared from ``agent_store.get_list_metadata()``,
         e.g. ``{"ag_abc": "research-agent"}``.
     :param grants: All permission grants for this conversation, as
         returned by ``permission_store.list_for_sessions()[conv.id]``.
@@ -1166,6 +1167,12 @@ def _build_session_list_item(
         host_id=conv.host_id,
         llm_model=concrete_reported_model(conv.reported_model) or conv.model_override,
         harness_override=conv.harness_override,
+        cost_control_mode_override=conv.cost_control_mode_override,
+        **(
+            {"child_harness": (child_harnesses or {}).get(conv.id)}
+            if conv.sub_agent_name and not conv.harness_override
+            else {}
+        ),
         reasoning_effort=conv.reasoning_effort,
         permission_level=level,
         owner=owner,
@@ -1200,6 +1207,16 @@ def _build_session_list_item(
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
     )
+
+
+def _dump_session_list_item(item: SessionListItem, *, full: bool = False) -> dict[str, Any]:
+    """A present null child answer means unresolved, not an old-server fallback."""
+    wire = item.model_dump(exclude={"search_snippet"} if full else set(), exclude_none=not full)
+    if "child_harness" in item.model_fields_set:
+        wire["child_harness"] = item.child_harness
+    else:
+        wire.pop("child_harness", None)
+    return wire
 
 
 def _publish_subtree_cost_to_ancestors(
