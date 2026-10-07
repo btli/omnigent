@@ -1,0 +1,587 @@
+// Interactive 3D preview for STL / 3MF / OBJ / glTF / GLB files.
+//
+// Mirrors the ImageViewer pattern in CodeViewer: it takes the already-fetched
+// FileContentResponse, decodes it via the shared `fileContentToBlob`, and
+// renders it. When the envelope is truncated (the file is past the server's
+// read cap), the full bytes come from the uncapped download stream instead.
+// three.js is imported at this module's top level so the lazy
+// dynamic import in CodeViewer keeps the whole 3D stack out of the main bundle
+// (same strategy as Monaco).
+//
+// The whole three.js scene is torn down on unmount (and on any init failure) —
+// geometry, materials, renderer, the animation frame, and the WebGL context are
+// all released so repeatedly opening model files can't leak GPU memory.
+
+import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import * as THREE from "three";
+import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
+import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
+import { applyThreeMfColors } from "./threeMfColors";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { Progress } from "@/components/ui/progress";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  fetchWorkspaceFileBytes,
+  type FileContentResponse,
+  fileContentToBlob,
+  type WorkspaceFileDownloadProgress,
+} from "@/hooks/useFileContent";
+import { formatBytes } from "./fileStatusUtils";
+import {
+  type ModelFormat,
+  type ModelViewerTheme,
+  getModelFormat,
+  modelViewerTheme,
+} from "./codeViewerHelpers";
+
+// What parseModel produces: the object to add to the scene, plus a handle to
+// the STL default material when we created one. The material handle lets the
+// theme-update effect recolor STL surfaces live; other formats carry their own
+// materials, so we never touch those.
+interface ParsedModel {
+  object: THREE.Object3D;
+  stlMaterial: THREE.MeshStandardMaterial | null;
+}
+
+const GENERIC_MODEL_ERROR = "Unable to render 3D model.";
+const MODEL_SIZE_ERROR = "Model exceeds the 256 MiB preview limit — download it to view.";
+const EXTERNAL_GLTF_ERROR =
+  "This glTF references external files, which preview does not support yet — download it to view.";
+
+class ExternalGltfResourceError extends Error {
+  constructor() {
+    super(EXTERNAL_GLTF_ERROR);
+    this.name = "ExternalGltfResourceError";
+  }
+}
+
+interface GltfDocument {
+  buffers?: { uri?: unknown }[];
+  images?: { uri?: unknown }[];
+}
+
+function gltfDocument(buffer: ArrayBuffer): GltfDocument {
+  const view = new DataView(buffer);
+  let jsonBytes: Uint8Array;
+  if (buffer.byteLength >= 20 && view.getUint32(0, true) === 0x46546c67) {
+    const jsonLength = view.getUint32(12, true);
+    const jsonType = view.getUint32(16, true);
+    if (jsonType !== 0x4e4f534a || 20 + jsonLength > buffer.byteLength) {
+      throw new Error("Invalid GLB JSON chunk");
+    }
+    jsonBytes = new Uint8Array(buffer, 20, jsonLength);
+  } else {
+    jsonBytes = new Uint8Array(buffer);
+  }
+  return JSON.parse(new TextDecoder().decode(jsonBytes).replace(/^\uFEFF/, "")) as GltfDocument;
+}
+
+function assertSelfContainedGltf(buffer: ArrayBuffer): void {
+  const document = gltfDocument(buffer);
+  const references = [...(document.buffers ?? []), ...(document.images ?? [])];
+  if (references.some(({ uri }) => typeof uri === "string" && !/^data:/i.test(uri))) {
+    throw new ExternalGltfResourceError();
+  }
+}
+
+// What the loading overlay shows until the first render or an error.
+type LoadState =
+  ({ phase: "downloading" } & WorkspaceFileDownloadProgress) | { phase: "processing" };
+
+function initialLoadState(data: FileContentResponse): LoadState {
+  return data.truncated
+    ? { phase: "downloading", receivedBytes: 0, totalBytes: null }
+    : { phase: "processing" };
+}
+
+function loadLabel(state: LoadState): string {
+  return state.phase === "downloading" ? "Downloading model…" : "Preparing model…";
+}
+
+function downloadDetail({ receivedBytes, totalBytes }: WorkspaceFileDownloadProgress) {
+  if (totalBytes !== null && receivedBytes <= totalBytes) {
+    const percent = Math.floor((receivedBytes / totalBytes) * 100);
+    return {
+      percent,
+      detail: `${percent}% · ${formatBytes(receivedBytes)} of ${formatBytes(totalBytes)}`,
+    };
+  }
+  return {
+    percent: null,
+    detail: receivedBytes > 0 ? `${formatBytes(receivedBytes)} received` : null,
+  };
+}
+
+// Resolves after the next paint, so a status change shows before a long synchronous parse.
+function afterNextPaint(): Promise<void> {
+  // A hidden tab never paints; waiting would only defer the parse until the user returns.
+  if (document.visibilityState === "hidden") return Promise.resolve();
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+}
+
+function ModelLoadingOverlay({ state }: { state: LoadState }) {
+  const { percent, detail } =
+    state.phase === "downloading" ? downloadDetail(state) : { percent: null, detail: null };
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background/80 p-8 text-center text-muted-foreground text-ui">
+      <Spinner className="size-5" aria-hidden="true" />
+      {/* Announced through the viewer's live region; this copy is visual only. */}
+      <p aria-hidden="true">{loadLabel(state)}</p>
+      {percent !== null && (
+        // The shared Progress wrapper drives only the bar, so the ARIA value is set here.
+        <Progress
+          value={percent}
+          aria-valuenow={percent}
+          className="w-48 max-w-full"
+          aria-label="Model download progress"
+        />
+      )}
+      {detail && <p className="tabular-nums">{detail}</p>}
+    </div>
+  );
+}
+
+function modelErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.name === "WorkspaceFilePreviewTooLargeError") {
+    return MODEL_SIZE_ERROR;
+  }
+  if (error instanceof Error && error.name === "ExternalGltfResourceError") {
+    return EXTERNAL_GLTF_ERROR;
+  }
+  return GENERIC_MODEL_ERROR;
+}
+
+/**
+ * Parse raw model bytes into a three.js Object3D for the given format.
+ *
+ * The `format` comes from the shared `getModelFormat` resolver — the same one
+ * that decides dispatch — so the parser only ever sees a format the viewer was
+ * routed for. STL and 3MF are parsed from an ArrayBuffer; OBJ and JSON glTF are
+ * text. The STL/3MF/OBJ loaders parse synchronously; GLTFLoader is
+ * callback-based, so it is wrapped in a promise and a malformed file rejects
+ * the same way the sync loaders throw — the caller surfaces the error state.
+ * GLB and self-contained glTF parse fully from the buffer. External glTF
+ * resources are not resolved through the workspace filesystem.
+ *
+ * STL carries no material, so we give it a theme-derived surface (`theme`);
+ * the returned `stlMaterial` handle lets the caller recolor it on a theme
+ * toggle without reparsing.
+ */
+export async function parseModel(
+  format: ModelFormat,
+  buffer: ArrayBuffer,
+  theme: ModelViewerTheme,
+): Promise<ParsedModel> {
+  // Print formats use Z-up coordinates; convert them once at the parsed root.
+  if (format === "stl") {
+    const geometry = new STLLoader().parse(buffer);
+    const material = new THREE.MeshStandardMaterial({
+      color: theme.stlMaterial,
+      metalness: 0.1,
+      roughness: 0.6,
+    });
+    const object = new THREE.Mesh(geometry, material);
+    object.rotation.x = -Math.PI / 2;
+    return { object, stlMaterial: material };
+  }
+  if (format === "3mf") {
+<<<<<<<
+    const object = new ThreeMFLoader().parse(buffer);
+    object.rotation.x = -Math.PI / 2;
+    return { object, stlMaterial: null };
+  }
+  if (format === "gltf") {
+    assertSelfContainedGltf(buffer);
+    const isGlb = buffer.byteLength >= 4 && new DataView(buffer).getUint32(0, true) === 0x46546c67;
+    const data = isGlb ? buffer : new TextDecoder().decode(buffer);
+    return new Promise((resolve, reject) => {
+      new GLTFLoader().parse(
+        data,
+        "",
+        (gltf) => resolve({ object: gltf.scene, stlMaterial: null }),
+        reject,
+      );
+    });
+=======
+    return { object: new ThreeMFLoader().parse(applyThreeMfColors(buffer)), stlMaterial: null };
+>>>>>>>
+  }
+  // OBJ is ASCII text.
+  const text = new TextDecoder().decode(buffer);
+  return { object: new OBJLoader().parse(text), stlMaterial: null };
+}
+
+/**
+ * Frame `object` in `camera`: center it at the origin and pull the camera back
+ * far enough that the whole bounding sphere is visible. TrackballControls must
+ * be constructed afterward so reset restores this fitted camera position.
+ *
+ * The caller has already validated that the object's bounding box is non-empty
+ * and finite, so `box` here is always usable.
+ */
+function fitToObject(
+  object: THREE.Object3D,
+  box: THREE.Box3,
+  camera: THREE.PerspectiveCamera,
+): void {
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+
+  // Recenter the model on the origin so orbiting rotates around its middle.
+  object.position.sub(center);
+
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const fov = (camera.fov * Math.PI) / 180;
+  // Distance so the bounding sphere fits the vertical FOV, with a little margin.
+  const distance = (maxDim / 2 / Math.tan(fov / 2)) * 1.6;
+
+  camera.position.set(distance, distance * 0.6, distance);
+  camera.near = distance / 100;
+  camera.far = distance * 100;
+  camera.updateProjectionMatrix();
+}
+
+/**
+ * Return `true` when `object` has a real, drawable shape — a non-empty,
+ * finite bounding box. OBJLoader (and the others) can return an empty group for
+ * empty or comment-only input, which would otherwise mount a blank canvas
+ * instead of the error UI.
+ */
+function hasRenderableBounds(box: THREE.Box3): boolean {
+  if (box.isEmpty()) return false;
+  const { min, max } = box;
+  return (
+    Number.isFinite(min.x) &&
+    Number.isFinite(min.y) &&
+    Number.isFinite(min.z) &&
+    Number.isFinite(max.x) &&
+    Number.isFinite(max.y) &&
+    Number.isFinite(max.z)
+  );
+}
+
+/**
+ * Dispose a material and every texture it references (`map`, `normalMap`,
+ * `roughnessMap`, …) so their GPU allocations are released. three.js frees
+ * neither the material nor its textures automatically, so a textured 3MF would
+ * otherwise leak its GPU textures on unmount. Texture slots are detected by the
+ * three.js `isTexture` flag rather than `instanceof` (the loaders and the app
+ * can hold different three copies).
+ */
+function disposeMaterial(material: THREE.Material, disposedTextures: Set<THREE.Texture>): void {
+  for (const value of Object.values(material)) {
+    const texture = value as THREE.Texture | null;
+    if (!texture?.isTexture || disposedTextures.has(texture)) continue;
+    disposedTextures.add(texture);
+    const sourceData = texture.source?.data as { close?: () => void } | undefined;
+    sourceData?.close?.();
+    texture.dispose();
+  }
+  material.dispose();
+}
+
+/**
+ * Dispose all geometries and materials reachable from `object` so the GPU
+ * buffers backing them are released. three.js does not do this automatically.
+ */
+function disposeObject(object: THREE.Object3D): void {
+  const disposedTextures = new Set<THREE.Texture>();
+  object.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    mesh.geometry?.dispose();
+    const material = mesh.material;
+    if (Array.isArray(material)) {
+      material.forEach((item) => disposeMaterial(item, disposedTextures));
+    } else if (material) {
+      disposeMaterial(material, disposedTextures);
+    }
+  });
+}
+
+// Everything the effect creates that must be released. A single mutable bag so
+// one idempotent teardown routine can clean up whether initialization finished,
+// partially completed, or threw midway.
+interface SceneResources {
+  scene: THREE.Scene;
+  renderer: THREE.WebGLRenderer | null;
+  controls: TrackballControls | null;
+  object: THREE.Object3D | null;
+  rafId: number;
+  resizeObserver: ResizeObserver | null;
+  // Theme-driven handles, kept so a live theme toggle can recolor the scene
+  // without reparsing the model. null until the scene is built.
+  ambient: THREE.HemisphereLight | null;
+  key: THREE.DirectionalLight | null;
+  stlMaterial: THREE.MeshStandardMaterial | null;
+}
+
+/**
+ * Push `theme` onto a built scene: light intensities and the STL default
+ * material (3MF/OBJ keep their own materials). Safe to call on
+ * a partially-built `res` — each field is guarded — so the theme effect can run
+ * before or after the async scene build completes.
+ */
+function applyTheme(res: SceneResources, theme: ModelViewerTheme): void {
+  if (res.ambient) res.ambient.intensity = theme.ambientIntensity;
+  if (res.key) res.key.intensity = theme.keyIntensity;
+  res.stlMaterial?.color.setHex(theme.stlMaterial);
+}
+
+/**
+ * Release every resource in `res`, in reverse order of creation. Idempotent and
+ * safe to call more than once (each field is nulled/reset as it's freed), so it
+ * can run from BOTH the init failure path and the effect cleanup without
+ * double-disposing.
+ */
+function teardownScene(res: SceneResources): void {
+  if (res.rafId) {
+    cancelAnimationFrame(res.rafId);
+    res.rafId = 0;
+  }
+  if (res.resizeObserver) {
+    res.resizeObserver.disconnect();
+    res.resizeObserver = null;
+  }
+  if (res.controls) {
+    res.controls.dispose();
+    res.controls = null;
+  }
+  if (res.object) {
+    disposeObject(res.object);
+    res.scene.remove(res.object);
+    res.object = null;
+  }
+  if (res.renderer) {
+    res.renderer.domElement.remove();
+    res.renderer.dispose();
+    // Force the WebGL context to be released rather than waiting on GC.
+    res.renderer.forceContextLoss();
+    res.renderer = null;
+  }
+}
+
+export function ModelViewer({
+  data,
+  path,
+  conversationId,
+}: {
+  data: FileContentResponse;
+  path: string;
+  conversationId: string;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [loadState, setLoadState] = useState<LoadState | null>(() => initialLoadState(data));
+  // Screen readers skip text a live region already holds when it mounts. A mount from a
+  // click flushes effects in the same task, so the label waits for the next task.
+  const [liveRegionReady, setLiveRegionReady] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setLiveRegionReady(true), 0);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Theme comes from the app's shared next-themes source (same hook Monaco and
+  // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
+  // effect below re-runs only on an actual toggle.
+  const mode = useResolvedThemeMode();
+
+  // The live scene, so the theme effect can recolor it without a rebuild, and
+  // the latest theme, so the build effect can seed it without depending on the
+  // theme (which would reparse the model on every toggle).
+  const resRef = useRef<SceneResources | null>(null);
+  const themeRef = useRef<ModelViewerTheme>(modelViewerTheme(mode));
+
+  // A theme toggle while a model is open updates the live scene in place —
+  // light intensities and the STL material — with no reload.
+  useEffect(() => {
+    const theme = modelViewerTheme(mode);
+    themeRef.current = theme;
+    if (resRef.current) applyTheme(resRef.current, theme);
+  }, [mode]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    // The container is always mounted (even in the error state, the canvas host
+    // sits under the overlay), so this ref is populated on every effect run —
+    // which is what lets an invalid → valid prop change recover.
+    if (!container) return;
+
+    // Same resolver used for dispatch, so a MIME-matched file with an unknown
+    // extension still selects the right loader here.
+    const format = getModelFormat(path, data.content_type);
+    if (!format) {
+      setLoadState(null);
+      setErrorMessage(GENERIC_MODEL_ERROR);
+      return;
+    }
+
+    setErrorMessage(null);
+    setLoadState(initialLoadState(data));
+
+    let disposed = false;
+    const abortController = new AbortController();
+    const res: SceneResources = {
+      scene: new THREE.Scene(),
+      renderer: null,
+      controls: null,
+      object: null,
+      rafId: 0,
+      resizeObserver: null,
+      ambient: null,
+      key: null,
+      stlMaterial: null,
+    };
+    resRef.current = res;
+    // Read the current theme without re-subscribing: the theme effect keeps
+    // this ref fresh, so a build triggered by a data/path change always seeds
+    // the scene with the active mode.
+    const theme = themeRef.current;
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+
+    const fail = (message = GENERIC_MODEL_ERROR) => {
+      // Free anything created before the failure, then show the error UI. The
+      // cleanup return also calls teardownScene, which is idempotent.
+      teardownScene(res);
+      if (resRef.current === res) resRef.current = null;
+      if (!disposed) {
+        setLoadState(null);
+        setErrorMessage(message);
+      }
+    };
+
+    let shownProgress: number | string | null = null;
+    const load = async () => {
+      try {
+        // The JSON envelope is sufficient for ordinary files. A truncated
+        // envelope means the model crossed the server read cap, so use the
+        // existing uncapped download stream instead.
+        const buffer = data.truncated
+          ? await fetchWorkspaceFileBytes(conversationId, path, {
+              signal: abortController.signal,
+              onProgress: (progress) => {
+                // Re-render per visible percent (or byte count when the total is unknown), not per chunk.
+                const { percent, detail } = downloadDetail(progress);
+                const shown = percent ?? detail;
+                if (disposed || shown === shownProgress) return;
+                shownProgress = shown;
+                setLoadState({ phase: "downloading", ...progress });
+              },
+            })
+          : await fileContentToBlob(data).arrayBuffer();
+        if (disposed) return;
+        // Commit and paint "Preparing model…" before the parse blocks the main thread.
+        flushSync(() => setLoadState({ phase: "processing" }));
+        await afterNextPaint();
+        if (disposed) return;
+
+        const { object, stlMaterial } = await parseModel(format, buffer, theme);
+        if (disposed) {
+          disposeObject(object);
+          return;
+        }
+        res.stlMaterial = stlMaterial;
+        // Validate BEFORE building the scene: an empty/degenerate model (e.g. a
+        // comment-only OBJ) has no finite bounds and would render a blank
+        // canvas, so surface the error UI instead.
+        const box = new THREE.Box3().setFromObject(object);
+        if (!hasRenderableBounds(box)) {
+          disposeObject(object);
+          fail();
+          return;
+        }
+        res.object = object;
+        res.scene.add(object);
+
+        // Lighting: a hemisphere fill plus a key directional light so surfaces
+        // read with depth rather than as a flat silhouette. Intensities come
+        // from the active theme (brighter in dark) and are kept on `res` so a
+        // theme toggle can update them live.
+        const ambient = new THREE.HemisphereLight(0xffffff, 0x444444, theme.ambientIntensity);
+        res.ambient = ambient;
+        res.scene.add(ambient);
+        const key = new THREE.DirectionalLight(0xffffff, theme.keyIntensity);
+        key.position.set(0, 0, 0);
+        key.target.position.set(0, 0, -1);
+        res.key = key;
+        res.scene.add(camera);
+        camera.add(key, key.target);
+
+        // Transparent canvas: the pane's theme background shows through, so it
+        // follows light/dark and custom theme colors with no JS plumbing.
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        res.renderer = renderer;
+        renderer.setPixelRatio(window.devicePixelRatio);
+        const rect = container.getBoundingClientRect();
+        renderer.setSize(rect.width || 1, rect.height || 1);
+        container.appendChild(renderer.domElement);
+
+        fitToObject(object, box, camera);
+
+        const controls = new TrackballControls(camera, renderer.domElement);
+        res.controls = controls;
+
+        const render = () => {
+          res.rafId = requestAnimationFrame(render);
+          controls.update();
+          renderer.render(res.scene, camera);
+        };
+        render();
+
+        const onResize = () => {
+          const r = container.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return;
+          camera.aspect = r.width / r.height;
+          camera.updateProjectionMatrix();
+          renderer.setSize(r.width, r.height);
+          controls.handleResize();
+        };
+        res.resizeObserver = new ResizeObserver(onResize);
+        res.resizeObserver.observe(container);
+        setLoadState(null);
+      } catch (error) {
+        fail(modelErrorMessage(error));
+      }
+    };
+    void load();
+
+    return () => {
+      disposed = true;
+      abortController.abort();
+      teardownScene(res);
+      if (resRef.current === res) resRef.current = null;
+    };
+  }, [data, path, conversationId]);
+
+  const filename = path.split("/").pop() ?? path;
+
+  const content = (
+    // The container is ALWAYS mounted so its ref stays live — the error is an
+    // overlay on top, never a replacement. This lets the effect recover on an
+    // invalid → valid {data, path} transition (the ref would be null if we
+    // swapped the element out).
+    <div className="relative min-h-0 flex-1 overflow-hidden">
+      <div
+        ref={containerRef}
+        aria-label={`3D preview of ${filename}`}
+        className="absolute inset-0 cursor-grab active:cursor-grabbing"
+      />
+      <p role="status" className="sr-only">
+        {liveRegionReady && loadState ? loadLabel(loadState) : ""}
+      </p>
+      {loadState && <ModelLoadingOverlay state={loadState} />}
+      {errorMessage && (
+        <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
+          {errorMessage}
+        </div>
+      )}
+    </div>
+  );
+
+  return <div className="flex h-full flex-col">{content}</div>;
+}
