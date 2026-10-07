@@ -113,6 +113,50 @@ def test_list_item_child_harness_presence(metadata, present, harness) -> None:
     assert item.child_harness == harness
 
 
+def test_list_item_preserves_legacy_positional_order() -> None:
+    item = SessionListItem(
+        "conversation",
+        "agent",
+        "running",
+        100,
+        200,
+        "title",
+        {"origin": "legacy"},
+        "runner",
+        "host",
+        "high",
+        "owner",
+        "external",
+        3,
+        True,
+        "parent",
+    )
+    expected = {
+        "id": "conversation",
+        "agent_id": "agent",
+        "status": "running",
+        "created_at": 100,
+        "updated_at": 200,
+        "title": "title",
+        "labels": {"origin": "legacy"},
+        "runner_id": "runner",
+        "host_id": "host",
+        "reasoning_effort": "high",
+        "owner": "owner",
+        "external_session_id": "external",
+        "pending_elicitations_count": 3,
+        "archived": True,
+        "parent_session_id": "parent",
+        "llm_model": None,
+        "harness_override": None,
+        "child_harness": None,
+        "cost_control_mode_override": None,
+        "child_harness_present": False,
+    }
+    for name, value in expected.items():
+        assert getattr(item, name) == value
+
+
 def _make_namespace(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> tuple[SessionsNamespace, httpx.AsyncClient]:
