@@ -6387,6 +6387,7 @@
                 "type": "null"
               }
             ],
+            "description": "Present only for sub-agent children without a harness override. `None` means the server could not resolve it; clients must not fall back to the parent's harness. Absent when not applicable or on older servers.",
             "title": "Child Harness"
           },
           "comments_count": {
@@ -6418,6 +6419,7 @@
                 "type": "null"
               }
             ],
+            "description": "Session's Smart Routing mode, `\"on\"` or `\"off\"`, or `None` when unset.",
             "title": "Cost Control Mode Override"
           },
           "created_at": {
@@ -6459,6 +6461,7 @@
                 "type": "null"
               }
             ],
+            "description": "Session's explicit harness. `None` means the agent's declared harness.",
             "title": "Harness Override"
           },
           "host_id": {
@@ -6507,6 +6510,7 @@
                 "type": "null"
               }
             ],
+            "description": "Concrete reported model, else the session's model override.",
             "title": "Llm Model"
           },
           "owner": {
