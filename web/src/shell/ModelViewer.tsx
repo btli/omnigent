@@ -18,6 +18,7 @@ import * as THREE from "three";
 import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
+import { applyThreeMfColors } from "./threeMfColors";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -190,7 +191,7 @@ export async function parseModel(
     return { object, stlMaterial: material };
   }
   if (format === "3mf") {
-    const object = new ThreeMFLoader().parse(buffer);
+    const object = new ThreeMFLoader().parse(applyThreeMfColors(buffer));
     object.rotation.x = -Math.PI / 2;
     return { object, stlMaterial: null };
   }
