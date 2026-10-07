@@ -171,6 +171,9 @@ export interface Conversation {
   agent_name?: string | null;
   llm_model?: string | null;
   harness_override?: string | null;
+  /** Present only for a server-resolved child; null means unresolved, not a parent fallback. */
+  child_harness?: string | null;
+  cost_control_mode_override?: "on" | "off" | null;
   reasoning_effort?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
@@ -1798,6 +1801,8 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     llm_model: session.modelOverride ?? session.llmModel,
     reasoning_effort: session.reasoningEffort,
     harness_override: session.harness ?? null,
+    ...(session.subAgentName ? { child_harness: session.harness ?? null } : {}),
+    cost_control_mode_override: session.costControlModeOverride,
     parent_session_id: session.parentSessionId,
     archived: session.archived,
   };
