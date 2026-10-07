@@ -279,6 +279,8 @@ class SessionListItem:
         sessions.
     :param parent_session_id: Parent session for a sub-agent child; ``None``
         for top-level sessions or when omitted by an older server.
+    :param child_harness_present: Whether the server supplied ``child_harness``;
+        an explicit ``None`` is unresolved, not an older-server fallback.
     """
 
     id: str
@@ -301,6 +303,7 @@ class SessionListItem:
     pending_elicitations_count: int = 0
     archived: bool = False
     parent_session_id: str | None = None
+    child_harness_present: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -332,6 +335,7 @@ class SessionListItem:
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
             parent_session_id=raw.get("parent_session_id"),
+            child_harness_present="child_harness" in raw,
         )
 
 

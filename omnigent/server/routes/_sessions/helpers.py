@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import re
@@ -1933,15 +1934,14 @@ def _prepare_child_harnesses(
             spec = specs[key]
             if spec is not None:
                 result[conv.id] = _harness_from_loaded_spec(conv, spec)
-        except (
-            KeyError,
-            AttributeError,
-            ValueError,
-            ImportError,
-            OSError,
-            RuntimeError,
-            OmnigentError,
-        ):
+        except Exception as exc:  # noqa: BLE001 — a child spec failure must not fail the session list
+            specs[key] = None
+            _logger.warning(
+                "Child harness unresolved for agent_id=%s bundle_key=%s exception_type=%s",
+                agent.id,
+                hashlib.sha256(agent.bundle_location.encode()).hexdigest(),
+                type(exc).__name__,
+            )
             continue
     return result
 
