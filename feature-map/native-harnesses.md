@@ -141,10 +141,84 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`;
   see also [composer](./composer.md) for effort.
+- **`model-and-effort`, Codex runtime settings:**
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_combined_model_and_reset_uses_target_default`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_effort_reset_survives_next_turn`.
+  These own their environment: run with plain `uv run pytest`. They drive a
+  real Codex TUI and REST session settings, checking the outgoing Responses
+  effort, native settings, private config, and session state. Only the model
+  replies are mocked; models absent from the installed CLI are skipped.
+  Existing-session cases also require the picker to show the applied effort
+  when an unsupported request clamps back to the already active native value.
+  Concurrent runner controls are covered by
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_concurrent_settings_use_the_applied_model`
+  (component test): an overlapping effort pick uses the newly applied model.
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror`
+  and
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_switch_inherits_an_effort_whose_config_write_failed`
+  cover a model or effort whose private-config write failed: later updates
+  still use it and retry the write until a terminal switch rewrites the config.
+  Routed switches and turns read the same record
+  (`tests/harnesses/codex_native/test_codex_native_hook.py::test_routed_model_switch_keeps_an_effort_whose_config_write_failed`).
+- **`model-and-effort`, rejected Codex reset (server/runner integration):**
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_preserves_concurrent_selection_and_sibling_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_keeps_an_effort_the_terminal_reported_meanwhile`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_restores_an_effort_the_terminal_reported_before_saving`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_refusal_after_the_runner_re_tunnelled_keeps_the_new_replicas_selection`,
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_reset_without_a_current_model_is_rejected_before_connecting`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_successful_update_mirrors_unchanged_native_effort_without_notification`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_combined_model_and_effort_uses_target_model_capabilities`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_server_split_reset_uses_the_previous_model_default`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_combined_reset_failure_preserves_the_applied_model`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_forwarder_recovers_a_failed_immediate_effort_mirror`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_overlapping_refused_changes_restore_the_applied_effort`,
+  `tests/runner/test_app_sessions_native_workflow_messages.py::test_refused_codex_startup_effort_follows_the_server_rollback_contract`,
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_settings_update_times_out_and_releases_the_lock`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_runner_refusal_keeps_the_effort_it_cached`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_unconfirmed_effort_update_is_kept_for_the_next_turn`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_lost_combined_change_restores_the_model_and_effort`.
+  Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
+  Codex RPC failures inject missing defaults and discovery timeouts. A refused
+  reset returns an error and preserves applied settings and concurrent edits:
+  a save or terminal report after the change stays, and one before it is restored;
+  a replica the runner has re-tunnelled away from re-addresses instead of rolling back;
+  overlapping refused changes end on the last applied setting. Offline and
+  silent explicit efforts are applied on resume; a saved Default is stored, but
+  resume keeps the private config's effort.
+  A combined model/effort PATCH uses the target model's capabilities. Older
+  runners apply the model first and then the effort; if that second step
+  fails, the error preserves the model already applied. A failed immediate
+  mirror is retried when the forwarder next reads the private config.
+  Target-model Default requires both the updated server and the updated runner.
+  An older server resets the previous model first, even with an updated runner;
+  its default is then inherited if the target supports it. On older servers,
+  switch models first and select Default as a separate action afterward.
+  While a connected runner is still starting Codex and has no loaded bridge,
+  live settings return a retryable 503 and retain the previous selection.
+  Retry once the terminal is ready; fully offline and silent saves remain deferred.
+  An older server keeps such a refused change, so the updated runner applies it
+  on the next turn; an older runner keeps it itself, so the updated server keeps
+  it too. A hung connect fails after five seconds; a hung update is unconfirmed,
+  so an effort or combined model/effort change is kept for the next turn instead
+  of rolled back. A combined change that never reaches the runner restores both.
+  An older server gets no early timeout; it waits for Codex as before
+  (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`resume`, Codex persisted effort after a runner restart:**
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
+  (own environment, real Codex with mock model replies).
+  `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_effort_update_times_out_and_closes_client`
+  checks that a stalled settings connection, write, or close cannot block resume;
+  `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
+  keeps a resumed effort whose config write failed for later updates.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
@@ -230,6 +304,9 @@ Cross-harness journeys:
   Omnigent's managed setup; the managed and unmanaged paths behave differently.
 - The mock instance proves Omnigent's integration with Claude and Codex, not a
   live vendor model. A passing mock run is not evidence for another harness.
+- Codex's background title requests can echo the user's prompt on another model.
+  Identify the user thread when checking its outgoing model and effort, and
+  script repeatable replies so title generation cannot exhaust the turn's reply.
 - A transport check is not a full reconnect journey. To verify that claim,
   use an isolated configured harness, interrupt only its test connection, then
   resume and send another turn; check both terminal and chat for missing or
