@@ -89,6 +89,30 @@ def test_list_item_model(metadata: dict[str, str | None]) -> None:
     assert item.cost_control_mode_override == metadata.get("cost_control_mode_override")
 
 
+@pytest.mark.parametrize(
+    ("metadata", "present", "harness"),
+    [
+        ({}, False, None),
+        ({"child_harness": None}, True, None),
+        ({"child_harness": "codex"}, True, "codex"),
+    ],
+    ids=["absent", "null", "value"],
+)
+def test_list_item_child_harness_presence(metadata, present, harness) -> None:
+    item = SessionListItem.from_dict(
+        {
+            "id": "child",
+            "agent_id": "agent",
+            "status": "idle",
+            "created_at": 1,
+            "updated_at": 1,
+            **metadata,
+        }
+    )
+    assert item.child_harness_present is present
+    assert item.child_harness == harness
+
+
 def _make_namespace(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> tuple[SessionsNamespace, httpx.AsyncClient]:
