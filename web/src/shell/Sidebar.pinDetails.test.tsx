@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { PINNED_CONVERSATIONS_KEY } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as HostsModule from "@/hooks/useHosts";
+import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { resetReadStateForTests } from "@/hooks/useUnseenConversations";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
@@ -19,6 +20,9 @@ import { Sidebar } from "./Sidebar";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const listRows = vi.hoisted(() => ({ current: [] as ConversationsModule.Conversation[] }));
+const availableAgents = vi.hoisted(() => ({
+  current: [] as AvailableAgent[],
+}));
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
@@ -38,11 +42,14 @@ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
     data: [{ host_id: "host_detail", name: "Remote workstation", status: "online" }],
   }),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: () => ({ data: [] }) }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({ data: availableAgents.current }),
+}));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 beforeEach(() => {
   listRows.current = [];
+  availableAgents.current = [];
   localStorage.clear();
   resetReadStateForTests();
   clearSessionDrafts();
@@ -56,6 +63,110 @@ afterEach(() => {
 });
 
 describe("header-pinned detail-only session tooltip", () => {
+  it.each(["codex", null] as const)(
+    "preserves the resolved child %s before list reconciliation",
+    async (harness) => {
+      availableAgents.current = [
+        {
+          id: "ag_bundle",
+          name: "bundle",
+          display_name: "Bundle",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      const wire = {
+        id: "child_detail",
+        agent_id: "ag_bundle",
+        agent_name: "bundle",
+        title: "Child detail",
+        created_at: 100,
+        status: "idle",
+        parent_session_id: "parent",
+        sub_agent_name: "worker",
+        harness,
+        cost_control_mode_override: "on",
+        labels: {},
+      };
+      let resolvePatch!: (response: Response) => void;
+      const patch = new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      });
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation((_url, init) =>
+          init?.method === "PATCH" ? patch : Promise.resolve(new Response(JSON.stringify(wire))),
+        );
+      const session = await getSession(wire.id);
+      const client = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false, staleTime: Infinity },
+          mutations: { retry: false },
+        },
+      });
+      client.setQueryData(["session", session.id], session);
+      client.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations: [], filterHonored: true });
+      render(
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <ExtensionCatalogProvider extensions={[]}>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                  <HeaderConversationMenu
+                    conversation={{
+                      id: session.id,
+                      object: "conversation",
+                      title: session.title,
+                      labels: {},
+                      created_at: 100,
+                      updated_at: 100,
+                      permission_level: session.permissionLevel,
+                    }}
+                    currentProject={null}
+                    canShare={false}
+                    canFork={false}
+                    onShare={vi.fn()}
+                    onFork={vi.fn()}
+                  />
+                </MemoryRouter>
+              </TooltipProvider>
+            </ExtensionCatalogProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>,
+      );
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(screen.getByTestId("header-pin-conversation"));
+      fireEvent.focus(await screen.findByRole("link", { name: "Child detail" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      const line = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(line).toHaveTextContent(harness ? /^Bundle · Codex$/ : /^bundle$/);
+      if (harness === null) expect(line.querySelector(".lucide-bot")).not.toBeNull();
+      const pinned = client.getQueryData<{ conversations: ConversationsModule.Conversation[] }>(
+        PINNED_CONVERSATIONS_KEY,
+      )!;
+      expect(pinned.conversations[0]).toMatchObject({
+        child_harness: harness,
+        cost_control_mode_override: "on",
+      });
+      expect(
+        fetchSpy.mock.calls.some(
+          ([url]) =>
+            String(url).includes("/model-options") || String(url).startsWith("/v1/sessions?"),
+        ),
+      ).toBe(false);
+      await act(async () =>
+        resolvePatch(
+          new Response(JSON.stringify({ ...wire, labels: { "omnigent.pinned": "123" } })),
+        ),
+      );
+    },
+  );
+
   it.each(["running", "failed"] as const)(
     "shows cached agent, location and %s status before list reconciliation",
     async (status) => {

@@ -153,7 +153,7 @@ export function useHostModelOptions(
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.
     staleTime: once ? Infinity : 15_000,
-    ...(once && { refetchOnMount: false }),
+    ...(once && { refetchOnMount: false, retryOnMount: false }),
     refetchInterval: canRefresh ? 15_000 : false,
     ...((!poll || once) && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
     // Retry boot-probe races while any picker uses this catalog. Persistent
