@@ -3851,7 +3851,6 @@ function SessionTooltipDetails({
     effort: conversation.reasoning_effort,
     routingOn,
   });
-  const serverInfo = useServerInfo();
   // The runner section's header names the host, replacing the location line.
   const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
   const workspace = conversation.workspace ?? "";
