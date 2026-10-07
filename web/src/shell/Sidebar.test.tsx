@@ -23,6 +23,11 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { AUTO_HARNESS_ID, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { buildComposerSessionDescriptor, composerModelChipLabel } from "@/lib/composerModelLabel";
+import {
+  type ConversationsInfiniteData,
+  mergeItemsIntoPages,
+  nullsToUndefined,
+} from "@/lib/sessionListCache";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -1944,6 +1949,79 @@ describe("Sidebar session list", () => {
             /^bundle$/,
           ),
         );
+      },
+    );
+
+    it.each([false, true])(
+      "renders an unresolved child after the real cache merge (project folder=%s)",
+      async (inProject) => {
+        agentsRef.current = [
+          {
+            id: "ag_bundle",
+            name: "bundle",
+            display_name: "Bundle",
+            harness: "claude-sdk",
+            description: null,
+            skills: [],
+          },
+        ];
+        const session = conv("child_legacy", "bundle", {
+          agent_id: "ag_bundle",
+          parent_session_id: "parent",
+          updated_at: 100,
+          labels: inProject ? { omni_project: "Alpha" } : {},
+        });
+        const client = new QueryClient();
+        const queryKey = inProject ? ["project-sessions", "Alpha"] : ["conversations", "", false];
+        client.setQueryData<ConversationsInfiniteData>(queryKey, {
+          pages: [{ data: [session], first_id: session.id, last_id: session.id, has_more: false }],
+          pageParams: [undefined],
+        });
+        function syncRows() {
+          const rows = client.getQueryData<ConversationsInfiniteData>(queryKey)!.pages[0].data;
+          mockConversations(inProject ? [] : rows);
+          if (inProject) projectSessionsMock.current.Alpha = rows;
+        }
+        if (inProject) projectsMock.push("Alpha");
+        syncRows();
+        const tree = () => (
+          <QueryClientProvider client={client}>
+            <SidebarDataProvider>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                </MemoryRouter>
+              </TooltipProvider>
+            </SidebarDataProvider>
+          </QueryClientProvider>
+        );
+        const { rerender } = render(tree());
+        if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+        fireEvent.focus(screen.getByRole("link", { name: "child_legacy" }));
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const line = () => within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(line()).toHaveTextContent(/^Bundle · Claude SDK$/);
+        const items = new Map([
+          [session.id, nullsToUndefined({ id: session.id, child_harness: null })],
+        ]);
+        client.setQueryData<ConversationsInfiniteData>(
+          queryKey,
+          (cached) =>
+            mergeItemsIntoPages(
+              cached,
+              items,
+              { searchQuery: "", includeArchived: false },
+              undefined,
+            ).data,
+        );
+        syncRows();
+        rerender(tree());
+        await waitFor(() => expect(line()).toHaveTextContent(/^bundle$/));
+        expect(line().querySelector(".lucide-bot")).not.toBeNull();
+        expect(line().querySelector("img")).toBeNull();
+        expect(
+          client.getQueryData<ConversationsInfiniteData>(queryKey)!.pages[0].data[0].updated_at,
+        ).toBe(session.updated_at);
       },
     );
 
