@@ -25,6 +25,7 @@ def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
         "harness_install": False,
         "canvas": False,
         "harness_settings_ui": True,
+        "host_stats": False,
     }
 
 
@@ -65,6 +66,13 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == ("canvas", "harness_settings_ui")
+
+
+def test_host_stats_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "host_stats"})
+
+    assert flags.enabled(Feature.HOST_STATS)
+    assert flags.frontend_dict()["host_stats"] is True
 
 
 def test_unknown_feature_fails_with_known_names() -> None:
