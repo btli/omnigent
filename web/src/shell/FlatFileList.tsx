@@ -12,7 +12,7 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
-import { FileRowActions, ROW_MENU_SIZE_SLOT_CLASS, type FileRowInfo } from "./FileRowActions";
+import { FileRowActions, type FileRowInfo } from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -105,7 +105,7 @@ function FileListItem({
         linesRemoved={file.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, primaryActionRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -178,7 +178,6 @@ function FileListItem({
               className={cn(
                 "relative flex shrink-0 items-center justify-end",
                 ROW_META_SLOT_CLASS,
-                ROW_MENU_SIZE_SLOT_CLASS,
                 "pointer-coarse:justify-start",
               )}
             >
@@ -199,7 +198,6 @@ function FileListItem({
                   <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 )}
                 <CopyPathButton path={file.path} revealOnHover />
-                {moreActions}
               </span>
             </span>
           </div>
