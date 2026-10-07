@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 /**
  * Display candidates for a path, longest first: the path itself, then
@@ -32,10 +32,38 @@ export function useLeftTrimmedPath<T extends HTMLElement>(path: string) {
     path,
     index: 0,
   });
+  const measured = useRef<{ el: T; path: string; width: number } | null>(null);
   const index = trim.el === el && trim.path === path ? trim.index : 0;
   useLayoutEffect(() => {
-    if (!el || index >= candidates.length - 1) return;
-    if (el.scrollWidth > el.clientWidth) setTrim({ el, path, index: index + 1 });
-  }, [el, path, index, candidates]);
+    if (!el) return;
+    const width = el.clientWidth;
+    if (
+      measured.current?.el === el &&
+      measured.current.path === path &&
+      measured.current.width === width
+    ) {
+      return;
+    }
+    const probe = el.cloneNode(false) as T;
+    probe.removeAttribute("id");
+    probe.removeAttribute("data-testid");
+    probe.style.position = "absolute";
+    probe.style.visibility = "hidden";
+    probe.style.width = "max-content";
+    probe.style.maxWidth = "none";
+    el.after(probe);
+    let chosenIndex = 0;
+    try {
+      for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+        probe.textContent = candidates[candidateIndex];
+        chosenIndex = candidateIndex;
+        if (probe.scrollWidth <= width) break;
+      }
+    } finally {
+      probe.remove();
+    }
+    measured.current = { el, path, width };
+    setTrim({ el, path, index: chosenIndex });
+  }, [el, path, candidates]);
   return { ref, text: candidates[index] };
 }

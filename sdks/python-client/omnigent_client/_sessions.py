@@ -292,17 +292,17 @@ class SessionListItem:
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
-    llm_model: str | None = None
-    harness_override: str | None = None
-    # Child-only server answer; a failed resolution has no harness.
-    child_harness: str | None = None
-    cost_control_mode_override: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
     parent_session_id: str | None = None
+    llm_model: str | None = None
+    harness_override: str | None = None
+    # Child-only server answer; a failed resolution has no harness.
+    child_harness: str | None = None
+    cost_control_mode_override: str | None = None
     child_harness_present: bool = False
 
     @classmethod
