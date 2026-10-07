@@ -4498,13 +4498,6 @@ function ConversationRowImpl({
       // Inline style, not utility classes — see the swipeTouchAction comment.
       style={!ownsPointer && swipeTouchAction ? { touchAction: swipeTouchAction } : undefined}
     >
-      {pinInsertion && pinOrder?.draggingId !== conversation.id && (
-        <span
-          data-testid="pin-order-insertion"
-          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
-          style={pinInsertion === "before" ? { top: 0 } : { bottom: 0 }}
-        />
-      )}
       {/* Clip the hint to the vacated strip so it cannot overlap the moving
           surface. The threshold also scales the glyph, avoiding a color-only cue.
           Action colors switch immediately so reversals cannot inherit the old color. */}
@@ -4553,6 +4546,13 @@ function ConversationRowImpl({
         )}
         style={{ transform: `translateX(${gesture.dx}px)` }}
       >
+        {pinInsertion && pinOrder?.draggingId !== conversation.id && (
+          <span
+            data-testid="pin-order-insertion"
+            className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
+            style={pinInsertion === "before" ? { top: 0 } : { bottom: 0 }}
+          />
+        )}
         {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
@@ -4686,7 +4686,7 @@ function ConversationRowImpl({
                   <Tooltip disableHoverableContent>
                     <TooltipContent>
                       <TooltipArrow />
-                      {!isPinned && atPinCap ? "Unpin a session first" : isPinned ? "Unpin" : "Pin"}
+                      {pinTooltip}
                     </TooltipContent>
                     <TooltipTrigger asChild>
                       <Button
@@ -4695,7 +4695,7 @@ function ConversationRowImpl({
                         size="icon-xs"
                         aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
                         data-testid="quick-pin-conversation"
-                        aria-disabled={!isPinned && atPinCap}
+                        aria-disabled={pinSaving || (!isPinned && atPinCap)}
                         // Pinned rows keep no persistent marker: the "Pinned" section
                         // header already conveys the state, so the glyph is unpin when
                         // pinned, pin otherwise.
@@ -4704,6 +4704,7 @@ function ConversationRowImpl({
                           // Keep the toggle click off the surrounding Link (no navigation).
                           e.preventDefault();
                           e.stopPropagation();
+                          if (pinSaving) return;
                           onTogglePinned(conversation.id);
                         }}
                       >
@@ -4786,212 +4787,9 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent
-            conversation={conversation}
-            hostsById={hostsById}
-            hasError={sessionState?.kind === "error"}
-          />
-        </Tooltip>
-      )}
-      {selectionMode ? (
-        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
-          {isSelected ? (
-            <SquareCheckIcon className="size-4 text-primary" />
-          ) : (
-            <SquareIcon className="size-4 text-muted-foreground" />
-          )}
-        </span>
-      ) : hasSessionIndicator ? (
-        <span
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            "right-1",
-            // The wide "awaiting" pill keeps its natural width; every other
-            // marker (running/starting/unseen dot, or the draft pencil) sits in
-            // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
-          )}
-        >
-          {sessionState !== null ? (
-            <SessionStateBadge state={sessionState} />
-          ) : (
-            <span
-              role="img"
-              aria-label="Draft"
-              data-testid="conversation-draft-indicator"
-              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
-            >
-              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
-            </span>
-          )}
-        </span>
-      ) : null}
-      {!selectionMode && showSharedIndicator && (
-        <span
-          role="img"
-          aria-label="Shared session"
-          title="Shared with you"
-          className={cn(
-            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            hasSessionIndicator ? "right-8" : "right-1",
-          )}
-        >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-        </span>
-      )}
-      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
-          row, so their spacing is defined once (gap-0.5) and stays aligned
-          with the project-folder header actions, which use the same pattern.
-          The kebab is the rightmost child (pinned to right-1); the pin sits a
-          gap to its left. Hidden entirely while selecting (bulk mode owns the
-          row controls). */}
-      {!selectionMode && (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
-              {/* Archived rows omit the pin entirely: pinning is meaningless there
-              (archive outranks pin), so there's no pin action even on hover. */}
-              {!isArchived && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {pinTooltip}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                      data-testid="quick-pin-conversation"
-                      aria-disabled={pinSaving || (!isPinned && atPinCap)}
-                      className={cn(
-                        // Desktop-only quick affordance: hidden on mobile (the kebab's
-                        // Pin item below covers that), hover/focus-revealed from `md`
-                        // up. Pinned rows no longer keep a persistent pin marker, since
-                        // the "Pinned" section header (and pinned-first ordering inside
-                        // a project) already conveys the pinned state. Revealed glyph:
-                        // unpin if pinned, pin otherwise.
-                        //
-                        // `md:inline-flex` (not `md:block`): the Button base is
-                        // `inline-flex` and relies on it for `items-center
-                        // justify-center` to center the icon. `md:block` would override
-                        // that display and collapse the centering, leaving the glyph
-                        // pinned to the top-left of the button — so keep the flex
-                        // display when revealing it.
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (pinSaving) return;
-                        onTogglePinned(conversation.id);
-                      }}
-                    >
-                      {isPinned ? (
-                        <PinOffIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <PinIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-              {/* Archive is owner-only, same as the kebab's Archive item; non-owners
-              don't get the quick affordance and instead see that item disabled
-              with an explanation. */}
-              {isOwner && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent>
-                    <TooltipArrow />
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                      data-testid="quick-archive-conversation"
-                      className={cn(
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (!isArchived) {
-                          runArchive();
-                        } else {
-                          runUnarchive();
-                        }
-                      }}
-                    >
-                      {isArchived ? (
-                        <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-
-              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Conversation actions"
-                    data-testid="conversation-actions"
-                    // Desktop-only: the chat page's own header menu covers these
-                    // per-session actions on mobile, so the row kebab is dropped
-                    // there. From `md` up it stays hidden until hover / keyboard
-                    // focus, with `aria-expanded` keeping it surfaced while the menu
-                    // is open so the trigger doesn't vanish under the cursor.
-                    className={cn(
-                      "text-muted-foreground transition-opacity",
-                      "hidden md:inline-flex",
-                      "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                      "md:aria-expanded:opacity-100",
-                    )}
-                    onClick={(e) => {
-                      // Keep the trigger click from bubbling into the Link.
-                      e.preventDefault();
-                      e.stopPropagation();
-                    }}
-                  >
-                    <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-44">
-                  <ConversationMenuItems
-                    components={dropdownBundle}
-                    setMenuOpen={setMenuOpen}
-                    {...menuItemProps}
-                  />
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      )}
-      </div>      {/* Mount only while open — one per row, its hook tree + JSX would
+        )}
+      </div>
+      {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
       {shareOpen && (
         <PermissionsModal
