@@ -48,7 +48,7 @@ def test_android_insets_skip_viewer_nested_in_workspace(page: Page) -> None:
     rule_start = css.index("/* Full-height native surfaces")
     selector_start = css.index(":is([data-ios-native], [data-android-native])", rule_start)
     rule_end = css.index("}", selector_start) + 1
-    page.add_style_tag(content=css[selector_start:rule_end])
+    web_inset_style = page.add_style_tag(content=css[selector_start:rule_end])
 
     kotlin = _NATIVE_SCRIPT.read_text(encoding="utf-8")
     match = re.search(
@@ -64,7 +64,6 @@ def test_android_insets_skip_viewer_nested_in_workspace(page: Page) -> None:
     page.evaluate("window.__omnigentNativeEmitInsets(52, 20)")
 
     page.locator("#open-file").click()
-    page.wait_for_timeout(500)
 
     wide = page.evaluate(
         """() => {
@@ -90,12 +89,12 @@ def test_android_insets_skip_viewer_nested_in_workspace(page: Page) -> None:
 
     page.set_viewport_size({"width": 390, "height": 844})
     page.locator('aside[aria-label="Workspace"]').evaluate("el => el.remove()")
+    web_inset_style.evaluate("style => style.remove()")
     page.locator("body").evaluate(
         "body => body.insertAdjacentHTML('beforeend', "
         '\'<section data-testid="file-viewer"><header '
         'data-testid="file-viewer-header">report.md</header></section>\')'
     )
-    page.wait_for_timeout(500)
     narrow = page.evaluate(
         """() => {
           const viewer = document.querySelector('[data-testid="file-viewer"]');
