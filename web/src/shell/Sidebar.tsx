@@ -256,6 +256,7 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { RunnerStatsSection, hasRunnerStats } from "./RunnerStatsSection";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
@@ -3897,6 +3898,8 @@ function SessionTooltipDetails({
     effort: conversation.reasoning_effort,
     routingOn,
   });
+  // The runner section's header names the host, replacing the location line.
+  const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
   // Runner-owned failure detail the server persists as a label; transcript-only
@@ -4008,13 +4011,15 @@ function SessionTooltipDetails({
           <span className="sr-only">{workspace}</span>
         </p>
       )}
-      <p
-        data-testid="session-tooltip-location"
-        className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-      >
-        <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-        <span className="truncate">{locationLabel}</span>
-      </p>
+      {!showRunnerStats && (
+        <p
+          data-testid="session-tooltip-location"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{locationLabel}</span>
+        </p>
+      )}
       {conversation.git_branch && (
         <p
           data-testid="session-tooltip-branch"
@@ -4043,6 +4048,7 @@ function SessionTooltipDetails({
           {errorMessage}
         </p>
       )}
+      {host && showRunnerStats && <RunnerStatsSection host={host} label={locationLabel} />}
     </>
   );
 }
