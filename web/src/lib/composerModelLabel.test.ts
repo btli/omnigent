@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildComposerSessionDescriptor,
+  isCostRoutingEligible,
   compactModelTriggerLabel,
   composerModelChipLabel,
   defaultModelLabel,
@@ -11,6 +12,39 @@ import {
   nativeModelLabel,
   normalizeEffortLabel,
 } from "@/lib/composerModelLabel";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+
+describe("shared routing eligibility", () => {
+  it.each([
+    [false, "claude-sdk", null, true, true, false, false],
+    [true, "claude-sdk", null, false, false, false, true],
+    [true, "codex", "parent", true, true, true, false],
+    [true, "claude-native", null, true, true, false, true],
+    [true, "codex-native", null, false, true, false, false],
+    [true, "codex-native", null, false, false, true, true],
+    [true, "devin-native", null, true, true, true, false],
+  ] as const)(
+    "matches the composer gates %s %s %s %s %s %s",
+    (enabled, harness, parentSessionId, gateway, external, oss, expected) => {
+      const info = {
+        ...FALLBACK_SERVER_INFO,
+        smart_routing_enabled: enabled,
+        smart_routing_sources: { external, oss },
+      };
+      const session = {
+        ...buildComposerSessionDescriptor(harness, {}),
+        labels: {},
+        parentSessionId,
+        agentName: "agent",
+      };
+      expect(
+        isCostRoutingEligible(info, session, { gateway_inference: { [harness]: gateway } }),
+      ).toBe(expected);
+      expect(isCostRoutingEligible("loading", session)).toBe(false);
+      expect(isCostRoutingEligible(info, { ...session, agentName: null })).toBe(false);
+    },
+  );
+});
 
 describe("composer session descriptors", () => {
   it("preserves the resolved harness, actual wrapper and session metadata without mutation", () => {

@@ -292,6 +292,9 @@ class SessionListItem:
     host_id: str | None = None
     llm_model: str | None = None
     harness_override: str | None = None
+    # Child-only server answer; a failed resolution has no harness.
+    child_harness: str | None = None
+    cost_control_mode_override: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
@@ -321,6 +324,8 @@ class SessionListItem:
             host_id=raw.get("host_id"),
             llm_model=raw.get("llm_model"),
             harness_override=raw.get("harness_override"),
+            child_harness=raw.get("child_harness"),
+            cost_control_mode_override=raw.get("cost_control_mode_override"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
