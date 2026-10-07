@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -27,10 +28,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event
 from starlette.websockets import WebSocketDisconnect
 
+import omnigent.server.routes._sessions.helpers as session_helpers
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.entities import Conversation
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.agent_store import AgentListMetadata
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -38,6 +42,13 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
+
+
+@pytest.fixture(autouse=True)
+def reset_child_harness_warnings() -> Iterator[None]:
+    session_helpers._warn_child_harness_failure.cache_clear()
+    yield
+    session_helpers._warn_child_harness_failure.cache_clear()
 
 
 class _NoIdentityAuthProvider:
@@ -242,29 +253,30 @@ def test_child_load_failure_isolated_per_bundle(stores, caplog, surface, error) 
     )
     headers = {"X-Forwarded-Email": ALICE}
     with caplog.at_level(logging.WARNING), TestClient(app) as client:
-        if surface == "http":
-            response = client.get("/v1/sessions?kind=any", headers=headers)
-            assert response.status_code == 200
-            rows = response.json()["data"]
-        else:
-            with client.websocket_connect("/v1/sessions/updates", headers=headers) as ws:
-                ws.send_json(
-                    {
-                        "type": "watch",
-                        "session_ids": [
-                            parent_id,
-                            *(child.id for child in failed_children),
-                            healthy_child.id,
-                        ],
-                    }
-                )
-                rows = _recv_until(ws, {"snapshot"})["items"]
-    items = {item["id"]: item for item in rows}
-    assert "child_harness" not in items[parent_id]
-    assert items[parent_id]["agent_name"] == "test-agent"
-    assert items[healthy_child.id]["child_harness"] == "codex"
-    assert all(items[child.id]["child_harness"] is None for child in failed_children)
-    assert cache.load.call_count == 2
+        for _ in range(2):
+            if surface == "http":
+                response = client.get("/v1/sessions?kind=any", headers=headers)
+                assert response.status_code == 200
+                rows = response.json()["data"]
+            else:
+                with client.websocket_connect("/v1/sessions/updates", headers=headers) as ws:
+                    ws.send_json(
+                        {
+                            "type": "watch",
+                            "session_ids": [
+                                parent_id,
+                                *(child.id for child in failed_children),
+                                healthy_child.id,
+                            ],
+                        }
+                    )
+                    rows = _recv_until(ws, {"snapshot"})["items"]
+            items = {item["id"]: item for item in rows}
+            assert "child_harness" not in items[parent_id]
+            assert items[parent_id]["agent_name"] == "test-agent"
+            assert items[healthy_child.id]["child_harness"] == "codex"
+            assert all(items[child.id]["child_harness"] is None for child in failed_children)
+    assert cache.load.call_count == 4
     warnings = [
         record for record in caplog.records if "Child harness unresolved" in record.message
     ]
@@ -274,6 +286,57 @@ def test_child_load_failure_isolated_per_bundle(stores, caplog, surface, error) 
     assert type(error).__name__ in warnings[0].message
     assert "private bundle content" not in warnings[0].message
     assert failed_bundle not in warnings[0].message
+
+
+@pytest.mark.parametrize("changed", ["agent", "bundle", "exception"])
+def test_child_harness_warning_dedupes_by_failure_key(caplog, changed) -> None:
+    child = Conversation(
+        id="child",
+        agent_id="agent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent",
+        sub_agent_name="worker",
+    )
+    metadata = {"agent": AgentListMetadata("agent", "bundle", "private-location", "user")}
+    cache = Mock()
+    cache.load.side_effect = TypeError("private bundle content")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            assert session_helpers._prepare_child_harnesses([child], metadata, cache) == {
+                "child": None
+            }
+        warnings = [
+            record for record in caplog.records if "Child harness unresolved" in record.message
+        ]
+        assert len(warnings) == 1
+        assert cache.load.call_count == 2
+        if changed == "agent":
+            child.agent_id = "other-agent"
+            metadata = {
+                "other-agent": AgentListMetadata(
+                    "other-agent", "bundle", "private-location", "user"
+                )
+            }
+        elif changed == "bundle":
+            metadata = {
+                "agent": AgentListMetadata("agent", "bundle", "other-private-location", "user")
+            }
+        else:
+            cache.load.side_effect = ValueError("private bundle content")
+        assert session_helpers._prepare_child_harnesses([child], metadata, cache) == {
+            "child": None
+        }
+    warnings = [
+        record for record in caplog.records if "Child harness unresolved" in record.message
+    ]
+    assert len(warnings) == 2
+    assert cache.load.call_count == 3
+    assert warnings[0].message != warnings[1].message
+    assert all("private" not in record.message for record in warnings)
+    info = session_helpers._warn_child_harness_failure.cache_info()
+    assert info.maxsize == 256
+    assert info.currsize == 2
 
 
 def test_child_stream_uses_one_batch_and_reloads_current_bundle(
