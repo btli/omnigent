@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import event
@@ -175,6 +176,104 @@ def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[s
         if frame.get("type") in wanted:
             return frame
     raise AssertionError(f"no frame in {wanted} after {max_frames} frames")
+
+
+@pytest.mark.parametrize("surface", ["http", "ws"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        TypeError("private bundle content"),
+        ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "private bundle content"}},
+            "GetObject",
+        ),
+    ],
+    ids=["type-error", "client-error"],
+)
+def test_child_load_failure_isolated_per_bundle(stores, caplog, surface, error) -> None:
+    conversations, agents, permissions = stores
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    parent = conversations.get_conversation(parent_id)
+    assert parent is not None and parent.agent_id is not None
+    failed_agent_id = "187b7cb7ac30abf4debfaa578d052ec6"
+    failed_bundle = f"{failed_agent_id}/private-bundle"
+    agents.create(agent_id=failed_agent_id, name="failed", bundle_location=failed_bundle)
+    failed_children = [
+        conversations.create_conversation(
+            agent_id=failed_agent_id,
+            parent_conversation_id=parent_id,
+            sub_agent_name="worker",
+        )
+        for _ in range(2)
+    ]
+    healthy_child = conversations.create_conversation(
+        agent_id=parent.agent_id, parent_conversation_id=parent_id, sub_agent_name="worker"
+    )
+    for child in [*failed_children, healthy_child]:
+        permissions.grant(ALICE, child.id, LEVEL_OWNER)
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1, name="worker", executor=ExecutorSpec(config={"harness": "codex"})
+            )
+        ],
+    )
+
+    def load(agent_id, bundle_location, *, expand_env):
+        if agent_id == failed_agent_id:
+            raise error
+        return SimpleNamespace(spec=spec)
+
+    cache = Mock()
+    cache.load.side_effect = load
+    app = FastAPI()
+    app.include_router(
+        create_sessions_router(
+            conversation_store=conversations,
+            agent_store=agents,
+            permission_store=permissions,
+            auth_provider=UnifiedAuthProvider(source="header"),
+            agent_cache=cache,
+        ),
+        prefix="/v1",
+    )
+    headers = {"X-Forwarded-Email": ALICE}
+    with caplog.at_level(logging.WARNING), TestClient(app) as client:
+        if surface == "http":
+            response = client.get("/v1/sessions?kind=any", headers=headers)
+            assert response.status_code == 200
+            rows = response.json()["data"]
+        else:
+            with client.websocket_connect("/v1/sessions/updates", headers=headers) as ws:
+                ws.send_json(
+                    {
+                        "type": "watch",
+                        "session_ids": [
+                            parent_id,
+                            *(child.id for child in failed_children),
+                            healthy_child.id,
+                        ],
+                    }
+                )
+                rows = _recv_until(ws, {"snapshot"})["items"]
+    items = {item["id"]: item for item in rows}
+    assert "child_harness" not in items[parent_id]
+    assert items[parent_id]["agent_name"] == "test-agent"
+    assert items[healthy_child.id]["child_harness"] == "codex"
+    assert all(items[child.id]["child_harness"] is None for child in failed_children)
+    assert cache.load.call_count == 2
+    warnings = [
+        record for record in caplog.records if "Child harness unresolved" in record.message
+    ]
+    assert len(warnings) == 1
+    assert failed_agent_id in warnings[0].message
+    assert "bundle_key=" in warnings[0].message
+    assert type(error).__name__ in warnings[0].message
+    assert "private bundle content" not in warnings[0].message
+    assert failed_bundle not in warnings[0].message
 
 
 def test_child_stream_uses_one_batch_and_reloads_current_bundle(
