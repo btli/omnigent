@@ -297,6 +297,7 @@ from omnigent.spec.types import (
     PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.agent_store import AgentListMetadata
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
@@ -1884,6 +1885,67 @@ def _resolve_harness(*args: Any, **kwargs: Any) -> str | None:
     return _facade._resolve_harness(*args, **kwargs)
 
 
+def _harness_from_loaded_spec(conv: Conversation, spec: AgentSpec) -> str | None:
+    """Resolve the bound executor, including nested and synthesized children."""
+    from omnigent.harness_aliases import canonicalize_harness
+
+    if conv.harness_override:
+        return conv.harness_override
+    executor = spec.executor
+    if conv.sub_agent_name:
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        sub = _find_spec_by_name(spec, conv.sub_agent_name)
+        if sub is not None:
+            executor = sub.executor
+    harness = (
+        executor.config.get("harness") or spec.executor.config.get("harness") or executor.type
+    )
+    return canonicalize_harness(harness) or harness
+
+
+def _prepare_child_harnesses(
+    conversations: Sequence[Conversation],
+    agents: Mapping[str, AgentListMetadata],
+    agent_cache: AgentCache | None,
+) -> dict[str, str | None]:
+    """Prepare child-only answers in a worker thread, loading each bundle once."""
+    children = [
+        conv for conv in conversations if conv.sub_agent_name and not conv.harness_override
+    ]
+    result: dict[str, str | None] = {conv.id: None for conv in children}
+    specs: dict[tuple[str, str, bool], AgentSpec | None] = {}
+    for conv in children:
+        agent = agents.get(conv.agent_id or "")
+        if agent is None:
+            continue
+        key = (agent.id, agent.bundle_location, agent.operator_authored)
+        try:
+            if key not in specs:
+                specs[key] = None
+                if agent_cache is None:
+                    from omnigent.runtime import get_agent_cache
+
+                    agent_cache = get_agent_cache()
+                specs[key] = agent_cache.load(
+                    agent.id, agent.bundle_location, expand_env=agent.operator_authored
+                ).spec
+            spec = specs[key]
+            if spec is not None:
+                result[conv.id] = _harness_from_loaded_spec(conv, spec)
+        except (
+            KeyError,
+            AttributeError,
+            ValueError,
+            ImportError,
+            OSError,
+            RuntimeError,
+            OmnigentError,
+        ):
+            continue
+    return result
+
+
 def _resolve_harness_impl(
     conv: Conversation | None,
     *,
@@ -1918,7 +1980,6 @@ def _resolve_harness_impl(
     if conv.agent_id is None:
         return None
     try:
-        from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime import get_agent_cache
 
         if agent_store is None:
@@ -1935,23 +1996,7 @@ def _resolve_harness_impl(
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
-        executor = loaded.spec.executor
-        # For a bundled-agent head sub-agent, report the HEAD's own harness,
-        # not the bundle brain's — `harness` is this session's provider family
-        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
-        # brain harness when the head declares none or can't be matched.
-        if conv.sub_agent_name:
-            from omnigent.runtime.workflow import _find_spec_by_name
-
-            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
-            if sub is not None:
-                executor = sub.executor
-        harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
-        )
-        return canonicalize_harness(harness) or harness
+        return _harness_from_loaded_spec(conv, loaded.spec)
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
     except (
         KeyError,
