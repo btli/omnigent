@@ -14,6 +14,7 @@ import json
 import math
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import weakref
@@ -28,6 +29,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
@@ -1905,6 +1907,20 @@ def _harness_from_loaded_spec(conv: Conversation, spec: AgentSpec) -> str | None
     return canonicalize_harness(harness) or harness
 
 
+_child_harness_warning_lock = threading.Lock()
+
+
+@lru_cache(maxsize=256)
+def _warn_child_harness_failure(agent_id: str, bundle_key: str, exception_type: str) -> None:
+    """Keep repeated bundle failures from flooding session-update logs."""
+    _logger.warning(
+        "Child harness unresolved for agent_id=%s bundle_key=%s exception_type=%s",
+        agent_id,
+        bundle_key,
+        exception_type,
+    )
+
+
 def _prepare_child_harnesses(
     conversations: Sequence[Conversation],
     agents: Mapping[str, AgentListMetadata],
@@ -1936,12 +1952,12 @@ def _prepare_child_harnesses(
                 result[conv.id] = _harness_from_loaded_spec(conv, spec)
         except Exception as exc:  # noqa: BLE001 — a child spec failure must not fail the session list
             specs[key] = None
-            _logger.warning(
-                "Child harness unresolved for agent_id=%s bundle_key=%s exception_type=%s",
-                agent.id,
-                hashlib.sha256(agent.bundle_location.encode()).hexdigest(),
-                type(exc).__name__,
-            )
+            with _child_harness_warning_lock:
+                _warn_child_harness_failure(
+                    agent.id,
+                    hashlib.sha256(agent.bundle_location.encode()).hexdigest(),
+                    type(exc).__name__,
+                )
             continue
     return result
 
