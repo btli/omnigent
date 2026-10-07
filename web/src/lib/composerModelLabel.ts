@@ -1,10 +1,5 @@
-// Canonical model / effort label formatting for the composer, shared by the
-// landing dialog and the in-session chat composer so both surfaces render the
-// same label for the same model.
-//
-// Pure leaf module (no React, no store) so the landing screen, the chat page,
-// the harness config controls, and the store can all depend on one source of
-// truth without a circular import.
+// Shared composer label, effort and routing helpers for chat and session tooltips.
+// Uses agent labels, routing controls and capability helpers for consistent display.
 
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { isCostRoutingSession } from "@/components/CostRoutingControl";
