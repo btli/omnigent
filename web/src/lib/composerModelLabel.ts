@@ -7,13 +7,49 @@
 // truth without a circular import.
 
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { isCostRoutingSession } from "@/components/CostRoutingControl";
+import type { ServerInfo } from "@/lib/capabilities";
+import {
+  SMART_ROUTING_ARMS,
+  hostBacksHarnessWithGateway,
+  smartRoutingSourceFor,
+} from "@/lib/smartRoutingAvailability";
+import {
+  isNativeTerminalSession,
+  nativeCodingAgentForSession,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
+import type { Session, NativeModelOption } from "@/lib/types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { fusionModelLabel, isFusionModelUid } from "@/lib/devinFusion";
-import type { NativeModelOption } from "@/lib/types";
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
+
+// Native routing also needs a router source that can serve the host family.
+export function isCostRoutingEligible(
+  serverInfo: ServerInfo | "loading",
+  // Only the fields the guards below read, so a temp/optimistic session can be
+  // evaluated from its seed without fabricating a whole Session. A real Session
+  // is structurally assignable.
+  session: Pick<Session, "agentName" | "parentSessionId" | "harness" | "labels"> | null | undefined,
+  host?: { gateway_inference?: Record<string, boolean> | null } | null,
+): boolean {
+  if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
+  if (!isCostRoutingSession(session)) return false;
+  if (!isNativeTerminalSession(session)) return true;
+  const native = nativeCodingAgentForSession(session);
+  if (native === undefined || !SMART_ROUTING_ARMS.some((arm) => arm === native.harness)) {
+    return false;
+  }
+  return (
+    smartRoutingSourceFor({
+      externalConfigured: serverInfo.smart_routing_sources.external,
+      ossConfigured: serverInfo.smart_routing_sources.oss,
+      gatewayBacked: hostBacksHarnessWithGateway(host, native.harness),
+    }) !== null
+  );
+}
 
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;

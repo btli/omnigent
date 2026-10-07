@@ -566,7 +566,7 @@ describe("useHostModelOptions", () => {
     expect(tooltip.result.current.data).toEqual([{ id: "opus" }]);
   });
 
-  it("makes one failed tooltip request per mount without background retries", async () => {
+  it("does not re-request a failed tooltip catalog across repeated opens until GC", async () => {
     fetchMock.mockResolvedValue(mockResponse({ detail: "CLI unavailable" }, 502));
     const client = new QueryClient();
     const sharedWrapper = ({ children }: { children: ReactNode }) => (
@@ -587,10 +587,40 @@ describe("useHostModelOptions", () => {
       const second = openTooltip();
       await waitFor(() => expect(second.result.current.isError).toBe(true));
       await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      second.unmount();
+      const third = openTooltip();
+      await waitFor(() => expect(third.result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      third.unmount();
+      await vi.advanceTimersByTimeAsync(300_001);
+      const afterGC = openTooltip();
+      await waitFor(() => expect(afterGC.result.current.isError).toBe(true));
       expect(fetchMock).toHaveBeenCalledTimes(2);
+      afterGC.unmount();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("recovers a failed tooltip catalog when a picker mounts", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: "CLI unavailable" }, 502));
+    fetchMock.mockResolvedValue(mockResponse({ models: [{ id: "opus" }] }));
+    const client = new QueryClient();
+    const sharedWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const tooltip = renderHook(
+      () => useHostModelOptions("host_1", "claude-native", true, { once: true }),
+      { wrapper: sharedWrapper },
+    );
+    await waitFor(() => expect(tooltip.result.current.isError).toBe(true));
+    const picker = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() => expect(picker.result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(tooltip.result.current.data).toEqual([{ id: "opus" }]);
   });
 
   it("does not extend a shared picker catalog's cache lifetime", async () => {
