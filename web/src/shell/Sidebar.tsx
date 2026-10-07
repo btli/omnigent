@@ -2,6 +2,7 @@ import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import {
   buildComposerSessionDescriptor,
+  isCostRoutingEligible,
   composerModelChipLabel,
   formatStatusModelLabel,
 } from "@/lib/composerModelLabel";
@@ -3776,6 +3777,9 @@ function SessionTooltipDetails({
       : (host?.name ?? conversation.host_id);
   const { data: agents = [] } = useAvailableAgents();
   const agent = agents.find((candidate) => candidate.id === conversation.agent_id);
+  const hasChildHarness = "child_harness" in conversation;
+  const unresolvedChild =
+    hasChildHarness && !conversation.child_harness && !conversation.harness_override;
   const nativePaneAgent = nativeCodingAgentForWrapper(conversation.labels?.["omnigent.wrapper"]);
   const declaredNativeAgent =
     nativePaneAgent ??
@@ -3785,14 +3789,35 @@ function SessionTooltipDetails({
     conversation.harness_override === AUTO_HARNESS_ID && nativePaneAgent
       ? null
       : conversation.harness_override;
-  const harness = harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null;
+  const harness = hasChildHarness
+    ? (harnessOverride ?? conversation.child_harness ?? null)
+    : (harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null);
   const nativeAgent = nativeCodingAgentForHarness(harness);
-  const iconAgent = nativeAgent
-    ? { name: nativeAgent.agentName, harness }
-    : agent
-      ? { name: agent.name, harness }
-      : null;
+  const iconAgent = unresolvedChild
+    ? null
+    : nativeAgent
+      ? { name: nativeAgent.agentName, harness }
+      : agent
+        ? { name: agent.name, harness }
+        : hasChildHarness && harness
+          ? { name: conversation.agent_name ?? "agent", harness }
+          : null;
+  const session = buildComposerSessionDescriptor(
+    harness,
+    conversation.labels,
+    conversation.parent_session_id,
+  );
+  const serverInfo = useContext(ServerInfoContext);
+  const routingOn =
+    !unresolvedChild &&
+    isCostRoutingEligible(
+      serverInfo,
+      { ...session, labels: conversation.labels ?? {}, agentName: conversation.agent_name ?? null },
+      host,
+    ) &&
+    conversation.cost_control_mode_override === "on";
   const catalogEnabled =
+    !routingOn &&
     nativeAgent !== undefined &&
     !!conversation.llm_model &&
     host?.status === "online" &&
@@ -3816,15 +3841,14 @@ function SessionTooltipDetails({
         : null,
     nativeDisplayName: nativeAgent?.displayName,
     harnessLabel:
-      agent || harness === AUTO_HARNESS_ID
+      !unresolvedChild && (agent || (hasChildHarness && harness) || harness === AUTO_HARNESS_ID)
         ? [agent?.display_name ?? conversation.agent_name, harnessLabel].filter(Boolean).join(" · ")
         : conversation.agent_name,
-    session: iconAgent
-      ? buildComposerSessionDescriptor(harness, conversation.labels, conversation.parent_session_id)
-      : null,
+    session: iconAgent ? session : null,
     model: conversation.llm_model ?? null,
     modelOptions: catalogEnabled ? models : [],
     effort: conversation.reasoning_effort,
+    routingOn,
   });
   const workspace = conversation.workspace ?? "";
   const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
@@ -4932,6 +4956,8 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "workspace",
   "llm_model",
   "harness_override",
+  "child_harness",
+  "cost_control_mode_override",
   "reasoning_effort",
   "parent_session_id",
   "archived",
@@ -4949,6 +4975,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
   if (a === b) return true;
+  if ("child_harness" in a !== "child_harness" in b) return false;
   for (const key of RENDERED_CONVERSATION_FIELDS) {
     if (a[key] !== b[key]) return false;
   }

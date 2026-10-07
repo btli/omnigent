@@ -57,8 +57,18 @@ from omnigent.server.schemas import (
 @pytest.mark.parametrize(
     "metadata",
     [
-        {"llm_model": "opus[1m]", "harness_override": "codex"},
-        {"llm_model": None, "harness_override": None},
+        {
+            "llm_model": "opus[1m]",
+            "harness_override": "codex",
+            "child_harness": "codex",
+            "cost_control_mode_override": "on",
+        },
+        {
+            "llm_model": None,
+            "harness_override": None,
+            "child_harness": None,
+            "cost_control_mode_override": None,
+        },
         {},
     ],
 )
@@ -75,6 +85,8 @@ def test_list_item_model(metadata: dict[str, str | None]) -> None:
     )
     assert item.llm_model == metadata.get("llm_model")
     assert item.harness_override == metadata.get("harness_override")
+    assert item.child_harness == metadata.get("child_harness")
+    assert item.cost_control_mode_override == metadata.get("cost_control_mode_override")
 
 
 def _make_namespace(
