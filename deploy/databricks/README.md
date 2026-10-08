@@ -346,15 +346,12 @@ connected is refused with a "Connect Databricks first" message: no Sandbox is
 created and nothing falls back to the server identity. `workspace_host` refuses a
 connection to any other workspace. `profile` cannot be combined with `owner`.
 
-`identity: owner` needs Databricks Connect configured on the server:
-
-- An account-level [custom OAuth app
-  integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
-  with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
-  scopes `all-apis offline_access`. Its client id and secret go in
-  `OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`.
-- A credential-store cipher for the stored tokens (`OMNIGENT_CREDENTIAL_KMS_KEY_ID`
-  or `OMNIGENT_CREDENTIAL_VAULT_KEY`).
+`identity: owner` needs [Databricks Connect](../../designs/DATABRICKS_CONNECT.md)
+configured on the server: an account-level [custom OAuth app
+integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
+with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
+scopes `all-apis offline_access`. Its client id and secret go in
+`OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`.
 
 **Stop and resume.** A Sandbox stopped by its idle timeout is started in place on
 the session's next turn, and its host is re-bootstrapped. The keepalive refreshes
