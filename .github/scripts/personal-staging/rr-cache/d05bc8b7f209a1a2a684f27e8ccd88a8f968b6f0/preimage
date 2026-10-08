@@ -18,10 +18,10 @@ import * as THREE from "three";
 import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
-import { applyThreeMfColors } from "./threeMfColors";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+<<<<<<<
 import { Progress } from "@/components/ui/progress";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -31,6 +31,10 @@ import {
   type WorkspaceFileDownloadProgress,
 } from "@/hooks/useFileContent";
 import { formatBytes } from "./fileStatusUtils";
+=======
+import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
+import { applyThreeMfColors } from "./threeMfColors";
+>>>>>>>
 import {
   type ModelFormat,
   type ModelViewerTheme,
@@ -525,6 +529,9 @@ export function ModelViewer({
 
         const controls = new TrackballControls(camera, renderer.domElement);
         res.controls = controls;
+        // A drag across the canvas width turns the model once, close to the
+        // full turn per canvas height OrbitControls gave.
+        controls.rotateSpeed = Math.PI;
 
         const render = () => {
           res.rafId = requestAnimationFrame(render);
