@@ -30,7 +30,7 @@ def android_bridge_script() -> str:
 
     :returns: The bridge script with Kotlin template placeholders substituted.
     """
-    source = BRIDGE_SOURCE.read_text()
+    source = BRIDGE_SOURCE.read_text(encoding="utf-8")
     match = re.search(r'val source: String =\s*"""\n(.*?)"""\.trimIndent\(\)', source, re.S)
     assert match, f"bridge raw string not found in {BRIDGE_SOURCE}"
     script = textwrap.dedent(match.group(1))
