@@ -1,21 +1,13 @@
-"""Android shell: the Workspace rail's embedded file viewer must not re-add the OS inset.
+"""Android shell: a file opened in the Workspace rail must not re-add the OS inset.
 
-The Android shell (``web/android``) injects its own ``!important`` safe-area
-stylesheet from ``NativeBridgeScript.kt`` on top of the SPA's CSS. Like the SPA's
-``index.css`` rule, it must exempt panels nested inside the already padded
-Workspace rail, or the frameless viewer inside the rail at ``md+`` is padded a
-second time.
-
-Plain Chromium stands in for the WebView: the Kotlin-embedded script is
-extracted and injected before any app script runs, and the OS insets are written
-into the page the way ``MainActivity.emitInsets()`` does.
+Plain Chromium stands in for the WebView, running the real injected bridge
+script with the OS insets written the way ``MainActivity.emitInsets()`` does.
 """
 
 from __future__ import annotations
 
 import re
 import shutil
-import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -24,17 +16,9 @@ import pytest
 from playwright.sync_api import FloatRect, Locator, Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.mobile._android_bridge import android_bridge_script, emit_android_insets
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_BRIDGE_SOURCE = (
-    _REPO_ROOT / "web/android/app/src/main/java/ai/omnigent/android/NativeBridgeScript.kt"
-)
-# Kotlin templates inside the raw string: the bridge transport object name and
-# the escaped literal dollar sign.
-_KOTLIN_SUBSTITUTIONS = {
-    "${OmnigentBridgeListener.JS_OBJECT_NAME}": "omnigentNativeBridge",
-    "${'$'}": "$",
-}
 
 # Unfolded foldable / tablet class (>= the 768px ``md`` breakpoint, where the
 # Workspace rail docks) and a phone, where the viewer is a standalone overlay.
@@ -45,42 +29,6 @@ _NAV_BAR_PX = 20
 
 _SEEDED_FILE = "android_workspace_viewer_inset.txt"
 _SEEDED_CONTENT = "Body of the file opened in the Workspace rail."
-
-
-def android_bridge_script() -> str:
-    """Return the JavaScript the Android shell injects, taken from the Kotlin source.
-
-    :returns: The bridge script with Kotlin template placeholders substituted.
-    """
-    source = _BRIDGE_SOURCE.read_text()
-    match = re.search(r'val source: String =\s*"""\n(.*?)""".trimIndent\(\)', source, re.S)
-    assert match, f"bridge raw string not found in {_BRIDGE_SOURCE}"
-    script = textwrap.dedent(match.group(1))
-    for placeholder, value in _KOTLIN_SUBSTITUTIONS.items():
-        script = script.replace(placeholder, value)
-    assert "${" not in script, "unsubstituted Kotlin template in the bridge script"
-    return script
-
-
-def emit_android_insets(page: Page, top: int, bottom: int) -> None:
-    """Push the OS insets into the page the way ``MainActivity.emitInsets()`` does.
-
-    :param page: Page running under the injected Android bridge.
-    :param top: Status-bar inset in CSS px.
-    :param bottom: Navigation-bar inset in CSS px.
-    """
-    page.evaluate(
-        """([top, bottom]) => {
-          const s = document.documentElement.style;
-          s.setProperty('--omnigent-safe-top', top + 'px');
-          s.setProperty('--omnigent-safe-bottom', bottom + 'px');
-          s.setProperty('--omnigent-android-safe-area-top', top + 'px');
-          s.setProperty('--omnigent-android-safe-area-bottom', bottom + 'px');
-          s.setProperty('--omnigent-android-safe-area-left', '0px');
-          s.setProperty('--omnigent-android-safe-area-right', '0px');
-        }""",
-        [top, bottom],
-    )
 
 
 @pytest.fixture
@@ -128,13 +76,6 @@ def _box(locator: Locator) -> FloatRect:
     return box
 
 
-def _vertical_padding(locator: Locator) -> tuple[str, str]:
-    top, bottom = locator.evaluate(
-        "el => { const cs = getComputedStyle(el); return [cs.paddingTop, cs.paddingBottom]; }"
-    )
-    return (top, bottom)
-
-
 @pytest.mark.browser_context_args(viewport=_UNFOLDED_VIEWPORT)
 def test_rail_file_viewer_keeps_single_status_bar_inset(
     request: pytest.FixtureRequest,
@@ -163,19 +104,15 @@ def test_rail_file_viewer_keeps_single_status_bar_inset(
     viewer = rail.get_by_test_id("file-viewer")
     expect(viewer).to_be_visible()
     expect(viewer.get_by_text(_SEEDED_CONTENT).first).to_be_visible(timeout=20_000)
-    strip = rail.locator(".workspace-tab-strip")
     header = viewer.locator(":scope > div").first
     expect(header).to_contain_text(_SEEDED_FILE)
-    page.wait_for_timeout(1_500)
+    expect(viewer).to_have_css("padding-top", "0px")
+    expect(viewer).to_have_css("padding-bottom", "0px")
 
-    strip_box = _box(strip)
+    strip_box = _box(rail.locator(".workspace-tab-strip"))
     header_box = _box(header)
     gap = header_box["y"] - (strip_box["y"] + strip_box["height"])
-    padding_top, padding_bottom = _vertical_padding(viewer)
-    assert gap <= 1.0 and padding_top == "0px" and padding_bottom == "0px", (
-        f"viewer header sits {gap:.0f}px below the Workspace tab strip; "
-        f"nested viewer padding top={padding_top} bottom={padding_bottom}"
-    )
+    assert abs(gap) <= 1.0, f"viewer header sits {gap:.0f}px below the Workspace tab strip"
 
 
 @pytest.mark.browser_context_args(viewport=_PHONE_VIEWPORT)
@@ -201,6 +138,5 @@ def test_standalone_file_viewer_keeps_one_inset_on_a_phone(
     viewer = page.locator('aside[data-testid="file-viewer"]')
     expect(viewer).to_be_visible()
     expect(viewer.get_by_text(_SEEDED_CONTENT).first).to_be_visible(timeout=20_000)
-    page.wait_for_timeout(1_500)
-
-    assert _vertical_padding(viewer) == (f"{_STATUS_BAR_PX}px", f"{_NAV_BAR_PX}px")
+    expect(viewer).to_have_css("padding-top", f"{_STATUS_BAR_PX}px")
+    expect(viewer).to_have_css("padding-bottom", f"{_NAV_BAR_PX}px")

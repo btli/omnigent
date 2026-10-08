@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import re
-import textwrap
 from pathlib import Path
 
 from playwright.sync_api import Page
 
+from tests.e2e_ui.mobile._android_bridge import android_bridge_script, emit_android_insets
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_NATIVE_SCRIPT = (
-    _REPO_ROOT / "web/android/app/src/main/java/ai/omnigent/android/NativeBridgeScript.kt"
-)
 _WEB_CSS = _REPO_ROOT / "web/src/index.css"
+
+
+def native_panel_rule() -> str:
+    """Return the SPA rule that pads full-height panels on native shells, from ``index.css``.
+
+    :returns: The complete rule, selector through closing brace, comments stripped.
+    """
+    css = re.sub(r"/\*.*?\*/", "", _WEB_CSS.read_text(encoding="utf-8"), flags=re.S)
+    match = re.search(
+        r":is\(\[data-ios-native\], \[data-android-native\]\)\s*"
+        r':is\(\s*aside\[aria-label="Workspace"\],[^{}]*\{[^{}]*\}',
+        css,
+    )
+    assert match, f"native panel rule not found in {_WEB_CSS}"
+    return match.group(0)
 
 
 def test_android_insets_skip_viewer_nested_in_workspace(page: Page) -> None:
@@ -22,7 +35,6 @@ def test_android_insets_skip_viewer_nested_in_workspace(page: Page) -> None:
         """<!doctype html>
         <html data-android-native>
           <head><style>
-            :root { --omnigent-safe-top: 52px; --omnigent-safe-bottom: 20px; }
             body { margin: 0; font: 16px sans-serif; }
             #open-file { height: 36px; }
             [role=tablist] { height: 44px; background: #ddd; }
@@ -44,24 +56,9 @@ def test_android_insets_skip_viewer_nested_in_workspace(page: Page) -> None:
         </html>"""
     )
 
-    css = _WEB_CSS.read_text(encoding="utf-8")
-    rule_start = css.index("/* Full-height native surfaces")
-    selector_start = css.index(":is([data-ios-native], [data-android-native])", rule_start)
-    rule_end = css.index("}", selector_start) + 1
-    web_inset_style = page.add_style_tag(content=css[selector_start:rule_end])
-
-    kotlin = _NATIVE_SCRIPT.read_text(encoding="utf-8")
-    match = re.search(
-        r"val source: String =\s*\"\"\"\n(?P<script>.*?)\n\s*\"\"\"\.trimIndent\(\)",
-        kotlin,
-        re.DOTALL,
-    )
-    assert match is not None, "could not extract NativeBridgeScript.source"
-    script = textwrap.dedent(match.group("script"))
-    script = script.replace("${OmnigentBridgeListener.JS_OBJECT_NAME}", "omnigentNativeBridge")
-    script = script.replace("${'$'}", "$")
-    page.add_script_tag(content=script)
-    page.evaluate("window.__omnigentNativeEmitInsets(52, 20)")
+    web_inset_style = page.add_style_tag(content=native_panel_rule())
+    page.add_script_tag(content=android_bridge_script())
+    emit_android_insets(page, 52, 20)
 
     page.locator("#open-file").click()
 
