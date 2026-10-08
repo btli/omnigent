@@ -18,3 +18,4 @@
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 #
+8957              # bot replacement for closed #8928 (safe workspace delete)

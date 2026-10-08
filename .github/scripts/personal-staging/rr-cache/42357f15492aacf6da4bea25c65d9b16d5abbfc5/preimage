@@ -12,6 +12,7 @@ by its MIME type (``mimetypes.guess_type('x.stl')`` →
 ``application/vnd.ms-pki.stl``, a recognized model type); OBJ has no model MIME
 (``application/x-tgif``) so it exercises the extension fallback. Seeded via the
 filesystem PUT endpoint (no agent run).
+<<<<<<<
 
 The Z-up print tests open a tall 3D-printing part (STL and 3MF, whose loaders
 return geometry in the slicer's Z-up frame) and read the rendered canvas: the
@@ -19,19 +20,24 @@ part must stand upright, dragging vertically must keep orbiting past the
 model's underside, and the faces turned toward the camera must stay lit while
 the view swings under it. The 3MF container is a zip, so it is written into the
 session workspace on disk rather than through the text-only PUT endpoint.
-
+=======
 The filesystem PUT is text-only: latin-1 is rejected because the writer
 decodes as UTF-8. The binary 3MF is written to the workspace root returned
 by the environment API, then checked byte-for-byte through the raw GET.
+>>>>>>>
 """
 
 from __future__ import annotations
 
 import io
 import json
+<<<<<<<
 import math
 import re
 import subprocess
+=======
+import re
+>>>>>>>
 import time
 import zipfile
 from collections.abc import Iterator
@@ -39,11 +45,16 @@ from pathlib import Path
 
 import httpx
 import pytest
+<<<<<<<
+from PIL import Image
+from playwright.sync_api import Page, expect
+=======
 from PIL import Image, ImageChops, ImageStat
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
+>>>>>>>
 
 # ---------------------------------------------------------------------------
 # Test fixtures — tiny, valid single-triangle models
@@ -602,6 +613,7 @@ def test_large_model_shows_loading_status_until_it_renders(
     expect(file_viewer.get_by_role("status")).to_have_text("")
     expect(file_viewer.get_by_text("Unable to render 3D model")).to_have_count(0)
 
+<<<<<<<
 
 # ---------------------------------------------------------------------------
 # Canvas background follows the active theme
@@ -762,6 +774,10 @@ def test_camera_facing_surfaces_stay_lit_under_the_model(
     assert darkest > lit / 2, (
         f"model luminance fell from {lit:.0f} to {darkest:.0f}/255 while swinging under the model"
     )
+=======
+    # It did NOT fall through to the binary placeholder or a source/editor view.
+    expect(file_viewer.get_by_text("Preview not available for binary files")).to_have_count(0)
+    expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -778,6 +794,7 @@ def test_coloured_3mf_keeps_filament_hues_across_themes(
         f"{base_url}/v1/sessions/{session_id}"
         f"/resources/environments/default/filesystem/{file_path}"
     )
+    # A filesystem request initializes the session workspace before metadata is read.
     response = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem",
         timeout=10.0,
@@ -833,3 +850,4 @@ def test_coloured_3mf_keeps_filament_hues_across_themes(
         assert_hues()
     settings.close()
     expect(viewer.get_by_text("Unable to render 3D model")).to_have_count(0)
+>>>>>>>
