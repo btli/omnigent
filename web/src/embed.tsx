@@ -64,8 +64,17 @@ import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+import { restoreFontPreferences } from "./lib/restoreFontPreferences";
 
-export type { OmnigentHostConfig } from "./lib/host";
+// Restore the saved font preferences (and kick off any catalog webfont loads)
+// when the embed module loads. The UI/code font controls stay visible when
+// embedded (per-device readability prefs that don't conflict with host theming),
+// so a chosen font must be applied + fetched here just as standalone does in
+// main.tsx — otherwise the selection would only take effect on the next Settings
+// change. Guarded for SSR by the apply/load helpers.
+restoreFontPreferences();
+
+export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
 
 // Re-export the host-config setter so the host can install transport config
@@ -171,7 +180,9 @@ function OmnigentProviders({
     initChatStore(hostQueryClient);
     // Resolve a session's routing host on demand (a hostless sub-agent child
     // walks up to its host-bound ancestor) before host-scoped requests key.
-    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
+    setSessionHostResolver((sessionId, options) =>
+      prefetchSessionHostChain(hostQueryClient, sessionId, options),
+    );
     void resolveIdentity();
     return null;
   });
