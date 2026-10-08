@@ -50,8 +50,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
 }));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
@@ -69,6 +69,7 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
     githubState: "ready" as "loading" | "ready" | "unknown",
     prCount: 0,
     prNumber: null as number | null,
+    prNumberPrefix: "#",
     refresh: vi.fn(),
     refreshing: false,
   },
@@ -98,6 +99,7 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       githubState: "ready",
       prCount: 0,
       prNumber: null,
+      prNumberPrefix: "#",
       refreshing: false,
     },
     overrides,
@@ -632,6 +634,8 @@ describe("Composer send shortcut", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
@@ -2487,7 +2491,7 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
+    expect(screen.queryByTestId("composer-pr-loading")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
 
     setComposerGitStatus({ githubState: "unknown" });
@@ -2496,8 +2500,15 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
+    expect(screen.queryByTestId("composer-pr-unknown")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("marks the PR number with the prefix of the PR's provider", () => {
+    setComposerGitStatus({ prCount: 1, prNumber: 7, prNumberPrefix: "!" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("!7");
+    expect(screen.getByTestId("composer-pr-link")).toHaveAccessibleName("!7");
   });
 
   it("keeps the PR to the right of the confirmed worktree status", () => {
@@ -4020,6 +4031,39 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("");
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
     expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("retracts delivery that arrives while the failed draft restore is rendering", () => {
+    const stableId = "8".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const unsubscribe = useChatStore.subscribe((state) => {
+      if (state.restoredSendDraft?.stableId !== stableId || state.restoredSendDraft.delivered)
+        return;
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+      });
+    });
+    try {
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "resend me",
+            files: [],
+            stableId,
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(getSessionDraft("conv_test")).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("keeps the user's edits when the delivered retraction lands", () => {
@@ -5636,7 +5680,7 @@ describe("Composer config gear", () => {
     expect(calls).toEqual(["model", "effort"]);
   });
 
-  it("shows a titled actionable tooltip when a session config update fails", async () => {
+  it("leaves no lingering error indicator when a session config update fails", async () => {
     const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
     const options = [
       { id: "opus", model: "opus", displayName: "Opus" },
@@ -5655,12 +5699,14 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    const error = await screen.findByTestId("composer-config-error");
-    fireEvent.focus(error);
-    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
-    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
-    expect(tooltip).toHaveTextContent("Host stopped responding");
-    expect(tooltip).toHaveTextContent("Try again");
+    await waitFor(() =>
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+    );
+    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
   });
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
