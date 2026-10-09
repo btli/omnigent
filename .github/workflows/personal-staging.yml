@@ -171,20 +171,20 @@ jobs:
         run: |
           set -euo pipefail
           python3 "$RUNNER_TEMP/gate/composition_gate.py" \
-            --report merge-report.json --summary composition-report.md \
+            --report merge-report.json --summary "$RUNNER_TEMP/composition-report.md" \
             >> "$GITHUB_OUTPUT"
           {
             echo "failed_count=$(jq '.skipped | length' merge-report.json)"
             echo "failed_prs=$(jq -r '[.skipped[].pr | select(type == "number")] | .[:10] | map("#\(.)") | join(" ")' merge-report.json)"
           } >> "$GITHUB_OUTPUT"
-          cat composition-report.md >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/composition-report.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload composition report
         if: steps.gate.outputs.complete != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: composition-report
-          path: composition-report.md
+          path: ${{ runner.temp }}/composition-report.md
 
       - name: Upload merge report
         if: always() && hashFiles('merge-report.json') != ''
