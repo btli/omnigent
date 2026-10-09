@@ -252,7 +252,9 @@ jobs:
           else
             gh release create "$tag" --draft --prerelease --target "$sha" \
               --title "Personal production $tag" --notes-file "$notes"
-            echo "created=true" >> "$GITHUB_OUTPUT"
+            # A file, not a step output: cleanup must see it even if this
+            # step is cancelled before its outputs are processed.
+            echo "$tag" > "$RUNNER_TEMP/draft-created"
           fi
           gh release upload "$tag" "$dist"/* --clobber
           cat "$notes" >> "$GITHUB_STEP_SUMMARY"
@@ -294,13 +296,18 @@ jobs:
             -t "ghcr.io/btli/omnigent-host:${tag}" -t "ghcr.io/btli/omnigent-host:sha-${short}" \
             "ghcr.io/btli/omnigent-host@${host}"
 
-      # Before the pin, a failure leaves production untouched: drop the draft
-      # only if this run created it and it is still a draft.
-      - name: Delete the draft if publishing failed before the pin
-        if: failure() && steps.draft.outputs.created == 'true'
+      # Before the pin, a failed or cancelled run leaves production untouched:
+      # drop the draft only if this run created it and it is still a draft.
+      - name: Delete the draft if publishing stopped before the pin
+        if: (failure() || cancelled()) && steps.plan.outputs.publish == 'true'
         run: |
           set -euo pipefail
-          tag=$(jq -r '.production_tag' "$RUNNER_TEMP/plan.json")
+          marker="$RUNNER_TEMP/draft-created"
+          if [ ! -f "$marker" ]; then
+            echo "this run created no draft release"
+            exit 0
+          fi
+          tag=$(cat "$marker")
           draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo unknown)
           if [ "$draft" = "true" ]; then
             gh release delete "$tag" --yes
@@ -365,14 +372,23 @@ jobs:
             gh release create production-latest --prerelease \
               --title "Personal production (latest — $tag)" --notes-file "$notes"
           fi
-          gh release upload production-latest "$RUNNER_TEMP/dist"/* --clobber
+          # source.json goes last: its sha is what tells a rerun the switch
+          # finished (promote.py plan only plans noop once it matches).
+          assets=()
+          for f in "$RUNNER_TEMP/dist"/*; do
+            if [ "$(basename "$f")" != "source.json" ]; then
+              assets+=("$f")
+            fi
+          done
+          gh release upload production-latest "${assets[@]}" --clobber
+          gh release upload production-latest "$RUNNER_TEMP/dist/source.json" --clobber
           echo "Promoted \`$nightly\` (\`$sha\`) to \`$tag\` and production-latest." >> "$GITHUB_STEP_SUMMARY"
 
   # Best-effort by contract, as in personal-production.yml: the curl can only
   # warn, never fail, so alerting never makes a red run harder to read.
   alert-failure:
     needs: [test-promote, promote]
-    if: failure() && github.repository == 'btli/omnigent'
+    if: (failure() || cancelled()) && github.repository == 'btli/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

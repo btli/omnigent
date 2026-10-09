@@ -85,8 +85,11 @@ Every rule must pass, or nothing is published.
    are evaluated inside the run, after the lock is acquired.
 
 `promote.py plan` prints a JSON plan
-`{"action": "promote|noop|blocked|refused", ...}`. The workflow carries out the
-plan. Every step is idempotent, so a rerun completes a partial promotion.
+`{"action": "promote|noop|blocked|refused|ignored|error", ...}`. The workflow
+carries out the plan. Every step is idempotent, so a rerun completes a partial
+promotion. `noop` requires both the `production-latest` tag and its release's
+`source.json` to name the candidate sha, so a rerun repairs a half-finished
+switch.
 
 ## Publish order
 

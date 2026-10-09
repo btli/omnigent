@@ -267,7 +267,14 @@ def _promoted(repo, gh, ptag, psha, source_tag, latest=False):
     repo.tag(ptag, psha)
     gh.releases[ptag] = {"source.json": {"source_tag": source_tag, "sha": psha}}
     if latest:
-        repo.tag("production-latest", psha)
+        _latest_at(repo, gh, psha, source_tag)
+
+
+def _latest_at(repo, gh, sha, source_tag, *, release=True):
+    """Point production-latest at *sha*; *release* also gives it a matching source.json."""
+    repo.tag("production-latest", sha)
+    if release:
+        gh.releases["production-latest"] = {"source.json": {"source_tag": source_tag, "sha": sha}}
 
 
 def test_plan_forward_only(repo):
@@ -374,7 +381,58 @@ def test_plan_noop_only_when_latest_points_at_sha(repo):
     _promoted(repo, gh, "production-20261010", sha, "nightly-20261010")
     assert run_plan(repo, gh, nightly="nightly-20261010")["action"] == "promote"
     repo.annotated_tag("production-latest", sha)  # annotated latest is peeled
+    gh.releases["production-latest"] = {
+        "source.json": {"source_tag": "nightly-20261010", "sha": sha}
+    }
     assert run_plan(repo, gh, nightly="nightly-20261010")["action"] == "noop"
+
+
+def test_plan_noop_requires_latest_release_showing_the_build(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    _promoted(repo, gh, "production-20261010", sha, "nightly-20261010", latest=True)
+    p = run_plan(repo, gh, nightly="nightly-20261010")
+    assert p["action"] == "noop" and "production_tag" not in p
+
+
+@pytest.mark.parametrize(
+    "latest_release",
+    [
+        None,  # tag moved, release never created
+        {},  # release exists, source.json never uploaded
+        {"source.json": {"source_tag": "nightly-20261009", "sha": "e" * 40}},  # stale
+        {"source.json": ["not", "an", "object"]},
+    ],
+)
+def test_plan_repairs_partially_switched_latest(repo, latest_release):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    _promoted(repo, gh, "production-20261010", sha, "nightly-20261010")
+    _latest_at(repo, gh, sha, "nightly-20261010", release=False)
+    if latest_release is not None:
+        gh.releases["production-latest"] = latest_release
+    p = run_plan(repo, gh, nightly="nightly-20261010", date="20261012")
+    assert p["action"] == "promote"
+    assert p["production_tag"] == "production-20261010" and p["tag_created"] is False
+
+
+def test_plan_unreadable_latest_source_is_an_error_not_a_match(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    _promoted(repo, gh, "production-20261010", sha, "nightly-20261010", latest=True)
+    real = gh.release_json
+
+    def flaky(tag, name):
+        if tag == "production-latest":
+            raise promote.PromoteError("cannot download production-latest/source.json")
+        return real(tag, name)
+
+    gh.release_json = flaky
+    with pytest.raises(promote.PromoteError):
+        run_plan(repo, gh, nightly="nightly-20261010")
 
 
 def test_plan_reuses_newest_tag_when_several_at_sha(repo):

@@ -186,6 +186,18 @@ def _check_marker(marker: dict, nightly: str, sha: str, assets: list[str]) -> st
     return None
 
 
+def _latest_release_shows(gh, sha: str) -> bool:
+    """True when the production-latest release's source.json names *sha*.
+
+    A tag moved without its release (a partial switch) is not done; an
+    unreadable source.json raises rather than counting as a match.
+    """
+    if SOURCE not in (gh.release_assets(PRODUCTION_LATEST) or []):
+        return False
+    source = gh.release_json(PRODUCTION_LATEST, SOURCE)
+    return bool(source) and source.get("sha") == sha
+
+
 def plan(
     cwd,
     fork,
@@ -254,8 +266,10 @@ def plan(
     at_latest = {t: s for t, s in tags.items() if s == latest_sha and tag_key(t, PRODUCTION_RE)}
     prev_tag, prev_sha = _latest(at_latest or tags, PRODUCTION_RE)
     fields = {"prev_tag": prev_tag, "prev_pin": prev_sha}
-    if latest_sha == sha:
-        return out("noop", f"production-latest already points at {sha}", **fields, gate=None)
+    if latest_sha == sha and _latest_release_shows(gh, sha):
+        return out(
+            "noop", f"production-latest and its release already show {sha}", **fields, gate=None
+        )
     if prev_tag and prev_sha != sha:  # prev_sha == sha: resuming this candidate's own pin
         cand = tag_key(nightly, NIGHTLY_RE)
         prev_assets = gh.release_assets(prev_tag) or []

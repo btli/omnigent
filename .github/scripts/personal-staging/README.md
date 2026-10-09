@@ -226,9 +226,13 @@ Flow:
 3. `personal-promote.yml` (manual dispatch for now) runs
    `promote.py plan`. The plan is JSON with an `action`:
    - `promote` publishes.
-   - `noop` means production-latest is already at the sha.
+   - `noop` means `production-latest` and its release already show this
+     build: the tag is at the sha and the release's `source.json` names it.
+     A tag moved without its release plans `promote` again, which repairs it.
    - `blocked` means the migration gate needs approval. The run stays green
      and sends an ha-notify alert with the approval hint.
+   - `ignored` means a status event carried no actionable verdict (status
+     trigger only); the run stays green.
    - `refused` and `error` fail the run.
 
    The workflow only carries out the plan; it never checks out the nightly.
@@ -258,8 +262,9 @@ Publish order (`production-latest` moves last):
 4. Switch: publish the release, move the `production-nightly` image channel,
    then point `production-latest` (tag, then release) at the sha.
 
-A failure before the pin deletes the draft this run created. From the pin
-onward a rerun resumes. Every failure alerts via ha-notify.
+If a run fails or is cancelled before the pin, it deletes the draft it
+created. From the pin onward a rerun resumes. Every failure or cancellation
+alerts via ha-notify.
 
 Dispatch (always from `main`):
 
