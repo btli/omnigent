@@ -16,7 +16,7 @@
 # Examples:
 # 1234              # keep the composer hotfix until upstream merges it
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
-branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 #
 8957              # bot replacement for closed #8928 (safe workspace delete)
 9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
+9475              # Databricks Sandbox managed hosts run as each user (third-party upstream PR)

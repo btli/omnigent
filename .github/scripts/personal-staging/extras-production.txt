@@ -8,3 +8,4 @@
 # remove them once merged upstream, or replace them when superseded.
 8957              # bot replacement for closed #8928 (safe workspace delete)
 9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
+9475              # Databricks Sandbox managed hosts run as each user (third-party upstream PR)
