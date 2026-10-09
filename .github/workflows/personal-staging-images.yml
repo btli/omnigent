@@ -28,6 +28,8 @@ jobs:
       server_digest: ${{ steps.build-server.outputs.digest }}
       host_digest: ${{ steps.build-host.outputs.digest }}
       channel: ${{ steps.source.outputs.channel }}
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -62,7 +64,10 @@ jobs:
             exit 1
           fi
 
-          short_sha="$(git rev-parse HEAD | cut -c1-12)"
+          full_sha="$(git rev-parse "refs/tags/${tag_name}^{commit}")"
+          short_sha="${full_sha:0:12}"
+          echo "tag=${tag_name}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${full_sha}" >> "${GITHUB_OUTPUT}"
           server_image='ghcr.io/btli/omnigent-server'
           host_image='ghcr.io/btli/omnigent-host'
           echo "server_tags=${server_image}:sha-${short_sha},${server_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
@@ -191,6 +196,7 @@ jobs:
     needs: [build-and-push, native-host-check]
     runs-on: ubuntu-latest
     permissions:
+      contents: write
       packages: write
     steps:
       - name: Set up Buildx
@@ -212,3 +218,26 @@ jobs:
           test -n "${HOST_DIGEST}"
           docker buildx imagetools create -t "ghcr.io/btli/omnigent-server:${CHANNEL}" "ghcr.io/btli/omnigent-server@${SERVER_DIGEST}"
           docker buildx imagetools create -t "ghcr.io/btli/omnigent-host:${CHANNEL}" "ghcr.io/btli/omnigent-host@${HOST_DIGEST}"
+      - name: Checkout trusted main (for promote.py)
+        if: startsWith(needs.build-and-push.outputs.tag, 'nightly-')
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          persist-credentials: false
+      # Written LAST: its presence is what makes this nightly a promote
+      # candidate, so it must follow every artifact and the channel move.
+      - name: Mark the nightly build complete
+        if: startsWith(needs.build-and-push.outputs.tag, 'nightly-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build-and-push.outputs.tag }}
+          SHA: ${{ needs.build-and-push.outputs.sha }}
+          SERVER_DIGEST: ${{ needs.build-and-push.outputs.server_digest }}
+          HOST_DIGEST: ${{ needs.build-and-push.outputs.host_digest }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D "$RUNNER_TEMP" --clobber
+          python3 .github/scripts/personal-staging/promote.py build-complete \
+            --tag "$TAG" --sha "$SHA" --sums "$RUNNER_TEMP/SHA256SUMS" \
+            --server-digest "$SERVER_DIGEST" --host-digest "$HOST_DIGEST" > "$RUNNER_TEMP/build-complete.json"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "$RUNNER_TEMP/build-complete.json" --clobber
