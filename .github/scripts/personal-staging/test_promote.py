@@ -679,3 +679,43 @@ def test_pin_cli_prints_created_then_exists_and_errors(repo, capsys):
     assert capsys.readouterr().out.strip() == "exists"
     assert promote.main([*base, "--sha", b]) == 1
     assert "production-20261011" in capsys.readouterr().out
+
+
+def _promote_workflow() -> dict:
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "workflows/personal-promote.yml"
+    return yaml.safe_load(path.read_text())
+
+
+def test_status_trigger_is_gated_on_trusted_soak_verdicts():
+    workflow = _promote_workflow()
+    assert set(workflow[True]) == {"status", "workflow_dispatch"}
+    for job in ("test-promote", "promote"):
+        gate = workflow["jobs"][job]["if"]
+        assert "github.event_name != 'status'" in gate
+        assert "github.event.context == 'soak/homelab'" in gate
+        assert "vars.SOAK_STATUS_LOGIN != ''" in gate
+        assert "github.ref == 'refs/heads/main'" in gate
+    # Job-level lock: skipped status runs never take the single pending slot.
+    assert "concurrency" not in workflow
+    assert workflow["jobs"]["promote"]["concurrency"] == {
+        "group": "personal-promote",
+        "cancel-in-progress": False,
+    }
+
+
+def test_status_plan_takes_event_values_only_through_env():
+    steps = _promote_workflow()["jobs"]["promote"]["steps"]
+    [plan_step] = [s for s in steps if s.get("id") == "plan"]
+    assert plan_step["env"]["EVENT_SHA"] == "${{ github.event.sha }}"
+    assert plan_step["env"]["SOAK_LOGIN"] == "${{ vars.SOAK_STATUS_LOGIN }}"
+    script = plan_step["run"]
+    assert "${{" not in script
+    status_args = script.split('if [ "$GITHUB_EVENT_NAME" = "status" ]; then', 1)[1]
+    status_args = status_args.split("else", 1)[0]
+    assert '--trigger status --sha "$EVENT_SHA" --soak-login "$SOAK_LOGIN"' in status_args
+    assert "approve" not in status_args and "allow-older" not in status_args
+    [alert] = [s for s in steps if s.get("name") == "Alert on a failed soak verdict"]
+    assert "steps.plan.outputs.action == 'ignored'" in alert["if"]
+    assert 'msg="soak $STATE for $sha ($nightly) — $RUN_URL"' in alert["run"]
