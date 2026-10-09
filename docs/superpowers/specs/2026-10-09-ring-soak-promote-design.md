@@ -18,7 +18,7 @@ Production stops composing and building on its own.
 | Verdict channel | Commit status `soak/homelab` on the candidate sha, from a credential limited to `statuses: write`. |
 | Artifacts | Reused byte-for-byte. Staging builds the `.dev` APK, the desktop app and the images. Promote copies them. |
 | Production cadence | Event-driven. The hardware watches `production-latest` (or the `production-nightly` image channel) and deploys on change. |
-| Approach | The staging nightly builds everything; a small `personal-promote.yml` plus a tested `stage.py promote` promotes. |
+| Approach | The staging nightly builds everything; a small `personal-promote.yml` plus a tested `promote.py plan\|pin\|verify-assets` promotes. |
 
 ## Flow
 
@@ -50,10 +50,10 @@ Production stops composing and building on its own.
 3. **Soak** (hardware, out of scope here): deploys the nightly to the soak
    namespace and database, then posts a status on the nightly sha:
    `context=soak/homelab`, `state=success|failure`, `target_url=<soak run>`.
-4. **Promote** (`personal-promote.yml` → `stage.py promote`), described below.
+4. **Promote** (`personal-promote.yml` → `promote.py plan|pin|verify-assets`), described below.
 5. **Production hardware** deploys whenever `production-latest` moves.
 
-## Promote rules (`stage.py promote`)
+## Promote rules (`promote.py plan|pin|verify-assets`)
 
 Every rule must pass, or nothing is published.
 
@@ -77,16 +77,23 @@ Every rule must pass, or nothing is published.
    - `assert_migration_graph(candidate)` must pass.
    - `assert_migration_history(candidate, prev_production_pin)` must pass: shipped
      migrations stay append-only and approval cannot override that.
-   - The gate uses `migration_touched(candidate, nightly upstream_sha,
-     prev_production_pin)`. If the candidate touches migrations and
+   - The gate uses `migration_touched(candidate, nightly base_sha,
+     prev_production_pin)`: `base_sha` is fork main as the nightly composed
+     on it (from its `merge-report.json`), so fork-only migrations already on
+     main don't gate. A missing or invalid `base_sha` refuses the run. If the
+     candidate touches migrations and
      `approve_migration` isn't exactly the candidate sha, the run **stops
      green**: it alerts, writes the approval hint and publishes nothing.
-6. **Serialized.** `concurrency: personal-promote`, never cancelled. Rules 3–5
+6. **Serialized.** `concurrency: personal-production` (shared with the legacy
+   compose run until cutover), never cancelled. Rules 3–5
    are evaluated inside the run, after the lock is acquired.
 
-`stage.py promote` prints a JSON plan
-`{"action": "promote|noop|blocked|refused", ...}`. The workflow carries out the
-plan. Every step is idempotent, so a rerun completes a partial promotion.
+`promote.py plan` prints a JSON plan
+`{"action": "promote|noop|blocked|refused|ignored|error", ...}`. The workflow
+carries out the plan. Every step is idempotent, so a rerun completes a partial
+promotion. `noop` requires both the `production-latest` tag and its release's
+`source.json` to name the candidate sha, so a rerun repairs a half-finished
+switch.
 
 ## Publish order
 
@@ -134,7 +141,7 @@ its own copies of the assets, so this protects provenance, not downloads.
 1. **PR 1, staging builds everything.** Add verify, the `.dev` APK, the desktop
    build, the `sync-main` step with fallback, and `build-complete.json` from the
    image workflow. Production keeps composing unchanged.
-2. **PR 2, promote (manual dispatch only).** Add `stage.py promote` with unit
+2. **PR 2, promote (manual dispatch only).** Add `promote.py plan|pin|verify-assets` with unit
    tests and `personal-promote.yml` with inputs `nightly`, `approve_migration`,
    `allow_older` and `dry_run`. Prove it with a dry run, then a real promote of
    one nightly.

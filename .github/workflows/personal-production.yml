@@ -659,6 +659,19 @@ jobs:
               --title "Personal production (latest — $TAG)" --notes-file notes.md
           fi
           gh release upload production-latest dist/* --clobber
+          # Drop promote-only assets so a composed build never inherits a
+          # promoted build's provenance or AAB.
+          for asset in source.json omnigent-production-release-unsigned.aab; do
+            if ! err=$(gh release delete-asset production-latest "$asset" -y 2>&1); then
+              case "$err" in
+                *"not found in release"*) ;;
+                *)
+                  echo "::error::cannot delete $asset from production-latest: $err"
+                  exit 1
+                  ;;
+              esac
+            fi
+          done
 
       - name: Report failure
         if: failure()
