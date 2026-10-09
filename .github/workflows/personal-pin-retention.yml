@@ -9,6 +9,8 @@
 # floor of the newest few per family so a stalled ring can never be stripped
 # bare. Floating refs (`production-latest`, `nightly-latest`), `pr-demos-*`,
 # release tags and `archive/*` are outside the matched families entirely.
+# The nightly named by production-latest's source.json (and its production
+# tag) is never pruned; an unreadable source.json fails the run instead.
 #
 # Ordering: runs after the nightly chain (staging 10:00, dev-rebase 10:45).
 #
