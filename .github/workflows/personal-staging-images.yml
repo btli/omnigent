@@ -64,7 +64,7 @@ jobs:
             exit 1
           fi
 
-          full_sha="$(git rev-parse "refs/tags/${tag_name}^{commit}")"
+          full_sha="$(git rev-parse HEAD)"
           short_sha="${full_sha:0:12}"
           echo "tag=${tag_name}" >> "${GITHUB_OUTPUT}"
           echo "sha=${full_sha}" >> "${GITHUB_OUTPUT}"
