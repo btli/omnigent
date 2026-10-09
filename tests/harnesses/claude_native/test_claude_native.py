@@ -11944,6 +11944,37 @@ async def test_claude_model_catalog_keeps_rows_when_ambient_listing_undetermined
         assert seen == []
 
 
+@pytest.mark.parametrize(
+    ("handler", "auth_token"),
+    [
+        pytest.param(_unreachable_handler, "dapi-ambient-token", id="unreachable"),
+        pytest.param(_empty_listing_handler, "dapi-ambient-token", id="empty"),
+        pytest.param(_litellm_models_handler, None, id="no-credential"),
+    ],
+)
+async def test_claude_model_catalog_drops_rows_when_databricks_listing_undetermined(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+    auth_token: str | None,
+) -> None:
+    """An undetermined listing on a Databricks AI Gateway fails CLOSED: it routes only
+    its own namespaced ids, so bare ``claude-*`` rows would never resolve."""
+    _ambient_litellm_env(monkeypatch)
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL", "https://example.cloud.databricks.com/ai-gateway/anthropic"
+    )
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS")
+    if auth_token is None:
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
+    else:
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", auth_token)
+    _route_gateway_listing(monkeypatch, handler)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows == []
+
+
 async def test_claude_model_catalog_drops_rows_when_ambient_gateway_is_namespaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
