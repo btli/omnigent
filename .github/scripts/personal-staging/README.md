@@ -201,11 +201,13 @@ Flow:
 1. The staging nightly builds everything (APK, AAB, desktop app, images) and
    `personal-staging-images.yml` uploads `build-complete.json` last: the sha,
    every asset's sha256 and both image digests. Without it a nightly is
-   never a candidate.
+   never a candidate. A failed or cancelled nightly sends one ha-notify alert
+   (an incomplete composition alerts from `composition-gate` instead).
 2. The soak hardware deploys the nightly and posts a `soak/homelab` commit
    status on its sha.
-3. `personal-promote.yml` (manual dispatch for now) runs
-   `promote.py plan`. The plan is JSON with an `action`:
+3. `personal-promote.yml` runs on that status (see
+   [Status-triggered promotion](#status-triggered-promotion)) or on a manual
+   dispatch, and calls `promote.py plan`. The plan is JSON with an `action`:
    - `promote` publishes.
    - `noop` means `production-latest` and its release already show this
      build: the tag is at the sha and the release's `source.json` names it.
@@ -213,7 +215,9 @@ Flow:
    - `blocked` means the migration gate needs approval. The run stays green
      and sends an ha-notify alert with the approval hint.
    - `ignored` means a status event carried no actionable verdict (status
-     trigger only); the run stays green.
+     trigger only); the run stays green with a summary line. A `failure` or
+     `error` verdict also sends an ha-notify alert
+     (`soak <state> for <sha> (<nightly>) — <run url>`).
    - `refused` and `error` fail the run.
 
    The workflow only carries out the plan; it never checks out the nightly.
@@ -230,8 +234,9 @@ Rules (all must pass, or nothing is published):
   `merge-report.json`) and the current production pin. A candidate touching
   migrations needs `approve_migration=<exact candidate sha>`.
 - One production tag per sha: a rerun or rollback reuses the existing tag.
-  Runs are serialized with the legacy production run
-  (`concurrency: personal-production`, never cancelled).
+  The promote job holds the `personal-promote` lock (never cancelled). It is
+  job-level, so the status events the gate skips never take the group's
+  single pending slot.
 
 Publish order (`production-latest` moves last):
 
@@ -269,10 +274,45 @@ Hardware contract:
   digests in `build-complete.json`.
 - Verdict: commit status `soak/homelab` on the candidate sha, posted with a
   token from repo variable `SOAK_STATUS_LOGIN`'s account (or a GitHub App),
-  limited to `statuses: write`. The status trigger arrives with the cutover;
-  until then, dispatch manually.
+  limited to `statuses: write`.
 - Production follows `production-latest` / the `production-nightly` image
-  channel.
+  channel. Nothing composes production any more: `personal-production.yml`
+  is a retired stub (see
+  [Personal production ring](#personal-production-ring-promoted-not-composed)).
+
+### Status-triggered promotion
+
+`personal-promote.yml` listens to every commit status, but both jobs run only
+for a `soak/homelab` status that is not `pending`, and only while repo
+variable `SOAK_STATUS_LOGIN` is set. Leave it unset to keep promotion
+manual. The run executes main's definition and checks out main; the plan
+gets only the event sha and the login (through `env:`) and runs with
+`--trigger status`, which refuses the dispatch-only `approve_migration` and
+`allow_older`. `promote.py` re-reads the sha's statuses and trusts only the
+newest `soak/homelab` status, and only when `SOAK_STATUS_LOGIN` created it:
+
+- `success` from that login: promote, subject to every rule above. A
+  migration-touching candidate stays blocked until a manual dispatch passes
+  `approve_migration`.
+- `failure` or `error`: nothing is published, the run stays green and an
+  ha-notify alert names the sha and nightly.
+- A newest status from another login, or a sha that is not a `nightly-*`
+  target, is `refused` (red run, failure alert).
+
+```sh
+gh variable set SOAK_STATUS_LOGIN -R btli/omnigent --body <soak-account-login>
+# what the soak hardware posts (with its statuses:write token):
+gh api repos/btli/omnigent/statuses/<nightly-sha> -f context=soak/homelab \
+  -f state=success -f target_url=<soak run url>
+```
+
+### Pin retention guard
+
+`prune_pins.py` never deletes the nightly named by `production-latest`'s
+`source.json` (`source_tag`), or that production tag, however old: they are
+production's provenance. A missing `production-latest` release or
+`source.json` protects nothing; any other failure reading it fails the
+retention run before anything is planned or deleted.
 
 ## Development auto-rebase (`personal-dev-rebase.yml`)
 

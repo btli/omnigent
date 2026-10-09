@@ -2,10 +2,11 @@
 #
 # Triggers: a `soak/homelab` commit status (enabled by repo variable
 # SOAK_STATUS_LOGIN; promote.py re-reads the statuses and trusts only that
-# login's newest verdict), or a manual dispatch. promote.py decides (spec docs/superpowers/specs/
-# 2026-10-09-ring-soak-promote-design.md); this workflow only moves the bytes
-# and refs the plan names, in the spec's publish order: draft release, images,
-# pin, then switch (production-latest moves LAST, it is what homelab watches).
+# login's newest verdict), or a manual dispatch. promote.py decides (spec
+# docs/superpowers/specs/2026-10-09-ring-soak-promote-design.md); this
+# workflow only moves the bytes and refs the plan names, in the spec's publish
+# order: draft release, images, pin, then switch (production-latest moves
+# LAST, it is what homelab watches).
 #
 # Trust boundary: the test gate runs third-party dev deps secretless. The
 # privileged promote job checks out trusted main only and runs nothing but the
