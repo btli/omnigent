@@ -77,11 +77,15 @@ Every rule must pass, or nothing is published.
    - `assert_migration_graph(candidate)` must pass.
    - `assert_migration_history(candidate, prev_production_pin)` must pass: shipped
      migrations stay append-only and approval cannot override that.
-   - The gate uses `migration_touched(candidate, nightly upstream_sha,
-     prev_production_pin)`. If the candidate touches migrations and
+   - The gate uses `migration_touched(candidate, nightly base_sha,
+     prev_production_pin)`: `base_sha` is fork main as the nightly composed
+     on it (from its `merge-report.json`), so fork-only migrations already on
+     main don't gate. A missing or invalid `base_sha` refuses the run. If the
+     candidate touches migrations and
      `approve_migration` isn't exactly the candidate sha, the run **stops
      green**: it alerts, writes the approval hint and publishes nothing.
-6. **Serialized.** `concurrency: personal-promote`, never cancelled. Rules 3–5
+6. **Serialized.** `concurrency: personal-production` (shared with the legacy
+   compose run until cutover), never cancelled. Rules 3–5
    are evaluated inside the run, after the lock is acquired.
 
 `promote.py plan` prints a JSON plan

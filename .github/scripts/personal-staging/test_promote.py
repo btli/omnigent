@@ -138,8 +138,14 @@ def status(state, login=LOGIN, context="soak/homelab"):
     }
 
 
-def complete_nightly(repo, gh, tag, sha, upstream_sha=None):
-    """Tag *sha* as *tag* with a release carrying build-complete.json + merge report."""
+UPSTREAM = "a" * 40  # upstream main: never local, never diffed by the promote gate
+
+
+def complete_nightly(repo, gh, tag, sha, base_sha=None, upstream_sha=UPSTREAM):
+    """Tag *sha* as *tag* with a release carrying build-complete.json + merge report.
+
+    *base_sha* is fork main as the nightly composed on it (default: the repo root).
+    """
     repo.tag(tag, sha)
     bc = {
         "schema": 1,
@@ -150,7 +156,7 @@ def complete_nightly(repo, gh, tag, sha, upstream_sha=None):
     }
     gh.releases[tag] = {
         "omnigent-staging-debug.apk": b"apk",
-        "merge-report.json": {"upstream_sha": upstream_sha or repo.base},
+        "merge-report.json": {"upstream_sha": upstream_sha, "base_sha": base_sha or repo.base},
         "SHA256SUMS": b"",
         "build-complete.json": bc,
     }
@@ -185,6 +191,7 @@ def test_plan_promotes_trusted_status(repo):
     assert p["nightly"] == "nightly-20261010" and p["sha"] == sha
     assert p["production_tag"] == "production-20261011" and p["tag_created"] is True
     assert p["source"]["soak_target_url"] == "https://soak/run/1"
+    assert p["source"]["production_tag"] == "production-20261011"
     assert p["assets"] == {"omnigent-staging-debug.apk": "1" * 64, "merge-report.json": "2" * 64}
 
 
@@ -311,10 +318,14 @@ def test_plan_legacy_pin_date_floor(repo):
 
 def test_plan_migration_gate_blocks_until_exact_approval(repo):
     gh = FakeGitHub()
-    sha = repo.commit(
+    # fork main already carries a fork-only migration; the candidate adds another on top
+    main = repo.commit(
         "omnigent/db/migrations/versions/0001_x.py", 'revision = "x"\ndown_revision = None\n'
     )
-    complete_nightly(repo, gh, "nightly-20261010", sha)
+    sha = repo.commit(
+        "omnigent/db/migrations/versions/0002_y.py", 'revision = "y"\ndown_revision = "x"\n'
+    )
+    complete_nightly(repo, gh, "nightly-20261010", sha, base_sha=main, upstream_sha=repo.base)
     blocked = run_plan(repo, gh, nightly="nightly-20261010")
     assert blocked["action"] == "blocked" and blocked["gate"]["blocked"] is True
     assert sha in blocked["gate"]["approval_hint"]
@@ -324,6 +335,46 @@ def test_plan_migration_gate_blocks_until_exact_approval(repo):
     assert run_plan(repo, gh, nightly="nightly-20261010", approve_migration=sha)["action"] == (
         "promote"
     )
+
+
+def test_plan_fork_only_migration_on_main_does_not_gate(repo):
+    gh = FakeGitHub()
+    # upstream lacks the fork-only migration fork main carries; the candidate adds none
+    main = repo.commit(
+        "omnigent/db/migrations/versions/0001_x.py", 'revision = "x"\ndown_revision = None\n'
+    )
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha, base_sha=main, upstream_sha=repo.base)
+    p = run_plan(repo, gh, nightly="nightly-20261010")
+    assert p["action"] == "promote" and p["gate"]["blocked"] is False
+    assert p["source"]["approve_migration"] is None
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {"upstream_sha": "a" * 40},  # no base_sha
+        {"upstream_sha": "a" * 40, "base_sha": "abc123"},
+        {"upstream_sha": "a" * 40, "base_sha": "G" * 40},
+        {"upstream_sha": "a" * 40, "base_sha": None},
+        ["not", "an", "object"],
+    ],
+)
+def test_plan_refuses_missing_or_invalid_base_sha(repo, report):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    gh.releases["nightly-20261010"]["merge-report.json"] = report
+    p = run_plan(repo, gh, nightly="nightly-20261010")
+    assert p["action"] == "refused" and "base_sha" in p["reason"]
+
+
+def test_plan_unfetchable_base_sha_is_operational_error(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha, base_sha="d" * 40)
+    with pytest.raises(promote.PromoteError, match="cannot fetch"):
+        run_plan(repo, gh, nightly="nightly-20261010")
 
 
 def test_plan_refuses_shipped_migration_rewrite(repo):
@@ -371,6 +422,7 @@ def test_plan_resumes_partial_promotion_reusing_tag(repo):
     p = run_plan(repo, gh, nightly="nightly-20261010", date="20261012")
     assert p["action"] == "promote"
     assert p["production_tag"] == "production-20261010" and p["tag_created"] is False
+    assert p["source"]["production_tag"] == "production-20261010"
     assert p["prev_tag"] == "production-20261009" and p["prev_pin"] == old
 
 
@@ -487,7 +539,7 @@ def test_plan_prev_pin_for_migration_gate_is_current_production(repo):
     mig = repo.commit(
         "omnigent/db/migrations/versions/0001_x.py", 'revision = "x"\ndown_revision = None\n'
     )
-    complete_nightly(repo, gh, "nightly-20261011", mig, upstream_sha=mig)
+    complete_nightly(repo, gh, "nightly-20261011", mig, base_sha=mig)
     p = run_plan(repo, gh, nightly="nightly-20261011")
     assert p["action"] == "blocked" and p["prev_pin"] == old
 

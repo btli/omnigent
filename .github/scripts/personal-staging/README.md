@@ -244,10 +244,13 @@ Rules (all must pass, or nothing is published):
 - Forward-only: the candidate must be newer than the source nightly in
   production's `source.json` (a legacy composed pin compares by date).
   Rollback needs `allow_older=true`.
-- Migrations: the graph and shipped history checks must pass. A candidate
-  touching migrations needs `approve_migration=<exact candidate sha>`.
+- Migrations: the graph and shipped history checks must pass. The gate diffs
+  the candidate against the nightly's `base_sha` (fork main, from its
+  `merge-report.json`) and the current production pin. A candidate touching
+  migrations needs `approve_migration=<exact candidate sha>`.
 - One production tag per sha: a rerun or rollback reuses the existing tag.
-  Runs are serialized (`concurrency: personal-promote`, never cancelled).
+  Runs are serialized with the legacy production run
+  (`concurrency: personal-production`, never cancelled).
 
 Publish order (`production-latest` moves last):
 

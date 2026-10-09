@@ -39,8 +39,9 @@ permissions:
 
 # One run at a time, never cancelled: plan + pin under this lock is what keeps
 # a single production tag per sha across runs.
+# Shares the legacy personal-production.yml lock so a promote never interleaves its publish.
 concurrency:
-  group: personal-promote
+  group: personal-production
   cancel-in-progress: false
 
 jobs:
@@ -54,6 +55,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -83,10 +85,11 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       # Migration diffs need full history and tags; the token lets pin push.
+      # Pinned to the commit test-promote tested, not wherever main has moved.
       - name: Checkout trusted main with tags
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: main
+          ref: ${{ github.sha }}
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 

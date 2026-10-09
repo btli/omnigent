@@ -154,12 +154,16 @@ def _have_commit(cwd, sha: str) -> bool:
 
 
 def _ensure_commits(cwd, fork, wanted: dict[str, str]) -> None:
-    """Fetch the history behind each missing ``tag -> sha`` (a clone may lack it)."""
+    """Fetch the history behind each missing ``tag -> sha`` (a clone may lack it).
+
+    A key equal to its sha names an untagged commit, fetched by sha.
+    """
     for tag, sha in wanted.items():
         if _have_commit(cwd, sha):
             continue
+        refspec = sha if tag == sha else f"+refs/tags/{tag}:refs/promote/{tag}"
         try:
-            stage.git(cwd, "fetch", "-q", fork, f"+refs/tags/{tag}:refs/promote/{tag}")
+            stage.git(cwd, "fetch", "-q", fork, refspec)
         except stage.StageError as error:
             raise PromoteError(f"cannot fetch {tag} from {fork}: {error}") from error
 
@@ -294,16 +298,17 @@ def plan(
         stage.assert_migration_graph(cwd, sha)
     except stage.StageError as error:
         return out("refused", str(error), **fields, gate=None)
+    # Gate on fork main as the nightly composed it (base_sha), not upstream:
+    # fork-only migrations already on main are not the candidate's change.
     report = gh.release_json(nightly, MERGE_REPORT) if MERGE_REPORT in assets else None
-    upstream_sha = (report or {}).get("upstream_sha")
-    if not isinstance(upstream_sha, str) or not SHA_RE.fullmatch(upstream_sha):
+    base_sha = (report or {}).get("base_sha")
+    if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
         return out(
-            "refused", f"{nightly} {MERGE_REPORT} has no valid upstream_sha", **fields, gate=None
+            "refused", f"{nightly} {MERGE_REPORT} has no valid base_sha", **fields, gate=None
         )
+    _ensure_commits(cwd, fork, {base_sha: base_sha})
     try:
-        if not _have_commit(cwd, upstream_sha):
-            stage.git(cwd, "fetch", "-q", fork, upstream_sha)
-        touched = stage.migration_touched(cwd, sha, upstream_sha, prev_sha)
+        touched = stage.migration_touched(cwd, sha, base_sha, prev_sha)
     except stage.StageError as error:
         raise PromoteError(f"cannot evaluate the migration gate: {error}") from error
     gate = {
@@ -336,6 +341,7 @@ def plan(
         source={
             "source_tag": nightly,
             "sha": sha,
+            "production_tag": production_tag,
             "trigger": trigger,
             "soak_target_url": (verdict or {}).get("target_url"),
             "approve_migration": approve_migration or None,
