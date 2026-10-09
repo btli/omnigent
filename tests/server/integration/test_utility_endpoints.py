@@ -93,6 +93,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "arca_shutdown_warnings": False,
         "harness_settings_ui": True,
         "custom_agents_settings_ui": False,
+        "host_stats": False,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
