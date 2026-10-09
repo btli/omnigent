@@ -40,12 +40,19 @@ class InventoryGh(FakeGh):
         branches: list[str] | None = None,
         releases: list[dict] | None = None,
         fail_on: str | None = None,
+        source: object = None,
     ) -> None:
         super().__init__()
         self._tags = tags
         self._branches = branches or []
         self._releases = releases or []
         self.fail_on = fail_on
+        self._source = source
+
+    def production_source(self) -> object:
+        if isinstance(self._source, Exception):
+            raise self._source
+        return self._source
 
     def tags(self) -> list[str]:
         return self._tags
@@ -244,6 +251,121 @@ def test_same_day_dev_tags_order_by_version():
     )
     pruned = prune.plan(pins, TODAY, keep_days=14, keep_per_family=1)
     assert [p.name for p in pruned.keep_floor] == ["v0.12.0.dev20260701"]
+
+
+def test_plan_never_prunes_protected_nightly():
+    # production-latest's source nightly and pin are old and beyond the floor.
+    pins = prune.collect(
+        tags=[f"nightly-202607{d:02d}" for d in range(1, 9)]
+        + [f"production-202607{d:02d}" for d in range(1, 9)],
+        branches=[],
+        releases=[
+            {"id": 7, "tag_name": "nightly-20260702"},
+            {"id": 8, "tag_name": "production-20260703"},
+        ],
+    )
+    protected = {"nightly-20260702", "production-20260703"}
+    pruned = prune.plan(pins, TODAY, keep_days=14, keep_per_family=1, protected=protected)
+    assert {p.name for p in pruned.keep_protected} == protected
+    deleted = {p.name for p in pruned.delete}
+    assert not deleted & protected
+    assert {p.name for p in pruned.keep_floor} == {"nightly-20260708", "production-20260708"}
+    assert len(pruned.delete) == 12
+    gh = FakeGh()
+    prune.execute(pruned, gh)
+    assert not [c for c in gh.calls if c.endswith(("nightly-20260702", "production-20260703"))]
+    assert "release:7" not in gh.calls and "release:8" not in gh.calls
+
+
+def test_protection_does_not_shrink_the_floor_or_the_window():
+    pins = prune.collect(tags=["nightly-20260701", "nightly-20260830"], branches=[], releases=[])
+    pruned = prune.plan(pins, TODAY, keep_per_family=1, protected={"nightly-20260830"})
+    assert [p.name for p in pruned.keep_recent] == ["nightly-20260830"]
+    assert pruned.keep_protected == []
+    assert [p.name for p in pruned.delete] == ["nightly-20260701"]
+
+
+def test_protected_tags_come_from_production_latest_source():
+    assert prune.protected_tags(None) == set()
+    source = {"source_tag": "nightly-20260702", "production_tag": "production-20260703"}
+    assert prune.protected_tags(source) == {"nightly-20260702", "production-20260703"}
+    assert prune.protected_tags({"source_tag": "nightly-20260702"}) == {"nightly-20260702"}
+    for bad in ({}, {"source_tag": None}, [], "nightly-20260702"):
+        with pytest.raises(prune.PruneError, match="refusing to prune"):
+            prune.protected_tags(bad)
+
+
+@pytest.mark.parametrize("stderr", ["release not found\n", "no assets match the file pattern\n"])
+def test_missing_production_source_protects_nothing(monkeypatch, stderr):
+    def run(cmd, **_kw):
+        assert cmd[:4] == ["gh", "release", "download", "production-latest"]
+        assert cmd[-4:] == ["-p", "source.json", "-O", "-"]
+        return prune.subprocess.CompletedProcess(cmd, 1, "", stderr)
+
+    monkeypatch.setattr(prune.subprocess, "run", run)
+    assert prune.GhClient("btli/omnigent").production_source() is None
+
+
+def test_other_gh_failures_reading_the_source_refuse_to_prune(monkeypatch):
+    def run(cmd, **_kw):
+        return prune.subprocess.CompletedProcess(cmd, 1, "", "HTTP 401: Bad credentials\n")
+
+    monkeypatch.setattr(prune.subprocess, "run", run)
+    with pytest.raises(prune.PruneError, match="Bad credentials"):
+        prune.GhClient("btli/omnigent").production_source()
+
+    def garbled(cmd, **_kw):
+        return prune.subprocess.CompletedProcess(cmd, 0, "{not json", "")
+
+    monkeypatch.setattr(prune.subprocess, "run", garbled)
+    with pytest.raises(prune.PruneError, match="not JSON"):
+        prune.GhClient("btli/omnigent").production_source()
+
+
+def test_production_source_parses_the_downloaded_json(monkeypatch):
+    doc = {"source_tag": "nightly-20260702", "production_tag": "production-20260703"}
+
+    def run(cmd, **_kw):
+        return prune.subprocess.CompletedProcess(cmd, 0, json.dumps(doc), "")
+
+    monkeypatch.setattr(prune.subprocess, "run", run)
+    assert prune.GhClient("btli/omnigent").production_source() == doc
+
+
+def test_main_protects_production_latest_source(tmp_path, monkeypatch):
+    client = InventoryGh(
+        ["nightly-20260801", "nightly-20260802", "nightly-20260830"],
+        source={"source_tag": "nightly-20260801", "production_tag": "production-20260805"},
+    )
+    monkeypatch.setattr(prune, "GhClient", lambda *_args, **_kwargs: client)
+    summary = tmp_path / "summary.md"
+    report = tmp_path / "report.json"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    assert (
+        prune.main(["--date", "20260831", "--keep-per-family", "1", "--report", str(report)]) == 0
+    )
+
+    payload = json.loads(report.read_text())
+    assert payload["kept_protected"] == ["nightly-20260801"]
+    assert payload["done"] == ["tag nightly-20260802"]
+    assert client.calls == ["tag:nightly-20260802"]
+    assert "Protected as production-latest's provenance: `nightly-20260801`" in summary.read_text()
+
+
+def test_main_stops_before_planning_when_the_source_is_unreadable(tmp_path, monkeypatch):
+    client = InventoryGh(
+        ["nightly-20260801", "nightly-20260830"],
+        source=prune.PruneError("cannot read production-latest/source.json: HTTP 502"),
+    )
+    monkeypatch.setattr(prune, "GhClient", lambda *_args, **_kwargs: client)
+    report = tmp_path / "report.json"
+
+    with pytest.raises(prune.PruneError, match="HTTP 502"):
+        prune.main(["--date", "20260831", "--keep-per-family", "1", "--report", str(report)])
+
+    assert client.calls == []
+    assert not report.exists()
 
 
 def test_deletes_branch_then_release_then_tag():

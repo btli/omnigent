@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Retire aged personal-ring pins on the fork.
 
-The staging and production nightlies each mint an immutable dated pin tag
-and prerelease, and staging also mints a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag.
+The staging nightly and production promotions each mint an immutable dated
+pin tag and prerelease, and staging also mints a PEP 440
+``vX.Y.Z.devYYYYMMDD`` tag.
 Before v0.15.0, ring pins also had a same-name compatibility branch.
 Nothing resolves a pin once the homelab has built it (fork CI re-fetches
 the canonical tag set, and dev versions are derived from pyproject, not
@@ -21,6 +22,10 @@ release tags (``v0.1.0``) and ``archive/*`` can never be candidates.
 Age comes from the datestamp in the name, not the ref's creation time:
 that is the same string the composer allocates pins from, so a same-day
 rerun and its parent always age out together.
+
+The nightly that ``production-latest`` was promoted from (its ``source.json``
+``source_tag``), and that production tag itself, are never pruned, however
+old: they are production's provenance.
 
 Stdlib only; the gh CLI is the sole API surface (injected in tests).
 """
@@ -55,6 +60,11 @@ DEV_TAG_RE = re.compile(
     re.ASCII,
 )
 DEV_FAMILY = "dev"
+PRODUCTION_LATEST = "production-latest"
+SOURCE_JSON = "source.json"
+# gh's errors for a missing release or a release without the asset; nothing
+# promoted yet (or a legacy composed pin) means nothing to protect.
+SOURCE_ABSENT = ("release not found", "no assets match the file pattern", "no assets to download")
 # Families with pre-v0.15.0 same-name compatibility branches.
 BRANCHED_FAMILIES = ("production", "nightly")
 
@@ -87,6 +97,7 @@ class Plan:
     delete: list[Pin] = field(default_factory=list)
     keep_recent: list[Pin] = field(default_factory=list)
     keep_floor: list[Pin] = field(default_factory=list)
+    keep_protected: list[Pin] = field(default_factory=list)
     deferred: list[Pin] = field(default_factory=list)
     cutoff: dt.date = dt.date.min
 
@@ -169,8 +180,12 @@ def plan(
     today: dt.date,
     keep_days: int = KEEP_DAYS,
     keep_per_family: int = KEEP_PER_FAMILY,
+    protected: set[str] | frozenset[str] = frozenset(),
 ) -> Plan:
-    """Split pins into delete / kept-recent / kept-by-floor buckets."""
+    """Split pins into delete / kept-recent / kept-by-floor / protected buckets.
+
+    *protected* names pins that are never deleted, whatever their age.
+    """
     if keep_days < 1 or keep_per_family < 1:
         raise PruneError("keep_days and keep_per_family must both be >= 1")
     cutoff = today - dt.timedelta(days=keep_days)
@@ -186,6 +201,8 @@ def plan(
                 out.keep_recent.append(pin)
             elif pin.name in floor:
                 out.keep_floor.append(pin)
+            elif pin.name in protected:
+                out.keep_protected.append(pin)
             else:
                 out.delete.append(pin)
     out.delete.sort(key=lambda p: (p.family, p.order))
@@ -200,6 +217,18 @@ def limit_plan(pruned: Plan, max_delete: int) -> Plan:
     pruned.delete = oldest_first[:max_delete]
     pruned.deferred = oldest_first[max_delete:]
     return pruned
+
+
+def protected_tags(source: object) -> set[str]:
+    """Pins named by production-latest's source.json; None (no file) protects nothing."""
+    if source is None:
+        return set()
+    if not isinstance(source, dict) or not isinstance(source.get("source_tag"), str):
+        raise PruneError(f"{PRODUCTION_LATEST}/{SOURCE_JSON} has no source_tag; refusing to prune")
+    names = {source["source_tag"]}
+    if isinstance(source.get("production_tag"), str):
+        names.add(source["production_tag"])
+    return names
 
 
 class PinDeleter(Protocol):
@@ -235,6 +264,35 @@ class GhClient:
     def branches(self) -> list[str]:
         refs = self._lines(f"repos/{self.repo}/git/refs/heads", ".[] | .ref")
         return [r.removeprefix("refs/heads/") for r in refs]
+
+    def production_source(self) -> object:
+        """production-latest's source.json, or None when the release or file is absent."""
+        proc = subprocess.run(
+            [
+                "gh",
+                "release",
+                "download",
+                PRODUCTION_LATEST,
+                "-R",
+                self.repo,
+                "-p",
+                SOURCE_JSON,
+                "-O",
+                "-",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            if any(marker in proc.stderr for marker in SOURCE_ABSENT):
+                return None
+            raise PruneError(
+                f"cannot read {PRODUCTION_LATEST}/{SOURCE_JSON}: {proc.stderr.strip()}"
+            )
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            raise PruneError(f"{PRODUCTION_LATEST}/{SOURCE_JSON} is not JSON: {e}") from e
 
     def releases(self) -> list[dict]:
         out = self._lines(f"repos/{self.repo}/releases", '.[] | "\\(.id)\\t\\(.tag_name)"')
@@ -319,6 +377,7 @@ def summarize(
         f"({pruned.ref_count} refs, {pruned.release_count} releases)",
         f"- Kept (within window): {len(pruned.keep_recent)}",
         f"- Kept (floor): {len(pruned.keep_floor)}",
+        f"- Kept (protected by {PRODUCTION_LATEST}): {len(pruned.keep_protected)}",
         "",
     ]
     if pruned.deferred:
@@ -340,6 +399,12 @@ def summarize(
         lines += [
             "Kept by the floor despite age: "
             + ", ".join(f"`{p.name}`" for p in pruned.keep_floor),
+            "",
+        ]
+    if pruned.keep_protected:
+        lines += [
+            f"Protected as {PRODUCTION_LATEST}'s provenance: "
+            + ", ".join(f"`{p.name}`" for p in pruned.keep_protected),
             "",
         ]
     if error:
@@ -381,6 +446,7 @@ def write_report(
         "done": done or [],
         "kept_recent": [p.name for p in pruned.keep_recent],
         "kept_floor": [p.name for p in pruned.keep_floor],
+        "kept_protected": [p.name for p in pruned.keep_protected],
         "error": error,
     }
     with open(path, "w") as fh:
@@ -412,8 +478,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--date {args.date!r} is not a YYYYMMDD calendar date")
 
     client = GhClient(args.repo, dry_run=args.dry_run)
+    # Read before the inventory: a failure here must stop the run, not prune blindly.
+    protected = protected_tags(client.production_source())
     pins = collect(client.tags(), client.branches(), client.releases())
-    pruned = plan(pins, today, args.keep_days, args.keep_per_family)
+    pruned = plan(pins, today, args.keep_days, args.keep_per_family, protected)
     if args.max_delete is not None:
         pruned = limit_plan(pruned, args.max_delete)
 
