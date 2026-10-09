@@ -87,13 +87,16 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
+  review, deletion, and capability gating.
+
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
-  approvals, resume, and terminal behavior, with Codex disconnect test boundaries.
+  approvals, resume, and terminal behavior, with native disconnect test boundaries.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.
@@ -163,8 +166,9 @@ map an area, remove it here in the same change.
 
 **Partly mapped:** embedded authentication covers project writes and supporting
 account-context tests; other resource APIs and real identity-provider journeys
-remain unmapped. Native disconnect recipes cover Codex transport/startup and
-browser stream recovery, not live reconnect across every harness. Network
+remain unmapped. Native disconnect recipes cover Codex transport/startup,
+completed Claude children after handoff, and browser stream recovery, not live
+reconnect across every harness. Network
 interruptions for claude-native are tracked as scenario rows in
 `docs/network-resilience.md`, driven by the resilience lab in
 `tests/e2e/resilience/`. The
