@@ -209,6 +209,82 @@ The approval publishes exactly that sha: if the composition drifted in the
 meantime (a PR or upstream moved), the rerun mints a different candidate,
 the approval no longer matches, and the gate blocks again with the new sha.
 
+## Soak and promote (`personal-promote.yml`)
+
+Build once in staging, soak that exact build, then promote the same commit
+and the same bytes to production. Design:
+`docs/superpowers/specs/2026-10-09-ring-soak-promote-design.md`.
+
+Flow:
+
+1. The staging nightly builds everything (APK, AAB, desktop app, images) and
+   `personal-staging-images.yml` uploads `build-complete.json` last: the sha,
+   every asset's sha256 and both image digests. Without it a nightly is
+   never a candidate.
+2. The soak hardware deploys the nightly and posts a `soak/homelab` commit
+   status on its sha.
+3. `personal-promote.yml` (manual dispatch for now) runs
+   `promote.py plan`. The plan is JSON with an `action`:
+   - `promote` publishes.
+   - `noop` means production-latest is already at the sha.
+   - `blocked` means the migration gate needs approval. The run stays green
+     and sends an ha-notify alert with the approval hint.
+   - `refused` and `error` fail the run.
+
+   The workflow only carries out the plan; it never checks out the nightly.
+
+Rules (all must pass, or nothing is published):
+
+- The nightly carries a sound `build-complete.json` naming its tag and sha,
+  and every listed asset is on its release.
+- Forward-only: the candidate must be newer than the source nightly in
+  production's `source.json` (a legacy composed pin compares by date).
+  Rollback needs `allow_older=true`.
+- Migrations: the graph and shipped history checks must pass. A candidate
+  touching migrations needs `approve_migration=<exact candidate sha>`.
+- One production tag per sha: a rerun or rollback reuses the existing tag.
+  Runs are serialized (`concurrency: personal-promote`, never cancelled).
+
+Publish order (`production-latest` moves last):
+
+1. Draft: download the listed assets, check them with `promote.py
+   verify-assets`, and rename `omnigent-staging-*` to
+   `omnigent-production-*`. Add `source.json` and a fresh `SHA256SUMS`,
+   then upload to a draft `production-YYYYMMDD[-rerunN]` release, or refresh
+   an existing release for that tag.
+2. Images: `imagetools create` the soaked digests as `:<production tag>` and
+   `:sha-<short>`.
+3. Pin: `promote.py pin` pushes the tag, or confirms it is already at the sha.
+4. Switch: publish the release, move the `production-nightly` image channel,
+   then point `production-latest` (tag, then release) at the sha.
+
+A failure before the pin deletes the draft this run created. From the pin
+onward a rerun resumes. Every failure alerts via ha-notify.
+
+Dispatch (always from `main`):
+
+```sh
+gh workflow run personal-promote.yml -R btli/omnigent --ref main \
+  -f nightly=nightly-YYYYMMDD -f dry_run=true     # print the plan only
+gh workflow run personal-promote.yml -R btli/omnigent --ref main \
+  -f nightly=nightly-YYYYMMDD                     # promote
+# after the CNPG backup, for a migration-touching candidate:
+#   -f approve_migration=<full-40-hex-candidate-sha>
+# rollback to an older soaked nightly:
+#   -f allow_older=true
+```
+
+Hardware contract:
+
+- Candidates are `nightly-*` tags. Soak images are `staging-nightly`, or the
+  digests in `build-complete.json`.
+- Verdict: commit status `soak/homelab` on the candidate sha, posted with a
+  token from repo variable `SOAK_STATUS_LOGIN`'s account (or a GitHub App),
+  limited to `statuses: write`. The status trigger arrives with the cutover;
+  until then, dispatch manually.
+- Production follows `production-latest` / the `production-nightly` image
+  channel.
+
 ## Development auto-rebase (`personal-dev-rebase.yml`)
 
 `Personal Dev Rebase` (cron `45 10 * * *`, plus `workflow_dispatch`) keeps
