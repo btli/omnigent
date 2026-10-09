@@ -2471,7 +2471,8 @@ def test_sync_main_cli(env, capsys):
     assert capsys.readouterr().out.strip() == env.fork_ref("refs/heads/main")
 
 
-def test_only_scheduled_production_owns_main_sync():
+def test_main_sync_owners():
+    """Staging nightly syncs main non-fatally, scheduled production syncs it, hourly never does."""
     import yaml
 
     workflows = Path(__file__).resolve().parents[2] / "workflows"
@@ -2501,6 +2502,10 @@ def test_only_scheduled_production_owns_main_sync():
             assert scripts.index("stage.py sync-main") < scripts.index(
                 "stage.py stage --ring production"
             )
+        elif filename == "personal-staging.yml":
+            assert scripts.count("stage.py sync-main") == 1
+            assert "if ! python3 .github/scripts/personal-staging/stage.py sync-main" in scripts
+            assert scripts.index("stage.py sync-main") < scripts.index("stage.py stage")
         else:
             assert "stage.py sync-main" not in text
         if filename == "personal-staging-hourly.yml":
@@ -2551,8 +2556,11 @@ def test_android_build_requires_successful_integration():
     workflow_path = Path(__file__).resolve().parents[2] / "workflows/personal-staging.yml"
     workflow = yaml.safe_load(workflow_path.read_text())
     android_build = workflow["jobs"]["android-build"]
-    assert android_build["needs"] == "integrate"
+    assert android_build["needs"] == ["integrate", "verify"]
     assert "if" not in android_build
+    verify = workflow["jobs"]["verify"]
+    assert verify["needs"] == "integrate"
+    assert "if" not in verify
 
 
 # --- two-phase publish: compose, verify elsewhere, then pin ------------------
