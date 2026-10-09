@@ -216,7 +216,6 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
-_AMBIENT_GATEWAY_LISTING_TIMEOUT_S = 10.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
 #: revalidation retries them later). Startup dominates each run and
