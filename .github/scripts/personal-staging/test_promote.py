@@ -99,7 +99,11 @@ class Repo:
         return git(self.work, "rev-parse", "HEAD")
 
     def tag(self, name: str, sha: str) -> None:
-        git(self.work, "push", "-q", "origin", f"{sha}:refs/tags/{name}")
+        git(self.work, "push", "-q", "origin", f"+{sha}:refs/tags/{name}")
+
+    def annotated_tag(self, name: str, sha: str) -> None:
+        git(self.work, "tag", "-f", "-a", "-m", name, name, sha)
+        git(self.work, "push", "-q", "-f", "origin", f"refs/tags/{name}")
 
 
 class FakeGitHub:
@@ -258,9 +262,11 @@ def test_plan_refuses_sha_without_nightly_tag(repo):
     assert run_plan(repo, gh, trigger="status", sha=sha)["action"] == "refused"
 
 
-def _promoted(repo, gh, ptag, psha, source_tag):
+def _promoted(repo, gh, ptag, psha, source_tag, latest=False):
     repo.tag(ptag, psha)
     gh.releases[ptag] = {"source.json": {"source_tag": source_tag, "sha": psha}}
+    if latest:
+        repo.tag("production-latest", psha)
 
 
 def test_plan_forward_only(repo):
@@ -278,7 +284,7 @@ def test_plan_noop_when_production_already_there(repo):
     gh = FakeGitHub()
     sha = repo.commit("a.txt", "a\n")
     complete_nightly(repo, gh, "nightly-20261010", sha)
-    _promoted(repo, gh, "production-20261010", sha, "nightly-20261010")
+    _promoted(repo, gh, "production-20261010", sha, "nightly-20261010", latest=True)
     assert run_plan(repo, gh, nightly="nightly-20261010")["action"] == "noop"
 
 
@@ -344,3 +350,128 @@ def test_plan_cli_writes_plan_for_refusal_and_error(repo, tmp_path, monkeypatch)
     assert json.loads(out.read_text())["action"] == "refused"
     assert promote.main([*base, "--trigger", "status"]) == 1  # status without --sha
     assert json.loads(out.read_text())["action"] == "error"
+
+
+def test_plan_resumes_partial_promotion_reusing_tag(repo):
+    gh = FakeGitHub()
+    old = repo.commit("a.txt", "a\n")
+    new = repo.commit("b.txt", "b\n")
+    complete_nightly(repo, gh, "nightly-20261009", old)
+    complete_nightly(repo, gh, "nightly-20261010", new)
+    _promoted(repo, gh, "production-20261009", old, "nightly-20261009", latest=True)
+    repo.tag("production-20261010", new)  # tag pushed, production-latest never moved
+    p = run_plan(repo, gh, nightly="nightly-20261010", date="20261012")
+    assert p["action"] == "promote"
+    assert p["production_tag"] == "production-20261010" and p["tag_created"] is False
+    assert p["prev_tag"] == "production-20261009" and p["prev_pin"] == old
+
+
+def test_plan_noop_only_when_latest_points_at_sha(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    _promoted(repo, gh, "production-20261010", sha, "nightly-20261010")
+    assert run_plan(repo, gh, nightly="nightly-20261010")["action"] == "promote"
+    repo.annotated_tag("production-latest", sha)  # annotated latest is peeled
+    assert run_plan(repo, gh, nightly="nightly-20261010")["action"] == "noop"
+
+
+def test_plan_reuses_newest_tag_when_several_at_sha(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    repo.tag("production-20261010", sha)
+    repo.tag("production-20261011-rerun1", sha)
+    p = run_plan(repo, gh, nightly="nightly-20261010")
+    assert p["production_tag"] == "production-20261011-rerun1" and p["tag_created"] is False
+
+
+def _rolled_back(repo, gh):
+    """production-20261010 (new) exists, but production-latest was rolled back to old."""
+    old = repo.commit("a.txt", "a\n")
+    new = repo.commit("b.txt", "b\n")
+    complete_nightly(repo, gh, "nightly-20261009", old)
+    complete_nightly(repo, gh, "nightly-20261010", new)
+    _promoted(repo, gh, "production-20261009", old, "nightly-20261009")
+    _promoted(repo, gh, "production-20261010", new, "nightly-20261010")
+    repo.tag("production-latest", old)
+    return old, new
+
+
+def test_plan_rollback_reuses_old_production_tag(repo):
+    gh = FakeGitHub()
+    _, new = _rolled_back(repo, gh)
+    repo.tag("production-latest", new)
+    assert run_plan(repo, gh, nightly="nightly-20261009")["action"] == "refused"
+    p = run_plan(repo, gh, nightly="nightly-20261009", allow_older=True)
+    assert p["action"] == "promote"
+    assert p["production_tag"] == "production-20261009" and p["tag_created"] is False
+
+
+def test_plan_forward_only_uses_current_production_not_newest_pin(repo):
+    gh = FakeGitHub()
+    _rolled_back(repo, gh)
+    mid = repo.commit("c.txt", "c\n")
+    complete_nightly(repo, gh, "nightly-20261009-rerun1", mid)
+    # newer than current production's source (20261009), older than the newest pin's (20261010)
+    p = run_plan(repo, gh, nightly="nightly-20261009-rerun1")
+    assert p["action"] == "promote" and p["prev_tag"] == "production-20261009"
+    older = repo.commit("d.txt", "d\n")
+    complete_nightly(repo, gh, "nightly-20261008", older)
+    assert run_plan(repo, gh, nightly="nightly-20261008")["action"] == "refused"
+
+
+def test_plan_prev_pin_for_migration_gate_is_current_production(repo):
+    gh = FakeGitHub()
+    old, _ = _rolled_back(repo, gh)
+    # candidate adds a migration relative to current production (old) only
+    mig = repo.commit(
+        "omnigent/db/migrations/versions/0001_x.py", 'revision = "x"\ndown_revision = None\n'
+    )
+    complete_nightly(repo, gh, "nightly-20261011", mig, upstream_sha=mig)
+    p = run_plan(repo, gh, nightly="nightly-20261011")
+    assert p["action"] == "blocked" and p["prev_pin"] == old
+
+
+@pytest.mark.parametrize("state", ["failure", "error", "pending"])
+def test_plan_ignored_status_reports_state(repo, state):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    gh.statuses_by_sha[sha] = [status(state)]
+    p = run_plan(repo, gh, trigger="status", sha=sha)
+    assert p["action"] == "ignored" and p["state"] == state
+    assert p["sha"] == sha and p["nightly"] == "nightly-20261010"
+
+
+def test_plan_status_refuses_dispatch_only_inputs(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    gh.statuses_by_sha[sha] = [status("success")]
+    for kw in ({"approve_migration": sha}, {"allow_older": True}):
+        p = run_plan(repo, gh, trigger="status", sha=sha, **kw)
+        assert p["action"] == "refused" and "dispatch" in p["reason"]
+
+
+def test_plan_refusals_carry_sha_and_nightly_when_known(repo):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    repo.tag("nightly-20261010", sha)
+    gh.releases["nightly-20261010"] = {}
+    p = run_plan(repo, gh, nightly="nightly-20261010")
+    assert p["action"] == "refused" and p["sha"] == sha and p["nightly"] == "nightly-20261010"
+
+
+def test_plan_fetch_failure_is_operational_error(repo, monkeypatch):
+    gh = FakeGitHub()
+    sha = repo.commit("a.txt", "a\n")
+    complete_nightly(repo, gh, "nightly-20261010", sha)
+    # candidate commit absent locally and the fetch fails
+    git(repo.work, "reset", "-q", "--hard", repo.base)
+    git(repo.work, "reflog", "expire", "--expire=now", "--all")
+    git(repo.work, "gc", "-q", "--prune=now")
+    git(repo.work, "remote", "set-url", "origin", str(repo.fork) + "-gone")
+    monkeypatch.setattr(promote, "_tags", lambda *_: {"nightly-20261010": sha})
+    with pytest.raises(promote.PromoteError):
+        run_plan(repo, gh, nightly="nightly-20261010")

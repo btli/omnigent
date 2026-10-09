@@ -26,6 +26,7 @@ DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 SUMS_LINE_RE = re.compile(r"([0-9a-f]{64})\s+\*?(?:\./)?([A-Za-z0-9._-]+)")
 BUILD_COMPLETE = "build-complete.json"
 SOAK_CONTEXT = "soak/homelab"
+PRODUCTION_LATEST = "production-latest"
 SOURCE = "source.json"
 MERGE_REPORT = "merge-report.json"
 
@@ -122,7 +123,11 @@ def _tags(cwd, fork) -> dict[str, str]:
     """name -> commit sha for every tag on *fork* (annotated tags are peeled)."""
     plain: dict[str, str] = {}
     peeled: dict[str, str] = {}
-    for line in stage.git(cwd, "ls-remote", "--tags", fork).stdout.splitlines():
+    try:
+        listing = stage.git(cwd, "ls-remote", "--tags", fork).stdout
+    except stage.StageError as error:
+        raise PromoteError(f"cannot list tags on {fork}: {error}") from error
+    for line in listing.splitlines():
         sha, _, ref = line.partition("\t")
         if not ref.startswith("refs/tags/"):
             continue
@@ -150,8 +155,12 @@ def _have_commit(cwd, sha: str) -> bool:
 def _ensure_commits(cwd, fork, wanted: dict[str, str]) -> None:
     """Fetch the history behind each missing ``tag -> sha`` (a clone may lack it)."""
     for tag, sha in wanted.items():
-        if not _have_commit(cwd, sha):
+        if _have_commit(cwd, sha):
+            continue
+        try:
             stage.git(cwd, "fetch", "-q", fork, f"+refs/tags/{tag}:refs/promote/{tag}")
+        except stage.StageError as error:
+            raise PromoteError(f"cannot fetch {tag} from {fork}: {error}") from error
 
 
 def _result(action: str, reason: str, **fields) -> dict:
@@ -196,26 +205,37 @@ def plan(
         raise PromoteError(f"date must be YYYYMMDD: {date!r}")
     tags = _tags(cwd, fork)
     verdict = None
+
+    def out(action: str, reason: str, **fields) -> dict:
+        known = {"sha": sha, "nightly": nightly}
+        return _result(action, reason, **{**{k: v for k, v in known.items() if v}, **fields})
+
     if trigger == "status":
+        nightly = None
         if not soak_login:
-            return _result(
+            return out(
                 "refused", "status-triggered promotion is disabled (SOAK_STATUS_LOGIN unset)"
             )
         if not sha or not SHA_RE.fullmatch(sha):
             raise PromoteError(f"status trigger needs a full commit sha: {sha!r}")
+        if approve_migration or allow_older:
+            return out(
+                "refused", "approve_migration and allow_older are dispatch-only inputs", sha=sha
+            )
+        candidates = [t for t, s in tags.items() if s == sha and tag_key(t, NIGHTLY_RE)]
+        nightly = max(candidates, key=lambda t: tag_key(t, NIGHTLY_RE)) if candidates else None
         mine = [s for s in gh.statuses(sha) if s.get("context") == SOAK_CONTEXT]
         if not mine:
-            return _result("ignored", f"no {SOAK_CONTEXT} status on {sha}")
+            return out("ignored", f"no {SOAK_CONTEXT} status on {sha}", state=None)
         newest = mine[0]
         if (newest.get("creator") or {}).get("login") != soak_login:
-            return _result("refused", f"newest {SOAK_CONTEXT} status is not from {soak_login}")
+            return out("refused", f"newest {SOAK_CONTEXT} status is not from {soak_login}")
         if newest.get("state") != "success":
-            return _result("ignored", f"soak verdict is {newest.get('state')}")
+            state = newest.get("state")
+            return out("ignored", f"soak verdict is {state}", state=state)
         verdict = newest
-        candidates = [t for t, s in tags.items() if s == sha and tag_key(t, NIGHTLY_RE)]
-        if not candidates:
-            return _result("refused", f"{sha} is not a nightly-* tag target")
-        nightly = max(candidates, key=lambda t: tag_key(t, NIGHTLY_RE))
+        if not nightly:
+            return out("refused", f"{sha} is not a nightly-* tag target")
     else:
         if not nightly or tag_key(nightly, NIGHTLY_RE) is None or nightly not in tags:
             return _result("refused", f"not an existing nightly tag: {nightly!r}")
@@ -224,50 +244,53 @@ def plan(
     assets = gh.release_assets(nightly) or []
     marker = gh.release_json(nightly, BUILD_COMPLETE) if BUILD_COMPLETE in assets else None
     if not marker:
-        return _result("refused", f"{nightly} has no {BUILD_COMPLETE}; the nightly is incomplete")
+        return out("refused", f"{nightly} has no {BUILD_COMPLETE}; the nightly is incomplete")
     if bad := _check_marker(marker, nightly, sha, assets):
-        return _result("refused", bad)
+        return out("refused", bad)
 
-    prev_tag, prev_sha = _latest(tags, PRODUCTION_RE)
-    fields = {"nightly": nightly, "sha": sha, "prev_tag": prev_tag, "prev_pin": prev_sha}
-    if prev_sha == sha:
-        return _result("noop", f"production already points at {sha}", **fields, gate=None)
-    if prev_tag:
+    # Current production is where production-latest points; fall back to the newest pin.
+    latest_sha = tags.get(PRODUCTION_LATEST)
+    at_latest = {t: s for t, s in tags.items() if s == latest_sha and tag_key(t, PRODUCTION_RE)}
+    prev_tag, prev_sha = _latest(at_latest or tags, PRODUCTION_RE)
+    fields = {"prev_tag": prev_tag, "prev_pin": prev_sha}
+    if latest_sha == sha:
+        return out("noop", f"production-latest already points at {sha}", **fields, gate=None)
+    if prev_tag and prev_sha != sha:  # prev_sha == sha: resuming this candidate's own pin
         cand = tag_key(nightly, NIGHTLY_RE)
         prev_assets = gh.release_assets(prev_tag) or []
         if SOURCE in prev_assets:
             source = gh.release_json(prev_tag, SOURCE) or {}
             floor = tag_key(str(source.get("source_tag")), NIGHTLY_RE)
             if floor is None:
-                return _result(
+                return out(
                     "refused", f"{prev_tag}/{SOURCE} has no valid source_tag", **fields, gate=None
                 )
             older = cand <= floor
         else:  # legacy composed pin: only its date is known
             older = cand[0] < tag_key(prev_tag, PRODUCTION_RE)[0]
         if older and not allow_older:
-            return _result(
+            return out(
                 "refused", f"{nightly} is not newer than production's source", **fields, gate=None
             )
 
+    _ensure_commits(cwd, fork, {nightly: sha, **({prev_tag: prev_sha} if prev_tag else {})})
     try:
-        _ensure_commits(cwd, fork, {nightly: sha, **({prev_tag: prev_sha} if prev_tag else {})})
         stage.assert_migration_history(cwd, sha, prev_sha)
         stage.assert_migration_graph(cwd, sha)
-        report = gh.release_json(nightly, MERGE_REPORT) if MERGE_REPORT in assets else None
-        upstream_sha = (report or {}).get("upstream_sha")
-        if not isinstance(upstream_sha, str) or not SHA_RE.fullmatch(upstream_sha):
-            return _result(
-                "refused",
-                f"{nightly} {MERGE_REPORT} has no valid upstream_sha",
-                **fields,
-                gate=None,
-            )
+    except stage.StageError as error:
+        return out("refused", str(error), **fields, gate=None)
+    report = gh.release_json(nightly, MERGE_REPORT) if MERGE_REPORT in assets else None
+    upstream_sha = (report or {}).get("upstream_sha")
+    if not isinstance(upstream_sha, str) or not SHA_RE.fullmatch(upstream_sha):
+        return out(
+            "refused", f"{nightly} {MERGE_REPORT} has no valid upstream_sha", **fields, gate=None
+        )
+    try:
         if not _have_commit(cwd, upstream_sha):
             stage.git(cwd, "fetch", "-q", fork, upstream_sha)
         touched = stage.migration_touched(cwd, sha, upstream_sha, prev_sha)
     except stage.StageError as error:
-        return _result("refused", str(error), **fields, gate=None)
+        raise PromoteError(f"cannot evaluate the migration gate: {error}") from error
     gate = {
         "candidate": sha,
         "prev_pin": prev_sha,
@@ -277,12 +300,16 @@ def plan(
         gate["approval_hint"] = (
             f"re-dispatch personal-promote.yml with nightly={nightly} approve_migration={sha}"
         )
-        return _result(
+        return out(
             "blocked", "candidate touches migrations and is not approved", **fields, gate=gate
         )
 
-    production_tag, created = stage.pin_name(cwd, fork, date, sha, stage.PRODUCTION)
-    return _result(
+    # One tag per sha: reuse the newest production tag already at the candidate.
+    production_tag, _ = _latest({t: s for t, s in tags.items() if s == sha}, PRODUCTION_RE)
+    created = production_tag is None
+    if created:
+        production_tag, created = stage.pin_name(cwd, fork, date, sha, stage.PRODUCTION)
+    return out(
         "promote",
         f"promote {nightly} to {production_tag}",
         **fields,
