@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -475,3 +476,96 @@ def test_plan_fetch_failure_is_operational_error(repo, monkeypatch):
     monkeypatch.setattr(promote, "_tags", lambda *_: {"nightly-20261010": sha})
     with pytest.raises(promote.PromoteError):
         run_plan(repo, gh, nightly="nightly-20261010")
+
+
+def _manifest(files: dict[str, bytes]) -> dict:
+    return {"assets": {n: hashlib.sha256(b).hexdigest() for n, b in files.items()}}
+
+
+def test_verify_assets_accepts_exact_match(tmp_path):
+    files = {"omnigent-staging-debug.apk": b"apk", "merge-report.json": b"{}"}
+    for n, b in files.items():
+        (tmp_path / n).write_bytes(b)
+    promote.verify_assets(_manifest(files), tmp_path)
+
+
+def test_verify_assets_rejects_hash_mismatch(tmp_path):
+    (tmp_path / "omnigent-staging-debug.apk").write_bytes(b"tampered")
+    with pytest.raises(promote.PromoteError, match="sha256"):
+        promote.verify_assets(_manifest({"omnigent-staging-debug.apk": b"apk"}), tmp_path)
+
+
+def test_verify_assets_rejects_extra_and_missing(tmp_path):
+    (tmp_path / "extra.bin").write_bytes(b"x")
+    with pytest.raises(promote.PromoteError):
+        promote.verify_assets(_manifest({"omnigent-staging-debug.apk": b"apk"}), tmp_path)
+
+
+def test_verify_assets_cli_exit_codes(tmp_path, capsys):
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "a.bin").write_bytes(b"a")
+    manifest = tmp_path / "build-complete.json"
+    manifest.write_text(json.dumps(_manifest({"a.bin": b"a"})))
+    args = ["verify-assets", "--manifest", str(manifest), "--dir", str(files)]
+    assert promote.main(args) == 0
+    (files / "a.bin").write_bytes(b"tampered")
+    assert promote.main(args) == 1
+    assert "sha256" in capsys.readouterr().out
+    manifest.write_text("not json")
+    assert promote.main(args) == 1
+
+
+def test_pin_creates_tag(repo):
+    sha = repo.commit("a.txt", "a\n")
+    assert promote.pin(repo.work, "origin", sha, "production-20261011") is True
+    assert git(repo.fork, "rev-parse", "refs/tags/production-20261011") == sha
+
+
+def test_pin_reuses_tag_for_same_sha(repo):
+    sha = repo.commit("a.txt", "a\n")
+    assert promote.pin(repo.work, "origin", sha, "production-20261011") is True
+    assert promote.pin(repo.work, "origin", sha, "production-20261011") is False
+
+
+def test_pin_reuses_annotated_tag_for_same_sha(repo):
+    sha = repo.commit("a.txt", "a\n")
+    repo.annotated_tag("production-20261011", sha)
+    assert promote.pin(repo.work, "origin", sha, "production-20261011") is False
+
+
+def test_pin_refuses_tag_at_different_sha(repo):
+    a = repo.commit("a.txt", "a\n")
+    b = repo.commit("b.txt", "b\n")
+    promote.pin(repo.work, "origin", a, "production-20261011")
+    with pytest.raises(promote.PromoteError, match="production-20261011"):
+        promote.pin(repo.work, "origin", b, "production-20261011")
+    assert git(repo.fork, "rev-parse", "refs/tags/production-20261011") == a
+
+
+@pytest.mark.parametrize(
+    "tag,sha",
+    [
+        ("nightly-20261011", None),
+        ("production-2026", None),
+        ("v1.0", None),
+        ("production-20261011", "abc123"),
+    ],
+)
+def test_pin_rejects_malformed_inputs(repo, tag, sha):
+    real = repo.commit("a.txt", "a\n")
+    with pytest.raises(promote.PromoteError):
+        promote.pin(repo.work, "origin", sha or real, tag)
+    assert git(repo.fork, "tag", "-l") == ""
+
+
+def test_pin_cli_prints_created_then_exists_and_errors(repo, capsys):
+    a = repo.commit("a.txt", "a\n")
+    b = repo.commit("b.txt", "b\n")
+    base = ["pin", "--workdir", str(repo.work), "--tag", "production-20261011"]
+    assert promote.main([*base, "--sha", a]) == 0
+    assert capsys.readouterr().out.strip() == "created"
+    assert promote.main([*base, "--sha", a]) == 0
+    assert capsys.readouterr().out.strip() == "exists"
+    assert promote.main([*base, "--sha", b]) == 1
+    assert "production-20261011" in capsys.readouterr().out

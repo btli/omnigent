@@ -9,6 +9,7 @@ bytes and refs the plan names.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -329,6 +330,67 @@ def plan(
     )
 
 
+def verify_assets(manifest: dict, directory: Path) -> None:
+    """Raise unless *directory* holds exactly the manifest's assets with matching sha256s."""
+    want = manifest.get("assets") or {}
+    got = {p.name for p in directory.iterdir() if p.is_file()}
+    if got != set(want):
+        missing, extra = sorted(set(want) - got), sorted(got - set(want))
+        raise PromoteError(f"asset set differs: missing {missing}, extra {extra}")
+    for name, digest in want.items():
+        actual = hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        if actual != digest:
+            raise PromoteError(f"{name}: sha256 {actual} != build-complete {digest}")
+
+
+def pin(cwd, fork, sha: str, tag: str) -> bool:
+    """Push production *tag* at *sha* unless it already points there; True when created."""
+    if not PRODUCTION_RE.fullmatch(tag):
+        raise PromoteError(f"not a production tag: {tag!r}")
+    if not SHA_RE.fullmatch(sha):
+        raise PromoteError(f"not a full commit sha: {sha!r}")
+    ref = f"refs/tags/{tag}"
+    try:
+        if stage.remote_ref(cwd, fork, ref):
+            # An annotated tag lists its commit under ^{}; a lightweight one does not.
+            current = stage.remote_ref(cwd, fork, f"{ref}^{{}}") or stage.remote_ref(
+                cwd, fork, ref
+            )
+            if current == sha:
+                return False
+            raise PromoteError(f"{tag} already points at {current}, not {sha}")
+        stage.git(cwd, "push", "--atomic", fork, f"--force-with-lease={ref}:", f"{sha}:{ref}")
+    except stage.StageError as error:
+        raise PromoteError(f"cannot pin {tag} on {fork}: {error}") from error
+    return True
+
+
+def _run_verify_assets(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(args.manifest.read_text())
+        if not isinstance(manifest, dict):
+            raise PromoteError(f"{args.manifest} is not a JSON object")
+        verify_assets(manifest, args.dir)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"cannot verify assets: {error}")
+        return 1
+    except PromoteError as error:
+        print(error)
+        return 1
+    print("assets verified")
+    return 0
+
+
+def _run_pin(args: argparse.Namespace) -> int:
+    try:
+        created = pin(args.workdir, args.fork_remote, args.sha, args.tag)
+    except PromoteError as error:
+        print(error)
+        return 1
+    print("created" if created else "exists")
+    return 0
+
+
 def _run_plan(args: argparse.Namespace) -> int:
     out = {"action": "error", "reason": "plan did not run"}
     code = 1
@@ -384,6 +446,14 @@ def main(argv: list[str] | None = None) -> int:
         "--date", default=datetime.now(timezone.utc).strftime("%Y%m%d"), help="promote date (UTC)"
     )
     p_plan.add_argument("--out", type=Path)
+    p_verify = sub.add_parser("verify-assets", help="check downloaded assets against a manifest")
+    p_verify.add_argument("--manifest", required=True, type=Path)
+    p_verify.add_argument("--dir", required=True, type=Path)
+    p_pin = sub.add_parser("pin", help="push the production tag idempotently")
+    p_pin.add_argument("--workdir", type=Path, default=Path("."))
+    p_pin.add_argument("--fork-remote", default="origin")
+    p_pin.add_argument("--sha", required=True)
+    p_pin.add_argument("--tag", required=True)
     args = parser.parse_args(argv)
     if args.cmd == "build-complete":
         doc = build_complete(
@@ -393,6 +463,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "plan":
         return _run_plan(args)
+    if args.cmd == "verify-assets":
+        return _run_verify_assets(args)
+    if args.cmd == "pin":
+        return _run_pin(args)
     return 2
 
 
