@@ -19,3 +19,4 @@
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
 #
 8957              # bot replacement for closed #8928 (safe workspace delete)
+9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
