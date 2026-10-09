@@ -14,8 +14,7 @@ It:
    branch with a lease on the pre-rescue head (a branch that moved keeps
    its newer work). A PR whose rescue also conflicts is skipped — its
    conflict paths land in `merge-report.json` — and the run continues.
-   Extras are never rebased (their refs are frozen pins), and the
-   production ring never rescues. All PRs conflicting is a reported
+   Extras are never rebased (their refs are frozen pins). All PRs conflicting is a reported
    outcome. If upstream is already contained, staging may equal fork main.
 2. Pins an immutable, canonical `nightly-YYYYMMDD` tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
@@ -65,11 +64,12 @@ the summary reports "unchanged". When it does push, the summary's one-line
 result names which of upstream HEAD, the open PR set, or the extras
 changed.
 
-Neither staging workflow advances main. Only the scheduled production compose
-runs `stage.py sync-main`. Each privileged composition job has its own
+Only the staging nightly advances main: its integrate job runs `stage.py
+sync-main` first and, if that fails, alerts and composes on the previous fork
+main. The hourly refresh never syncs. Each privileged composition job has its own
 non-cancelling concurrency group, so GitHub's single pending slot cannot evict a
 different ring. Hourly runs are also non-cancelling and skip 10:17 UTC, leaving
-the nightly and production window clear. A human main push invalidates an
+the nightly window clear. A human main push invalidates an
 in-flight composition:
 every ring, pin, or rescue update is atomically coupled to an explicit lease and
 no-op refspec for main, so the entire push fails if `base_sha` is stale.
@@ -77,21 +77,21 @@ no-op refspec for main, so the entire push fails if `base_sha` is stale.
 ## Bases and sync ownership
 
 ```text
-upstream/main -- scheduled production sync-main --> published fork main
-                                                   | base_sha
-                                                   +-- production PRs --> production pin
-                                                   |
-                                                   +-- fresh upstream (entry zero)
-                                                       --> staging PRs --> homelab --> staging pin
+upstream/main -- staging nightly sync-main --> published fork main
+                                              | base_sha
+                                              +-- fresh upstream (entry zero)
+                                                  --> staging PRs --> staging pin
+                                                      --> soak --> promote --> production pin
 ```
 
 `stage --base-ref REF` defaults to freshly fetched fork main. An explicit ref
 must resolve to that same published commit before anything can be published.
 Every report, including hourly infrastructure/extra blocks and migration blocks,
-carries `base_sha` and `upstream_sha`. `base_sha` anchors ancestry, production's
-first-parent identity validation, and the first migration-gate diff.
-`upstream_sha` remains the PR fetch/rescue and dev-version baseline. The previous
-production pin is the second migration baseline.
+carries `base_sha` and `upstream_sha`. `base_sha` anchors ancestry and the
+first migration-gate diff (promote reads it from the nightly's
+`merge-report.json`). `upstream_sha` remains the PR fetch/rescue and
+dev-version baseline. The previous production pin is the second migration
+baseline.
 
 Staging reports also carry `entry_zero` (`source: upstream`, `pr: 0`, `oid`,
 `minted`, and `rerere_paths` when used), separately from the existing PR lists.
@@ -99,22 +99,21 @@ A real entry-zero merge has subject `staging: merge upstream <sha12>` and uses
 the upstream committer date and staging identity. The composition decoder includes
 it under `upstream`. If upstream is already contained, `minted` is false and
 no redundant commit is made. A conflict without a complete verified rerere
-resolution fails closed. Production has no entry zero.
+resolution fails closed.
 
 ```sh
 python3 .github/scripts/personal-staging/stage.py sync-main \
   --workdir /path/to/disposable-clone --upstream-remote upstream --fork-remote origin
 ```
 
-This command writes fork main: use it only in the production sync path or an
-intentional operator sync. It merges from fresh main, verifies fast-forward
+This command writes fork main: use it only in the staging nightly's sync path
+or an intentional operator sync. It merges from fresh main, verifies fast-forward
 ancestry, and pushes with an explicit old-value lease. It never rewrites main.
 Only a confirmed stale-ref rejection gets one retry, rebuilt from fresh main;
-a second race, merge conflict, hook, auth or transport failure stops publication.
-Scheduled production invokes it only with empty migration approval. Manual and
-approval dispatches compose from already-published main, which is fetched again
-by `stage` after sync. A candidate equal to its base is valid and pins main when
-there are no new composition commits.
+a second race, merge conflict, hook, auth or transport failure fails the sync,
+and the nightly then composes on the previous base. `stage` fetches main again
+after sync. A candidate equal to its base is valid and pins main when there are
+no new composition commits.
 
 ### Main-sync recovery
 
@@ -122,8 +121,8 @@ Rerere seeds apply to composition and staging entry zero, not `sync-main`. If
 sync-main or entry zero conflicts, check out fork main in a disposable clone,
 fetch and merge upstream main, resolve and commit, then use a normal
 `git push origin main`. Never use `--force` or `--force-with-lease` to rewrite
-main. After main contains the resolved merge, use **Re-run jobs** on the failed
-scheduled production run; an empty workflow dispatch intentionally skips sync.
+main. After main contains the resolved merge, the next staging nightly (or a
+dispatch of `personal-staging.yml`) composes on it.
 
 Git may elide the no-op main refspec after advertising a matching main, leaving
 a residual window during the atomic push. The composer therefore re-reads main
@@ -138,31 +137,26 @@ published fork main.
 See the [staging ring README](../../../docs/rings/staging/README.md) and
 [production ring README](../../../docs/rings/production/README.md) for verification.
 
-## Personal production nightly (`personal-production.yml`)
+## Personal production ring (promoted, not composed)
 
-Production pins also dispatch `personal-staging-images.yml`, which accepts
-both ring tag families. Server and host artifacts contain native amd64 and
-arm64 images. Native GitHub runners check the host binaries as uid 1000 and
-1000660000 before promoting `production-nightly` (or `staging-nightly`).
-Clusters using a multi-architecture host image can select Pi workers with
+Production no longer composes or builds. `personal-production.yml` is a
+retired stub: no cron, and a dispatch fails with a pointer to
+`personal-promote.yml`. The PRODUCTION extras manifest
+(`extras-production.txt`) is gone too; `stage.py` keeps its PRODUCTION ring
+only so promotion can allocate `production-YYYYMMDD[-rerunN]` names through
+`pin_name`. A production pin is now a soaked staging nightly's own commit,
+with that nightly's artifacts and image digests copied byte-for-byte (see
+[Soak and promote](#soak-and-promote-personal-promoteyml)).
+
+`personal-staging-images.yml` still accepts both ring tag families. Server
+and host artifacts contain native amd64 and arm64 images. Native GitHub
+runners check the host binaries as uid 1000 and 1000660000 before moving
+`staging-nightly`; promote then retags the same digests as
+`production-nightly`. Clusters using a multi-architecture host image can
+select Pi workers with
 `sandbox.providers[].kubernetes.node_selector: {kubernetes.io/arch: arm64}`.
 Set `pod_ready_timeout_s: 600` in that provider block to allow a cold image
 download; the default is 90 seconds.
-
-`Personal Production Nightly` (cron `30 10 * * *`, plus `workflow_dispatch`)
-runs the same composer with `--ring production`: fork branch `production` =
-published fork main + every open btli PR (drafts included, same stream as
-staging) plus numeric pins from `extras-production.txt`, and no dev tag. Pins
-are only for refs outside that stream (closed or bot-authored PRs) and resolve
-mutable `refs/pull/N/head` refs. Each run mints an immutable,
-canonical `production-YYYYMMDD` tag pin (same rerun/no-op semantics as
-`nightly-*`). Same-name compatibility branches were removed in v0.15.0, and
-homelab's `build-omnigent-production.yml` resolves the immutable tag
-`refs/tags/production-YYYYMMDD` — not a branch — at 11:10 UTC to build and
-digest-pin the prod server + host images. The workflow also builds APK and
-desktop release artifacts and dispatches image publication. Its concurrency group (`personal-production`,
-`cancel-in-progress: false`) is disjoint from the staging groups, so the
-rings can never cancel each other.
 
 ### Migration gate
 
@@ -176,7 +170,7 @@ Fresh databases and upgrades from historical production and staging revisions
 are covered by `tests/db/test_ring_migration_history.py`.
 
 Published migration files are immutable. Before considering backup approval,
-the composer rejects any edit, deletion, or rename under the migrations path
+the composer and `promote.py plan` reject any edit, deletion, or rename under the migrations path
 relative to the previous production pin. This is a hard failure that approval
 cannot bypass. Keep shipped ancestry intact and add a new revision to join new
 heads; a merge revision's ID cannot be reused with different parents. For a
@@ -189,25 +183,12 @@ scheduled-project and merge revisions preserve existing databases; the forward
 repair handles databases stamped by the earlier merge graph without overwriting
 existing project-order preferences.
 
-A candidate that touches `omnigent/db/migrations/versions/**` — on either
-`base_sha..candidate` or `previous-production-pin..candidate` (the second leg
-catches a migration arriving on main between compositions) —
-is never auto-published. `stage.py` itself refuses the atomic push, so **no
-ring refs move** (the scheduled main sync may already have advanced main): the run stays green (blocked is a success outcome), the
-step summary shows a BLOCKED row with the candidate sha, and a best-effort
-HMAC-signed alert goes to `hooks.bryanli.net/hooks/ha-notify` (repo secret
-`HA_NOTIFY_HMAC`; absent secret or unreachable receiver only warns — CI
-never holds an HA API token). To promote, take the CNPG backup checkpoint
-per the homelab runbook, then re-dispatch with the exact candidate sha:
-
-```sh
-gh workflow run personal-production.yml -R btli/omnigent --ref main \
-  -f approve_migration=<full-40-hex-candidate-sha>
-```
-
-The approval publishes exactly that sha: if the composition drifted in the
-meantime (a PR or upstream moved), the rerun mints a different candidate,
-the approval no longer matches, and the gate blocks again with the new sha.
+Production's migration gate now runs at promote time: `promote.py plan`
+diffs the candidate against the nightly's `base_sha` and the current
+production pin, and a migration-touching candidate stays blocked (green run,
+ha-notify alert, nothing published) until a dispatch passes
+`approve_migration=<exact candidate sha>` after the CNPG backup checkpoint.
+See [Soak and promote](#soak-and-promote-personal-promoteyml).
 
 ## Soak and promote (`personal-promote.yml`)
 

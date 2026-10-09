@@ -16,5 +16,11 @@ inputs are already contained in main. Check `base_sha` against main at
 publication and verify that entry zero precedes PR merges and the homelab merge
 is last. A later main push requires comparison with the recorded base.
 
+The nightly is the only workflow that advances fork main (`stage.py
+sync-main`). If that sync conflicts, the run alerts, leaves main untouched
+and composes on the previous base. Resolve it in a disposable clone: check
+out fork main, fetch and merge upstream main, commit, then use a normal
+`git push origin main` (never force main). The next nightly composes on it.
+
 For composition semantics, concurrency, conflict recovery, and rollback, see
-the [composer README](../../../../.github/scripts/personal-staging/README.md).
+the [composer README](../../../.github/scripts/personal-staging/README.md).
