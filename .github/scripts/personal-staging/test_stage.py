@@ -2560,7 +2560,7 @@ def test_android_build_requires_successful_integration():
     assert "if" not in android_build
     verify = workflow["jobs"]["verify"]
     assert verify["needs"] == "integrate"
-    assert "if" not in verify
+    assert verify["if"] == "needs.integrate.outputs.complete == 'true'"
 
 
 # --- two-phase publish: compose, verify elsewhere, then pin ------------------
