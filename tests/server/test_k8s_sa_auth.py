@@ -49,6 +49,7 @@ class _FakeRequest:
 
     cookies: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    scope: dict[str, object] = field(default_factory=dict)
 
 
 class _SaKeys:
