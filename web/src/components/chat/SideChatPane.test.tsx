@@ -189,6 +189,25 @@ describe("side chat opened from a text selection", () => {
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
   });
 
+  it("restores the quotes with the text when a live send fails", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "why?", files: [], quotes: ["the selection"] } },
+    });
+    renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+    act(() => send.mock.calls[0]?.[3]?.onError?.("Send failed"));
+
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
+      text: "why?",
+      quotes: ["the selection"],
+    });
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("the selection");
+    expect(screen.getByRole("alert")).toHaveTextContent("Send failed");
+  });
+
   it("clears the selection target when the pane is hidden or read-only", () => {
     const view = renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
     expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe(childId);

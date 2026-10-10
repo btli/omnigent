@@ -463,6 +463,7 @@ function SideChatComposer({
     setSendError(null);
     setAttachmentError(null);
     const outgoing = files;
+    const outgoingQuotes = composer?.quotes ?? [];
     clearComposer(childId);
     void send(
       serializeReplyDraft({ quotes, text: trimmed }),
@@ -471,9 +472,11 @@ function SideChatComposer({
       {
         pinnedConversationId: childId,
         onError: (message) => {
-          // Restore the trimmed text and outgoing files to the store on send error
+          // Restore the trimmed text, quotes and outgoing files to the store on send error
           updateComposer(childId, (current) => ({
+            ...current,
             text: current.text ? `${trimmed}\n\n${current.text}` : trimmed,
+            quotes: [...outgoingQuotes, ...(current.quotes ?? [])],
             files: [...outgoing, ...current.files],
           }));
           setSendError(message);
