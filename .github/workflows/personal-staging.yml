@@ -450,8 +450,9 @@ jobs:
             -PversionCode="$VERSION_CODE"
 
       # Gradle silently ignores unknown -P properties, so a composition that
-      # dropped the applicationIdSuffix support would rebuild the colliding
-      # store id — fail loud instead of publishing that.
+      # dropped the applicationIdSuffix support (the open btli PR on branch
+      # feat/android-side-by-side-install) would rebuild the colliding store
+      # id — fail loud instead of publishing that.
       - name: Verify package id
         run: |
           set -euo pipefail
@@ -459,7 +460,7 @@ jobs:
           pkg="$("$bt/aapt2" dump badging app/build/outputs/apk/debug/app-debug.apk \
             | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
           if [ "$pkg" != "ai.omnigent.android.dev" ]; then
-            echo "::error::expected package id ai.omnigent.android.dev, got '$pkg' — applicationIdSuffix support missing from the composition?"
+            echo "::error::expected package id ai.omnigent.android.dev, got '$pkg' — applicationIdSuffix support missing: did the feat/android-side-by-side-install PR drop out of the composition?"
             exit 1
           fi
 
