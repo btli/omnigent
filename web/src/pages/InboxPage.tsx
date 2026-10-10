@@ -370,6 +370,11 @@ export function InboxPage() {
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
             onSubmit={makeSubmit(item)}
+            requester={
+              item.resolveSessionId !== item.row.id
+                ? { sessionId: item.resolveSessionId, ancestorSessionId: item.row.id }
+                : null
+            }
             className="border-0 bg-transparent p-0"
           />
           <InboxActions>

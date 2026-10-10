@@ -40,15 +40,22 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     status,
     allowAutoMode,
     onSubmit,
+    requester,
   }: {
     elicitationId: string;
     message: string;
     status: string;
     allowAutoMode?: boolean;
     onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
+    requester?: { sessionId: string; ancestorSessionId: string } | null;
   }) => (
     <div data-testid="approval-card" data-status={status}>
       <span>{message}</span>
+      {requester && (
+        <span data-testid="approval-card-requester">
+          {requester.sessionId} under {requester.ancestorSessionId}
+        </span>
+      )}
       <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
         Stub Accept
       </button>
@@ -433,6 +440,22 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
     );
+    // The card names the child, since the row it surfaced under is the parent.
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent("child under parent");
+  });
+
+  it("does not attribute a session's own prompt to a sub-agent", async () => {
+    // WHY: only mirrored prompts carry a requester; a row's own prompt must
+    // not read as coming from a sub-agent.
+    const row = conversation({ id: "parent" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_own", "Own approval?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    expect(await screen.findByRole("button", { name: "Stub Accept" })).toBeInTheDocument();
+    expect(screen.queryByTestId("approval-card-requester")).toBeNull();
   });
 });
 
