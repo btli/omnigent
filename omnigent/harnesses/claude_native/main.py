@@ -1505,16 +1505,29 @@ async def claude_model_catalog(
         # endpoint without one falls back to the hostname heuristic; an
         # undetermined listing keeps the probe rows (the fail-open path), except on
         # a Databricks AI Gateway, which always serves namespaced ids.
-        _non_canonical = (
-            listing_provider is None
-            and claude_config is not None
-            and not _serves_canonical_anthropic_ids(claude_config)
-        ) or (
-            # For ambient gateways: fail open unless it's a Databricks AI Gateway.
+        from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+        is_undetermined_configured_databricks_gateway = (
             gateway_serves_canonical is None
-            and claude_config is None
+            and claude_config is not None
             and listing_provider is not None
-            and _ambient_env_is_databricks_gateway()
+            and listing_provider.base_url
+            and is_databricks_ai_gateway_url(listing_provider.base_url)
+        )
+        _non_canonical = (
+            is_undetermined_configured_databricks_gateway
+            or (
+                listing_provider is None
+                and claude_config is not None
+                and not _serves_canonical_anthropic_ids(claude_config)
+            )
+            or (
+                # For ambient gateways: fail open unless it's a Databricks AI Gateway.
+                gateway_serves_canonical is None
+                and claude_config is None
+                and listing_provider is not None
+                and _ambient_env_is_databricks_gateway()
+            )
         )
     if _non_canonical:
         rows = [
