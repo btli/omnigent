@@ -29,7 +29,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, Protocol, cast
 
 import httpx
 from fastapi import (
@@ -11325,7 +11325,14 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _request_attachment_policy(request: Request | None) -> FilesystemAttachmentPolicy:
+class _AppCarrier(Protocol):
+    """A request, or a runner-event context, that exposes the FastAPI app."""
+
+    @property
+    def app(self) -> Any: ...
+
+
+def _request_attachment_policy(request: _AppCarrier | None) -> FilesystemAttachmentPolicy:
     """Use the application's advertised snapshot; standalone route mounts load their own policy."""
     policy = getattr(request.app.state, "filesystem_attachment_policy", None) if request else None
     return policy if policy is not None else filesystem_attachment_policy()
