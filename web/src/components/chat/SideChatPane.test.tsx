@@ -184,6 +184,7 @@ describe("side chat opened from a text selection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
     expect(send).toHaveBeenCalledWith("> second selection\n\nwhy?", "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
   });
@@ -371,6 +372,7 @@ describe("side-chat interrupt", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
     expect(send).toHaveBeenCalledExactlyOnceWith("Keep this follow-up", "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(useChatStore.getState().sessionStatus).toBe("running");
   });
