@@ -14,9 +14,11 @@ branches were removed in v0.15.0.
 The refs ever pushed are ``staging``, the ``nightly-*`` pin, the dev tag,
 and (rescues only) the rescued PR's own fork branch. ``--ring production``
 composes the production ring instead: every open PR (drafts included) plus
-the ``extras-production.txt`` pins, branch ``production`` + immutable
-``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
-(``--staging-only`` is rejected for it). A production composition
+the ``extras-production.txt`` pins (retired with the production compose, so
+none), branch ``production`` + immutable ``production-YYYYMMDD`` pins, no dev
+tag, and no hourly mode (``--staging-only`` is rejected for it). CI no longer
+composes production (personal-promote.yml promotes a soaked nightly and
+names its pin through ``pin_name``). A production composition
 that touches DB migrations is BLOCKED before any ref moves unless
 ``--migration-approval`` names the exact candidate sha.
 
@@ -114,9 +116,9 @@ STAGING = Ring(
 
 
 # The production ring: fork main + every open PR, drafts included (same stream
-# as staging), plus the extras-production.txt pins (its own manifest, so
-# nothing staged-only reaches prod by accident). No dev tag (nothing
-# downstream consumes one), immutable production-YYYYMMDD pins.
+# as staging), plus the extras-production.txt pins (its own manifest; retired,
+# and a missing manifest means no extras). No dev tag, immutable
+# production-YYYYMMDD pins. Promotion still names its pins through pin_name.
 PRODUCTION = Ring(
     name="production",
     branch="production",

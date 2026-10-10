@@ -1,7 +1,7 @@
 # Retires aged personal-ring pins on the btli fork.
 #
-# The staging and production nightlies each mint an immutable dated pin —
-# a `<ring>-YYYYMMDD[-rerunN]` tag and dated prerelease — plus a PEP 440
+# The staging nightly and production promotions each mint an immutable dated
+# pin — a `<ring>-YYYYMMDD[-rerunN]` tag and dated prerelease — plus a PEP 440
 # `vX.Y.Z.devYYYYMMDD` tag on staging. Same-name compatibility branches were
 # removed in v0.15.0; historical branches remain eligible for pruning.
 # Nothing resolves a pin after the homelab has built it, so they accumulate
@@ -9,11 +9,10 @@
 # floor of the newest few per family so a stalled ring can never be stripped
 # bare. Floating refs (`production-latest`, `nightly-latest`), `pr-demos-*`,
 # release tags and `archive/*` are outside the matched families entirely.
+# The nightly named by production-latest's source.json (and its production
+# tag) is never pruned; an unreadable source.json fails the run instead.
 #
-# Ordering: runs after the whole nightly chain (staging 10:00, production
-# 10:30, dev-rebase 10:45) and after the homelab has resolved today's
-# production pin at 11:10 UTC, so a prune can never race a pin being
-# consumed.
+# Ordering: runs after the nightly chain (staging 10:00, dev-rebase 10:45).
 #
 # Trust boundary: the test gate installs third-party dev deps and holds no
 # write token; the prune job runs the stdlib-only pruner with contents:write
@@ -23,8 +22,8 @@ name: Personal Pin Retention
 
 on:
   schedule:
-    # 12:20 UTC — clear of the 10:00/10:30/10:45 composes and the homelab's
-    # 11:10 pin poll. Off :00 like the other personal rings.
+    # 12:20 UTC — clear of the 10:00/10:45 composes. Off :00 like the other
+    # personal rings.
     - cron: "20 12 * * *"
   workflow_dispatch:
     inputs:

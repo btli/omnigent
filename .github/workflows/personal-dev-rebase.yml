@@ -13,7 +13,7 @@ name: Personal Dev Rebase
 
 on:
   schedule:
-    # After the production compose's 10:30 slot; off the congested :00 minute
+    # After the staging nightly's 10:00 slot; off the congested :00 minute
     # like the other fork schedules.
     - cron: "45 10 * * *"
   workflow_dispatch:
@@ -22,8 +22,8 @@ permissions:
   contents: read
 
 # Reruns coalesce — a queued rebase is worthless once a newer one runs. Own
-# group so it can never cancel (or be cancelled by) the staging or
-# production composes.
+# group so it can never cancel (or be cancelled by) the staging composes or
+# a production promote.
 concurrency:
   group: personal-dev-rebase
   cancel-in-progress: true
