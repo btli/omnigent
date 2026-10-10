@@ -16,8 +16,10 @@ which is what the Agents-rail tests assert on.
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
+import tarfile
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
