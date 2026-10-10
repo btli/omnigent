@@ -226,6 +226,7 @@ describe("side chat opened from a text selection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
     expect(send).toHaveBeenCalledWith("> second selection\n\nwhy?", "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
   });
