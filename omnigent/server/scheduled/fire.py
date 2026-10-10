@@ -53,6 +53,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfoNotFoundError
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
@@ -68,6 +69,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.schemas import ProjectSessionCreateRequest, SessionEventInput
 from omnigent.stores.project_store import ProjectStore
 
@@ -481,7 +483,7 @@ async def _run_fire_for_task(
         effective = replace(effective, project_id=await _resolve_fire_project(deps, task))
         try:
             effective = await _own_task_agent(deps, effective)
-            conv = await _create_session(deps, effective)
+            conv = await _create_session(deps, effective, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
             await _record_run(
@@ -965,12 +967,20 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     return agent.bundle_location if agent is not None else None
 
 
-async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+async def _create_session(deps: FireDeps, task: ScheduledTask, scheduled_at: int) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
+    try:
+        title = render_session_name(task.name, scheduled_at, task.timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        title = task.name
+        _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
+    except Exception as exc:
+        title = task.name
+        _logger.exception("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
-        title=task.name,
+        title=title,
         host_id=task.host_id,
         workspace=task.workspace,
         project_id=task.project_id,
