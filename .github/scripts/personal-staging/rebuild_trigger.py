@@ -59,8 +59,32 @@ def diff(current: dict[int, str], composed: dict[int, str]) -> list[dict]:
     return changes
 
 
-def plan(changes: list[dict], committed_at: dict[str, int], now: int, settle_s: int) -> dict:
-    """Rebuild once the newest changed head is ``settle_s`` old."""
+def plan(
+    changes: list[dict],
+    committed_at: dict[str, int],
+    now: int,
+    settle_s: int,
+    attempted_at: int = 0,
+) -> dict:
+    """Rebuild once the newest changed head is ``settle_s`` old.
+
+    ``attempted_at`` is when a newer nightly than the baseline was last
+    composed, one whose composition gate failed (no release). Heads committed
+    before it were already tried; rebuilding again would only repeat the same
+    merge conflict, so only a later push re-arms the trigger.
+    """
+    if (
+        attempted_at
+        and changes
+        and all(c["oid"] and committed_at[c["oid"]] <= attempted_at for c in changes)
+    ):
+        summary = ", ".join(f"#{c['pr']} {c['kind']}" for c in changes)
+        return {
+            "action": "noop",
+            "reason": f"{summary}; already attempted by the newest nightly (composition failed)",
+            "changed": changes,
+            "settle_at": None,
+        }
     if not changes:
         return {
             "action": "noop",
@@ -102,6 +126,43 @@ def commit_time(oid: str) -> int:
     return int(datetime.fromisoformat(stamp).timestamp())
 
 
+def release_report(repo: str, tag: str) -> dict | None:
+    """The nightly's merge-report.json, or None when it has no release/report."""
+    out = subprocess.run(
+        ["gh", "release", "download", tag, "-R", repo, "-p", "merge-report.json", "-O", "-"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode:
+        return None
+    return json.loads(out.stdout)
+
+
+def last_attempt_time(repo: str) -> int:
+    """When the newest staging nightly run started (unix seconds), or 0.
+
+    A tag's commit time is no use here: the composer stamps merges with each PR
+    head's own commit time for reproducibility. The run start is when the
+    composer read the PR heads, so anything committed before it was attempted.
+    """
+    runs = gh_json(
+        "run",
+        "list",
+        "-R",
+        repo,
+        "--workflow",
+        "personal-staging.yml",
+        "--limit",
+        "1",
+        "--json",
+        "createdAt",
+    )
+    if not runs:
+        return 0
+    stamp = runs[0]["createdAt"].replace("Z", "+00:00")
+    return int(datetime.fromisoformat(stamp).timestamp())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default="btli/omnigent")
@@ -125,51 +186,55 @@ def main(argv: list[str] | None = None) -> int:
         ).stdout.splitlines()
         if "^{}" not in line
     ]
-    nightly = newest_nightly(tags)
-    if nightly is None:
+    newest = newest_nightly(tags)
+    if newest is None:
         print(
             json.dumps(
                 {"action": "noop", "reason": "no nightly yet", "changed": [], "settle_at": None}
             )
         )
         return 0
-    report_raw = subprocess.run(
-        [
-            "gh",
-            "release",
-            "download",
-            nightly,
-            "-R",
-            args.repo,
-            "-p",
-            "merge-report.json",
-            "-O",
-            "-",
-        ],
-        capture_output=True,
-        text=True,
+    # A nightly whose composition gate failed keeps its tag but never gets a
+    # release, so its report is missing for good: the baseline is the newest
+    # nightly that published one. A freshly minted nightly still publishing is
+    # the same shape, and is covered by the caller's in-flight check.
+    ordered = sorted(
+        (t for t in tags if NIGHTLY_RE.fullmatch(t)),
+        key=lambda t: (
+            NIGHTLY_RE.fullmatch(t).group(1),
+            int(NIGHTLY_RE.fullmatch(t).group(2) or 0),
+        ),
+        reverse=True,
     )
-    if report_raw.returncode:
-        # The newest nightly is still publishing; its own report is the baseline.
+    nightly, report = None, None
+    for candidate in ordered[:10]:
+        report = release_report(args.repo, candidate)
+        if report is not None:
+            nightly = candidate
+            break
+    if nightly is None:
         print(
             json.dumps(
                 {
                     "action": "wait",
-                    "reason": f"{nightly} has no merge report yet",
+                    "reason": "no recent nightly has a merge report",
                     "changed": [],
                     "settle_at": None,
                 }
             )
         )
         return 0
-    composed = composed_heads(json.loads(report_raw.stdout))
+    attempted_at = last_attempt_time(args.repo) if newest != nightly else 0
+    composed = composed_heads(report)
     # Same selection as the composer: open btli PRs minus exclude.txt.
     prs, _ = stage.apply_exclusions(stage.list_prs(), stage.parse_exclusions(Path(args.exclude)))
     current = {int(p["number"]): p["headRefOid"] for p in prs}
     changes = diff(current, composed)
     committed = {c["oid"]: commit_time(c["oid"]) for c in changes if c["oid"]}
-    result = plan(changes, committed, int(time.time()), args.settle_minutes * 60)
+    result = plan(changes, committed, int(time.time()), args.settle_minutes * 60, attempted_at)
     result["baseline"] = nightly
+    if newest != nightly:
+        result["newest_tag"] = newest
     print(json.dumps(result))
     return 0
 
