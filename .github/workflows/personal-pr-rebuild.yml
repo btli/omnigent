@@ -1,0 +1,76 @@
+# Rebuild the staging nightly when btli PRs change, once the changes settle.
+#
+# personal-staging.yml builds once a day (10:00 UTC). Between nightlies the
+# open btli PRs keep moving; rebuild_trigger.py compares their heads with what
+# the newest nightly composed and asks for a rerun only when every changed
+# head is at least 30 min old. A burst of pushes keeps resetting that clock,
+# so an afternoon of force-pushes yields one rerun (nightly-YYYYMMDD-rerunN),
+# not a dozen. The rerun then flows like any nightly: homelab soaks it (latest
+# wins) and a passing soak/homelab verdict promotes it.
+#
+# Never doubles up: skips while a staging nightly is queued or running (its
+# report becomes the next baseline), and personal-staging's own concurrency
+# group serializes any race.
+name: Personal PR Rebuild
+
+on:
+  schedule:
+    # Off :00 and the 10:00-11:10 ring window; every 10 min is cheap
+    # (one ls-remote, one release asset, one PR list).
+    - cron: "7-59/10 0-9,11-23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-pr-rebuild
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Decide
+        id: plan
+        run: |
+          set -euo pipefail
+          # A nightly already queued or running composes the latest heads
+          # itself and becomes the next baseline: never stack a second.
+          busy=$(gh run list --workflow personal-staging.yml --limit 10 \
+            --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [ "$busy" -gt 0 ]; then
+            echo "A staging nightly is already queued or running; nothing to do."
+            echo "action=busy" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          plan=$(cd .github/scripts/personal-staging && python3 rebuild_trigger.py --repo "$GITHUB_REPOSITORY")
+          echo "$plan" | jq .
+          echo "action=$(jq -r .action <<<"$plan")" >> "$GITHUB_OUTPUT"
+          {
+            echo "## PR rebuild check"
+            echo ""
+            echo "- action: \`$(jq -r .action <<<"$plan")\`"
+            echo "- baseline: \`$(jq -r '.baseline // "-"' <<<"$plan")\`"
+            echo "- $(jq -r .reason <<<"$plan")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dispatch the staging nightly
+        if: steps.plan.outputs.action == 'rebuild'
+        run: |
+          set -euo pipefail
+          gh workflow run personal-staging.yml --ref main
+          echo "Dispatched personal-staging.yml for the settled PR changes." >> "$GITHUB_STEP_SUMMARY"
