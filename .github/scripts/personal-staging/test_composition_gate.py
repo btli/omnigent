@@ -147,3 +147,25 @@ def test_workflow_composition_gate_job_is_secretless_and_fails():
     assert gate["steps"][-1]["run"].rstrip().endswith("exit 1")
     # untrusted values reach run: only through env:
     assert not any("${{" in s.get("run", "") for s in gate["steps"])
+
+
+def test_nightly_failure_alert_skips_the_composition_gate():
+    """A red build or publish alerts once; an incomplete composition already
+    alerted from composition-gate, so that job is not an ancestor of the alert."""
+    jobs = _workflow()
+    alert = jobs["alert-failure"]
+    assert alert["needs"] == [
+        "test-composer",
+        "integrate",
+        "verify",
+        "android-build",
+        "android-sign",
+        "desktop-build",
+        "publish",
+    ]
+    assert "composition-gate" not in alert["needs"]
+    assert alert["if"] == "(failure() || cancelled()) && github.repository == 'btli/omnigent'"
+    text = str(alert)
+    assert text.count("secrets.") == 1
+    assert "omnigent staging nightly FAILED" in text
+    assert not any("${{" in s.get("run", "") for s in alert["steps"])

@@ -51,7 +51,7 @@ jobs:
         run: uv run --frozen --group dev python -m pytest .github/scripts/personal-staging/ tests/db/test_ring_migration_history.py
 
   # Privileged (pushes refs/heads/staging) but runs ONLY the stdlib composer.
-  # Composes from published fork main; only production syncs main.
+  # Composes from published fork main; only the staging nightly syncs main.
   compose:
     concurrency:
       group: personal-staging-hourly-compose

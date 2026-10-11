@@ -1,36 +1,25 @@
 # Personal production ring
 
-To verify a completed run, use a disposable clone and replace `PIN` with the
-report's immutable `production-YYYYMMDD[-rerunN]` tag:
+Production is promoted, not composed: `personal-promote.yml` points an
+immutable `production-YYYYMMDD[-rerunN]` tag at a soaked staging nightly's
+own commit and copies that nightly's artifacts and image digests. The old
+`personal-production.yml` compose is retired.
+
+To verify a completed promotion, replace `PIN` with the production tag:
 
 ```sh
-git fetch origin main production --tags
-git merge-base --is-ancestor origin/main PIN
-git rev-list --left-right --count origin/main...PIN
-git log --first-parent --reverse --format='%s' origin/main..PIN
-git checkout --detach PIN
-omni
+gh release download PIN -R btli/omnigent -p source.json -O -
+git fetch origin --tags
+git rev-parse PIN^{commit} "$(gh release download PIN -R btli/omnigent -p source.json -O - | jq -r .source_tag)^{commit}"
+gh release download production-latest -R btli/omnigent -p source.json -O - | jq -r .production_tag
 ```
 
-Expect ancestry exit 0 and counts `0 N`; `N` may be zero when a zero-input
-production run pins main. Check production merge subjects and confirm that the
-update check reports main is not behind. Compare the report's `base_sha` with
-main at publication; a later main push or blocked production run can leave the
-immutable pin behind.
+Expect both `rev-parse` lines to print the same sha, `source.json` to name the
+nightly, its sha and trigger, and `production-latest` to name `PIN`. Each
+`omnigent-production-*` asset's sha256 in the release's `SHA256SUMS` equals
+the nightly's `omnigent-staging-*` entry in its `build-complete.json`.
 
-Git can elide the matching no-op main refspec from an atomic push. A
-post-publication read records `base_matches_remote_main` and detects a main move
-after advertisement. That detection fails the run, but ring or rescue refs may
-already have moved; they are not rolled back, and the next compose reconciles
-them from the new main.
-
-If sync-main conflicts, check out fork main, fetch and merge upstream main,
-resolve and commit, then use a normal `git push origin main`. Never force or
-force-with-lease main. Use **Re-run jobs** on the failed scheduled run afterward;
-an empty workflow dispatch skips sync-main. To roll back the design, revert the
-change on main; `--base-ref upstream/main` cannot bypass the published-main
-check.
-
-For composition semantics, migration approval, concurrency, and detailed
-recovery guidance, see the
-[composer README](../../../../.github/scripts/personal-staging/README.md).
+Main sync and its conflict recovery now belong to the staging nightly; see the
+[staging ring README](../staging/README.md). For promote rules, migration
+approval, rollback and the hardware contract, see the
+[composer README](../../../.github/scripts/personal-staging/README.md).

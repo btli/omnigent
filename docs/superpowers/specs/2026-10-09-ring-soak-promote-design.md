@@ -84,9 +84,9 @@ Every rule must pass, or nothing is published.
      candidate touches migrations and
      `approve_migration` isn't exactly the candidate sha, the run **stops
      green**: it alerts, writes the approval hint and publishes nothing.
-6. **Serialized.** `concurrency: personal-production` (shared with the legacy
-   compose run until cutover), never cancelled. Rules 3–5
-   are evaluated inside the run, after the lock is acquired.
+6. **Serialized.** `concurrency: personal-promote` on the promote job, never
+   cancelled (job-level, so skipped status events never take its pending
+   slot). Rules 3–5 are evaluated inside the run, after the lock is acquired.
 
 `promote.py plan` prints a JSON plan
 `{"action": "promote|noop|blocked|refused|ignored|error", ...}`. The workflow
@@ -145,10 +145,14 @@ its own copies of the assets, so this protects provenance, not downloads.
    tests and `personal-promote.yml` with inputs `nightly`, `approve_migration`,
    `allow_older` and `dry_run`. Prove it with a dry run, then a real promote of
    one nightly.
-3. **PR 3, cutover** (left open until the hardware posts statuses):
+3. **PR 3, cutover** (this PR, `feat/rings-promote-cutover`; left open until
+   the hardware posts statuses):
    - Add the `status` trigger, gated on `SOAK_STATUS_LOGIN`.
-   - Remove `personal-production.yml`'s compose and build jobs and its cron.
-   - Remove `extras-production.txt` and the PRODUCTION compose ring.
+   - Remove `personal-production.yml`'s compose and build jobs and its cron
+     (it remains as a dispatch stub that fails with a pointer).
+   - Remove `extras-production.txt` and the PRODUCTION compose. `stage.py`
+     keeps the PRODUCTION ring definition because `pin_name` uses it.
+   - Alert on a failed staging nightly.
    - Add the retention guard and update the docs.
 
 ## Out of scope

@@ -1424,10 +1424,12 @@ def test_production_extras_reject_branch_pins(tmp_path):
 
 def test_checked_in_extras_manifests_parse_for_their_rings():
     stage_mod.parse_extras(stage_mod.EXTRAS_FILE, stage_mod.STAGING)
-    _, production_branches = stage_mod.parse_extras(
-        stage_mod.PRODUCTION_EXTRAS_FILE, stage_mod.PRODUCTION
+    # Production no longer composes, so its manifest is retired: absent means no extras.
+    assert not stage_mod.PRODUCTION_EXTRAS_FILE.exists()
+    assert stage_mod.parse_extras(stage_mod.PRODUCTION_EXTRAS_FILE, stage_mod.PRODUCTION) == (
+        [],
+        [],
     )
-    assert production_branches == []
 
 
 @pytest.mark.parametrize("source", ["extra-branch"])
@@ -2472,14 +2474,20 @@ def test_sync_main_cli(env, capsys):
 
 
 def test_main_sync_owners():
-    """Staging nightly syncs main non-fatally, scheduled production syncs it, hourly never does."""
+    """The staging nightly is the only sync-main owner (non-fatal); hourly never
+    syncs, and production has no compose left to sync from."""
     import yaml
 
     workflows = Path(__file__).resolve().parents[2] / "workflows"
+    owners = [
+        name
+        for name in sorted(p.name for p in workflows.glob("*.yml"))
+        if "stage.py sync-main" in (workflows / name).read_text()
+    ]
+    assert owners == ["personal-staging.yml"]
     for filename, job, group in (
         ("personal-staging-hourly.yml", "compose", "personal-staging-hourly-compose"),
         ("personal-staging.yml", "integrate", "personal-staging-nightly-compose"),
-        ("personal-production.yml", "compose", "personal-production-compose"),
     ):
         text = (workflows / filename).read_text()
         workflow = yaml.safe_load(text)
@@ -2494,15 +2502,7 @@ def test_main_sync_owners():
         }
         scripts = "\n".join(step.get("run", "") for step in compose["steps"])
         assert not re.search(r"git push.*(?:main|refs/heads/main)", text)
-        if filename == "personal-production.yml":
-            assert scripts.count("stage.py sync-main") == 1
-            assert (
-                'if [ "$EVENT_NAME" = "schedule" ] && [ -z "$APPROVE_MIGRATION" ]; then' in scripts
-            )
-            assert scripts.index("stage.py sync-main") < scripts.index(
-                "stage.py stage --ring production"
-            )
-        elif filename == "personal-staging.yml":
+        if filename == "personal-staging.yml":
             assert scripts.count("stage.py sync-main") == 1
             assert "if ! python3 .github/scripts/personal-staging/stage.py sync-main" in scripts
             assert scripts.index("stage.py sync-main") < scripts.index("stage.py stage")
@@ -2520,7 +2520,6 @@ def test_failed_composition_uploads_saved_report():
     for filename, job in (
         ("personal-staging-hourly.yml", "compose"),
         ("personal-staging.yml", "integrate"),
-        ("personal-production.yml", "compose"),
     ):
         workflow = yaml.safe_load((workflows / filename).read_text())
         [upload] = [
@@ -2687,51 +2686,20 @@ def test_no_publish_rejects_the_hourly_mode(env, tmp_path, capsys):
     assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == env.initial_refs
 
 
-def yaml_text(obj) -> str:
-    import yaml
-
-    return yaml.safe_dump(obj)
-
-
-def _production_workflow():
+def test_production_workflow_is_a_retired_stub():
+    """Production is promoted from a soaked nightly; its old workflow composes,
+    builds and publishes nothing and fails any dispatch with a pointer."""
     import yaml
 
     path = Path(__file__).resolve().parents[2] / "workflows/personal-production.yml"
-    return yaml.safe_load(path.read_text())
-
-
-def test_production_composes_without_publishing():
-    """Phase one must not move a ref: the pin is minted by a later job."""
-    compose = _production_workflow()["jobs"]["compose"]
-    scripts = "\n".join(step.get("run", "") for step in compose["steps"])
-    assert "--no-publish" in scripts
-    assert "publish-candidate" not in scripts
-    assert compose["outputs"].keys() == {"date", "production_sha", "candidate_ref"}
-
-
-def test_production_verifies_the_candidate_builds_before_pinning():
-    """A pin is immutable, so the tree it names must compile first. The build
-    runs merged-PR code, so it holds no secrets and no git credentials."""
-    jobs = _production_workflow()["jobs"]
-    verify = jobs["verify"]
-    assert verify["needs"] == "compose"
-    assert "secrets" not in yaml_text(verify)
-    [checkout] = [
-        s for s in verify["steps"] if str(s.get("uses", "")).startswith("actions/checkout")
-    ]
-    assert checkout["with"]["persist-credentials"] is False
-    assert checkout["with"]["ref"] == "${{ needs.compose.outputs.production_sha }}"
-    scripts = "\n".join(step.get("run", "") for step in verify["steps"])
-    assert "pnpm install --frozen-lockfile" in scripts
-    assert "pnpm --filter web run build" in scripts
-
-    pin = jobs["pin"]
-    assert pin["needs"] == ["compose", "verify"]
-    assert pin["environment"] == "staging-push"
-    assert "publish-candidate" in "\n".join(step.get("run", "") for step in pin["steps"])
-    # Everything that consumes a pin waits for the job that mints it, so no
-    # release artifact can exist for an unverified composition.
-    for job in ("publish-images", "android-build", "desktop-build"):
-        assert jobs[job]["needs"] == "pin"
-        assert jobs[job]["if"] == "needs.pin.outputs.tag != ''"
-    assert jobs["publish"]["needs"] == ["pin", "android-sign", "desktop-build"]
+    text = path.read_text()
+    workflow = yaml.safe_load(text)
+    assert set(workflow[True]) == {"workflow_dispatch"}
+    assert workflow[True]["workflow_dispatch"] is None
+    assert workflow["permissions"] == {}
+    [job] = workflow["jobs"].values()
+    [step] = job["steps"]
+    assert "production is promoted by personal-promote.yml (see the spec)" in step["run"]
+    assert "exit 1" in step["run"]
+    for retired in ("stage.py", "gh release", "extras-production", "secrets."):
+        assert retired not in text
