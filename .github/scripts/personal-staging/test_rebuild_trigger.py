@@ -69,3 +69,25 @@ def test_settled_changes_rebuild():
 def test_a_closed_pr_alone_is_already_settled():
     changes = [{"pr": 3, "kind": "closed", "oid": None}]
     assert rt.plan(changes, {}, NOW, SETTLE)["action"] == "rebuild"
+
+
+def test_changes_already_attempted_by_a_failed_composition_do_not_loop():
+    changes = [{"pr": 2, "kind": "updated", "oid": "d" * 40}]
+    times = {"d" * 40: NOW - 3 * 3600}
+    out = rt.plan(changes, times, NOW, SETTLE, attempted_at=NOW - 3600)
+    assert out["action"] == "noop"
+    assert "already attempted" in out["reason"]
+
+
+def test_a_push_after_the_failed_attempt_re_arms_the_trigger():
+    changes = [
+        {"pr": 2, "kind": "updated", "oid": "d" * 40},
+        {"pr": 4, "kind": "updated", "oid": "e" * 40},
+    ]
+    times = {"d" * 40: NOW - 3 * 3600, "e" * 40: NOW - 40 * 60}
+    assert rt.plan(changes, times, NOW, SETTLE, attempted_at=NOW - 3600)["action"] == "rebuild"
+
+
+def test_a_closed_pr_after_the_failed_attempt_still_rebuilds():
+    changes = [{"pr": 3, "kind": "closed", "oid": None}]
+    assert rt.plan(changes, {}, NOW, SETTLE, attempted_at=NOW - 3600)["action"] == "rebuild"
