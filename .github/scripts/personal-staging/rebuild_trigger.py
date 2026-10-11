@@ -62,7 +62,12 @@ def diff(current: dict[int, str], composed: dict[int, str]) -> list[dict]:
 def plan(changes: list[dict], committed_at: dict[str, int], now: int, settle_s: int) -> dict:
     """Rebuild once the newest changed head is ``settle_s`` old."""
     if not changes:
-        return {"action": "noop", "reason": "open btli PRs match the newest nightly", "changed": [], "settle_at": None}
+        return {
+            "action": "noop",
+            "reason": "open btli PRs match the newest nightly",
+            "changed": [],
+            "settle_at": None,
+        }
     # A closed PR has no head to age; its removal is settled the moment it closes,
     # so it alone rebuilds immediately on the next poll.
     times = [committed_at[c["oid"]] for c in changes if c["oid"]]
@@ -77,7 +82,12 @@ def plan(changes: list[dict], committed_at: dict[str, int], now: int, settle_s: 
             "changed": changes,
             "settle_at": settle_at,
         }
-    return {"action": "rebuild", "reason": f"{summary}; settled", "changed": changes, "settle_at": settle_at}
+    return {
+        "action": "rebuild",
+        "reason": f"{summary}; settled",
+        "changed": changes,
+        "settle_at": settle_at,
+    }
 
 
 def gh_json(*args: str):
@@ -102,23 +112,55 @@ def main(argv: list[str] | None = None) -> int:
     tags = [
         line.split("refs/tags/", 1)[1]
         for line in subprocess.run(
-            ["git", "ls-remote", "--tags", f"https://github.com/{args.repo}.git", "refs/tags/nightly-*"],
-            check=True, capture_output=True, text=True,
+            [
+                "git",
+                "ls-remote",
+                "--tags",
+                f"https://github.com/{args.repo}.git",
+                "refs/tags/nightly-*",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout.splitlines()
         if "^{}" not in line
     ]
     nightly = newest_nightly(tags)
     if nightly is None:
-        print(json.dumps({"action": "noop", "reason": "no nightly yet", "changed": [], "settle_at": None}))
+        print(
+            json.dumps(
+                {"action": "noop", "reason": "no nightly yet", "changed": [], "settle_at": None}
+            )
+        )
         return 0
     report_raw = subprocess.run(
-        ["gh", "release", "download", nightly, "-R", args.repo, "-p", "merge-report.json", "-O", "-"],
-        capture_output=True, text=True,
+        [
+            "gh",
+            "release",
+            "download",
+            nightly,
+            "-R",
+            args.repo,
+            "-p",
+            "merge-report.json",
+            "-O",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
     )
     if report_raw.returncode:
         # The newest nightly is still publishing; its own report is the baseline.
-        print(json.dumps({"action": "wait", "reason": f"{nightly} has no merge report yet",
-                          "changed": [], "settle_at": None}))
+        print(
+            json.dumps(
+                {
+                    "action": "wait",
+                    "reason": f"{nightly} has no merge report yet",
+                    "changed": [],
+                    "settle_at": None,
+                }
+            )
+        )
         return 0
     composed = composed_heads(json.loads(report_raw.stdout))
     # Same selection as the composer: open btli PRs minus exclude.txt.

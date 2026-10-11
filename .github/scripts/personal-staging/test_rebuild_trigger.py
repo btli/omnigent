@@ -7,17 +7,24 @@ NOW = 1_800_000_000
 
 
 def test_newest_nightly_orders_reruns_numerically():
-    tags = ["nightly-20261009", "nightly-20261010-rerun2", "nightly-20261010-rerun10", "production-20261011"]
+    tags = [
+        "nightly-20261009",
+        "nightly-20261010-rerun2",
+        "nightly-20261010-rerun10",
+        "production-20261011",
+    ]
     assert rt.newest_nightly(tags) == "nightly-20261010-rerun10"
     assert rt.newest_nightly(["production-20261010"]) is None
 
 
 def test_composed_heads_counts_only_the_open_stream():
-    report = {"applied": [
-        {"pr": 1, "oid": "a" * 40, "source": "open"},
-        {"pr": 2, "oid": "b" * 40, "source": "extra"},
-        {"pr": 0, "oid": "c" * 40, "source": "upstream"},
-    ]}
+    report = {
+        "applied": [
+            {"pr": 1, "oid": "a" * 40, "source": "open"},
+            {"pr": 2, "oid": "b" * 40, "source": "extra"},
+            {"pr": 0, "oid": "c" * 40, "source": "upstream"},
+        ]
+    }
     assert rt.composed_heads(report) == {1: "a" * 40}
 
 
