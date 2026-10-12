@@ -16,6 +16,18 @@ from omnigent.models import model_catalog
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GATEWAY_KIND
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ambient_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the shell's Anthropic endpoint env from reaching a real gateway listing."""
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _stub_picker(
     monkeypatch: pytest.MonkeyPatch,
     models: list[dict[str, Any]] | None,
@@ -355,11 +367,13 @@ async def test_catalog_keeps_canonical_rows_for_bare_id_gateway(
         *,
         transport: object = None,
         params: object = None,
+        headers: object = None,
     ) -> model_catalog.ModelListing:
         return original_fetch(
             provider,
             transport=httpx.MockTransport(_gateway_models_handler),
             params=params,
+            headers=headers,
         )
 
     monkeypatch.setattr(model_catalog, "_fetch_openai_compatible_listing", _mocked_fetch)
