@@ -295,6 +295,7 @@ import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { RunnerStatsSection, hasRunnerStats } from "./RunnerStatsSection";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
@@ -4494,6 +4495,10 @@ function SessionTooltipContent({
       ? { name: "nessie", harness: null }
       : null;
 
+  // Runner stats section replaces the location line when available.
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
+  const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
+
   return (
     <TooltipContent
       side="right"
@@ -4524,13 +4529,24 @@ function SessionTooltipContent({
             )}
           </span>
         )}
-        <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
-          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
-        </span>
+        {!showRunnerStats && (
+          <span
+            data-testid="session-tooltip-location"
+            className="flex min-w-0 items-center gap-1.5"
+          >
+            <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+            <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
+          </span>
+        )}
       </p>
       <SessionTooltipDetails conversation={conversation} />
       {hasError && <SessionErrorHint />}
+      {host && showRunnerStats && (
+        <>
+          <div className="mt-2.5 border-t border-border" />
+          <RunnerStatsSection host={host} label={sessionLocationLabel(conversation, hostsById)} />
+        </>
+      )}
     </TooltipContent>
   );
 }
