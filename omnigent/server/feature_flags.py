@@ -57,6 +57,7 @@ class Feature(StrEnum):
     PROACTIVE_AGENT = "proactive_agent"
     USER_INBOX = "user_inbox"
     MEMORY = "memory"
+    HOST_STATS = "host_stats"
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # On by default; remove the flag and its off path in 0.23.0.
         review_by_release="0.23.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
+        review_by_release="0.19.0",
     ),
     FeatureDefinition(
         feature=Feature.CLAUDE_OSC_STATUS,
