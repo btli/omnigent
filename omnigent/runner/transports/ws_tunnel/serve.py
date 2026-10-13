@@ -34,6 +34,7 @@ from websockets.exceptions import (
     InvalidURI,
     WebSocketException,
 )
+from websockets.protocol import State
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event, runner_primary_session_id
@@ -153,6 +154,8 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # end-of-stream sentinel is enqueued. A task still running past this is
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
+# A cancellation acknowledgement must not delay cancellation on a stalled socket.
+_CANCELLED_RESPONSE_END_TIMEOUT_S = 1.0
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
@@ -185,6 +188,7 @@ async def dispatch_via_asgi(
     send_text: Callable[[str], Awaitable[None]],
     *,
     raw_body: bytes | None = None,
+    is_tunnel_open: Callable[[], bool] | None = None,
 ) -> None:
     """Run a tunneled ``request`` frame through the runner's ASGI app
     and stream the response back as frames via ``send_text``.
@@ -194,6 +198,7 @@ async def dispatch_via_asgi(
     :param send_text: Async callback that writes a frame onto the
         WebSocket back to the server (typically ``ws.send_text``).
     :param raw_body: Raw envelope bytes, bypassing JSON body decoding when present.
+    :param is_tunnel_open: Optional socket-state check to skip cancellation ends after close.
     """
     body_bytes = raw_body
     if body_bytes is None:
@@ -293,9 +298,14 @@ async def dispatch_via_asgi(
     try:
         async with deadline:
             await app(scope, receive, send)
-    except asyncio.CancelledError:
-        await send_end("runner_request_cancelled")
-        raise
+    except asyncio.CancelledError as cancellation:
+        try:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(_CANCELLED_RESPONSE_END_TIMEOUT_S):
+                    if is_tunnel_open is None or is_tunnel_open():
+                        await send_end("runner_request_cancelled")
+        finally:
+            raise cancellation
     except Exception:
         # If the app crashed BEFORE sending head, surface a 500 so
         # the server's request-side awaiter doesn't hang. If it
@@ -1096,6 +1106,9 @@ async def _serve_tunnel_once(
         async def send_text(data: str) -> None:
             await diagnostics.send(ws.send, data)
 
+        def is_tunnel_open() -> bool:
+            return ws.state is State.OPEN
+
         if on_connected is not None:
             on_connected()
         downtime_s = (
@@ -1186,6 +1199,7 @@ async def _serve_tunnel_once(
                         on_activity=on_activity,
                         event_dispatcher=event_dispatcher,
                         diagnostics=diagnostics,
+                        is_tunnel_open=is_tunnel_open,
                     )
             else:
                 # Race reads against the shutdown signal. When it fires,
@@ -1252,6 +1266,7 @@ async def _serve_tunnel_once(
                             on_activity=on_activity,
                             event_dispatcher=event_dispatcher,
                             diagnostics=diagnostics,
+                            is_tunnel_open=is_tunnel_open,
                         )
                 finally:
                     shutdown_wait.cancel()
@@ -1405,6 +1420,7 @@ async def _handle_tunnel_frame(
     on_activity: Callable[[], None] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
+    is_tunnel_open: Callable[[], bool] | None = None,
 ) -> None:
     """Handle one server-to-runner tunnel frame.
 
@@ -1420,6 +1436,7 @@ async def _handle_tunnel_frame(
     :param on_activity: Optional sync callback fired for non-ping
         frames that represent real runner work.
     :param diagnostics: Connection-local application frame and heartbeat observations.
+    :param is_tunnel_open: Optional live socket-state check for cancellation acknowledgements.
     :returns: None.
     """
     if diagnostics is not None:
@@ -1463,7 +1480,9 @@ async def _handle_tunnel_frame(
         if on_activity is not None:
             on_activity()
         task = asyncio.create_task(
-            dispatch_via_asgi(app, frame, send_text, raw_body=raw_body),
+            dispatch_via_asgi(
+                app, frame, send_text, raw_body=raw_body, is_tunnel_open=is_tunnel_open
+            ),
             name=f"ws-tunnel-dispatch:{frame.id}",
         )
         dispatch_tasks[frame.id] = task
