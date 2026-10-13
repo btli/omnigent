@@ -163,6 +163,7 @@ describe("side chat opened from a text selection", () => {
     } else {
       expect(send).toHaveBeenCalledExactlyOnceWith(text, "agent_side", undefined, {
         pinnedConversationId: childId,
+        onError: expect.any(Function),
       });
     }
   });
