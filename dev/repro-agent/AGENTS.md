@@ -660,6 +660,10 @@ Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- **Caption the screen from screen evidence.** Compare claimed outcomes with
+  inspected frames or visible-state assertions from the clip. Backend storage
+  and logs do not establish what the UI displayed; keep those findings in
+  `evidence`. Correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -822,11 +826,13 @@ Field meanings:
   what the clip shows — e.g. `"start a session → open the model picker → select
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
-  behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
-  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
-  authored-but-unrendered VHS tape in the artifact, but do not declare it as a
-  recording. Empty list when nothing valid was recorded.
+  behavior (the journey completing). Each screen claim comes from screen
+  evidence, not from a transcript or API check (Step 4). This is per-recording
+  (each clip drives its own steps), distinct from the bug-level `journey`
+  field. `capture_mode` is one of the surface-appropriate values in
+  `dev/recording-lanes.md`. Keep an authored-but-unrendered VHS tape in the
+  artifact, but do not declare it as a recording. Empty list when nothing valid
+  was recorded.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 
