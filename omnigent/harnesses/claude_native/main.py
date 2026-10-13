@@ -195,6 +195,7 @@ _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
@@ -466,9 +467,9 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
     """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
-    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
-    set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
-    fingerprint must treat the env as a non-canonical endpoint.
+    :func:`_serves_canonical_anthropic_ids`: when the env (or managed settings)
+    sets ``ANTHROPIC_BASE_URL`` to a gateway, the catalog asks that gateway's
+    live listing what it serves (:func:`_ambient_listing_provider`).
     """
     managed_base_url, _ = managed_claude_gateway_signal()
     base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
@@ -478,10 +479,49 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
 
 
+def _ambient_listing_provider() -> model_catalog.ResolvedModelProvider | None:
+    """The ambient ``ANTHROPIC_BASE_URL`` gateway as a listing descriptor.
+
+    Carries the credential Claude Code itself sends there (``ANTHROPIC_AUTH_TOKEN``,
+    else ``ANTHROPIC_API_KEY``); ``None`` for real Anthropic or no override.
+    """
+    if not _ambient_env_is_non_anthropic_gateway():
+        return None
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GATEWAY_KIND
+
+    return model_catalog.ResolvedModelProvider(
+        kind=GATEWAY_KIND,
+        family=ANTHROPIC_FAMILY,
+        base_url=os.environ[_UCODE_CLAUDE_BASE_URL_ENV],
+        api_key=os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV)
+        or os.environ.get(_ANTHROPIC_API_KEY_ENV)
+        or None,
+        detail="ambient ANTHROPIC_BASE_URL",
+    )
+
+
+def _ambient_env_is_databricks_gateway() -> bool:
+    """Whether the ambient ``ANTHROPIC_BASE_URL`` names a Databricks AI Gateway."""
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    return is_databricks_ai_gateway_url(os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, ""))
+
+
+def _ambient_custom_headers() -> dict[str, str]:
+    """Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` (``Name: value`` lines) as a dict."""
+    headers: dict[str, str] = {}
+    for line in os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV, "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip():
+            headers[name.strip()] = value.strip()
+    return headers
+
+
 def _gateway_claude_listing(
     listing_provider: model_catalog.ResolvedModelProvider,
     *,
     transport: httpx.BaseTransport | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> tuple[bool | None, tuple[str, ...]]:
     """Enumerate a gateway's live ``/v1/models`` for Claude servability.
 
@@ -491,6 +531,8 @@ def _gateway_claude_listing(
     Anthropic ids are lowercase, so a differently-cased id proves nothing about
     the bare ``claude-*`` rows the probe offers.
 
+    :param headers: Extra request headers for the gateway listing, e.g. the
+        ambient ``ANTHROPIC_CUSTOM_HEADERS``; values are never logged.
     :returns: ``(serves_canonical, concrete_ids)``:
 
         - ``serves_canonical=True`` — the listing reports a bare ``claude-*`` id
@@ -517,12 +559,16 @@ def _gateway_claude_listing(
                 listing_provider,
                 transport=transport,
                 params={"return_wildcard_routes": "true"},
+                headers=headers,
             )
-    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError):
+    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        # The error text carries the request URL (userinfo, query tokens): log none of it.
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
         _logger.debug(
-            "claude gateway model listing failed for %s",
-            listing_provider.detail or listing_provider.base_url,
-            exc_info=True,
+            "claude gateway model listing failed for %s: %s (HTTP status %s)",
+            listing_provider.detail or listing_provider.kind,
+            type(exc).__name__,
+            status,
         )
         return (None, ())
     ids = [entry.id for entry in listing.models]
@@ -1385,7 +1431,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     )
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v4",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1406,7 +1452,10 @@ async def claude_model_catalog(
     Rows come from the harness's own enumeration alone (no configured/static
     merge). Servability filtering matches the listing composition: on a
     non-canonical endpoint, aliases resolving to bare Anthropic ids are
-    dropped unless the provider explicitly declares them routable. The
+    dropped unless the provider explicitly declares them routable. With no
+    config, an ambient ``ANTHROPIC_BASE_URL`` gateway is asked what it serves;
+    an unreadable listing keeps the CLI's rows, except on a Databricks AI
+    Gateway, whose namespaced ids reject bare Anthropic spellings. The
     default marker is what a Default launch of this config
     actually runs: the config's own launch pin when the provider resolves
     one (those launches pass ``--model`` explicitly), else the enumeration
@@ -1424,16 +1473,26 @@ async def claude_model_catalog(
         return []
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
-    # A configured gateway provider's live /v1/models is the source of truth for
-    # what it serves (mirrors pi #7007), overriding the hostname heuristic. It is
-    # three-valued: True (a bare ``claude-*`` is listed → keep the canonical
-    # rows), False (a reachable listing with none → authoritatively namespaced,
-    # e.g. OpenRouter → drop), or None (unreachable/empty → fail OPEN, keep the
-    # probe rows rather than blank the picker on a blip). Fetched off-thread.
-    listing_provider = claude_config.listing_provider if claude_config is not None else None
+    # A gateway's live /v1/models (a configured provider's, or the ambient
+    # ANTHROPIC_BASE_URL's) is the source of truth for what it serves (mirrors
+    # pi's live listing), overriding the hostname heuristic. It is three-valued:
+    # True (a bare ``claude-*`` is listed → keep the canonical rows), False (a
+    # reachable listing with none → authoritatively namespaced, e.g. OpenRouter
+    # → drop), or None (unreachable/empty/no credential → fail OPEN, keep the
+    # probe rows rather than blank the picker on a blip, except on Databricks gateway).
+    # Fetched off-thread.
+    if claude_config is not None:
+        listing_provider = claude_config.listing_provider
+    else:
+        listing_provider = _ambient_listing_provider()
     gateway_serves_canonical: bool | None = None
     gateway_concrete_ids: tuple[str, ...] = ()
-    if listing_provider is not None:
+    if listing_provider is not None and claude_config is None:
+        # Claude Code sends its custom headers (e.g. a LiteLLM key) to the ambient host too.
+        gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
+            _gateway_claude_listing, listing_provider, headers=_ambient_custom_headers()
+        )
+    elif listing_provider is not None:
         gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
             _gateway_claude_listing, listing_provider
         )
@@ -1442,24 +1501,32 @@ async def claude_model_catalog(
     elif gateway_serves_canonical is False:
         _non_canonical = True
     else:
-        # No listing provider, or the listing was undetermined: fall back to the
-        # hostname heuristic (which, for a configured gateway provider whose
-        # listing failed, keeps the probe rows — the fail-open path). Exception:
-        # Databricks AI Gateway whose /v1/models 404s should not offer bare
-        # claude-* ids that fail at the first turn.
+        # No listing provider, or the listing was undetermined: only a configured
+        # endpoint without one falls back to the hostname heuristic; an
+        # undetermined listing keeps the probe rows (the fail-open path), except on
+        # a Databricks AI Gateway, which always serves namespaced ids.
         from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
-        is_undetermined_databricks_gateway = (
+        is_undetermined_configured_databricks_gateway = (
             gateway_serves_canonical is None
+            and claude_config is not None
             and listing_provider is not None
             and listing_provider.base_url
             and is_databricks_ai_gateway_url(listing_provider.base_url)
         )
-        _non_canonical = is_undetermined_databricks_gateway or (
-            listing_provider is None
-            and (
-                (claude_config is not None and not _serves_canonical_anthropic_ids(claude_config))
-                or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+        _non_canonical = (
+            is_undetermined_configured_databricks_gateway
+            or (
+                listing_provider is None
+                and claude_config is not None
+                and not _serves_canonical_anthropic_ids(claude_config)
+            )
+            or (
+                # For ambient gateways: fail open unless it's a Databricks AI Gateway.
+                gateway_serves_canonical is None
+                and claude_config is None
+                and listing_provider is not None
+                and _ambient_env_is_databricks_gateway()
             )
         )
     if _non_canonical:
