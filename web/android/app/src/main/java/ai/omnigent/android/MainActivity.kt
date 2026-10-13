@@ -303,7 +303,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun recoverFromMainFrameHttpError() {
-        if (httpErrorRecoveryStarted) return
+        if (isFinishing || isDestroyed || httpErrorRecoveryStarted) return
         httpErrorRecoveryStarted = true
         startActivity(Intent(this, ConnectActivity::class.java))
         finish()

@@ -58,6 +58,23 @@ class MainActivityTest {
     }
 
     @Test
+    fun `http error after activity starts finishing does not reopen connect`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val activityShadow = shadowOf(activity)
+        activityShadow.clearNextStartedActivities()
+        activity.finish()
+
+        webView.webViewClient.onReceivedHttpError(
+            webView,
+            request("https://example.com/app"),
+            httpError(503),
+        )
+
+        assertNull(activityShadow.nextStartedActivity)
+    }
+
+    @Test
     fun `webview leaves algorithmic darkening disabled`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()

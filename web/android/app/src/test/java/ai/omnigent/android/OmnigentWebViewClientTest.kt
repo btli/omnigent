@@ -21,27 +21,16 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
-    fun `pinned main-frame 503 reports the status to the shell`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        var reportedStatus: Int? = null
-        val client = client(onMainFrameHttpError = { reportedStatus = it })
-
-        client.onReceivedHttpError(webView, request(PINNED_URL), httpError(503))
-
-        assertEquals(503, reportedStatus)
-    }
-
-    @Test
-    fun `all pinned main-frame non-success statuses report to the shell`() {
+    fun `pinned main-frame client and server errors report their status to the shell`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val reportedStatuses = mutableListOf<Int>()
         val client = client(onMainFrameHttpError = reportedStatuses::add)
 
-        listOf(500, 403, 404).forEach { status ->
+        listOf(503, 500, 403, 404).forEach { status ->
             client.onReceivedHttpError(webView, request(PINNED_URL), httpError(status))
         }
 
-        assertEquals(listOf(500, 403, 404), reportedStatuses)
+        assertEquals(listOf(503, 500, 403, 404), reportedStatuses)
     }
 
     @Test
