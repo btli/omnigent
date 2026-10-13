@@ -118,6 +118,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "shared_session_updates_socket": False,
         "warm_switch_keep_mounted_ui": False,
         "pull_requests_v2": False,
+        "host_stats": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
