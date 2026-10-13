@@ -3181,6 +3181,7 @@ describe("session tooltip project detail", () => {
     mockConversations([
       filedSession("conv_first_class", {
         project_id: "p_alpha",
+        labels: {},
       }),
     ]);
     renderGroupingSidebar();
