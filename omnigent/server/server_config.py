@@ -137,6 +137,17 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
     return value
 
 
+def runner_tunnel_binary_request_body() -> bool:
+    """Allow opted-in raw request bodies; YAML false restores the JSON/base64 path."""
+    raw = load_server_config().get("runner_tunnel_binary_request_body")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    logger.warning("server config runner_tunnel_binary_request_body must be a bool; using true")
+    return True
+
+
 def _config_positive_int(key: str, default: int) -> int:
     """Read a positive-int setting from the server config, else *default*.
 
