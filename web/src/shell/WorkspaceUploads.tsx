@@ -79,9 +79,17 @@ interface UploadContextValue {
   directory: string;
   destination: string;
   setDirectory: (directory: string) => void;
+  /** Drop-root target: the mounted Files tree's location, else the workspace root. */
+  dropDirectory: string;
+  dropDestination: string;
+  setTreeDirectory: (directory: string | null) => void;
   enqueue: (files: File[], directory?: string) => void;
 }
 const UploadContext = createContext<UploadContextValue | null>(null);
+
+export function useWorkspaceUpload() {
+  return useContext(UploadContext);
+}
 
 export function WorkspaceUploadProvider({
   sessionId,
@@ -103,6 +111,8 @@ export function WorkspaceUploadProvider({
       ),
     [sessionId],
   );
+  // Only the Files tree browses; the Changes view mounts no tree, so its drops go to the root.
+  const [treeDirectory, setTreeDirectory] = useState<string | null>(null);
   const client = useQueryClient();
   const liveStatus = useChatStore((state) =>
     state.conversationId === sessionId ? state.sessionStatus : undefined,
@@ -193,7 +203,8 @@ export function WorkspaceUploadProvider({
     probeReason,
     routeAnswered,
   ]);
-  const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const rootName = root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const destination = directory || rootName;
   const value = useMemo<UploadContextValue>(
     () => ({
       owner,
@@ -210,12 +221,15 @@ export function WorkspaceUploadProvider({
       directory,
       destination,
       setDirectory,
+      dropDirectory: treeDirectory ?? "",
+      dropDestination: treeDirectory || rootName,
+      setTreeDirectory,
       enqueue: (files, target = directory) => {
         if (!gate.enabled || !capability.data) {
           toast.error(gate.reason ?? "Workspace upload permission is pending");
           return;
         }
-        enqueueUploads(owner, files, target, target || destination, capability.data.limits, client);
+        enqueueUploads(owner, files, target, target || rootName, capability.data.limits, client);
       },
     }),
     [
@@ -229,6 +243,8 @@ export function WorkspaceUploadProvider({
       directory,
       destination,
       setDirectory,
+      treeDirectory,
+      rootName,
       client,
     ],
   );
@@ -313,8 +329,15 @@ export function UploadPicker({ directory }: { directory: string }) {
   );
 }
 
-export function resolveUploadTarget(_event: DragEvent, browsedDirectory: string): string {
-  return browsedDirectory;
+export function resolveUploadTarget(event: DragEvent, browsedDirectory: string): string {
+  const row =
+    event.target instanceof Element ? event.target.closest<HTMLElement>("[data-drop-dir]") : null;
+  return [
+    browsedDirectory.replace(/\/$/, ""),
+    row?.closest("[data-upload-tree]") ? row.dataset.dropDir : undefined,
+  ]
+    .filter(Boolean)
+    .join("/");
 }
 
 export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
@@ -330,13 +353,20 @@ export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
 export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
   const context = useContext(UploadContext);
   const [target, setTarget] = useState<HTMLDivElement | null>(null);
-  const active = useFileDropTarget(context?.enabled ? target : null, (files, event) => {
-    if (context)
-      context.enqueue(
-        droppedUploadFiles(event, files),
-        resolveUploadTarget(event, context.directory),
-      );
-  });
+  const active = useFileDropTarget(
+    context?.enabled ? target : null,
+    (files, event) => {
+      if (context)
+        context.enqueue(
+          droppedUploadFiles(event, files),
+          resolveUploadTarget(event, context.dropDirectory),
+        );
+    },
+    {
+      ignore: (event) =>
+        event.target instanceof Element && event.target.closest("[data-upload-tree]") !== null,
+    },
+  );
   return (
     <div
       ref={setTarget}
@@ -352,7 +382,7 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
           container={target}
           variant="upload"
           label="Upload to workspace"
-          destination={context.destination}
+          destination={context.dropDestination}
           subtext="Saved to this session's files"
         />
       )}
