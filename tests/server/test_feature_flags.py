@@ -21,6 +21,7 @@ def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
 
     assert flags.enabled_features == frozenset({Feature.HARNESS_SETTINGS_UI})
     assert flags.frontend_dict() == {
+        "workspace_upload": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
