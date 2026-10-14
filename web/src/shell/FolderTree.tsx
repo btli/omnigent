@@ -1,6 +1,10 @@
 import { ChevronRightIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
+import { createPortal } from "react-dom";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
+import { droppedUploadFiles, resolveUploadTarget, useWorkspaceUpload } from "./WorkspaceUploads";
+import { useTreeUploadDrop } from "./useTreeUploadDrop";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type DirectoryResult,
@@ -743,6 +747,53 @@ function FolderTreeInner({
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
 
+  const upload = useWorkspaceUpload();
+  const { active: dropActive, hover: dropHover } = useTreeUploadDrop(scrollElementRef, {
+    enabled:
+      !!upload?.enabled && !!visibleTree?.length && !searchQuery.trim() && !isLoading && !isError,
+    directory: browseLocation,
+    onFiles: (droppedFiles, event) =>
+      upload?.enqueue(
+        droppedUploadFiles(event, droppedFiles),
+        resolveUploadTarget(event, browseLocation),
+      ),
+    onExpand: togglePath,
+  });
+  const dropRoot = scrollElementRef.current?.closest<HTMLElement>("[data-upload-drop-root]");
+  const hoverBounds = dropHover?.row?.getBoundingClientRect();
+  const rootBounds = dropRoot?.getBoundingClientRect();
+  const dropFeedback =
+    dropActive &&
+    dropHover &&
+    dropRoot &&
+    upload &&
+    (dropHover.row && hoverBounds && rootBounds ? (
+      // The rail's transform must not offset the label's viewport coordinates.
+      createPortal(
+        <div
+          aria-hidden="true"
+          data-drop-variant="upload"
+          className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card-solid px-2 py-1 text-ui text-info shadow-composer"
+          style={{
+            left: rootBounds.left + 8,
+            top: Math.min(hoverBounds.bottom, rootBounds.bottom - 32),
+            maxWidth: rootBounds.width - 16,
+          }}
+        >
+          Upload to {dropHover.directory || upload.destination}
+        </div>,
+        document.body,
+      )
+    ) : (
+      <FileDropOverlay
+        container={dropRoot}
+        variant="upload"
+        label="Upload to workspace"
+        destination={upload.destination}
+        subtext="Saved to this session's files"
+      />
+    ));
+
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
   // highlight flash — exactly once. Re-runs as `flatRows` changes so it can
@@ -911,6 +962,9 @@ function FolderTreeInner({
                   browseLocation={browseLocation}
                   onOpenInfo={onOpenInfo}
                   highlighted={row.kind === "node" && row.key === revealedPath}
+                  dropHighlighted={
+                    dropHover?.directory === [browseLocation, row.key].filter(Boolean).join("/")
+                  }
                 />
               )}
             </div>
@@ -930,6 +984,7 @@ function FolderTreeInner({
           {spacer}
         </div>
       )}
+      {dropFeedback}
     </TooltipProvider>
   );
 }
@@ -1012,6 +1067,7 @@ function FileRowItem({
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
+            data-drop-dir={path.split("/").slice(0, -1).join("/")}
             tabIndex={-1}
             className={cn(
               "group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 [-webkit-touch-callout:none]",
@@ -1186,6 +1242,7 @@ function SearchDirRow({
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
+            data-drop-dir={file.path}
             tabIndex={-1}
             className="group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted [-webkit-touch-callout:none]"
           >
@@ -1276,6 +1333,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   browseLocation,
   onOpenInfo,
   highlighted = false,
+  dropHighlighted = false,
 }: {
   node: TreeNode;
   depth: number;
@@ -1291,6 +1349,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
   /** Briefly flash this row — used when a folder is revealed from search. */
   highlighted?: boolean;
+  dropHighlighted?: boolean;
 }) {
   if (node.type === "file") {
     return (
@@ -1335,12 +1394,16 @@ const TreeNodeRow = memo(function TreeNodeRow({
         <div
           ref={rowRef}
           data-actions-open={actionsOpen}
+          data-drop-dir={node.path}
+          data-drop-folder=""
+          data-upload-hover={dropHighlighted ? "" : undefined}
           tabIndex={-1}
           className={cn(
             "group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted [-webkit-touch-callout:none]",
             // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
             // from search catches the eye briefly, then settles.
             highlighted && "animate-user-msg-flash",
+            dropHighlighted && "ring-2 ring-info ring-inset",
           )}
           style={{ paddingLeft: `${indentFor(depth)}px` }}
         >
