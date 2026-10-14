@@ -1409,6 +1409,7 @@ async def _send_hello(
                 frame_protocol_version=1,
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
+                    CAP_MCP_REGISTRY,
                     BINARY_REQUEST_BODY_CAPABILITY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
