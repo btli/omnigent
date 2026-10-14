@@ -42,8 +42,17 @@ jobs:
       actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    # FORK-ONLY (btli/omnigent): never upstream. The owner's own same-repo PRs pass
+    # without review; the repository guard keeps this inert on any other repo.
+    env:
+      FORK_OWNER_PR: ${{ github.repository == 'btli/omnigent' && github.event.pull_request.head.repo.full_name == 'btli/omnigent' && github.event.pull_request.user.login == 'btli' }}
     steps:
+      - name: Pass fork owner's PR
+        if: env.FORK_OWNER_PR == 'true'
+        run: echo "Fork owner's same-repo PR on btli/omnigent; maintainer approval not required."
+
       - name: Check out approval evaluator
+        if: env.FORK_OWNER_PR != 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: main
@@ -51,6 +60,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Require maintainer approval
+        if: env.FORK_OWNER_PR != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO:     ${{ github.repository }}
