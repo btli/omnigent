@@ -197,7 +197,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
-import { useFileDropTarget } from "@/hooks/useFileDropTarget";
+import { ignoreWorkspaceUploadDrag, useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { isBrandHarness, useHostMcpServers } from "@/hooks/useHarnessInventory";
@@ -3271,7 +3271,9 @@ function ComposerImpl(
   const bindComposerCard = useCallback((el: HTMLDivElement | null) => {
     setDropTarget(el?.closest<HTMLElement>("[data-chat-surface]") ?? el);
   }, []);
-  const isDragActive = useFileDropTarget(dropTarget, addFiles);
+  const isDragActive = useFileDropTarget(dropTarget, addFiles, {
+    ignore: ignoreWorkspaceUploadDrag,
+  });
 
   const clearComposerAfterSend = (resetNativeInputSession: boolean) => {
     const textarea = textareaRef.current;
@@ -3607,7 +3609,14 @@ function ComposerImpl(
         }}
       />
       {/* Drop cue, spanning the chat column this composer belongs to. */}
-      {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
+      {isDragActive && dropTarget ? (
+        <FileDropOverlay
+          container={dropTarget}
+          label="Attach to message"
+          subtext="Sent with your next message"
+          variant="attach"
+        />
+      ) : null}
       {/* The composer stack above the card: trays dock onto the inset
           workspace bar, so they share its column wrapper and its mx-3
           inset — a tray's negative-margin tuck only hides its square
