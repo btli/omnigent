@@ -1044,7 +1044,9 @@ describe("SettingsPage", () => {
     renderPage("/settings/appearance");
 
     expect(
-      screen.getByText("Use any font installed on this device. Leave blank for the system default."),
+      screen.getByText(
+        "Use any font installed on this device. Leave blank for the system default.",
+      ),
     ).toBeInTheDocument();
     expect(
       screen.getByText("Font for the code editor and terminal. Leave blank for the default."),
