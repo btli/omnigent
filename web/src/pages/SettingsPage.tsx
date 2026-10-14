@@ -2224,7 +2224,7 @@ function UiCodeFontFamilyControl() {
         <span className="text-sm font-medium">Code font family</span>
         <span className="text-sm text-muted-foreground">
           {catalogEnabled
-            ? "Font for the code editor and terminal. Pick from the catalog or type any font installed on this device."
+            ? "Font for the code editor and terminal. Pick from the catalog or type any installed font."
             : "Font for the code editor and terminal. Leave blank for the default."}
         </span>
       </div>
