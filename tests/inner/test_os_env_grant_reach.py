@@ -318,6 +318,91 @@ def test_dotdot_traversal_from_grant_cannot_escape(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Delete is confined like write: parent resolved, leaf never followed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def delete_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Workspace with links to a write grant and to an ungranted directory."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    grant = tmp_path / "rw"
+    grant.mkdir()
+    (grant / "granted.txt").write_text("granted")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_text("keep me")
+    (workspace / "to_grant").symlink_to(grant)
+    (workspace / "to_outside").symlink_to(outside)
+    return workspace, grant, outside
+
+
+@pytest.mark.parametrize("supported", [True, False], ids=["dir_fd", "path_fallback"])
+def test_delete_follows_parents_only_into_write_reach(
+    delete_layout: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, supported: bool
+) -> None:
+    monkeypatch.setattr("omnigent.inner.os_env._NOFOLLOW_DELETE_SUPPORTED", supported)
+    workspace, grant, outside = delete_layout
+    policy = _grant_policy(write_roots=[grant])
+
+    escaped = _req("delete", Path("to_outside/victim.txt"), workspace, policy)
+    granted = _req("delete", Path("to_grant/granted.txt"), workspace, policy)
+
+    assert escaped["code"] == "invalid_path"
+    assert str(outside) not in escaped["error"]
+    assert (outside / "victim.txt").read_text() == "keep me"
+    assert granted == {"deleted": True, "type": "file", "bytes_deleted": len("granted")}
+    assert not (grant / "granted.txt").exists()
+
+
+def test_delete_without_grants_refuses_a_link_into_a_read_grant(
+    delete_layout: tuple[Path, Path, Path],
+) -> None:
+    workspace, _grant, outside = delete_layout
+    policy = _grant_policy(read_roots=[outside])
+
+    res = _req("delete", Path("to_outside/victim.txt"), workspace, policy)
+
+    assert res["code"] == "invalid_path"
+    assert (outside / "victim.txt").read_text() == "keep me"
+
+
+def test_delete_refuses_the_root_reached_through_a_link(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "keep.txt").write_text("keep")
+    (workspace / "up").symlink_to(tmp_path)
+    policy = _grant_policy(write_roots=[tmp_path])
+
+    res = _req("delete", Path("up/ws"), workspace, policy, recursive=True)
+
+    assert res["code"] == "invalid_path"
+    assert (workspace / "keep.txt").exists()
+
+
+def test_delete_refuses_a_component_that_became_a_symlink(
+    delete_layout: tuple[Path, Path, Path],
+) -> None:
+    """The walk after the reach check does not follow a swapped-in link."""
+    from omnigent.inner.os_env import _delete_beneath
+
+    workspace, _grant, outside = delete_layout
+
+    res = _delete_beneath(workspace, ("to_outside",), "victim.txt", recursive=False)
+
+    assert res["code"] == "invalid_path"
+    assert (outside / "victim.txt").read_text() == "keep me"
+
+
+def test_delete_rejects_a_malformed_request(tmp_path: Path) -> None:
+    policy = _grant_policy()
+
+    assert _req("delete", Path("x"), tmp_path, policy, recursive="yes")["code"] == "invalid_path"
+    assert _req("delete", Path("a/.."), tmp_path, policy)["code"] == "invalid_path"
+
+
+# ---------------------------------------------------------------------------
 # resolve_sandbox(type=none) grant plumbing.
 # ---------------------------------------------------------------------------
 
