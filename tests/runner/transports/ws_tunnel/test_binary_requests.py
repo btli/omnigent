@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import socket
+import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -1182,3 +1184,284 @@ async def test_binary_dispatch_deadline_recovers_slot_with_healthy_pings(
                 blocked.set()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "mode", ["supported", "no-routes", "no-raw-helper", "runtime-error", "assertion-error"]
+)
+async def test_hello_workspace_upload_requires_routes_and_raw_helper(tmp_path, monkeypatch, mode):
+    from omnigent.inner import os_env_upload
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner import workspace_upload
+
+    app = FastAPI()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    resolutions = 0
+
+    async def resolve_environment(session_id, environment_id):
+        nonlocal resolutions
+        resolutions += 1
+        if mode == "runtime-error":
+            raise RuntimeError("resolver unavailable")
+        if mode == "assertion-error":
+            raise AssertionError("helper unavailable")
+        return env
+
+    async def resolve_registry(session_id):
+        return None
+
+    manager = None
+    if mode != "no-routes":
+        manager = workspace_upload.register_upload_routes(
+            app,
+            resolve_environment=resolve_environment,
+            resolve_registry=resolve_registry,
+            state_path=tmp_path / "index.json",
+        )
+        await manager.start()
+    if mode == "no-raw-helper":
+        monkeypatch.setattr(
+            os_env_upload.UploadHelperClient, "call", lambda *args, **kwargs: {"raw_upload": False}
+        )
+    monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
+    frames = []
+
+    async def send(raw):
+        frames.append(decode_frame(raw))
+
+    try:
+        serve_module._start_workspace_upload_hello_probe(app)
+        for _ in range(2):
+            serve_module._start_workspace_upload_hello_probe(app)
+            await _send_hello(send, "test", app=app)
+        assert len(frames) == 2
+        assert all(isinstance(frame, HelloFrame) for frame in frames)
+        assert all(
+            ("workspace_upload_v1" in frame.capabilities) == (mode == "supported")
+            for frame in frames
+        )
+        assert frames[0].frame_protocol_version == 1
+        assert resolutions == (
+            0 if manager is None else 2 if mode in ("runtime-error", "assertion-error") else 1
+        )
+        if manager is not None:
+            await manager.stop()
+            await _send_hello(send, "test", app=app)
+            assert "workspace_upload_v1" not in frames[-1].capabilities
+    finally:
+        if manager is not None:
+            await manager.stop()
+        env.close()
+
+
+@pytest.mark.parametrize("blocked_probe", [True, False], ids=["probe", "cleanup"])
+async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
+    tmp_path, monkeypatch, blocked_probe
+):
+    from omnigent.inner import os_env_upload
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner import workspace_upload
+
+    app = FastAPI()
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    entered = threading.Event()
+    interrupted = threading.Event()
+    closing = threading.Event()
+    release = threading.Event()
+
+    class BlockedHelper:
+        def __init__(self, environment):
+            pass
+
+        def call(self, metadata, *, timeout_s=None):
+            entered.set()
+            if blocked_probe:
+                interrupted.wait(1)
+            return {"raw_upload": True}
+
+        def interrupt(self):
+            interrupted.set()
+
+        def close(self):
+            closing.set()
+            release.wait(1)
+
+    async def environment(sid, eid):
+        return env
+
+    async def registry(sid):
+        return None
+
+    manager = workspace_upload.register_upload_routes(
+        app,
+        resolve_environment=environment,
+        resolve_registry=registry,
+        state_path=tmp_path / "index.json",
+    )
+    monkeypatch.setattr(os_env_upload, "UploadHelperClient", BlockedHelper)
+    monkeypatch.setattr(workspace_upload, "UploadHelperClient", BlockedHelper)
+    monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
+    monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.04)
+    frames = []
+
+    async def send(raw):
+        frames.append(decode_frame(raw))
+
+    try:
+        await manager.start()
+        serve_module._start_workspace_upload_hello_probe(app)
+        assert await asyncio.to_thread(entered.wait, 0.5)
+        started = time.monotonic()
+        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.25)
+        assert time.monotonic() - started < 0.25
+        assert "workspace_upload_v1" not in frames[-1].capabilities
+        assert await asyncio.to_thread(closing.wait, 0.5)
+        assert interrupted.is_set()
+        started = time.monotonic()
+        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.25)
+        assert time.monotonic() - started < 0.25
+        assert "workspace_upload_v1" not in frames[-1].capabilities
+        await asyncio.wait_for(app.state.workspace_upload_hello_capability.probe, 0.5)
+    finally:
+        interrupted.set()
+        release.set()
+        await manager.stop()
+        probe = getattr(app.state, "workspace_upload_hello_capability", None)
+        if probe is not None:
+            await asyncio.gather(probe.probe, return_exceptions=True)
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "mode,first_reply",
+    [
+        pytest.param("ready", None, id="ready"),
+        pytest.param("resolver-error", None, id="resolver-error"),
+        pytest.param("timeout", None, id="timeout"),
+        pytest.param("cleanup-error", None, id="cleanup-error"),
+        pytest.param("lifecycle", None, id="lifecycle"),
+        pytest.param("busy-reply", {"error": "launch delayed", "code": "busy"}, id="busy-reply"),
+        pytest.param(
+            "timeout-reply", {"error": "watchdog fired", "code": "timeout"}, id="timeout-reply"
+        ),
+        pytest.param("gone-reply", {"error": "EOF", "code": "gone"}, id="gone-reply"),
+        pytest.param(
+            "permanent-reply",
+            {"error": "Workspace is read-only", "code": "permission_denied"},
+            id="permanent-reply",
+        ),
+        pytest.param(
+            "unknown-reply", {"error": "probe failed", "code": "unexpected"}, id="unknown-reply"
+        ),
+        pytest.param("error-only", {"error": "probe failed"}, id="error-only"),
+        pytest.param("code-only", {"code": "busy"}, id="code-only"),
+        pytest.param("empty-reply", {}, id="empty-reply"),
+        pytest.param("invalid-reply", {"raw_upload": 0}, id="invalid-reply"),
+        pytest.param(
+            "conflicting-reply",
+            {"raw_upload": True, "error": "probe failed", "code": "busy"},
+            id="conflicting-reply",
+        ),
+        pytest.param(
+            "unsupported",
+            {"raw_upload": False, "reason": "platform unsupported"},
+            id="unsupported",
+        ),
+    ],
+)
+async def test_hello_waits_for_upload_readiness_and_recovers(
+    tmp_path, monkeypatch, mode, first_reply
+):
+    from omnigent.inner import os_env_upload
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner import workspace_upload
+
+    app = FastAPI()
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    resolutions = 0
+    closes = 0
+    calls = 0
+
+    async def environment(sid, eid):
+        nonlocal resolutions
+        resolutions += 1
+        await asyncio.sleep(0.2 if mode == "timeout" and resolutions == 1 else 0.05)
+        if mode == "resolver-error" and resolutions == 1:
+            raise RuntimeError("server not ready")
+        return env
+
+    async def registry(sid):
+        return None
+
+    def close(client):
+        nonlocal closes
+        closes += 1
+        if mode == "cleanup-error" and closes == 1:
+            raise RuntimeError("helper cleanup failed")
+
+    def call(client, metadata, *, timeout_s):
+        nonlocal calls
+        calls += 1
+        assert metadata == {"op": "probe"}
+        return first_reply if calls == 1 and first_reply is not None else {"raw_upload": True}
+
+    monkeypatch.setattr(os_env_upload.UploadHelperClient, "call", call)
+    monkeypatch.setattr(os_env_upload.UploadHelperClient, "close", close)
+    monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
+    monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.1)
+    manager = workspace_upload.register_upload_routes(
+        app,
+        resolve_environment=environment,
+        resolve_registry=registry,
+        state_path=tmp_path / "index.json",
+    )
+    frames = []
+
+    async def send(raw):
+        frames.append(decode_frame(raw))
+
+    try:
+        await manager.start()
+        serve_module._start_workspace_upload_hello_probe(app)
+        initial = app.state.workspace_upload_hello_capability
+        assert not initial.probe.done()
+        await _send_hello(send, "test", app=app, connection_id="first")
+        assert ("workspace_upload_v1" in frames[0].capabilities) == (
+            mode in ("ready", "lifecycle")
+        )
+        await asyncio.wait_for(initial.probe, 0.5)
+        if mode == "lifecycle":
+            await manager.stop()
+            await manager.start()
+        await _send_hello(send, "test", app=app, connection_id="reconnected")
+        retry = mode in (
+            "resolver-error",
+            "timeout",
+            "cleanup-error",
+            "lifecycle",
+            "busy-reply",
+            "timeout-reply",
+            "gone-reply",
+            "code-only",
+            "conflicting-reply",
+        )
+        assert ("workspace_upload_v1" in frames[1].capabilities) == (mode == "ready" or retry)
+        assert resolutions == (2 if retry else 1)
+        assert calls == (2 if retry and mode not in ("resolver-error", "timeout") else 1)
+        assert frames[1].connection_id == "reconnected"
+    finally:
+        await manager.stop()
+        state = app.state.workspace_upload_hello_capability
+        await asyncio.gather(state.probe, return_exceptions=True)
+        env.close()
