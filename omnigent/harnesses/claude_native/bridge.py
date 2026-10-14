@@ -616,6 +616,10 @@ class ClaudeUserPromptPending(RuntimeError):
     """A native question or permission prompt must be answered before injection."""
 
 
+class ClaudeMessageNotAccepted(RuntimeError):
+    """The submitted draft remained in Claude's input box until the deadline."""
+
+
 @contextlib.contextmanager
 def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
@@ -1275,7 +1279,13 @@ class ClaudeNativeToolRelay:
     """
 
     def __init__(
-        self, *, bridge_dir: Path, httpd: ThreadingHTTPServer, advertised_url: str
+        self,
+        *,
+        bridge_dir: Path,
+        httpd: ThreadingHTTPServer,
+        advertised_url: str,
+        relay_info: _JsonObject,
+        tool_executor: ToolExecutor,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1284,11 +1294,30 @@ class ClaudeNativeToolRelay:
             advertisement, e.g. ``Path("/tmp/omnigent/...")``.
         :param httpd: Started HTTP server for tool calls.
         :param advertised_url: Base URL advertised in ``tool_relay.json``.
+        :param relay_info: Current relay advertisement, including its stable token.
+        :param tool_executor: Callback for the current tool surface.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
         self._httpd = httpd
         self._advertised_url = advertised_url
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
+
+    def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
+        """Refresh tools on the owning event loop without changing cached relay credentials.
+
+        :param tools: Replacement tool schemas.
+        :param tool_executor: Callback dispatching against the updated spec.
+        """
+        relay_info = {
+            **self._relay_info,
+            "tools": _normalize_relay_tool_specs(tools),
+            "updated_at": time.time(),
+        }
+        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
 
     def close(self) -> None:
         """
@@ -3509,18 +3538,12 @@ def compute_transcript_cumulative_cost(
     pricing the token totals — but per-message pricing also stays correct
     across a model switch within one transcript.
 
-    **Deduplicated by ``requestId``.** Claude writes more than one
-    transcript record for a single API response (a streamed partial plus
-    the final record, retries, etc.), and those records share one
-    ``requestId`` while each carries that response's full ``message.usage``
-    (not an increment). Summing every record would bill the same response
-    two-plus times — observed ~2x inflation, with the parent badge and the
-    cost-budget gate both reading the doubled figure. So records are keyed
-    by ``requestId`` (last priceable record per id wins, as its usage is
-    the authoritative final figure) and each billed response is counted
-    exactly once. A record with no ``requestId`` (rare non-API assistant
-    entry) gets a per-record unique key so it is never collapsed with
-    another.
+    Claude can write several records per API response, each repeating its
+    usage. ``requestId`` may be absent without an Anthropic ``request-id``
+    response header. Deduplicate by ``message.id``, falling back to
+    ``requestId`` for records without one. Priceable records carrying both IDs
+    link request-only fragments to the same response. The last priceable record
+    wins; records with neither ID remain separate.
 
     :param transcript_path: Path to a Claude transcript JSONL, e.g.
         ``".../<session>.jsonl"`` (parent) or
@@ -3547,13 +3570,9 @@ def compute_transcript_cumulative_cost(
     provider_config = load_config()
     provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
-    # Per-``requestId`` cost (USD); last priceable record per id wins so a
-    # response written across multiple transcript records is counted once.
-    cost_by_request: dict[str, float] = {}
-    # Counter minting unique keys for records lacking a ``requestId`` so
-    # they each count once instead of collapsing onto a shared key.
-    no_request_id_index = 0
-    for record in read_result.records:
+    cost_by_response: dict[tuple[str, str | int], float] = {}
+    message_keys_by_request: dict[str, tuple[str, str | int]] = {}
+    for index, record in enumerate(read_result.records):
         if record.text is None:
             continue
         try:
@@ -3577,14 +3596,27 @@ def compute_transcript_cumulative_cost(
         )
         if pricing is None:
             continue
+        message = entry.get("message")
+        message_id = message.get("id") if isinstance(message, dict) else None
+        if not isinstance(message_id, str) or not message_id:
+            message_id = None
         request_id = entry.get("requestId")
         if not isinstance(request_id, str) or not request_id:
-            request_id = f"__no_request_id_{no_request_id_index}"
-            no_request_id_index += 1
-        cost_by_request[request_id] = compute_llm_cost(usage, pricing)
-    if not cost_by_request:
+            request_id = None
+        if message_id is not None:
+            key = ("message", message_id)
+            if request_id is not None:
+                # A later fragment can supply the identity missing from earlier ones.
+                cost_by_response.pop(("request", request_id), None)
+                message_keys_by_request[request_id] = key
+        elif request_id is not None:
+            key = message_keys_by_request.get(request_id, ("request", request_id))
+        else:
+            key = ("record", index)
+        cost_by_response[key] = compute_llm_cost(usage, pricing)
+    if not cost_by_response:
         return None
-    return sum(cost_by_request.values())
+    return sum(cost_by_response.values())
 
 
 def count_hook_events(bridge_dir: Path) -> int:
@@ -4358,7 +4390,7 @@ def _paste_and_submit(
         ) from exc
     if accepted:
         return
-    raise RuntimeError(
+    raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
@@ -5336,6 +5368,11 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
 
+    A ``send-keys`` first leaves any pane mode (``copy-mode -q``, tmux
+    3.1a+), so keys reach the application instead of the copy mode a
+    scrolled-back pane is in. Both run in one tmux invocation, so the pane
+    cannot enter a mode between the exit and the send.
+
     :param socket_path: Absolute path to the tmux socket the terminal
         was launched on, e.g. ``"/tmp/.../tmux.sock"``.
     :param args: Arguments after ``tmux -S <socket_path>``, e.g.
@@ -5347,6 +5384,10 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     import subprocess
 
     _check_injection_cancelled()
+    operation = args[0] if args else ""
+    if operation == "send-keys" and "-t" in args:
+        target = args[args.index("-t") + 1]
+        args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -5357,8 +5398,13 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired as exc:
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
         raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+    except OSError as exc:
+        delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
+        raise
     if proc.returncode != 0:
+        delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
@@ -6317,9 +6363,13 @@ def start_tool_relay(
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
+
+    async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
+        return await relay._tool_executor(name, arguments)
+
     handler_cls = _tool_relay_handler_factory(
         token,
-        tool_executor,
+        _execute_current_tool,
         loop,
         policy_client=policy_client,
         session_id=session_id,
@@ -6344,13 +6394,20 @@ def start_tool_relay(
         encoding="utf-8",
     )
     os.chmod(env_path, 0o600)
+    relay = ClaudeNativeToolRelay(
+        bridge_dir=bridge_dir,
+        httpd=httpd,
+        advertised_url=advertised_url,
+        relay_info=relay_info,
+        tool_executor=tool_executor,
+    )
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-tool-relay",
         daemon=True,
     )
     thread.start()
-    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd, advertised_url=advertised_url)
+    return relay
 
 
 def main(argv: list[str] | None = None) -> None:

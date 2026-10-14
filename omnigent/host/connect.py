@@ -719,6 +719,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Executable selection must survive CLI -> daemon -> runner. The
         # passthrough list is only applied at the second boundary.
         "OMNIGENT_CODEX_PATH",
+        "OMNIGENT_PI_PATH",
         # Credential-env denylists must survive both daemon and runner hops.
         # This carries variable names only; their values still follow normal forwarding.
         "OMNIGENT_PI_ENV_UNSET",
@@ -1895,28 +1896,28 @@ class HostProcess:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness
             )
-        if not harness_ready:
-            if frame.harness in {"pi", "pi-native"}:
-                from omnigent.harnesses.pi_native.main import (
-                    PiNativeCliOutdatedError,
-                    check_pi_cli_version_floor,
-                    pi_version,
-                    resolve_pi_executable,
-                )
+        if frame.harness in {"pi", "pi-native"}:
+            from omnigent.harnesses.pi_native.main import (
+                PiNativeCliOutdatedError,
+                check_pi_cli_version_floor,
+                pi_version,
+                resolve_pi_executable,
+            )
 
+            try:
+                executable = resolve_pi_executable()
+            except click.ClickException:
+                version = None
+            else:
+                version = await asyncio.to_thread(pi_version, executable)
+            if version is not None:
                 try:
-                    executable = resolve_pi_executable()
-                except click.ClickException:
-                    version = None
-                else:
-                    version = await asyncio.to_thread(pi_version, executable)
-                if version is not None:
-                    try:
-                        check_pi_cli_version_floor(version)
-                    except PiNativeCliOutdatedError as exc:
-                        return self._launch_failed(
-                            frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
-                        )
+                    check_pi_cli_version_floor(version)
+                except PiNativeCliOutdatedError as exc:
+                    return self._launch_failed(
+                        frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
+                    )
+        if not harness_ready:
             return self._launch_failed(
                 frame,
                 (
