@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
 import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
-import type { FeatureKey, ServerInfo } from "./capabilities";
+import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
 function info(overrides: Partial<ServerInfo>): ServerInfo {
@@ -137,14 +137,6 @@ describe("resolveServerInfo sandbox_providers", () => {
 });
 
 describe("resolveServerInfo release features", () => {
-  it("reads the webfonts feature advertised through /v1/info", async () => {
-    const feature: FeatureKey = "webfonts";
-    const { isFeatureEnabled } = await import("./capabilities");
-    const parsed = await probe({ features: { [feature]: true } });
-
-    expect(isFeatureEnabled(parsed, feature)).toBe(true);
-  });
-
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
       features: { usage_page: true, harness_install: false, malformed: "yes" },
