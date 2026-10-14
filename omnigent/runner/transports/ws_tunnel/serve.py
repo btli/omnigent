@@ -1581,9 +1581,10 @@ async def _send_hello(
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
-                    BINARY_REQUEST_BODY_CAPABILITY,
+                    CAP_MCP_REGISTRY,
                     CAP_SIDE_CHAT_SETTINGS,
                     CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
+                    BINARY_REQUEST_BODY_CAPABILITY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,
