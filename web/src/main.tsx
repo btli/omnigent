@@ -24,8 +24,7 @@ import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
-import { restoreFontPreferences } from "./lib/restoreFontPreferences";
-import { setWebFontsEnabled } from "./lib/webFontLoader";
+import { applyWebFontCapability, restoreFontPreferences } from "./lib/restoreFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -128,9 +127,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
     let alive = true;
     void bootServerInfo.settled.then((resolved) => {
       if (!alive) return;
-      const webfontsEnabled = isFeatureEnabled(resolved, "webfonts");
-      setWebFontsEnabled(webfontsEnabled);
-      if (webfontsEnabled) restoreFontPreferences();
+      applyWebFontCapability(isFeatureEnabled(resolved, "webfonts"));
       setInfo(resolved);
     });
     return () => {
