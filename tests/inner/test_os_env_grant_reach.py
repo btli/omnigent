@@ -318,6 +318,182 @@ def test_dotdot_traversal_from_grant_cannot_escape(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Delete is confined like write: parent resolved, leaf never followed.
+# ---------------------------------------------------------------------------
+
+
+_IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.fixture(params=["dir_fd", "read_only_dirs", "path_fallback"])
+def delete_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """How the helper reaches the entry: the platform's directory descriptors
+    (search-only on Linux), descriptors that need read permission (platforms
+    without a search-only open), or the checked path (no dir_fd support)."""
+    if request.param == "read_only_dirs":
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        monkeypatch.setattr("omnigent.inner.os_env._DIR_TRAVERSE_FLAGS", flags)
+        monkeypatch.setattr("omnigent.inner.os_env._DIR_OPEN_MAY_NEED_READ", True)
+    elif request.param == "path_fallback":
+        monkeypatch.setattr("omnigent.inner.os_env._NOFOLLOW_DELETE_SUPPORTED", False)
+    return request.param
+
+
+@pytest.fixture
+def delete_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Workspace with links to a write grant and to an ungranted directory."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    grant = tmp_path / "rw"
+    grant.mkdir()
+    (grant / "granted.txt").write_text("granted")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_text("keep me")
+    (workspace / "to_grant").symlink_to(grant)
+    (workspace / "to_outside").symlink_to(outside)
+    return workspace, grant, outside
+
+
+def test_delete_follows_parents_only_into_write_reach(
+    delete_layout: tuple[Path, Path, Path], delete_mode: str
+) -> None:
+    workspace, grant, outside = delete_layout
+    policy = _grant_policy(write_roots=[grant])
+
+    escaped = _req("delete", Path("to_outside/victim.txt"), workspace, policy)
+    granted = _req("delete", Path("to_grant/granted.txt"), workspace, policy)
+
+    assert escaped["code"] == "invalid_path"
+    assert str(outside) not in escaped["error"]
+    assert (outside / "victim.txt").read_text() == "keep me"
+    assert granted == {"deleted": True, "type": "file", "bytes_deleted": len("granted")}
+    assert not (grant / "granted.txt").exists()
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_delete_removes_a_leaf_link_not_its_target(
+    delete_layout: tuple[Path, Path, Path], delete_mode: str, recursive: bool
+) -> None:
+    workspace, _grant, outside = delete_layout
+
+    res = _req("delete", Path("to_outside"), workspace, _grant_policy(), recursive=recursive)
+
+    assert res == {"deleted": True, "type": "symlink", "bytes_deleted": None}
+    assert not (workspace / "to_outside").is_symlink()
+    assert (outside / "victim.txt").read_text() == "keep me"
+
+
+def test_delete_directory_needs_recursive_unless_empty(tmp_path: Path, delete_mode: str) -> None:
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "keep.txt").write_text("keep")
+    policy = _grant_policy()
+
+    emptied = _req("delete", Path("empty"), tmp_path, policy)
+    refused = _req("delete", Path("full"), tmp_path, policy)
+    kept = (tmp_path / "full" / "keep.txt").read_text()
+    removed = _req("delete", Path("full"), tmp_path, policy, recursive=True)
+
+    assert emptied == {"deleted": True, "type": "directory", "bytes_deleted": None}
+    assert refused["code"] == "directory_not_empty"
+    assert kept == "keep"
+    assert removed["type"] == "directory"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
+@pytest.mark.parametrize("unreadable", ["parent", "grant_root"])
+def test_delete_under_a_searchable_unreadable_directory(
+    tmp_path: Path, delete_mode: str, unreadable: str
+) -> None:
+    """Removing a known child needs write and search on its parent, not read."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    if unreadable == "parent":
+        locked = workspace / "locked"
+        policy = _grant_policy()
+    else:
+        locked = tmp_path / "rw"
+        (workspace / "locked").symlink_to(locked)
+        policy = _grant_policy(write_roots=[locked])
+    locked.mkdir()
+    (locked / "victim.txt").write_text("x")
+    locked.chmod(0o300)
+    try:
+        res = _req("delete", Path("locked/victim.txt"), workspace, policy)
+    finally:
+        locked.chmod(0o700)
+
+    assert res == {"deleted": True, "type": "file", "bytes_deleted": 1}
+    assert list(locked.iterdir()) == []
+
+
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
+def test_delete_refused_by_permissions_is_not_reported_missing(
+    tmp_path: Path, delete_mode: str
+) -> None:
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    (sealed / "keep.txt").write_text("keep")
+    sealed.chmod(0o500)
+    try:
+        res = _req("delete", Path("sealed/keep.txt"), tmp_path, _grant_policy())
+    finally:
+        sealed.chmod(0o700)
+
+    assert res["code"] == "permission_denied"
+    assert (sealed / "keep.txt").read_text() == "keep"
+
+
+def test_delete_without_grants_refuses_a_link_into_a_read_grant(
+    delete_layout: tuple[Path, Path, Path],
+) -> None:
+    workspace, _grant, outside = delete_layout
+    policy = _grant_policy(read_roots=[outside])
+
+    res = _req("delete", Path("to_outside/victim.txt"), workspace, policy)
+
+    assert res["code"] == "invalid_path"
+    assert (outside / "victim.txt").read_text() == "keep me"
+
+
+def test_delete_refuses_the_root_reached_through_a_link(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "keep.txt").write_text("keep")
+    (workspace / "up").symlink_to(tmp_path)
+    policy = _grant_policy(write_roots=[tmp_path])
+
+    res = _req("delete", Path("up/ws"), workspace, policy, recursive=True)
+
+    assert res["code"] == "invalid_path"
+    assert (workspace / "keep.txt").exists()
+
+
+@pytest.mark.parametrize("delete_mode", ["dir_fd", "read_only_dirs"], indirect=True)
+def test_delete_refuses_a_component_that_became_a_symlink(
+    delete_layout: tuple[Path, Path, Path], delete_mode: str
+) -> None:
+    """The walk after the reach check does not follow a swapped-in link."""
+    from omnigent.inner.os_env import _delete_beneath
+
+    workspace, _grant, outside = delete_layout
+
+    res = _delete_beneath(workspace, ("to_outside",), "victim.txt", recursive=False)
+
+    assert res["code"] == "invalid_path"
+    assert (outside / "victim.txt").read_text() == "keep me"
+
+
+def test_delete_rejects_a_malformed_request(tmp_path: Path) -> None:
+    policy = _grant_policy()
+
+    assert _req("delete", Path("x"), tmp_path, policy, recursive="yes")["code"] == "invalid_path"
+    assert _req("delete", Path("a/.."), tmp_path, policy)["code"] == "invalid_path"
+
+
+# ---------------------------------------------------------------------------
 # resolve_sandbox(type=none) grant plumbing.
 # ---------------------------------------------------------------------------
 
