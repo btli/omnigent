@@ -18,6 +18,7 @@ import {
 } from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 import { UI_FONT_FAMILY_FALLBACK } from "@/lib/uiFontPreferences";
+import { resetFontLoaderForTests, setWebFontsEnabled } from "@/lib/webFontLoader";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -259,6 +260,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  resetFontLoaderForTests();
   // Reset the font-size preference + applied desktop size so the Appearance
   // tests don't leak state into each other.
   localStorage.clear();
@@ -989,6 +991,8 @@ describe("SettingsPage", () => {
 
   it("hides downloadable fonts when disabled and keeps defaults and installed fonts usable", () => {
     mocks.webfontsEnabled = false;
+    resetFontLoaderForTests();
+    setWebFontsEnabled(true);
     localStorage.clear();
     renderPage("/settings/appearance");
 
