@@ -458,7 +458,7 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
             self._consumed_ids.append(inj_id)
 
         class _Response:
-            status_code = 200
+            status_code = 204
             headers: dict[str, str] = {}
             content = b""
 
@@ -562,6 +562,8 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
             f"got {resp2.status_code}: {resp2.text}"
         )
         assert resp2.json()["status"] == "buffered"
+        assert "ede98a0180773a70b1e81cc854ff7d8a" in app.state.active_turns
+        assert _pm.has_active_turn("ede98a0180773a70b1e81cc854ff7d8a")
 
         # Release turn 1; the stream then emits injection.consumed (for
         # "second") and response.completed. The runner drops the buffered
@@ -589,6 +591,8 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
     )
     continuation_has_second = any(_body_contains_text(b, "second") for b in hc.posted_bodies[1:])
     assert not continuation_has_second
+    assert "ede98a0180773a70b1e81cc854ff7d8a" not in app.state.active_turns
+    assert not _pm.has_active_turn("ede98a0180773a70b1e81cc854ff7d8a")
 
 
 @pytest.mark.asyncio

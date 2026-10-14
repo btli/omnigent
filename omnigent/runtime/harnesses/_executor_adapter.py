@@ -1436,9 +1436,16 @@ def _extract_last_user_message(
 def _extract_user_text(
     input_value: str | list[dict[str, Any]],
 ) -> str:
-    """Extract concatenated text from an injection input for ``enqueue_session_message``."""
+    """Extract current user text from content blocks or conversation-shaped steering."""
     if isinstance(input_value, str):
         return input_value
+    if any("role" in item for item in input_value):
+        # A full history can arrive as steering; never replay its earlier messages.
+        for item in reversed(input_value):
+            if item.get("role") == "user":
+                content = item.get("content")
+                return _extract_user_text(content) if isinstance(content, (str, list)) else ""
+        return ""
     parts: list[str] = []
     for block in input_value:
         text_value = block.get("text")

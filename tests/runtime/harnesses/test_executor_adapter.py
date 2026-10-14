@@ -2122,7 +2122,25 @@ class _OneInjectionCtx:
 
 
 @pytest.mark.asyncio
-async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
+@pytest.mark.parametrize(
+    "input_value",
+    [
+        "steer me",
+        [{"type": "input_text", "text": "steer me"}],
+        [
+            {"type": "message", "role": "user", "content": "earlier request"},
+            {"type": "message", "role": "assistant", "content": "earlier reply"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "steer me"}],
+            },
+            {"type": "function_call_output", "output": "tool output"},
+        ],
+    ],
+    ids=["string", "content-blocks", "conversation-history"],
+)
+async def test_watch_injections_emits_consumed_marker_on_accept(input_value: Any) -> None:
     """An accepted mid-turn injection echoes an injection.consumed marker.
 
     The runner stamps an ``injection_id`` on a forwarded mid-turn message;
@@ -2141,7 +2159,7 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     executor = _AcceptingInjectionExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
     ctx = _OneInjectionCtx(
-        CreateResponseRequest(model="m", input="steer me", injection_id="inj_x")
+        CreateResponseRequest(model="m", input=input_value, injection_id="inj_x")
     )
 
     task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
@@ -2165,6 +2183,39 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert isinstance(marker, InjectionConsumedEvent)
     assert marker.type == "injection.consumed"
     assert marker.injection_id == "inj_x"
+
+
+@pytest.mark.parametrize(
+    ("input_value", "expected"),
+    [
+        (
+            [
+                {"type": "input_text", "text": "first line"},
+                {"type": "input_text", "text": "second line"},
+            ],
+            "first line\nsecond line",
+        ),
+        ([{"type": "message", "role": "user", "content": "Status?"}], "Status?"),
+        ([{"type": "message", "role": "assistant", "content": "not steering"}], ""),
+        (
+            [
+                {"type": "message", "role": "user", "content": "do not replay"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": "https://example.test/a"}],
+                },
+            ],
+            "",
+        ),
+    ],
+    ids=["multiple-blocks", "message-string", "no-user", "latest-user-without-text"],
+)
+def test_injection_text_preserves_only_latest_user_input(input_value: Any, expected: str) -> None:
+    """History-shaped steering must not replay prior user, assistant, or tool output."""
+    from omnigent.runtime.harnesses._executor_adapter import _extract_user_text
+
+    assert _extract_user_text(input_value) == expected
 
 
 @pytest.mark.asyncio
