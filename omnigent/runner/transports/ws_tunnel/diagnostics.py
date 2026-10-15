@@ -13,7 +13,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import TypedDict, TypeVar, cast
+from typing import TypedDict, cast
 
 _logger = logging.getLogger(__name__)
 
@@ -22,7 +22,6 @@ _SLOW_OPERATION_S = 1.0
 _REPORT_INTERVAL_S = 60.0
 _MAX_TRACKED_SENDS = 64
 _MAX_TRACKED_PINGS = 8
-_Payload = TypeVar("_Payload", str, bytes)
 
 
 class TunnelKeepaliveSettings(TypedDict, total=False):
@@ -246,8 +245,8 @@ class TunnelDiagnostics:
 
     async def send(
         self,
-        send_text: Callable[[_Payload], Awaitable[None]],
-        data: _Payload,
+        send_text: Callable[..., Awaitable[None]],
+        data: str | bytes,
         *,
         app_ping_ts: int | None = None,
     ) -> None:
