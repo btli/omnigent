@@ -8,7 +8,7 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { withBasePath } from "@/lib/basePath";
-import { isDatabricksWorkspace } from "@/lib/host";
+import { isHostRoutingEnabled } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -94,8 +94,8 @@ export function fileContentToBlob(data: FileContentResponse): Blob {
  * Programmatically trigger a browser file download for the given ``Blob``.
  *
  * Creates a temporary object URL, clicks a synthetic ``<a>`` element to
- * initiate the download, then immediately cleans up both the element and
- * the URL.
+ * initiate the download, then removes the element. URL cleanup is delayed
+ * so the browser can consume the blob after the click returns.
  *
  * :param blob: The file data to download.
  * :param filename: The suggested filename presented to the browser's save dialog.
@@ -103,7 +103,7 @@ export function fileContentToBlob(data: FileContentResponse): Blob {
 export function triggerBrowserDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   clickDownloadLink(url, filename);
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function clickDownloadLink(href: string, filename: string): void {
@@ -124,9 +124,10 @@ function clickDownloadLink(href: string, filename: string): void {
  *
  * In a browser this is a plain same-origin link click: the browser streams the
  * attachment straight to disk and shows it in its download UI at once, and the
- * session cookie or proxy identity header rides along as on any request. The
- * managed embed owns the transport (auth headers, replica routing) and the
- * mobile shells save http(s) downloads outside the WebView's session, so those
+ * session cookie or proxy identity header rides along as on any request. A
+ * host-routed deployment (the managed embed included) needs the replica-routing
+ * slice-key header an anchor can't send, and the mobile shells save http(s)
+ * downloads outside the WebView's session, so those
  * fetch the bytes through `authenticatedFetch` and hand them over as a Blob,
  * which only surfaces once the whole file has arrived.
  *
@@ -136,7 +137,7 @@ function clickDownloadLink(href: string, filename: string): void {
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
   const url = workspaceFileUrl(conversationId, path, { download: "true" });
   const filename = path.split("/").pop() ?? path;
-  if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
+  if (!isHostRoutingEnabled() && !isIOSShell() && !isAndroidShell()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
     // fetch paths get for free via hostFetch/authenticatedFetch. Without it a
     // stripping proxy (`/proxy/<port>/`) sends it to the origin root and misses
