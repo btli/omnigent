@@ -25,12 +25,7 @@ import {
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { RevealBaseContext } from "./RevealInFileManager";
-import {
-  FileRowActions,
-  ROW_MENU_SIZE_SLOT_CLASS,
-  ROW_MENU_SLOT_CLASS,
-  type FileRowInfo,
-} from "./FileRowActions";
+import { FileRowActions, type FileRowInfo } from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -1013,7 +1008,7 @@ function FileRowItem({
         linesRemoved={fileStatus?.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -1026,7 +1021,6 @@ function FileRowItem({
           >
             <IndentGuides depth={depth} />
             <button
-              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
               onClick={() => !isDeleted && onFileSelect(path)}
@@ -1070,17 +1064,12 @@ function FileRowItem({
             included) shares it: metadata at rest, the copy/download pair on
             hover. */}
             <span
-              className={cn(
-                "relative flex shrink-0 items-center justify-end",
-                ROW_META_SLOT_CLASS,
-                ROW_MENU_SIZE_SLOT_CLASS,
-                "pointer-coarse:justify-start",
-              )}
+              className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
             >
               {bytes !== null && !isDeleted && (
                 <span
                   className={cn(
-                    "mr-6 w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
+                    "w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
                     actionsOpen && "invisible",
                   )}
                 >
@@ -1094,7 +1083,6 @@ function FileRowItem({
                   <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 )}
                 <CopyPathButton path={canonicalPath} revealOnHover />
-                {moreActions}
               </span>
             </span>
           </div>
@@ -1194,7 +1182,7 @@ function SearchDirRow({
         onBrowse={() => (onNavigateDir ? onNavigateDir(file.path) : onRevealDir(file.path))}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -1202,7 +1190,6 @@ function SearchDirRow({
             className="group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted [-webkit-touch-callout:none]"
           >
             <button
-              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
               onClick={() => onRevealDir(file.path)}
@@ -1213,16 +1200,11 @@ function SearchDirRow({
               </span>
             </button>
             <span
-              className={cn(
-                "relative flex shrink-0 items-center justify-end",
-                ROW_META_SLOT_CLASS,
-                ROW_MENU_SLOT_CLASS,
-              )}
+              className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
             >
               <span className="absolute inset-0 flex items-center justify-end gap-1">
                 <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
-                {moreActions}
               </span>
             </span>
           </div>
@@ -1349,7 +1331,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
       onBrowse={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
       onOpenInfo={onOpenInfo ?? (() => {})}
     >
-      {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+      {(rowRef, actionsOpen) => (
         <div
           ref={rowRef}
           data-actions-open={actionsOpen}
@@ -1364,7 +1346,6 @@ const TreeNodeRow = memo(function TreeNodeRow({
         >
           <IndentGuides depth={depth} />
           <button
-            ref={primaryActionRef}
             type="button"
             className="group/folder flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
             onClick={() => onTogglePath(node.path)}
@@ -1401,16 +1382,11 @@ const TreeNodeRow = memo(function TreeNodeRow({
           the download's footprint reserved beside it so that button lands in
           the same x as every file row's. */}
           <span
-            className={cn(
-              "relative flex shrink-0 items-center justify-end",
-              ROW_META_SLOT_CLASS,
-              ROW_MENU_SLOT_CLASS,
-            )}
+            className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
           >
             <span className="absolute inset-0 flex items-center justify-end gap-1">
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
               <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
-              {moreActions}
             </span>
           </span>
         </div>
