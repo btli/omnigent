@@ -1,8 +1,9 @@
-"""Unit tests for the Databricks Sandbox launcher (REST command execution).
+"""Unit tests for the Databricks Sandbox launcher.
 
-The SDK's generic ``ApiClient.do`` is replaced by an in-memory fake that
-records every request and models the Sandbox lifecycle, so these tests pin the
-exact REST shapes the launcher sends and how it maps responses and errors.
+The launcher drives the SDK's real ``SandboxAPI``; only the transport beneath
+it (``ApiClient.do``) is an in-memory fake that records every request and
+models the Sandbox lifecycle. These tests therefore pin the exact wire shapes
+the SDK sends for the launcher and how it maps responses and errors.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any
 import click
 import pytest
 from databricks.sdk.errors import NotFound
+from databricks.sdk.service.sandbox import SandboxAPI
 
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes import databricks_sandbox as mod
@@ -27,6 +29,7 @@ class _FakeApi:
     """In-memory stand-in for ``WorkspaceClient().api_client``."""
 
     def __init__(self) -> None:
+        self._cfg = SimpleNamespace(workspace_id=None)
         self.calls: list[dict[str, Any]] = []
         self.states: dict[str, list[str]] = {}
         self.exec_results: list[dict[str, Any]] = []
@@ -80,6 +83,7 @@ def _launcher(api: _FakeApi, **kwargs: Any) -> DatabricksSandboxLauncher:
     launcher = DatabricksSandboxLauncher(**kwargs)
     launcher._client = SimpleNamespace(
         api_client=api,
+        sandbox=SandboxAPI(api),
         config=SimpleNamespace(authenticate=lambda: {"Authorization": "Bearer launcher-token"}),
     )
     return launcher
@@ -352,3 +356,28 @@ def test_start_host_without_proxy_bearer_sets_no_bearer_env() -> None:
     launch = api.exec_calls()[-1]["body"]
     assert PROXY_BEARER_FILE_ENV_VAR not in launch["envs"]
     assert not any("proxy-bearer" in " ".join(c["body"]["args"]) for c in api.exec_calls())
+
+
+def test_start_host_logs_under_home_so_the_log_survives_a_stop() -> None:
+    api = _FakeApi()
+    _launcher(api).start_host(
+        "sb-1",
+        token="launch-token",
+        host_id="host-1",
+        host_name="managed-host-1",
+        server_url="https://omnigent.example.com",
+    )
+    launch = api.exec_calls()[-1]["body"]["args"][1]
+    assert 'mkdir -p "$HOME/.omnigent";' in launch
+    assert '>> "$HOME/.omnigent/host.log"' in launch
+    assert "/tmp" not in launch
+
+
+def test_sdk_without_the_sandbox_service_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    import databricks.sdk
+    import databricks.sdk.config
+
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_kw: SimpleNamespace())
+    monkeypatch.setattr(databricks.sdk.config, "Config", lambda **_kw: None)
+    with pytest.raises(click.ClickException, match=r"databricks-sdk>=0\.145"):
+        DatabricksSandboxLauncher().prepare()
