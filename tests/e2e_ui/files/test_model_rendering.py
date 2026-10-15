@@ -19,6 +19,12 @@ part must stand upright, dragging vertically must keep orbiting past the
 model's underside, and the faces turned toward the camera must stay lit while
 the view swings under it. The 3MF container is a zip, so it is written into the
 session workspace on disk rather than through the text-only PUT endpoint.
+
+The filesystem PUT is text-only: latin-1 is rejected because the writer
+decodes as UTF-8. The binary 3MF is written to the workspace root returned
+by the environment API, then checked byte-for-byte through the raw GET.
+Coloured cases skip a nonlocal root only with an external server configured;
+local spawned servers must provide a same-host workspace for binary seeding.
 """
 
 from __future__ import annotations
@@ -38,8 +44,13 @@ import pytest
 from PIL import Image, ImageChops, ImageStat
 from playwright.sync_api import Locator, Page, expect
 
-from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests._helpers.session import (
+    bind_session_runner,
+    bundle_files,
+    post_session_bundle,
+)
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
+from tests.helpers.ui_configuration import prepared_repro_environment
 
 # ---------------------------------------------------------------------------
 # Test fixtures — tiny, valid single-triangle models
@@ -117,7 +128,9 @@ def _tower_stl() -> str:
 
 
 def _tower_3mf() -> bytes:
-    vertices = "".join(f'<vertex x="{x}" y="{y}" z="{z}"/>' for x, y, z in _TOWER_VERTICES)
+    vertices = "".join(
+        f'<vertex x="{x}" y="{y}" z="{z}"/>' for x, y, z in _TOWER_VERTICES
+    )
     triangles = "".join(
         f'<triangle v1="{a}" v2="{b}" v3="{c}"/>'
         for _, face_triangles in _TOWER_FACES
@@ -232,6 +245,84 @@ _LOAD_PROBE_JS = """
 """
 
 
+def _coloured_3mf() -> bytes:
+    """Build five separated Bambu parts without committing binary fixtures."""
+    palette = ["#F53B9D", "#4DC5A0", "#212329", "#FF7A18", "#FEFEFE"]
+    namespace = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+    production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+    triangles = [
+        (0, 2, 1),
+        (0, 3, 2),
+        (4, 5, 6),
+        (4, 6, 7),
+        (0, 1, 5),
+        (0, 5, 4),
+        (1, 2, 6),
+        (1, 6, 5),
+        (2, 3, 7),
+        (2, 7, 6),
+        (3, 0, 4),
+        (3, 4, 7),
+    ]
+    parts = []
+    components = []
+    for index in range(5):
+        vertices = [
+            (0, 0, 0),
+            (22, 0, 0),
+            (22, 22, 0),
+            (0, 22, 0),
+            (0, 0, 35),
+            (22, 0, 35),
+            (22, 22, 35),
+            (0, 22, 35),
+        ]
+        mesh = (
+            "<mesh><vertices>"
+            + "".join(f'<vertex x="{x}" y="{y}" z="{z}"/>' for x, y, z in vertices)
+            + "</vertices><triangles>"
+            + "".join(
+                f'<triangle v1="{first}" v2="{second}" v3="{third}"/>'
+                for first, second, third in triangles
+            )
+            + "</triangles></mesh>"
+        )
+        parts.append(f'<object id="{index + 1}" type="model">{mesh}</object>')
+        components.append(
+            f'<component objectid="{index + 1}" transform="1 0 0 0 1 0 0 0 1 {index * 34} 0 0"/>'
+        )
+    root = (
+        f'<model xmlns="{namespace}" xmlns:p="{production}" unit="millimeter">'
+        f'<resources>{"".join(parts)}<object id="100" type="model"><components>'
+        f"{''.join(components)}</components></object></resources>"
+        '<build><item objectid="100"/></build></model>'
+    )
+    settings = (
+        '<config><object id="100">'
+        + "".join(
+            f'<part id="{index + 1}" subtype="normal_part">'
+            f'<metadata key="extruder" value="{index + 1}"/></part>'
+            for index in range(5)
+        )
+        + "</object></config>"
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "_rels/.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="r" Target="/3D/3dmodel.model" '
+            'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+            "</Relationships>",
+        )
+        archive.writestr("3D/3dmodel.model", root)
+        archive.writestr("Metadata/model_settings.config", settings)
+        archive.writestr(
+            "Metadata/project_settings.config", json.dumps({"filament_colour": palette})
+        )
+    return output.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
@@ -282,7 +373,9 @@ def zup_print_session(
     bundle = bundle_files(
         {"print_project.yaml": _PRINT_AGENT_YAML.format(workspace=workspace).encode()}
     )
-    create = post_session_bundle(httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0)
+    create = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0
+    )
     create.raise_for_status()
     session_id = create.json()["session_id"]
     bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
@@ -350,13 +443,17 @@ def _changed_fraction(before: Image.Image, after: Image.Image) -> float:
     return changed.histogram()[255] / (changed.width * changed.height)
 
 
-def _open_files_tab_preview(page: Page, base_url: str, session_id: str, file_path: str) -> Locator:
+def _open_files_tab_preview(
+    page: Page, base_url: str, session_id: str, file_path: str
+) -> Locator:
     """Open ``file_path`` from the Files tab and return its 3D preview canvas."""
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
-    file_button = rail.get_by_role("button", name=re.compile(rf"^{re.escape(file_path)}\b"))
+    file_button = rail.get_by_role(
+        "button", name=re.compile(rf"^{re.escape(file_path)}\b")
+    )
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
 
@@ -403,7 +500,9 @@ def _drag_up(page: Page, canvas: Locator, distance: float) -> None:
     box = canvas.bounding_box()
     assert box is not None
     x = box["x"] + box["width"] / 2
-    start_y = min(box["y"] + box["height"] / 2 + distance / 2, box["y"] + box["height"] - 2)
+    start_y = min(
+        box["y"] + box["height"] / 2 + distance / 2, box["y"] + box["height"] - 2
+    )
     page.mouse.move(x, start_y)
     page.mouse.down()
     page.mouse.move(x, start_y - distance, steps=12)
@@ -427,10 +526,14 @@ def _drag_to_underside(page: Page, canvas: Locator) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _open_model_preview(page: Page, base_url: str, session_id: str, file_path: str) -> Locator:
+def _open_model_preview(
+    page: Page, base_url: str, session_id: str, file_path: str
+) -> Locator:
     """Open ``file_path`` in the Explore file viewer and return its rendered canvas."""
     page.goto(f"{base_url}/c/{session_id}?view=explore")
-    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(file_path)}\b"))
+    file_button = page.get_by_role(
+        "button", name=re.compile(rf"^{re.escape(file_path)}\b")
+    )
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
 
@@ -481,7 +584,9 @@ def test_model_file_renders_as_3d_preview(
 
     # It did NOT fall through to the binary placeholder or a source/editor view.
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer.get_by_text("Preview not available for binary files")).to_have_count(0)
+    expect(
+        file_viewer.get_by_text("Preview not available for binary files")
+    ).to_have_count(0)
     expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
 
 
@@ -500,7 +605,9 @@ def test_large_model_shows_loading_status_until_it_renders(
     page.add_init_script(_LOAD_PROBE_JS)
     page.goto(f"{base_url}/c/{session_id}?view=explore")
 
-    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(file_path)}\b"))
+    file_button = page.get_by_role(
+        "button", name=re.compile(rf"^{re.escape(file_path)}\b")
+    )
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
 
@@ -565,7 +672,8 @@ def _apply_theme_preferences(page: Page, mode: str, extra: dict[str, str]) -> No
     store = {"web-theme": mode, **extra}
     page.add_init_script(
         ";".join(
-            f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})" for k, v in store.items()
+            f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})"
+            for k, v in store.items()
         )
     )
 
@@ -584,7 +692,9 @@ def _pixels_across_top_edge(
     return image.getpixel((x, top - 2)), image.getpixel((x, top + 2))
 
 
-@pytest.mark.parametrize("seeded_model_session", [_MODELS["stl"]], ids=["stl"], indirect=True)
+@pytest.mark.parametrize(
+    "seeded_model_session", [_MODELS["stl"]], ids=["stl"], indirect=True
+)
 @pytest.mark.parametrize("mode, extra", list(_THEMES.values()), ids=list(_THEMES))
 def test_model_preview_canvas_matches_pane_background(
     page: Page,
@@ -597,7 +707,9 @@ def test_model_preview_canvas_matches_pane_background(
     _apply_theme_preferences(page, mode, extra)
     canvas = _open_model_preview(page, base_url, session_id, file_path)
 
-    assert page.evaluate("document.documentElement.classList.contains('dark')") == (mode == "dark")
+    assert page.evaluate("document.documentElement.classList.contains('dark')") == (
+        mode == "dark"
+    )
     pane, canvas_pixel = _pixels_across_top_edge(page, canvas)
     legacy = _LEGACY_CLEAR_COLORS[mode]
     assert max(abs(p - o) for p, o in zip(pane, legacy, strict=True)) > _TOLERANCE, (
@@ -605,12 +717,14 @@ def test_model_preview_canvas_matches_pane_background(
         "so this case cannot detect a regression"
     )
 
-    assert all(abs(p - c) <= _TOLERANCE for p, c in zip(pane, canvas_pixel, strict=True)), (
-        f"3D preview canvas rgb{canvas_pixel} does not match the pane rgb{pane} above it"
-    )
+    assert all(
+        abs(p - c) <= _TOLERANCE for p, c in zip(pane, canvas_pixel, strict=True)
+    ), f"3D preview canvas rgb{canvas_pixel} does not match the pane rgb{pane} above it"
 
 
-@pytest.mark.parametrize("file_path", [_TOWER_STL_PATH, _TOWER_3MF_PATH], ids=["stl", "3mf"])
+@pytest.mark.parametrize(
+    "file_path", [_TOWER_STL_PATH, _TOWER_3MF_PATH], ids=["stl", "3mf"]
+)
 def test_zup_print_opens_upright(
     page: Page,
     zup_print_session: tuple[str, str],
@@ -680,3 +794,91 @@ def test_camera_facing_surfaces_stay_lit_under_the_model(
     assert darkest > lit / 2, (
         f"model luminance fell from {lit:.0f} to {darkest:.0f}/255 while swinging under the model"
     )
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_coloured_3mf_keeps_filament_hues_across_themes(
+    page: Page,
+    seeded_session: tuple[str, str],
+    theme: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Filament hues survive initial themes and a live Settings theme toggle."""
+    base_url, session_id = seeded_session
+    file_path = "bambu-five-colours.3mf"
+    blob = _coloured_3mf()
+    file_url = (
+        f"{base_url}/v1/sessions/{session_id}"
+        f"/resources/environments/default/filesystem/{file_path}"
+    )
+    # A filesystem request initializes the session workspace before metadata is read.
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem",
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default",
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    workspace = Path(response.json()["metadata"]["root"])
+    external = (
+        request.config.getoption("--ui-base-url")
+        or prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"]
+    )
+    if external and (not workspace.is_absolute() or not workspace.is_dir()):
+        pytest.skip(
+            "binary seeding needs a same-host workspace; filesystem PUT is text-only"
+        )
+    assert workspace.is_absolute() and workspace.is_dir()
+    (workspace / file_path).write_bytes(blob)
+    response = httpx.get(file_url, params={"download": "true"}, timeout=10.0)
+    response.raise_for_status()
+    assert response.content == blob
+    page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    file_button = page.get_by_role(
+        "button", name=re.compile(rf"^{re.escape(file_path)}\b")
+    )
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    canvas = viewer.locator(f'[aria-label="3D preview of {file_path}"] canvas')
+    expect(canvas).to_be_visible(timeout=15_000)
+
+    def assert_hues() -> None:
+        deadline = time.monotonic() + 10
+        counts = {"pink": 0, "mint": 0, "orange": 0}
+        while time.monotonic() < deadline:
+            image = Image.open(io.BytesIO(canvas.screenshot())).convert("RGB")
+            counts = {"pink": 0, "mint": 0, "orange": 0}
+            for red, green, blue in image.get_flattened_data():
+                if red > 100 and red > green * 1.35 and blue > green * 1.15:
+                    counts["pink"] += 1
+                if green > 75 and green > red * 1.2 and green > blue * 1.07:
+                    counts["mint"] += 1
+                if red > 100 and red > green * 1.35 and green > blue * 1.4:
+                    counts["orange"] += 1
+            if min(counts.values()) > 40:
+                return
+        pytest.fail(f"Missing filament hues in {theme} theme: {counts}")
+
+    assert_hues()
+    original_canvas = canvas.element_handle()
+    settings = page.context.new_page()
+    settings.goto(f"{base_url}/settings/appearance")
+    modes = settings.get_by_role("radiogroup", name="Mode", exact=True)
+    for selected in ["dark" if theme == "light" else "light", theme]:
+        modes.get_by_role("radio", name=selected.title(), exact=True).click()
+        expect(page.locator("html")).to_have_class(
+            re.compile(r"\bdark\b")
+            if selected == "dark"
+            else re.compile(r"^(?!.*\bdark\b).*$")
+        )
+        assert canvas.evaluate(
+            "(element, original) => element === original", original_canvas
+        )
+        assert_hues()
+    settings.close()
+    expect(viewer.get_by_text("Unable to render 3D model")).to_have_count(0)
