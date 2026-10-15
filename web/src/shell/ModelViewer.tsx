@@ -30,6 +30,7 @@ import {
   type WorkspaceFileDownloadProgress,
 } from "@/hooks/useFileContent";
 import { formatBytes } from "./fileStatusUtils";
+import { applyThreeMfColors } from "./threeMfColors";
 import {
   type ModelFormat,
   type ModelViewerTheme,
@@ -190,7 +191,7 @@ export async function parseModel(
     return { object, stlMaterial: material };
   }
   if (format === "3mf") {
-    const object = new ThreeMFLoader().parse(buffer);
+    const object = new ThreeMFLoader().parse(applyThreeMfColors(buffer));
     object.rotation.x = -Math.PI / 2;
     return { object, stlMaterial: null };
   }
