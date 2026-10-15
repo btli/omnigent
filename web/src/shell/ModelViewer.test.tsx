@@ -1,7 +1,10 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Profiler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { FileContentResponse, WorkspaceFileDownloadProgress } from "@/hooks/useFileContent";
+import type {
+  FileContentResponse,
+  WorkspaceFileDownloadProgress,
+} from "@/hooks/useFileContent";
 import type * as UseFileContentModule from "@/hooks/useFileContent";
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
@@ -15,9 +18,9 @@ import type * as UseFileContentModule from "@/hooks/useFileContent";
 interface LoaderBehavior {
   // What the active loader's parse should do.
   mode: "valid" | "empty" | "nan" | "throw";
-  // If set, the OrbitControls constructor throws AFTER the renderer is created,
+  // If set, the TrackballControls constructor throws AFTER the renderer is created,
   // exercising the partial-init failure/teardown path.
-  orbitThrows: boolean;
+  trackballThrows: boolean;
   // If set, the parsed object carries a mesh whose material references textures
   // (as a textured 3MF does), so teardown's texture disposal can be asserted.
   texturedMaterial: boolean;
@@ -29,7 +32,7 @@ interface LoaderBehavior {
 
 const behavior: LoaderBehavior = {
   mode: "valid",
-  orbitThrows: false,
+  trackballThrows: false,
   texturedMaterial: false,
   deferGltf: false,
   duplicateTexture: false,
@@ -82,11 +85,50 @@ interface RendererRecord {
 }
 let lastRenderer: RendererRecord | null = null;
 // The scene's `background`, which three.js paints over the clear color when set.
-let lastScene: { background: unknown } | null = null;
+let lastScene: { background: unknown; children: unknown[] } | null = null;
 
 // The mesh's material, exposed so theme tests can assert its color. Set when
 // the STL loader runs (the only format that builds its own material).
 let lastMaterial: { color: number } | null = null;
+let lastParsedObject: { rotation: { x: number } } | null = null;
+let rotationAtBounds: number | null = null;
+interface ControlsRecord {
+  kind: "orbit" | "trackball";
+  instance: { rotateSpeed: number };
+  camera: unknown;
+  element: HTMLElement;
+  cameraPositionOnConstruction: { x: number; y: number; z: number };
+  handleResizeCalls: number;
+  updateCalls: number;
+  disposeCalls: number;
+}
+let lastControls: ControlsRecord | null = null;
+let lastCamera: {
+  children: unknown[];
+  position: { x: number; y: number; z: number };
+} | null = null;
+let lastKeyTarget: {
+  parent: unknown;
+  position: { x: number; y: number; z: number };
+} | null = null;
+let resizeControls: (() => void) | null = null;
+const resizeCallOrder: string[] = [];
+let rotationWrites = 0;
+
+function makeRotation() {
+  let x = 0;
+  return Object.defineProperty({}, "x", {
+    get: () => x,
+    set: (value: number) => {
+      x = value;
+      rotationWrites += 1;
+    },
+  }) as { x: number };
+}
+
+function parsedRotation(): number | null {
+  return lastParsedObject?.rotation.x ?? null;
+}
 
 function makeParsedObject() {
   // A textured mesh mirrors what a 3MF loader yields: a material whose slots
@@ -97,7 +139,9 @@ function makeParsedObject() {
         geometry: { dispose: () => {} },
         material: {
           map: materialTextures.map,
-          normalMap: behavior.duplicateTexture ? materialTextures.map : materialTextures.normalMap,
+          normalMap: behavior.duplicateTexture
+            ? materialTextures.map
+            : materialTextures.normalMap,
           dispose: () => {},
         },
       }
@@ -111,6 +155,7 @@ function makeParsedObject() {
           ? { empty: false, nan: true }
           : { empty: false, nan: false },
     position: { sub: () => {} },
+    rotation: makeRotation(),
     traverse: (cb: (child: unknown) => void) => cb(child),
   };
 }
@@ -125,9 +170,15 @@ function loaderStub(name: string) {
   };
 }
 
-vi.mock("three/examples/jsm/loaders/STLLoader.js", () => ({ STLLoader: loaderStub("stl") }));
-vi.mock("three/examples/jsm/loaders/3MFLoader.js", () => ({ ThreeMFLoader: loaderStub("3mf") }));
-vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStub("obj") }));
+vi.mock("three/examples/jsm/loaders/STLLoader.js", () => ({
+  STLLoader: loaderStub("stl"),
+}));
+vi.mock("three/examples/jsm/loaders/3MFLoader.js", () => ({
+  ThreeMFLoader: loaderStub("3mf"),
+}));
+vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({
+  OBJLoader: loaderStub("obj"),
+}));
 // GLTFLoader's parse is callback-based rather than sync like the loaders
 // above, so its stub invokes onLoad/onError to mirror that contract.
 vi.mock("three/examples/jsm/loaders/GLTFLoader.js", () => ({
@@ -162,21 +213,56 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
     fetchWorkspaceFileBytes: fetchWorkspaceFileBytesMock,
     fileContentToBlob: (data: FileContentResponse) =>
       blobBehavior.pending
-        ? Object.assign(new Blob(), { arrayBuffer: () => new Promise<ArrayBuffer>(() => {}) })
+        ? Object.assign(new Blob(), {
+            arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+          })
         : actual.fileContentToBlob(data),
   };
 });
 
-vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
-  OrbitControls: class {
-    constructor() {
-      if (behavior.orbitThrows) throw new Error("orbit init failed");
+function controlsStub(kind: "orbit" | "trackball") {
+  return class {
+    rotateSpeed = 1;
+    constructor(camera: unknown, element: HTMLElement) {
+      if (kind === "trackball" && behavior.trackballThrows) {
+        throw new Error("controls init failed");
+      }
+      const position = (
+        camera as { position: { x: number; y: number; z: number } }
+      ).position;
+      lastControls = {
+        kind,
+        instance: this,
+        camera,
+        element,
+        cameraPositionOnConstruction: {
+          x: position.x,
+          y: position.y,
+          z: position.z,
+        },
+        handleResizeCalls: 0,
+        updateCalls: 0,
+        disposeCalls: 0,
+      };
     }
-    enableDamping = false;
-    target = { set: () => {} };
-    update() {}
-    dispose() {}
-  },
+    handleResize() {
+      resizeCallOrder.push("controls.handleResize");
+      if (lastControls) lastControls.handleResizeCalls += 1;
+    }
+    update() {
+      if (lastControls) lastControls.updateCalls += 1;
+    }
+    dispose() {
+      if (lastControls) lastControls.disposeCalls += 1;
+    }
+  };
+}
+
+vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
+  OrbitControls: controlsStub("orbit"),
+}));
+vi.mock("three/examples/jsm/controls/TrackballControls.js", () => ({
+  TrackballControls: controlsStub("trackball"),
 }));
 
 vi.mock("three", () => {
@@ -184,7 +270,10 @@ vi.mock("three", () => {
     x = 0;
     y = 0;
     z = 0;
-    set() {
+    set(x: number, y: number, z: number) {
+      this.x = x;
+      this.y = y;
+      this.z = z;
       return this;
     }
     sub() {
@@ -196,6 +285,8 @@ vi.mock("three", () => {
     max = { x: 1, y: 1, z: 1 };
     private empty = false;
     setFromObject(obj: { boxSpec?: { empty: boolean; nan: boolean } }) {
+      lastParsedObject = obj as { rotation: { x: number } };
+      rotationAtBounds = (obj as { rotation?: { x: number } }).rotation?.x ?? 0;
       const box = obj.boxSpec ?? { empty: false, nan: false };
       this.empty = box.empty;
       if (box.nan) this.max = { x: NaN, y: 1, z: 1 };
@@ -212,11 +303,22 @@ vi.mock("three", () => {
     }
   }
   class PerspectiveCamera {
+    isPerspectiveCamera = true;
     fov = 45;
     aspect = 1;
     near = 0.1;
     far = 1000;
     position = new Vector3();
+    children: unknown[] = [];
+    constructor() {
+      lastCamera = { children: this.children, position: this.position };
+    }
+    add(...objects: { parent?: unknown }[]) {
+      for (const object of objects) {
+        object.parent = this;
+        this.children.push(object);
+      }
+    }
     updateProjectionMatrix() {}
   }
   class WebGLRenderer {
@@ -228,7 +330,9 @@ vi.mock("three", () => {
       lastRenderer = this.record;
     }
     setPixelRatio() {}
-    setSize() {}
+    setSize(width: number, height: number) {
+      resizeCallOrder.push(`renderer.setSize:${width}x${height}`);
+    }
     setClearColor(_color: number, alpha = 1) {
       this.record.clearAlpha = alpha;
     }
@@ -237,7 +341,8 @@ vi.mock("three", () => {
     }
     render() {
       // Whether the loading label was still in the DOM when the first frame drew.
-      this.record.labelAtFirstRender ??= document.body.textContent?.includes("Preparing model…");
+      this.record.labelAtFirstRender ??=
+        document.body.textContent?.includes("Preparing model…");
     }
     dispose() {
       this.record.disposed = true;
@@ -254,7 +359,11 @@ vi.mock("three", () => {
   }
   class Scene {
     // Shared with the test so a scene background is observable after the build.
-    record: { background: unknown } = { background: null };
+    children: unknown[] = [];
+    record: { background: unknown; children: unknown[] } = {
+      background: null,
+      children: this.children,
+    };
     constructor() {
       lastScene = this.record;
     }
@@ -264,13 +373,16 @@ vi.mock("three", () => {
     set background(value: unknown) {
       this.record.background = value;
     }
-    add() {}
+    add(...objects: unknown[]) {
+      this.children.push(...objects);
+    }
     remove() {}
   }
   class Mesh {
     geometry = null;
     material = null;
     position = new Vector3();
+    rotation = makeRotation();
     traverse(cb: (c: unknown) => void) {
       cb(this);
     }
@@ -305,10 +417,14 @@ vi.mock("three", () => {
       }
     },
     DirectionalLight: class {
+      isDirectionalLight = true;
       position = new Vector3();
       intensity: number;
+      parent: unknown = null;
+      target = { parent: null as unknown, position: new Vector3() };
       constructor(_color?: number, intensity = 1) {
         this.intensity = intensity;
+        lastKeyTarget = this.target;
       }
     },
   };
@@ -324,7 +440,9 @@ import { ModelViewer } from "./ModelViewer";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResponse {
+function makeData(
+  overrides: Partial<FileContentResponse> = {},
+): FileContentResponse {
   return {
     object: "session.environment.filesystem.file_content",
     path: "part.stl",
@@ -337,7 +455,9 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
   };
 }
 
-function makeGlbData(overrides: Partial<FileContentResponse> = {}): FileContentResponse {
+function makeGlbData(
+  overrides: Partial<FileContentResponse> = {},
+): FileContentResponse {
   const bytes = new Uint8Array(glbFixture());
   return makeData({
     path: "scene.glb",
@@ -375,7 +495,7 @@ function nextTask(): Promise<void> {
 
 beforeEach(() => {
   behavior.mode = "valid";
-  behavior.orbitThrows = false;
+  behavior.trackballThrows = false;
   behavior.texturedMaterial = false;
   behavior.deferGltf = false;
   behavior.duplicateTexture = false;
@@ -386,6 +506,14 @@ beforeEach(() => {
   lastRenderer = null;
   lastScene = null;
   lastMaterial = null;
+  lastParsedObject = null;
+  rotationAtBounds = null;
+  lastControls = null;
+  lastCamera = null;
+  lastKeyTarget = null;
+  resizeControls = null;
+  resizeCallOrder.length = 0;
+  rotationWrites = 0;
   themeState.resolvedTheme = "light";
   fetchWorkspaceFileBytesMock.mockReset();
   blobBehavior.pending = false;
@@ -398,6 +526,9 @@ beforeEach(() => {
   vi.stubGlobal(
     "ResizeObserver",
     class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeControls = () => callback([], this as unknown as ResizeObserver);
+      }
       observe() {}
       unobserve() {}
       disconnect() {}
@@ -416,7 +547,11 @@ afterEach(() => {
 // defaults to opaque unless created with `alpha: true`) or a scene background.
 function paintsOwnBackground(record: RendererRecord | null): boolean {
   if (!record) return true;
-  return !record.alpha || (record.clearAlpha ?? 0) > 0 || lastScene?.background != null;
+  return (
+    !record.alpha ||
+    (record.clearAlpha ?? 0) > 0 ||
+    lastScene?.background != null
+  );
 }
 
 // `bg-*` classes and inline or computed backgrounds on anything ModelViewer
@@ -427,10 +562,14 @@ function backgroundsPainted(): string[] {
     // Variant and important forms too (`dark:bg-…`, `!bg-…`); jsdom applies no Tailwind.
     found.push(...Array.from(el.classList).filter((c) => /(^|:)!?bg-/.test(c)));
     // Inline values jsdom can't resolve (e.g. `var(--background)`) never reach the computed color.
-    const inline = el.style.background || el.style.backgroundColor || el.style.backgroundImage;
+    const inline =
+      el.style.background ||
+      el.style.backgroundColor ||
+      el.style.backgroundImage;
     if (inline) found.push(inline);
     const color = getComputedStyle(el).backgroundColor;
-    if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") found.push(color);
+    if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)")
+      found.push(color);
   }
   return found;
 }
@@ -471,7 +610,10 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
   it("selects the STL loader for a binary .stl (extension fallback)", async () => {
     render(
       <ModelViewer
-        data={makeData({ path: "widget.stl", content_type: "application/octet-stream" })}
+        data={makeData({
+          path: "widget.stl",
+          content_type: "application/octet-stream",
+        })}
         path="widget.stl"
         conversationId="conv_1"
       />,
@@ -511,17 +653,154 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
 
   it("selects the GLTF loader by MIME when the extension is unknown", async () => {
     render(
-      <ModelViewer data={makeGlbData({ path: "blob" })} path="blob" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeGlbData({ path: "blob" })}
+        path="blob"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(parseCalls).toContain("gltf"));
     expect(parseCalls).not.toContain("stl");
   });
 });
 
+describe("ModelViewer print orientation", () => {
+  it("rotates STL once before bounds and leaves OBJ unchanged", async () => {
+    const { unmount } = render(
+      <ModelViewer
+        data={makeData({ path: "part.stl" })}
+        path="part.stl"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["stl"]);
+    expect(parsedRotation()).toBe(-Math.PI / 2);
+    expect(rotationAtBounds).toBe(-Math.PI / 2);
+    expect(rotationWrites).toBe(1);
+    unmount();
+
+    rotationWrites = 0;
+    parseCalls.length = 0;
+    lastRenderer = null;
+    lastParsedObject = null;
+    rotationAtBounds = null;
+    render(
+      <ModelViewer
+        data={makeData({ path: "mesh.obj" })}
+        path="mesh.obj"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["obj"]);
+    expect(parsedRotation()).toBe(0);
+    expect(rotationAtBounds).toBe(0);
+    expect(rotationWrites).toBe(0);
+  });
+
+  it("rotates 3MF once before calculating bounds", async () => {
+    render(
+      <ModelViewer
+        data={makeData({ path: "part.3mf" })}
+        path="part.3mf"
+        conversationId="conv_1"
+      />,
+    );
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["3mf"]);
+    expect(parsedRotation()).toBe(-Math.PI / 2);
+    expect(rotationAtBounds).toBe(-Math.PI / 2);
+    expect(rotationWrites).toBe(1);
+  });
+});
+
+describe("ModelViewer trackball controls and headlight", () => {
+  it("fits before creating trackball controls and resizes controls after the renderer", async () => {
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
+    const container = screen.getByLabelText("3D preview of part.stl");
+    vi.spyOn(container, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 400,
+      bottom: 900,
+      width: 400,
+      height: 900,
+      toJSON: () => ({}),
+    } as DOMRect);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    const controls = lastControls;
+    if (!controls) throw new Error("TrackballControls were not initialized");
+
+    expect(controls.kind).toBe("trackball");
+    expect((controls.camera as { children: unknown[] }).children).toBe(
+      lastCamera?.children,
+    );
+    expect(controls.cameraPositionOnConstruction).toEqual(lastCamera?.position);
+    expect(controls.cameraPositionOnConstruction).not.toEqual({
+      x: 0,
+      y: 0,
+      z: 0,
+    });
+    expect(controls.updateCalls).toBeGreaterThanOrEqual(1);
+    expect(
+      lastCamera?.children.some(
+        (child) =>
+          (child as { isDirectionalLight?: boolean }).isDirectionalLight,
+      ),
+    ).toBe(true);
+    expect(lastCamera?.children).toContain(lastKeyTarget);
+    expect(lastKeyTarget?.parent).toBe(controls.camera);
+    expect(lastKeyTarget?.position).toMatchObject({ x: 0, y: 0, z: -1 });
+    expect(
+      lastScene?.children.some(
+        (child) =>
+          (child as { isPerspectiveCamera?: boolean }).isPerspectiveCamera,
+      ),
+    ).toBe(true);
+    expect(lastScene?.background).toBeNull();
+    expect(paintsOwnBackground(lastRenderer)).toBe(false);
+
+    const resizeStart = resizeCallOrder.length;
+    resizeControls?.();
+    expect(resizeCallOrder.slice(resizeStart)).toEqual([
+      "renderer.setSize:400x900",
+      "controls.handleResize",
+    ]);
+    expect(controls.handleResizeCalls).toBe(1);
+  });
+
+  it("turns the model about once per canvas width of drag", async () => {
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    // TrackballControls rotate rotateSpeed radians per half canvas width.
+    expect(lastControls?.instance.rotateSpeed).toBe(Math.PI);
+  });
+
+  it("disposes its controls on teardown", async () => {
+    const { unmount } = render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    const controls = lastControls;
+    expect(controls?.kind).toBe("trackball");
+    unmount();
+    expect(controls?.disposeCalls).toBe(1);
+  });
+});
+
 describe("ModelViewer error states", () => {
   it("shows the error overlay for a malformed model (parse throws)", async () => {
     behavior.mode = "throw";
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
   });
 
@@ -542,7 +821,11 @@ describe("ModelViewer error states", () => {
   it("shows the error overlay for a model with non-finite bounds", async () => {
     behavior.mode = "nan";
     render(
-      <ModelViewer data={makeData({ path: "nan.obj" })} path="nan.obj" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ path: "nan.obj" })}
+        path="nan.obj"
+        conversationId="conv_1"
+      />,
     );
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
   });
@@ -550,18 +833,28 @@ describe("ModelViewer error states", () => {
   it("shows the error overlay when the uncapped fetch for a truncated envelope fails", async () => {
     fetchWorkspaceFileBytesMock.mockRejectedValue(new Error("404 Not Found"));
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="part.stl" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="part.stl"
+        conversationId="conv_1"
+      />,
     );
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
   });
 
   it("shows a specific size-limit error for models above 256 MiB", async () => {
-    const error = new Error("Workspace file exceeds the 256 MiB preview limit.");
+    const error = new Error(
+      "Workspace file exceeds the 256 MiB preview limit.",
+    );
     error.name = "WorkspaceFilePreviewTooLargeError";
     fetchWorkspaceFileBytesMock.mockRejectedValue(error);
 
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="huge.glb" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="huge.glb"
+        conversationId="conv_1"
+      />,
     );
 
     expect(await screen.findByText(/256 MiB preview limit/)).toBeDefined();
@@ -597,7 +890,11 @@ describe("ModelViewer error states", () => {
 describe("ModelViewer large models (past the read cap)", () => {
   it("fetches the uncapped stream and renders when the envelope is truncated", async () => {
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="part.stl" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="part.stl"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(parseCalls).toContain("stl"));
     expect(fetchWorkspaceFileBytesMock).toHaveBeenCalledWith(
@@ -613,7 +910,9 @@ describe("ModelViewer large models (past the read cap)", () => {
   });
 
   it("reads the JSON envelope (not the download stream) when the file fits", async () => {
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(parseCalls).toContain("stl"));
     expect(fetchWorkspaceFileBytesMock).not.toHaveBeenCalled();
   });
@@ -623,7 +922,11 @@ describe("ModelViewer async cleanup", () => {
   it("does not build a scene when glTF parsing finishes after unmount", async () => {
     behavior.deferGltf = true;
     const { unmount } = render(
-      <ModelViewer data={makeGlbData()} path="scene.glb" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeGlbData()}
+        path="scene.glb"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(pendingGltfLoad).not.toBeNull());
 
@@ -639,7 +942,11 @@ describe("ModelViewer async cleanup", () => {
   it("aborts a pending uncapped fetch when unmounted", async () => {
     let fetchSignal: AbortSignal | undefined;
     fetchWorkspaceFileBytesMock.mockImplementation(
-      (_conversationId: string, _path: string, options?: { signal?: AbortSignal }) => {
+      (
+        _conversationId: string,
+        _path: string,
+        options?: { signal?: AbortSignal },
+      ) => {
         fetchSignal = options?.signal;
         return new Promise<ArrayBuffer>((_resolve, reject) => {
           options?.signal?.addEventListener("abort", () => {
@@ -649,7 +956,11 @@ describe("ModelViewer async cleanup", () => {
       },
     );
     const { unmount } = render(
-      <ModelViewer data={makeData({ truncated: true })} path="large.stl" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="large.stl"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(fetchSignal).toBeDefined());
 
@@ -661,7 +972,11 @@ describe("ModelViewer async cleanup", () => {
   it("aborts the previous uncapped fetch when switching model files", async () => {
     const fetchSignals: AbortSignal[] = [];
     fetchWorkspaceFileBytesMock.mockImplementation(
-      (_conversationId: string, path: string, options?: { signal?: AbortSignal }) => {
+      (
+        _conversationId: string,
+        path: string,
+        options?: { signal?: AbortSignal },
+      ) => {
         if (options?.signal) fetchSignals.push(options.signal);
         if (path === "new.stl") return Promise.resolve(new ArrayBuffer(8));
         return new Promise<ArrayBuffer>((_resolve, reject) => {
@@ -672,7 +987,11 @@ describe("ModelViewer async cleanup", () => {
       },
     );
     const { rerender } = render(
-      <ModelViewer data={makeData({ truncated: true })} path="old.stl" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="old.stl"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(fetchSignals).toHaveLength(1));
 
@@ -696,10 +1015,16 @@ describe("ModelViewer loading state", () => {
 
   // Holds each uncapped download open so the downloading phase can be driven.
   function holdDownloads() {
-    const downloads: { onProgress?: ProgressCallback; resolve: (buffer: ArrayBuffer) => void }[] =
-      [];
+    const downloads: {
+      onProgress?: ProgressCallback;
+      resolve: (buffer: ArrayBuffer) => void;
+    }[] = [];
     fetchWorkspaceFileBytesMock.mockImplementation(
-      (_conversationId: string, _path: string, options?: { onProgress?: ProgressCallback }) =>
+      (
+        _conversationId: string,
+        _path: string,
+        options?: { onProgress?: ProgressCallback },
+      ) =>
         new Promise<ArrayBuffer>((resolve) => {
           downloads.push({ onProgress: options?.onProgress, resolve });
         }),
@@ -720,40 +1045,66 @@ describe("ModelViewer loading state", () => {
   it("keeps the preparing status while the file bytes are still being read", async () => {
     blobBehavior.pending = true;
     render(
-      <ModelViewer data={makeData({ path: "big.stl" })} path="big.stl" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ path: "big.stl" })}
+        path="big.stl"
+        conversationId="conv_1"
+      />,
     );
 
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
-    expect(screen.getByLabelText("3D preview of big.stl").querySelector("canvas")).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe("Preparing model…"),
+    );
+    expect(
+      screen.getByLabelText("3D preview of big.stl").querySelector("canvas"),
+    ).toBeNull();
     expect(screen.queryByText(/Unable to render 3D model/)).toBeNull();
     expect(parseCalls).toEqual([]);
   });
 
   it("keeps the loading label up until the first frame is drawn", async () => {
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
 
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(lastRenderer?.labelAtFirstRender).toBe(true);
-    await waitFor(() => expect(screen.queryByText("Preparing model…")).toBeNull());
-    expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByText("Preparing model…")).toBeNull(),
+    );
+    expect(
+      screen.getByLabelText("3D preview of part.stl").querySelector("canvas"),
+    ).not.toBeNull();
   });
 
   it("shows a preparing status from mount and clears it once the model renders", async () => {
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
-    expect(screen.getByText("Preparing model…").parentElement?.querySelectorAll("p")).toHaveLength(
-      1,
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
     );
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
+    expect(
+      screen.getByText("Preparing model…").parentElement?.querySelectorAll("p"),
+    ).toHaveLength(1);
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe("Preparing model…"),
+    );
 
     await waitFor(() => expect(lastRenderer).not.toBeNull());
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe(""),
+    );
     expect(screen.queryByText(/Preparing model/)).toBeNull();
   });
 
   it("fills the live region only after the mount task so screen readers announce it", async () => {
     // A synchronous act() flushes the mount and its effects in one task, like a click.
     act(() => {
-      render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+      render(
+        <ModelViewer
+          data={makeData()}
+          path="part.stl"
+          conversationId="conv_1"
+        />,
+      );
     });
     expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.getByText("Preparing model…")).toBeDefined();
@@ -761,49 +1112,90 @@ describe("ModelViewer loading state", () => {
     await act(nextTask);
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
     expect(
-      screen.getByText("Preparing model…", { selector: '[aria-hidden="true"]' }),
+      screen.getByText("Preparing model…", {
+        selector: '[aria-hidden="true"]',
+      }),
     ).toBeDefined();
   });
 
   it("shows determinate download progress when the total size is known", async () => {
     const downloads = holdDownloads();
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Downloading model…"));
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe("Downloading model…"),
+    );
     await waitFor(() => expect(downloads).toHaveLength(1));
 
-    act(() => downloads[0].onProgress?.({ receivedBytes: 512 * 1024, totalBytes: 1024 * 1024 }));
+    act(() =>
+      downloads[0].onProgress?.({
+        receivedBytes: 512 * 1024,
+        totalBytes: 1024 * 1024,
+      }),
+    );
 
-    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("50");
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe(
+      "50",
+    );
     expect(screen.getByText("50% · 512 KB of 1.0 MB")).toBeDefined();
   });
 
   it("shows the progress bar from 0% through 100% of the declared size", async () => {
     const downloads = holdDownloads();
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
 
-    act(() => downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: 1024 * 1024 }));
-    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("0");
+    act(() =>
+      downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: 1024 * 1024 }),
+    );
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe(
+      "0",
+    );
 
-    act(() => downloads[0].onProgress?.({ receivedBytes: 1024 * 1024, totalBytes: 1024 * 1024 }));
-    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("100");
+    act(() =>
+      downloads[0].onProgress?.({
+        receivedBytes: 1024 * 1024,
+        totalBytes: 1024 * 1024,
+      }),
+    );
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe(
+      "100",
+    );
     expect(screen.getByText("100% · 1.0 MB of 1.0 MB")).toBeDefined();
   });
 
   it("shows indeterminate download progress when the total size is unknown", async () => {
     const downloads = holdDownloads();
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
-    act(() => downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: null }));
+    act(() =>
+      downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: null }),
+    );
     expect(screen.queryByText(/received/)).toBeNull();
 
-    act(() => downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: null }));
+    act(() =>
+      downloads[0].onProgress?.({
+        receivedBytes: 2 * 1024 * 1024,
+        totalBytes: null,
+      }),
+    );
 
     expect(screen.getByRole("status").textContent).toBe("Downloading model…");
     expect(screen.queryByRole("progressbar")).toBeNull();
@@ -813,12 +1205,19 @@ describe("ModelViewer loading state", () => {
   it("falls back to received bytes when more arrives than the declared size", async () => {
     const downloads = holdDownloads();
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
 
     act(() =>
-      downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: 1024 * 1024 }),
+      downloads[0].onProgress?.({
+        receivedBytes: 2 * 1024 * 1024,
+        totalBytes: 1024 * 1024,
+      }),
     );
 
     expect(screen.queryByRole("progressbar")).toBeNull();
@@ -829,13 +1228,19 @@ describe("ModelViewer loading state", () => {
     const downloads = holdDownloads();
     const frames = holdFrames();
     render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
 
     await act(async () => downloads[0].resolve(new ArrayBuffer(8)));
 
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe("Preparing model…"),
+    );
     expect(screen.queryByRole("progressbar")).toBeNull();
     expect(parseCalls).toEqual([]);
 
@@ -857,7 +1262,11 @@ describe("ModelViewer loading state", () => {
       });
     });
     const { unmount } = render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
 
@@ -876,11 +1285,19 @@ describe("ModelViewer loading state", () => {
   });
 
   it("parses without waiting for a frame while the tab is hidden", async () => {
-    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden");
     try {
       // Frames are queued but never run, so the parse can only happen if it skips the wait.
       holdFrames();
-      render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+      render(
+        <ModelViewer
+          data={makeData()}
+          path="part.stl"
+          conversationId="conv_1"
+        />,
+      );
 
       await waitFor(() => expect(parseCalls).toEqual(["stl"]));
     } finally {
@@ -893,7 +1310,11 @@ describe("ModelViewer loading state", () => {
     let commits = 0;
     render(
       <Profiler id="viewer" onRender={() => (commits += 1)}>
-        <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />
+        <ModelViewer
+          data={makeData({ truncated: true })}
+          path="big.3mf"
+          conversationId="conv_1"
+        />
       </Profiler>,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
@@ -902,10 +1323,18 @@ describe("ModelViewer loading state", () => {
     // 100 chunks (512–521 KB) within one percent, each its own task as in a browser.
     for (let i = 0; i < 100; i += 1) {
       act(() =>
-        downloads[0].onProgress?.({ receivedBytes: 512 * 1024 + i * 100, totalBytes: 1024 * 1024 }),
+        downloads[0].onProgress?.({
+          receivedBytes: 512 * 1024 + i * 100,
+          totalBytes: 1024 * 1024,
+        }),
       );
     }
-    act(() => downloads[0].onProgress?.({ receivedBytes: 768 * 1024, totalBytes: 1024 * 1024 }));
+    act(() =>
+      downloads[0].onProgress?.({
+        receivedBytes: 768 * 1024,
+        totalBytes: 1024 * 1024,
+      }),
+    );
 
     expect(commits - before).toBe(2);
     expect(screen.getByText("75% · 768 KB of 1.0 MB")).toBeDefined();
@@ -916,7 +1345,11 @@ describe("ModelViewer loading state", () => {
     let commits = 0;
     render(
       <Profiler id="viewer" onRender={() => (commits += 1)}>
-        <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />
+        <ModelViewer
+          data={makeData({ truncated: true })}
+          path="big.3mf"
+          conversationId="conv_1"
+        />
       </Profiler>,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
@@ -925,12 +1358,20 @@ describe("ModelViewer loading state", () => {
     // 100 chunks (20 MiB to 20 MiB + 9.9 KB) that all read "20 MB received".
     for (let i = 0; i < 100; i += 1) {
       act(() =>
-        downloads[0].onProgress?.({ receivedBytes: 20 * 1024 * 1024 + i * 100, totalBytes: null }),
+        downloads[0].onProgress?.({
+          receivedBytes: 20 * 1024 * 1024 + i * 100,
+          totalBytes: null,
+        }),
       );
     }
     expect(commits - before).toBe(1);
 
-    act(() => downloads[0].onProgress?.({ receivedBytes: 21 * 1024 * 1024, totalBytes: null }));
+    act(() =>
+      downloads[0].onProgress?.({
+        receivedBytes: 21 * 1024 * 1024,
+        totalBytes: null,
+      }),
+    );
     expect(commits - before).toBe(2);
     expect(screen.getByText("21 MB received")).toBeDefined();
   });
@@ -938,7 +1379,9 @@ describe("ModelViewer loading state", () => {
   it("replaces the loading state with the error overlay on failure", async () => {
     behavior.mode = "throw";
     const frames = holdFrames();
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(frames).toHaveLength(1));
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
 
@@ -954,7 +1397,10 @@ describe("ModelViewer loading state", () => {
   it("shows only the error overlay for an unsupported model format", async () => {
     render(
       <ModelViewer
-        data={makeData({ path: "part.xyz", content_type: "application/octet-stream" })}
+        data={makeData({
+          path: "part.xyz",
+          content_type: "application/octet-stream",
+        })}
         path="part.xyz"
         conversationId="conv_1"
       />,
@@ -971,7 +1417,11 @@ describe("ModelViewer loading state", () => {
   it("leaves no overlay or parse after unmounting mid-download", async () => {
     const downloads = holdDownloads();
     const { unmount } = render(
-      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="big.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads[0]?.onProgress).toBeDefined());
 
@@ -1006,7 +1456,11 @@ describe("ModelViewer loading state", () => {
   it("ignores progress and bytes from a superseded download", async () => {
     const downloads = holdDownloads();
     const { rerender } = render(
-      <ModelViewer data={makeData({ truncated: true })} path="old.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ truncated: true })}
+        path="old.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
     rerender(
@@ -1029,7 +1483,9 @@ describe("ModelViewer loading state", () => {
 
     await act(async () => downloads[1].resolve(new ArrayBuffer(8)));
     await waitFor(() => expect(parseCalls).toEqual(["stl"]));
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe(""),
+    );
   });
 });
 
@@ -1046,24 +1502,32 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
     // (and its ref) stayed mounted under the overlay through the error state.
     behavior.mode = "valid";
     rerender(
-      <ModelViewer data={makeData({ path: "good.stl" })} path="good.stl" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ path: "good.stl" })}
+        path="good.stl"
+        conversationId="conv_1"
+      />,
     );
     // The error overlay gives way to the loading state, then to the model.
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
     expect(screen.queryByText(/Unable to render 3D model/)).toBeNull();
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(parseCalls).toEqual(["stl", "stl"]);
-    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toBe(""),
+    );
   });
 });
 
 describe("ModelViewer teardown", () => {
   it("releases the renderer/WebGL context on a post-init failure (no leak)", async () => {
-    // Renderer is created, then OrbitControls throws — the failure path must
+    // Renderer is created, then TrackballControls throws — the failure path must
     // tear down the already-created renderer (dispose + forceContextLoss)
     // rather than leaking the context until unmount.
-    behavior.orbitThrows = true;
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    behavior.trackballThrows = true;
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     await waitFor(() => expect(lastRenderer?.contextLost).toBe(true));
     expect(lastRenderer?.disposed).toBe(true);
@@ -1088,7 +1552,11 @@ describe("ModelViewer teardown", () => {
     // each texture the material holds.
     behavior.texturedMaterial = true;
     const { unmount } = render(
-      <ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ path: "part.3mf" })}
+        path="part.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(materialTextures.map.disposed).toBe(false);
@@ -1101,7 +1569,11 @@ describe("ModelViewer teardown", () => {
     behavior.texturedMaterial = true;
     behavior.duplicateTexture = true;
     const { unmount } = render(
-      <ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" conversationId="conv_1" />,
+      <ModelViewer
+        data={makeData({ path: "part.3mf" })}
+        path="part.3mf"
+        conversationId="conv_1"
+      />,
     );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
 
@@ -1119,7 +1591,9 @@ function modelBinary(): Uint8Array {
   return bytes;
 }
 
-function gltfDocument(buffer: Record<string, unknown>): Record<string, unknown> {
+function gltfDocument(
+  buffer: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     asset: { version: "2.0" },
     scene: 0,
@@ -1193,7 +1667,9 @@ describe("ModelViewer real GLTFLoader fixtures", () => {
           format: "gltf",
           buffer: ArrayBuffer,
           theme: ReturnType<typeof modelViewerTheme>,
-        ) => Promise<{ object: { traverse: (callback: (child: unknown) => void) => void } }>;
+        ) => Promise<{
+          object: { traverse: (callback: (child: unknown) => void) => void };
+        }>;
       }
     ).parseModel;
   }
@@ -1201,15 +1677,22 @@ describe("ModelViewer real GLTFLoader fixtures", () => {
   it.each([
     ["embedded glTF", embeddedGltfFixture],
     ["binary GLB", glbFixture],
-  ])("parses a minimal valid %s with the real loader", async (_label, fixture) => {
-    const parseModel = await loadRealParser();
-    const parsed = await parseModel("gltf", fixture(), modelViewerTheme("light"));
-    let meshCount = 0;
-    parsed.object.traverse((child) => {
-      if ((child as { isMesh?: boolean }).isMesh) meshCount += 1;
-    });
-    expect(meshCount).toBe(1);
-  });
+  ])(
+    "parses a minimal valid %s with the real loader",
+    async (_label, fixture) => {
+      const parseModel = await loadRealParser();
+      const parsed = await parseModel(
+        "gltf",
+        fixture(),
+        modelViewerTheme("light"),
+      );
+      let meshCount = 0;
+      parsed.object.traverse((child) => {
+        if ((child as { isMesh?: boolean }).isMesh) meshCount += 1;
+      });
+      expect(meshCount).toBe(1);
+    },
+  );
 });
 
 describe("ModelViewer theme awareness", () => {
@@ -1218,7 +1701,9 @@ describe("ModelViewer theme awareness", () => {
 
   it("builds the scene from the active light theme", async () => {
     themeState.resolvedTheme = "light";
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     // The canvas is transparent and no wrapper paints its own background, so
     // the pane's theme token shows through; the STL material tracks the theme.
@@ -1229,7 +1714,9 @@ describe("ModelViewer theme awareness", () => {
 
   it("builds the scene from the active dark theme", async () => {
     themeState.resolvedTheme = "dark";
-    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
     expect(backgroundsPainted()).toEqual([]);
@@ -1255,7 +1742,9 @@ describe("ModelViewer theme awareness", () => {
     // Toggle to dark and re-render with the SAME data/path — the scene must
     // recolor in place rather than rebuild (same renderer, no extra parse).
     themeState.resolvedTheme = "dark";
-    rerender(<ModelViewer data={stableData} path="part.stl" conversationId="conv_1" />);
+    rerender(
+      <ModelViewer data={stableData} path="part.stl" conversationId="conv_1" />,
+    );
     await waitFor(() => expect(lastMaterial?.color).toBe(dark.stlMaterial));
     // The toggle must not paint an opaque per-mode color over the pane.
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
