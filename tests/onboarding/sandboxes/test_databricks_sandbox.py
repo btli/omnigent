@@ -8,6 +8,7 @@ the SDK sends for the launcher and how it maps responses and errors.
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -166,6 +167,9 @@ def test_run_omits_envs_when_none() -> None:
         ({"status": "EXECUTE_COMMAND_STATUS_COMPLETED", "exit_code": 5}, 5, None),
         ({"status": "EXECUTE_COMMAND_STATUS_TIMED_OUT"}, 124, "timed out"),
         ({"status": "EXECUTE_COMMAND_STATUS_FAILED"}, 1, None),
+        # A status this SDK does not know, or none at all, must not read as success.
+        ({"status": "EXECUTE_COMMAND_STATUS_START_FAILED"}, 1, None),
+        ({}, 1, None),
         (
             {"status": "EXECUTE_COMMAND_STATUS_COMPLETED", "exit_code": 0, "truncated": True},
             0,
@@ -358,7 +362,8 @@ def test_start_host_without_proxy_bearer_sets_no_bearer_env() -> None:
     assert not any("proxy-bearer" in " ".join(c["body"]["args"]) for c in api.exec_calls())
 
 
-def test_start_host_logs_under_home_so_the_log_survives_a_stop() -> None:
+def test_host_launch_logs_under_home_and_holds_a_lock() -> None:
+    """$HOME survives a stop; the lock makes a replayed launch exit, not double-start."""
     api = _FakeApi()
     _launcher(api).start_host(
         "sb-1",
@@ -369,15 +374,27 @@ def test_start_host_logs_under_home_so_the_log_survives_a_stop() -> None:
     )
     launch = api.exec_calls()[-1]["body"]["args"][1]
     assert 'mkdir -p "$HOME/.omnigent";' in launch
+    assert 'setsid nohup flock -n "$HOME/.omnigent/host.lock" sh -c ' in launch
     assert '>> "$HOME/.omnigent/host.log"' in launch
-    assert "/tmp" not in launch
 
 
-def test_sdk_without_the_sandbox_service_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    import databricks.sdk
-    import databricks.sdk.config
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda launcher: launcher.prepare(),
+        lambda launcher: launcher.is_running("sb-1"),
+        lambda launcher: launcher.resume("sb-1"),
+        lambda launcher: launcher.run("sb-1", "true"),
+    ],
+    ids=["prepare", "is_running", "resume", "run"],
+)
+def test_sdk_without_the_sandbox_service_asks_for_an_upgrade(
+    monkeypatch: pytest.MonkeyPatch, call: Any
+) -> None:
+    import databricks.sdk.service
 
-    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_kw: SimpleNamespace())
-    monkeypatch.setattr(databricks.sdk.config, "Config", lambda **_kw: None)
+    # Hide the module both ways `from databricks.sdk.service import sandbox` finds it.
+    monkeypatch.delattr(databricks.sdk.service, "sandbox")
+    monkeypatch.setitem(sys.modules, "databricks.sdk.service.sandbox", None)
     with pytest.raises(click.ClickException, match=r"databricks-sdk>=0\.145"):
-        DatabricksSandboxLauncher().prepare()
+        call(DatabricksSandboxLauncher())
