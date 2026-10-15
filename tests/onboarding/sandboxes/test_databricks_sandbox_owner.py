@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from databricks.sdk.service.sandbox import SandboxAPI
 
 from omnigent.onboarding.sandboxes import databricks_sandbox as mod
 from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
@@ -25,6 +26,7 @@ class _FakeApiClient:
 
     def __init__(self, config: _FakeConfig) -> None:
         self._config = config
+        self._cfg = config
         self.calls: list[dict[str, Any]] = []
 
     def do(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -48,6 +50,7 @@ class _FakeConfig:
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self.workspace_id = None
         strategy = kwargs.get("credentials_strategy")
         self._headers = (
             strategy(self)
@@ -64,6 +67,7 @@ class _FakeWorkspaceClient:
     def __init__(self, *, config: _FakeConfig) -> None:
         self.config = config
         self.api_client = _FakeApiClient(config)
+        self.sandbox = SandboxAPI(self.api_client)
 
 
 @pytest.fixture(autouse=True)
