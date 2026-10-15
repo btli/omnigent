@@ -120,7 +120,7 @@ jobs:
           file: deploy/docker/Dockerfile
           target: runtime
           build-args: |
-            OMNIGENT_EXTRAS=kubernetes,openshell,microsandbox,postgres,tracing,databricks,vault,hindsight
+            OMNIGENT_EXTRAS=all,kubernetes,openshell,microsandbox,postgres,tracing,databricks,vault,hindsight
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.source.outputs.server_tags }}
@@ -137,7 +137,7 @@ jobs:
           file: deploy/docker/Dockerfile
           target: host
           build-args: |
-            OMNIGENT_HOST_EXTRAS=antigravity,hindsight
+            OMNIGENT_HOST_EXTRAS=all,antigravity,hindsight
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.source.outputs.host_tags }}
@@ -190,6 +190,34 @@ jobs:
                 kiro-cli --version
                 gh --version
               '
+          done
+
+      - name: Verify all extras in both native images
+        env:
+          SERVER_DIGEST: ${{ needs.build-and-push.outputs.server_digest }}
+          HOST_DIGEST: ${{ needs.build-and-push.outputs.host_digest }}
+        run: |
+          set -euo pipefail
+          for image in "ghcr.io/btli/omnigent-server@${SERVER_DIGEST}" "ghcr.io/btli/omnigent-host@${HOST_DIGEST}"; do
+            docker run --rm -i --entrypoint /opt/venv/bin/python "$image" - <<'PY'
+          from importlib.metadata import metadata, requires, version
+          from packaging.requirements import Requirement
+
+          assert "all" in (metadata("omnigent").get_all("Provides-Extra") or []), "Missing all extra"
+          for value in requires("omnigent") or []:
+              requirement = Requirement(value)
+              if requirement.marker and not requirement.marker.evaluate({"extra": "all"}):
+                  continue
+              installed = version(requirement.name)
+              assert requirement.specifier.contains(installed, prereleases=True), f"{requirement.name} {installed} does not satisfy {requirement.specifier}"
+          import databricks.sdk
+          import opentelemetry.exporter.otlp.proto.grpc.trace_exporter
+          import opentelemetry.exporter.otlp.proto.http.trace_exporter
+          import opentelemetry.instrumentation.fastapi
+          import opentelemetry.instrumentation.httpx
+          import opentelemetry.instrumentation.sqlalchemy
+          print("OK: omnigent[all] dependencies and imports")
+          PY
           done
 
   promote-channel:
