@@ -12,7 +12,7 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
-import { FileRowActions, ROW_MENU_SIZE_SLOT_CLASS, type FileRowInfo } from "./FileRowActions";
+import { FileRowActions, type FileRowInfo } from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -105,7 +105,7 @@ function FileListItem({
         linesRemoved={file.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -116,7 +116,6 @@ function FileListItem({
             )}
           >
             <button
-              ref={primaryActionRef}
               type="button"
               className={cn(
                 "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
@@ -175,17 +174,12 @@ function FileListItem({
             {/* File size at rest, replaced by copy/download actions on hover — the
             same far-right slot used by the Files tree. */}
             <span
-              className={cn(
-                "relative flex shrink-0 items-center justify-end",
-                ROW_META_SLOT_CLASS,
-                ROW_MENU_SIZE_SLOT_CLASS,
-                "pointer-coarse:justify-start",
-              )}
+              className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
             >
               {file.bytes !== null && !isDeleted && (
                 <span
                   className={cn(
-                    "mr-6 w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
+                    "w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
                     actionsOpen && "invisible",
                   )}
                 >
@@ -199,7 +193,6 @@ function FileListItem({
                   <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 )}
                 <CopyPathButton path={file.path} revealOnHover />
-                {moreActions}
               </span>
             </span>
           </div>
