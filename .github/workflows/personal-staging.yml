@@ -216,6 +216,25 @@ jobs:
           ref: ${{ needs.integrate.outputs.staging_sha }}
           persist-credentials: false
 
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Verify composed MCP routes and credential policies
+        env:
+          OMNIGENT_SKIP_WEB_UI: "true"
+        run: |
+          uv run --frozen --extra all --group test python -m pytest --reruns 0 \
+            tests/server/integration/test_mcp_proxy.py \
+            tests/server/integration/test_mcp_gateway_http.py \
+            tests/server/routes/test_sessions_mcp_proxy_policy_retry.py
+
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
