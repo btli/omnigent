@@ -14,7 +14,7 @@ vi.mock("@/store/chatStore", () => ({
 }));
 vi.mock("@/lib/host", async (importOriginal) => ({
   ...(await importOriginal<typeof HostModule>()),
-  isDatabricksWorkspace: vi.fn(() => false),
+  isHostRoutingEnabled: vi.fn(() => false),
 }));
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridgeModule>()),
@@ -24,7 +24,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 }));
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
-import { isDatabricksWorkspace } from "@/lib/host";
+import { isHostRoutingEnabled } from "@/lib/host";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "@/lib/sessionHost";
 import { useChatStore } from "@/store/chatStore";
@@ -92,6 +92,7 @@ function stubChatStore(state: Partial<ChatStoreState> = {}) {
 
 beforeEach(() => {
   fetchMock.mockReset();
+  vi.mocked(isHostRoutingEnabled).mockReturnValue(false);
   vi.stubGlobal("fetch", fetchMock);
   fetchMock.mockResolvedValue(
     jsonResponse({
@@ -109,6 +110,8 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  vi.useRealTimers();
+  setSessionHost("sess_routed", null);
   // restore (not just reset) so any `vi.spyOn` a test installs is removed even
   // if that test threw before its own cleanup — otherwise a leaked
   // `document.createElement` spy is recaptured as the "original" by the next
@@ -181,13 +184,14 @@ describe("fileContentToBlob", () => {
 
 describe("triggerBrowserDownload", () => {
   it("creates and clicks a synthetic link then removes it", () => {
+    vi.useFakeTimers();
     const blob = new Blob(["data"], { type: "text/plain" });
     const createdLinks: HTMLAnchorElement[] = [];
     const origCreateElement = document.createElement.bind(document);
     vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
       const el = origCreateElement(tag);
       if (tag === "a") {
-        vi.spyOn(el as HTMLAnchorElement, "click");
+        vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {});
         createdLinks.push(el as HTMLAnchorElement);
       }
       return el;
@@ -206,6 +210,9 @@ describe("triggerBrowserDownload", () => {
     expect(link.click).toHaveBeenCalledOnce();
     // Element must have been removed from the DOM.
     expect(document.body.contains(link)).toBe(false);
+    // The browser consumes the blob after click() returns, so revoking now aborts it.
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(60_000);
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:fake");
 
     vi.restoreAllMocks();
@@ -260,7 +267,7 @@ describe("downloadWorkspaceFile", () => {
   });
 
   it.each([
-    ["the managed embed", isDatabricksWorkspace],
+    ["a host-routed deployment", isHostRoutingEnabled],
     ["the iOS shell", isIOSShell],
     ["the Android shell", isAndroidShell],
     ["the Electron shell", isElectronShell],
@@ -292,7 +299,10 @@ describe("downloadWorkspaceFile", () => {
 
   it("preserves host routing when downloading in Electron", async () => {
     vi.mocked(isElectronShell).mockReturnValueOnce(true);
-    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    // Electron alone picks the fetch path; the slice key still needs host routing,
+    // which this file mocks off by default.
+    vi.mocked(isHostRoutingEnabled).mockReturnValueOnce(false).mockReturnValue(true);
+    onTestFinished(() => vi.mocked(isHostRoutingEnabled).mockReturnValue(false));
     setSessionHost("sess_desktop", "host_desktop");
     onTestFinished(() => setSessionHost("sess_desktop", null));
     const file = new Blob([new Uint8Array([0, 255, 1, 128])]);
@@ -316,6 +326,26 @@ describe("downloadWorkspaceFile", () => {
     );
   });
 
+  it("carries the slice key on a host-routed standalone deployment", async () => {
+    // A bare anchor can't send the slice-key header, so it lands on a replica
+    // without the session's host tunnel.
+    vi.mocked(isHostRoutingEnabled).mockReturnValue(true);
+    setSessionHost("sess_routed", "host_routed");
+    const file = new Blob(["routed"]);
+    fetchMock.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+      const key = new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key");
+      return key === "host_routed"
+        ? blobResponse(file)
+        : { ok: false, status: 400, statusText: "Wrong replica" };
+    });
+    const clicked = captureDownloadClicks();
+    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:routed"), revokeObjectURL: vi.fn() });
+
+    await downloadWorkspaceFile("sess_routed", "report.bin");
+
+    expect(clicked).toEqual([["blob:routed", "report.bin"]]);
+  });
+
   it("names the host base for an absolute path alongside download=true", async () => {
     const clicked = captureDownloadClicks();
 
@@ -331,7 +361,7 @@ describe("downloadWorkspaceFile", () => {
     vi.restoreAllMocks();
   });
   it.each([
-    ["the managed embed", isDatabricksWorkspace],
+    ["a host-routed deployment", isHostRoutingEnabled],
     ["the Electron shell", isElectronShell],
   ])("propagates fetch errors to the caller in %s", async (_label, predicate) => {
     vi.mocked(predicate).mockReturnValueOnce(true);
