@@ -1,6 +1,6 @@
 """Owner-identity mode of the Databricks Sandbox launcher.
 
-With ``identity="owner"`` every Sandbox REST call and the in-sandbox proxy
+With ``identity="owner"`` every Sandbox API call and the in-sandbox proxy
 bearer use the host owner's connected Databricks token — never the server's
 own identity — and an unconnected owner is refused. The SDK client is replaced
 by fakes that capture how the launcher builds it, so these tests pin which

@@ -348,7 +348,7 @@ def test_instantiate_rejects_non_launcher_class(
 
 
 def test_databricks_provider_is_builtin_and_instantiates_without_extras() -> None:
-    """The REST launcher needs no optional SDK beyond the databricks extra."""
+    """Instantiating the launcher touches no SDK; it is imported on first use."""
     reset_plugin_state_for_tests()
     assert "databricks" in available_providers()
     launcher = instantiate("databricks")

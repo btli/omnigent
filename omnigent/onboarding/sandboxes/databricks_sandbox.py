@@ -45,10 +45,12 @@ by, and only holds a credential for, its owner. A user who has not connected
 Databricks is refused with :class:`OwnerCredentialMissingError`; there is no
 fallback to the server identity.
 
-The SDK's default HTTP client retries timed-out requests, which re-executes a
-non-idempotent command. The exec client is therefore built with an HTTP
-timeout above the longest execution timeout this launcher requests, so a long
-command never trips the client-side timeout in the first place.
+The SDK retries a request after a connection error or timeout, so an exec can
+run twice. Commands are therefore safe to repeat or fail loudly (a re-run clone
+hits its existing directory), and the host launch holds a lock
+(:data:`_HOST_LOCK`) so a replayed launch exits instead of starting a second
+host. The HTTP timeout sits above the longest execution timeout so a slow
+command is not cut off and retried client-side.
 """
 
 from __future__ import annotations
@@ -83,8 +85,8 @@ if TYPE_CHECKING:
 # Longest single remote command (git clone of a large repo, a bootstrap
 # install). The server clamps execution_timeout to its own ceiling.
 _EXEC_TIMEOUT_S: int = 1800
-# Client HTTP timeout for exec calls: above _EXEC_TIMEOUT_S so the SDK never
-# times out (and retries, i.e. re-runs) a still-executing command.
+# Client HTTP timeout for exec calls: above _EXEC_TIMEOUT_S so a still-running
+# command is not cut off client-side (which the SDK would retry).
 _EXEC_HTTP_TIMEOUT_S: int = _EXEC_TIMEOUT_S + 120
 _STATE_TIMEOUT_S: float = 600.0
 _STATE_POLL_S: float = 1.0
@@ -92,6 +94,13 @@ _STATE_POLL_S: float = 1.0
 # Under $HOME, the only sandbox storage that survives a stop / resume cycle.
 _HOST_LOG_DIR: str = "$HOME/.omnigent"
 _HOST_LOG: str = f"{_HOST_LOG_DIR}/host.log"
+# Held by the running host supervisor; a replayed launch fails to take it and exits.
+_HOST_LOCK: str = f"{_HOST_LOG_DIR}/host.lock"
+
+_SDK_TOO_OLD = (
+    "the 'databricks' sandbox provider needs databricks-sdk>=0.145 "
+    "(pip install -U 'omnigent[databricks]')"
+)
 
 #: Seconds an owner-identity launcher reuses one resolved owner token before
 #: asking the server again. The server's resolver refreshes tokens well before
@@ -112,6 +121,15 @@ _HOME_PRELUDE: str = (
     # must shadow the image's baked /usr/local/bin/omnigent.
     'export PATH="$HOME/.local/bin:$PATH"; '
 )
+
+
+def _sandbox_sdk() -> Any:
+    """The SDK's ``databricks.sdk.service.sandbox`` module, or an upgrade error."""
+    try:
+        from databricks.sdk.service import sandbox
+    except ImportError as exc:
+        raise click.ClickException(_SDK_TOO_OLD) from exc
+    return sandbox
 
 
 def _resource_name(sandbox_id: str) -> str:
@@ -316,6 +334,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     def _workspace_client(self) -> Any:
         """Return the SDK ``WorkspaceClient`` (built lazily, cached)."""
         if self._client is None:
+            _sandbox_sdk()
             try:
                 from databricks.sdk import WorkspaceClient
                 from databricks.sdk.config import Config
@@ -337,13 +356,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 kwargs["credentials_strategy"] = _owner_token_strategy(self._owner_access_token)
             elif self._profile:
                 kwargs["profile"] = self._profile
-            client = WorkspaceClient(config=Config(**kwargs))
-            if not hasattr(client, "sandbox"):
-                raise click.ClickException(
-                    "the 'databricks' sandbox provider needs databricks-sdk>=0.145 "
-                    "(pip install -U 'omnigent[databricks]')"
-                )
-            self._client = client
+            self._client = WorkspaceClient(config=Config(**kwargs))
         return self._client
 
     def _sandboxes(self) -> Any:
@@ -395,23 +408,22 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     def provision(self, name: str) -> str:
         """Create a sandbox labelled *name* and wait for it to run."""
-        from databricks.sdk.service.sandbox import ComputeSpec, Sandbox, SandboxSpec, SandboxState
-
+        sdk = _sandbox_sdk()
         sandbox_id = f"{self._prefix}-{secrets.token_hex(5)}"
         spec = None
         if self._inactivity_timeout_s is not None:
             timeout = _duration(self._inactivity_timeout_s)
-            spec = SandboxSpec(compute=ComputeSpec(inactivity_timeout=timeout))
+            spec = sdk.SandboxSpec(compute=sdk.ComputeSpec(inactivity_timeout=timeout))
         click.echo(f"▸ Creating Databricks Sandbox '{sandbox_id}' ({name})")
         try:
             self._sandboxes().create_sandbox(
-                Sandbox(display_name=name, spec=spec), sandbox_id=sandbox_id
+                sdk.Sandbox(display_name=name, spec=spec), sandbox_id=sandbox_id
             )
         except Exception as exc:
             _reraise_owner_refusal(exc)
             raise click.ClickException(f"could not create a Databricks Sandbox: {exc}") from exc
         try:
-            waited = self._wait_for(sandbox_id, SandboxState.SANDBOX_STATE_RUNNING)
+            waited = self._wait_for(sandbox_id, sdk.SandboxState.SANDBOX_STATE_RUNNING)
         except Exception:
             self.terminate(sandbox_id)
             raise
@@ -420,15 +432,14 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     def resume(self, sandbox_id: str) -> None:
         """Start a stopped (or stopping) sandbox in place and wait for RUNNING."""
-        from databricks.sdk.service.sandbox import SandboxState
-
+        states = _sandbox_sdk().SandboxState
         state = _state_of(self._get(sandbox_id))
-        if state == SandboxState.SANDBOX_STATE_RUNNING:
+        if state == states.SANDBOX_STATE_RUNNING:
             return
-        if state == SandboxState.SANDBOX_STATE_STOPPING:
-            self._wait_for(sandbox_id, SandboxState.SANDBOX_STATE_STOPPED)
-            state = SandboxState.SANDBOX_STATE_STOPPED
-        if state == SandboxState.SANDBOX_STATE_STOPPED:
+        if state == states.SANDBOX_STATE_STOPPING:
+            self._wait_for(sandbox_id, states.SANDBOX_STATE_STOPPED)
+            state = states.SANDBOX_STATE_STOPPED
+        if state == states.SANDBOX_STATE_STOPPED:
             click.echo(f"▸ Starting Databricks Sandbox '{sandbox_id}'")
             try:
                 self._sandboxes().start_sandbox(_resource_name(sandbox_id))
@@ -443,24 +454,23 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                     raise click.ClickException(
                         f"could not start Databricks Sandbox '{sandbox_id}': {exc}"
                     ) from exc
-        self._wait_for(sandbox_id, SandboxState.SANDBOX_STATE_RUNNING)
+        self._wait_for(sandbox_id, states.SANDBOX_STATE_RUNNING)
 
     def is_running(self, sandbox_id: str) -> bool | None:
         """Map the control-plane state onto running / not running / unknown."""
-        from databricks.sdk.service.sandbox import SandboxState
-
+        states = _sandbox_sdk().SandboxState
         try:
             state = _state_of(self._get(sandbox_id))
         except SandboxGoneError:
             return False
         except click.ClickException:
             return None
-        if state == SandboxState.SANDBOX_STATE_RUNNING:
+        if state == states.SANDBOX_STATE_RUNNING:
             return True
         if state in (
-            SandboxState.SANDBOX_STATE_STOPPED,
-            SandboxState.SANDBOX_STATE_STOPPING,
-            SandboxState.SANDBOX_STATE_PENDING,
+            states.SANDBOX_STATE_STOPPED,
+            states.SANDBOX_STATE_STOPPING,
+            states.SANDBOX_STATE_PENDING,
         ):
             return False
         return None
@@ -494,8 +504,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             API request body, so secrets passed here never appear in the
             sandbox's process argv (unlike an ``ENV=value cmd`` prefix).
         """
-        from databricks.sdk.service.sandbox import ExecuteCommandStatus
-
+        statuses = _sandbox_sdk().ExecuteCommandStatus
         try:
             response = self._sandboxes().execute_command_sync(
                 _resource_name(sandbox_id),
@@ -518,11 +527,12 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         stderr = response.stderr or ""
         if response.truncated:
             stderr += "\n[omnigent: output truncated by the sandbox exec API]\n"
-        if status == ExecuteCommandStatus.EXECUTE_COMMAND_STATUS_TIMED_OUT:
+        if status == statuses.EXECUTE_COMMAND_STATUS_TIMED_OUT:
             returncode = 124
             stderr += f"\n[omnigent: command timed out after {_EXEC_TIMEOUT_S}s]\n"
         elif response.exit_code is None:
-            returncode = 1 if status == ExecuteCommandStatus.EXECUTE_COMMAND_STATUS_FAILED else 0
+            # An unrecognized status decodes to None; treat it as a failure.
+            returncode = 0 if status == statuses.EXECUTE_COMMAND_STATUS_COMPLETED else 1
         else:
             returncode = int(response.exit_code)
         if check and returncode != 0:
@@ -563,12 +573,11 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         would defeat the platform's idle stop. A stopped host is revived by the
         wake path, whose :meth:`start_host` writes a fresh bearer anyway.
         """
-        from databricks.sdk.service.sandbox import SandboxState
-
         if not self._proxy_bearer:
             return None
+        states = _sandbox_sdk().SandboxState
         try:
-            if _state_of(self._get(sandbox_id)) != SandboxState.SANDBOX_STATE_RUNNING:
+            if _state_of(self._get(sandbox_id)) != states.SANDBOX_STATE_RUNNING:
                 return None
             self._write_proxy_bearer(sandbox_id)
         except (click.ClickException, SandboxGoneError) as exc:
@@ -623,7 +632,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         # Double-quoted (not shlex-quoted) so the remote shell expands $HOME.
         launch = (
             f'mkdir -p "{_HOST_LOG_DIR}"; '
-            f"setsid nohup sh -c {shlex.quote(supervised)} "
+            f'setsid nohup flock -n "{_HOST_LOCK}" sh -c {shlex.quote(supervised)} '
             f'>> "{_HOST_LOG}" 2>&1 < /dev/null & echo launched'
         )
         self.run(
