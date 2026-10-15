@@ -38,6 +38,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.name_template import NameTemplateError, validate_name_template
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -215,6 +216,14 @@ def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
         "finished_at": run.finished_at,
         "error_code": run.error_code,
     }
+
+
+def _validate_name_template_or_400(name: str) -> None:
+    """Raise a 400 for invalid date placeholders in a task name."""
+    try:
+        validate_name_template(name)
+    except NameTemplateError as exc:
+        raise OmnigentError(f"invalid name template: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 async def _validate_rrule_or_400(rrule: str) -> None:
@@ -417,6 +426,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        _validate_name_template_or_400(body.name)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         if "project_id" in body.model_fields_set and body.project_id is None:
             raise OmnigentError(
@@ -639,6 +649,8 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        if body.name is not None and body.name != existing.name:
+            _validate_name_template_or_400(body.name)
         if "project_id" in body.model_fields_set:
             if body.project_id is None:
                 raise OmnigentError(
