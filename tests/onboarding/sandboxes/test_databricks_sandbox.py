@@ -19,7 +19,7 @@ from databricks.sdk.service.sandbox import SandboxAPI
 
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes import databricks_sandbox as mod
-from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.base import SandboxCapabilityError, SandboxGoneError
 from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
 from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
 
@@ -93,6 +93,7 @@ def _launcher(api: _FakeApi, **kwargs: Any) -> DatabricksSandboxLauncher:
 def test_capabilities_declare_managed_resumable_terminable() -> None:
     caps = DatabricksSandboxLauncher().capabilities
     assert caps.managed_launch and caps.resume_stopped and caps.programmatic_terminate
+    assert caps.streaming_exec and caps.foreground_exec
     assert not caps.cli_bootstrap and not caps.local_port_forward
     assert DatabricksSandboxLauncher.provider == "databricks"
 
@@ -396,5 +397,125 @@ def test_sdk_without_the_sandbox_service_asks_for_an_upgrade(
     # Hide the module both ways `from databricks.sdk.service import sandbox` finds it.
     monkeypatch.delattr(databricks.sdk.service, "sandbox")
     monkeypatch.setitem(sys.modules, "databricks.sdk.service.sandbox", None)
-    with pytest.raises(click.ClickException, match=r"databricks-sdk>=0\.145"):
+    with pytest.raises(click.ClickException, match=r"databricks-sdk\[sandbox\]>=0\.153"):
         call(DatabricksSandboxLauncher())
+
+
+# ── Streaming exec ──────────────────────────────────────────────────────────
+
+
+class _FakeCommand:
+    """Stand-in for the SDK's ``CommandProcess``: lines, a pid, an exit code."""
+
+    def __init__(self, lines: list[str], *, exit_code: int | None = 0) -> None:
+        self.stdout = iter(lines)
+        self.pid = 4242
+        self.exit_code = exit_code
+        self.closed = 0
+
+    def wait(self) -> int:
+        assert self.exit_code is not None
+        return self.exit_code
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def _streaming(api: _FakeApi, command: _FakeCommand | Exception) -> tuple[Any, list[dict]]:
+    launcher = _launcher(api)
+    started: list[dict[str, Any]] = []
+
+    def execute_command(name: str, cmd: str, **kwargs: Any) -> _FakeCommand:
+        started.append({"name": name, "cmd": cmd, **kwargs})
+        if isinstance(command, Exception):
+            raise command
+        return command
+
+    launcher._client.sandbox.execute_command = execute_command
+    return launcher, started
+
+
+def test_stream_exec_streams_merged_output_and_exit_code() -> None:
+    from databricks.sdk.mixins.sandbox import StreamMode
+
+    api = _FakeApi()
+    command = _FakeCommand(["Visit https://login\n", "done\n"], exit_code=3)
+    launcher, started = _streaming(api, command)
+
+    process = launcher.stream_exec("sb-1", "omnigent login https://srv")
+    assert list(process.lines) == ["Visit https://login\n", "done\n"]
+    assert process.wait() == 3
+    process.close()
+
+    (call,) = started
+    assert call["name"] == "sandboxes/sb-1"
+    assert call["args"][1].endswith("omnigent login https://srv")
+    assert call["stderr"] is StreamMode.STDOUT
+    assert command.closed == 1
+    assert api.exec_calls() == []  # finished: nothing to kill
+
+
+def test_stream_exec_close_stops_a_running_command_once() -> None:
+    api = _FakeApi()
+    command = _FakeCommand([], exit_code=None)
+    launcher, _ = _streaming(api, command)
+
+    process = launcher.stream_exec("sb-1", "sleep 600")
+    process.close()
+    process.close()
+
+    (kill,) = api.exec_calls()
+    assert kill["body"]["args"][1].endswith("pkill -TERM -P 4242; kill -TERM 4242")
+    assert command.closed == 1
+
+
+def test_stream_exec_refuses_a_pty() -> None:
+    launcher, started = _streaming(_FakeApi(), _FakeCommand([]))
+    with pytest.raises(SandboxCapabilityError):
+        launcher.stream_exec("sb-1", "omnigent login https://srv", pty=True)
+    assert started == []
+
+
+class _GrpcNotFound(Exception):
+    """Shape of a ``grpc.RpcError`` for a missing sandbox."""
+
+    def code(self) -> Any:
+        return SimpleNamespace(name="NOT_FOUND")
+
+
+@pytest.mark.parametrize("error", [NotFound("gone"), _GrpcNotFound()], ids=["rest", "grpc"])
+def test_stream_exec_on_missing_sandbox_raises_gone(error: Exception) -> None:
+    launcher, _ = _streaming(_FakeApi(), error)
+    with pytest.raises(SandboxGoneError):
+        launcher.stream_exec("sb-1", "true")
+
+
+def test_exec_foreground_echoes_output_and_returns_the_exit_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    launcher, started = _streaming(_FakeApi(), _FakeCommand(["host up\n"], exit_code=0))
+
+    assert launcher.exec_foreground("sb-1", "omnigent host --server https://srv") == 0
+
+    assert "host up" in capsys.readouterr().out
+    (call,) = started
+    assert call["args"][1].endswith("exec omnigent host --server https://srv")
+    assert call["envs"] == {"TERM": "xterm-256color"}
+
+
+def test_exec_foreground_ctrl_c_stops_the_remote_command() -> None:
+    api = _FakeApi()
+    command = _FakeCommand([], exit_code=None)
+
+    def interrupted() -> Any:
+        raise KeyboardInterrupt
+        yield
+
+    command.stdout = interrupted()
+    launcher, _ = _streaming(api, command)
+
+    with pytest.raises(KeyboardInterrupt):
+        launcher.exec_foreground("sb-1", "omnigent host --server https://srv")
+
+    (kill,) = api.exec_calls()
+    assert "kill -TERM 4242" in kill["body"]["args"][1]

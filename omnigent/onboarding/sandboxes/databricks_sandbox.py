@@ -3,36 +3,16 @@ Databricks Sandbox launcher over the SDK's Sandbox service.
 
 Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher` for
 `Databricks Sandbox <https://docs.databricks.com/aws/en/compute/serverless/sandbox>`_
-through ``databricks-sdk``'s generated ``WorkspaceClient.sandbox`` service
-(``databricks-sdk>=0.145``): create / get / start / delete for lifecycle and
-``execute_command_sync`` for every remote command. Using the generated client
-means a server-side contract change is absorbed by an SDK bump.
+through ``databricks-sdk``'s ``WorkspaceClient.sandbox`` service
+(``databricks-sdk>=0.153``): create / get / start / delete for lifecycle,
+``execute_command_sync`` for remote commands, and the streaming
+``execute_command`` for :meth:`~DatabricksSandboxLauncher.stream_exec` and
+:meth:`~DatabricksSandboxLauncher.exec_foreground`. Using the SDK client means
+a server-side contract change is absorbed by an SDK bump.
 
 There is no SSH, no CLI subprocess, and no gateway port to reach, so the
 server works anywhere that can call the workspace API over HTTPS
 (including Databricks Apps compute, whose DNS stubs the SSH gateway).
-
-Platform behavior this launcher is built on (measured live, 2026-10-01):
-
-- Create returns ``PENDING`` and the box is ``RUNNING`` within a
-  few seconds; the image already ships ``omnigent``, ``git``, ``tmux``,
-  ``uv``, ``node``, and the ``databricks`` CLI, with a Databricks token for the
-  creating identity pre-provisioned (``DATABRICKS_CONFIG_FILE``).
-- ``execute_command_sync`` runs as ``sandbox-agent`` but with ``HOME=/root``,
-  which that user cannot write. Every command is therefore wrapped to export
-  the passwd home directory first.
-- Output is capped at 512 KiB per stream (``truncated=true`` past it) and the
-  call blocks until every holder of the stdout/stderr pipes exits — a plain
-  ``cmd &`` hangs the request. ``setsid nohup … >log 2>&1 </dev/null &``
-  returns at once and the detached process outlives the call, which is what
-  :meth:`~omnigent.onboarding.sandboxes.base.SandboxExecTransport.run_background`
-  already emits.
-- ``execution_timeout`` is honored (``TIMED_OUT`` status, no exit code).
-- Stopping kills every process; starting does **not** restart the
-  host. The managed wake path (:func:`omnigent.server.managed_hosts.
-  resume_managed_host`) calls :meth:`resume` and then re-runs
-  :meth:`start_host`, which is exactly the re-bootstrap this provider needs.
-- An exec against a ``STOPPED`` sandbox transparently starts it.
 
 Identity. By default the launcher acts as one deployment-wide identity (a
 config profile, or ``DATABRICKS_*`` env such as a Databricks App's service
@@ -67,6 +47,7 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes.base import (
     OwnerCredentialMissingError,
     RemoteCommandResult,
+    RemoteProcess,
     SandboxGoneError,
     SandboxLauncher,
     render_host_config_write_command,
@@ -76,7 +57,7 @@ from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_n
 from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from databricks.sdk.service.sandbox import SandboxState
 
@@ -98,7 +79,7 @@ _HOST_LOG: str = f"{_HOST_LOG_DIR}/host.log"
 _HOST_LOCK: str = f"{_HOST_LOG_DIR}/host.lock"
 
 _SDK_TOO_OLD = (
-    "the 'databricks' sandbox provider needs databricks-sdk>=0.145 "
+    "the 'databricks' sandbox provider needs databricks-sdk[sandbox]>=0.153 "
     "(pip install -U 'omnigent[databricks]')"
 )
 
@@ -126,6 +107,7 @@ _HOME_PRELUDE: str = (
 def _sandbox_sdk() -> Any:
     """The SDK's ``databricks.sdk.service.sandbox`` module, or an upgrade error."""
     try:
+        from databricks.sdk.mixins.sandbox import StreamMode  # noqa: F401 - streaming, 0.153+
         from databricks.sdk.service import sandbox
     except ImportError as exc:
         raise click.ClickException(_SDK_TOO_OLD) from exc
@@ -151,10 +133,13 @@ def _state_of(sandbox: Any) -> SandboxState | None:
 
 
 def _is_not_found(exc: Exception) -> bool:
-    """Whether an SDK error is a 404 / NOT_FOUND."""
+    """Whether an SDK error is a 404 / NOT_FOUND (REST or gRPC)."""
     from databricks.sdk.errors import NotFound
 
-    return isinstance(exc, NotFound)
+    if isinstance(exc, NotFound):
+        return True
+    code = getattr(exc, "code", None)  # grpc.RpcError from a streaming exec
+    return callable(code) and getattr(code(), "name", "") == "NOT_FOUND"
 
 
 def _reraise_owner_refusal(exc: Exception) -> None:
@@ -197,6 +182,33 @@ def _owner_token_strategy(token: Callable[[], str]) -> Any:
             return lambda: {"Authorization": f"Bearer {token()}"}
 
     return _OwnerTokenStrategy()
+
+
+class _DatabricksRemoteProcess(RemoteProcess):
+    """:class:`RemoteProcess` over an SDK ``CommandProcess`` (stderr merged into stdout)."""
+
+    def __init__(self, process: Any, kill: Callable[[int], None]) -> None:
+        self._process = process
+        self._kill = kill
+        self._lines: Iterator[str] = iter(process.stdout)
+        self._closed = False
+
+    @property
+    def lines(self) -> Iterator[str]:
+        return self._lines
+
+    def wait(self) -> int:
+        return int(self._process.wait())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # The SDK's close() only drops the client stream; the command keeps
+        # running, so stop it by the pid its start event reported.
+        if self._process.exit_code is None and self._process.pid:
+            self._kill(int(self._process.pid))
+        self._process.close()
 
 
 class DatabricksSandboxLauncher(SandboxLauncher):
@@ -266,7 +278,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     @property
     def capabilities(self) -> SandboxCapabilities:
-        """Managed launch + resume + terminate; no CLI-bootstrap transport."""
+        """Managed launch + resume + terminate + non-PTY streaming exec."""
         return SandboxCapabilities(
             cli_bootstrap=False,
             managed_launch=True,
@@ -274,8 +286,8 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             resume_stopped=True,
             programmatic_terminate=True,
             file_copy=False,
-            streaming_exec=False,
-            foreground_exec=False,
+            streaming_exec=True,
+            foreground_exec=True,
             git_clone_options=True,
         )
 
@@ -543,6 +555,65 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             )
         return RemoteCommandResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
+    # ── Streaming exec ──────────────────────────────────
+
+    def _kill_tree(self, sandbox_id: str, pid: int) -> None:
+        """SIGTERM *pid* and its children (the shell may have forked the command)."""
+        self.run(sandbox_id, f"pkill -TERM -P {pid}; kill -TERM {pid}", check=False)
+
+    def stream_exec(self, sandbox_id: str, command: str, *, pty: bool = False) -> RemoteProcess:
+        """Spawn *command* and stream its combined output; ``close()`` stops it.
+
+        The SDK starts a streaming command exactly once (no retry), unlike
+        :meth:`run`. The Sandbox API has no PTY, so ``pty=True`` is refused.
+        """
+        return self._stream(sandbox_id, command, pty=pty)
+
+    def _stream(
+        self,
+        sandbox_id: str,
+        command: str,
+        *,
+        pty: bool = False,
+        envs: dict[str, str] | None = None,
+    ) -> RemoteProcess:
+        if pty:
+            raise self._capability_error("stream a remote process with a PTY")
+        from databricks.sdk.mixins.sandbox import StreamMode
+
+        try:
+            process = self._sandboxes().execute_command(
+                _resource_name(sandbox_id),
+                "/bin/bash",
+                args=["-c", _HOME_PRELUDE + command],
+                envs=envs,
+                stderr=StreamMode.STDOUT,
+            )
+        except Exception as exc:
+            _reraise_owner_refusal(exc)
+            if _is_not_found(exc):
+                raise SandboxGoneError(
+                    f"Databricks Sandbox '{sandbox_id}' no longer exists"
+                ) from exc
+            raise click.ClickException(
+                f"could not start a command on Databricks Sandbox '{sandbox_id}': {exc}"
+            ) from exc
+        return _DatabricksRemoteProcess(process, lambda pid: self._kill_tree(sandbox_id, pid))
+
+    def exec_foreground(self, sandbox_id: str, command: str) -> int:
+        """Run *command*, echoing its output locally until it exits; Ctrl-C stops it."""
+        # Native harnesses spawn tmux, which refuses a dumb/unset TERM.
+        process = self._stream(sandbox_id, f"exec {command}", envs={"TERM": "xterm-256color"})
+        try:
+            for line in process.lines:
+                click.echo(line, nl=False)
+            return process.wait()
+        except KeyboardInterrupt:
+            click.echo("\n  → detaching; stopping the remote process")
+            raise
+        finally:
+            process.close()
+
     # ── Front-door bearer (Databricks Apps OAuth proxy) ──
 
     def _current_bearer(self) -> str:
@@ -629,7 +700,9 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         # detached supervisor and every host restart — never in argv, where any
         # process in the sandbox could read it from `ps`.
         supervised = supervise_host_command(f"omnigent host --server {shlex.quote(server_url)}")
-        # Double-quoted (not shlex-quoted) so the remote shell expands $HOME.
+        # exec-sync waits on every holder of its pipes, so the host must fully
+        # detach (setsid, redirects, </dev/null). Paths are double-quoted (not
+        # shlex-quoted) so the remote shell expands $HOME.
         launch = (
             f'mkdir -p "{_HOST_LOG_DIR}"; '
             f'setsid nohup flock -n "{_HOST_LOCK}" sh -c {shlex.quote(supervised)} '
