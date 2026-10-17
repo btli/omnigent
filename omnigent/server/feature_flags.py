@@ -29,6 +29,7 @@ class Feature(StrEnum):
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     MOBILE_PUSH = "mobile_push"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
+    HOST_STATS = "host_stats"
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.SIDEBAR_GROUPING_UI,
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
+        review_by_release="0.19.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
         review_by_release="0.19.0",
     ),
 )
