@@ -137,7 +137,8 @@ class _RunnerStreamResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            await self._upstream.aclose()
+            with anyio.CancelScope(shield=True):
+                await self._upstream.aclose()
 
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
