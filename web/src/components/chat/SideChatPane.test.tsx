@@ -796,7 +796,7 @@ describe("side-chat slash commands", () => {
       "> a selection\n\n/review",
       "agent_side",
       undefined,
-      { pinnedConversationId: childId },
+      { pinnedConversationId: childId, onError: expect.any(Function) },
     );
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
@@ -815,6 +815,7 @@ describe("side-chat slash commands", () => {
     fireEvent.click(screen.getByTestId("side-chat-send"));
     expect(send).toHaveBeenCalledExactlyOnceWith(input, "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
