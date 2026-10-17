@@ -424,13 +424,12 @@ default-groups = []
 # shared dependencies like databricks-sdk.
 #   cwsandbox:  protobuf<7 (cwsandbox itself)
 #   modal:      protobuf<7 (modal itself)
-#   databricks: protobuf<7 (databricks-sdk>=0.56 caps at <7.0)
 #   lint group: protobuf<7 (grpcio-tools<=1.81.1 requires protobuf<7) — only
-#               conflicts with antigravity, not with cwsandbox/modal/databricks
+#               conflicts with antigravity, not with cwsandbox/modal
+# `databricks` needs no entry: databricks-sdk>=0.153 accepts protobuf 7.
 conflicts = [
     [{ extra = "antigravity" }, { extra = "cwsandbox" }],
     [{ extra = "antigravity" }, { extra = "modal" }],
-    [{ extra = "antigravity" }, { extra = "databricks" }],
     [{ group = "lint" }, { extra = "antigravity" }],
 ]
 
