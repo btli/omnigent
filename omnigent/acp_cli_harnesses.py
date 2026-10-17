@@ -91,7 +91,9 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
     # ``grok agent --always-approve stdio``. Ships via a curl installer (not
     # npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no
-    # credential.
+    # credential. ``--always-approve`` makes Grok approve tool calls itself, so
+    # Omnigent's TOOL_CALL policy (DENY/ASK, approval cards, permission_mode)
+    # never sees them.
     "grok": AcpCliHarness(
         install=HarnessInstallSpec(
             "Grok Build",
