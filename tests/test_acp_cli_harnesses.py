@@ -204,6 +204,16 @@ def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.binary == "fakecli"
 
 
+def test_grok_spawn_command_includes_always_approve() -> None:
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+
+    assert shlex.split(env["HARNESS_ACP_COMMAND"])[1:] == [
+        "agent",
+        "--always-approve",
+        "stdio",
+    ]
+
+
 def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rows that opt out of MCP injection must propagate that to the wrap.
 
