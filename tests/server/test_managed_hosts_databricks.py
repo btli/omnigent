@@ -56,6 +56,7 @@ def test_provider_and_server_url_alone_use_defaults() -> None:
     assert launcher._profile is None
     assert launcher._prefix == "omnigent"
     assert launcher._proxy_bearer is False
+    assert launcher.owner_credential_provider is None  # identity defaults to "server"
 
 
 def test_unknown_keys_are_rejected() -> None:
@@ -95,12 +96,6 @@ def test_owner_identity_and_workspace_host_reach_the_launcher() -> None:
     assert isinstance(launcher, DatabricksSandboxLauncher)
     assert launcher.owner_credential_provider == "databricks"
     assert launcher._workspace_host == "https://ws.cloud.databricks.com"
-
-
-def test_identity_defaults_to_server() -> None:
-    cfg = parse_sandbox_config({"provider": "databricks", "server_url": "https://x.example"})
-    assert cfg is not None
-    assert cfg.default.launcher_factory().owner_credential_provider is None
 
 
 @pytest.mark.parametrize(

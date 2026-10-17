@@ -92,12 +92,9 @@ _OWNER_TOKEN_CACHE_S: float = 60.0
 #: The ``identity`` values :class:`DatabricksSandboxLauncher` accepts.
 DatabricksIdentity = Literal["server", "owner"]
 
-# Exported before every command: exec-sync's environment carries HOME=/root,
-# which the unprivileged sandbox user cannot write, so `omnigent host`, git,
-# uv, and pip would all fail to persist state. Resolve the real home from
-# passwd and start in it.
+# Run before every command: commands start outside $HOME, so begin there.
 _HOME_PRELUDE: str = (
-    'HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"; export HOME; cd "$HOME" || exit 1; '
+    'cd "$HOME" || exit 1; '
     # User-level tool installs (e.g. a bootstrap `uv tool install omnigent`)
     # must shadow the image's baked /usr/local/bin/omnigent.
     'export PATH="$HOME/.local/bin:$PATH"; '

@@ -318,10 +318,11 @@ Sandbox](https://docs.databricks.com/aws/en/compute/serverless/sandbox) over the
 workspace REST API. The Sandbox preview must be enabled in the workspace.
 
 > [!NOTE]
-> The Databricks Apps entry point (`src/app.py`) does not yet pass the server
-> config's `sandbox:` section or Databricks Connect to `create_app`
-> ([#8878](https://github.com/omnigent-ai/omnigent/issues/8878)). Until it does,
-> configure this on a server started with `omnigent server -c config.yaml`.
+> The Databricks Apps entry point (`src/app.py`) passes the server config's
+> `sandbox:` section to `create_app`, so `identity: server` works there. It does
+> not yet set up Databricks Connect, which `identity: owner` needs. Run owner
+> mode on a server started with `omnigent server -c config.yaml` or the Docker
+> entry point.
 
 ```yaml
 sandbox:
