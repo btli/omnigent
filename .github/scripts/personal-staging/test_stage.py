@@ -2562,6 +2562,25 @@ def test_android_build_requires_successful_integration():
     assert verify["if"] == "needs.integrate.outputs.complete == 'true'"
 
 
+def test_desktop_build_bundles_the_server_selector_page():
+    """electron-builder runs directly, skipping the electron package's prebuild
+    hook. The job runs that package's build:overlay itself; the web-only script
+    omits the server selector, and MDM Macs then open a blank setup window."""
+    import yaml
+
+    workflow_path = Path(__file__).resolve().parents[2] / "workflows/personal-staging.yml"
+    workflow = yaml.safe_load(workflow_path.read_text())
+    [build] = [
+        step
+        for step in workflow["jobs"]["desktop-build"]["steps"]
+        if step.get("name") == "Build macOS desktop app (ad-hoc signed, arm64)"
+    ]
+    script = build["run"]
+    bundle_pages = "pnpm --dir web/electron run build:overlay"
+    assert bundle_pages in script
+    assert script.index(bundle_pages) < script.index("exec electron-builder")
+
+
 # --- two-phase publish: compose, verify elsewhere, then pin ------------------
 
 
