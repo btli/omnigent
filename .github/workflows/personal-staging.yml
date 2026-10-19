@@ -667,7 +667,9 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
-          pnpm --filter web run build:overlay
+          # The electron package's build:overlay also builds the server selector
+          # page; calling electron-builder directly skips its prebuild hook.
+          pnpm --dir web/electron run build:overlay
           # --dir, not --filter: a filter that matches nothing makes pnpm
           # exec a silent no-op, and this build must never no-op quietly.
           # Two phases with an ad-hoc re-sign between: a fully unsigned (or
