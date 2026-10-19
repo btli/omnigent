@@ -338,7 +338,11 @@ sandbox:
 
 **Identity.** With `identity: server`, every Sandbox is created and driven by the
 server's own Databricks identity (`sandbox.databricks.profile`, or `DATABRICKS_*`
-env). Sandboxes then share one owner, so use it only for single-tenant servers.
+env). The Sandbox's workspace credential, and with `proxy_bearer: true` its bearer
+file, are then that identity's. Code in any user's Sandbox can act as the server:
+it can reach every other user's Sandbox and anything else the identity can access,
+which on Databricks Apps includes the app's Lakebase database. Use it only when
+every user may act as the server identity, such as on a single-user server.
 
 With `identity: owner`, each Sandbox is created and driven by the user who started
 the session, with the token they connected under **Settings → Connections →

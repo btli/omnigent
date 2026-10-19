@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 from fastapi import HTTPException
 
+from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
 from omnigent.server.managed_hosts import (
@@ -16,8 +17,10 @@ from omnigent.server.managed_hosts import (
     build_owner_launcher,
     launch_managed_host,
     parse_sandbox_config,
+    relaunch_managed_host,
+    resume_managed_host,
 )
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import Host, HostStore
 
 
 def test_full_section_reaches_the_launcher() -> None:
@@ -156,3 +159,58 @@ async def test_launch_for_an_unconnected_owner_is_a_409_connect_prompt(db_uri: s
 
     assert info.value.status_code == 409
     assert "Connect Databricks" in str(info.value.detail)
+
+
+_DORMANT_HOST_ID = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
+
+
+def _dormant_owner_host(host_store: HostStore) -> Host:
+    host_store.register_managed_host(
+        host_id=_DORMANT_HOST_ID,
+        name="managed-dormant",
+        user_id="alice@example.com",
+        token="tok-dormant",
+        provider="databricks",
+        sandbox_id="sb-dormant",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host = host_store.get_host(_DORMANT_HOST_ID)
+    assert host is not None
+    return host
+
+
+def _assert_dormant_host_kept(host_store: HostStore) -> None:
+    host = host_store.get_host(_DORMANT_HOST_ID)
+    assert host is not None
+    assert host.sandbox_id == "sb-dormant"
+    assert host_store.resolve_launch_token(_DORMANT_HOST_ID, "tok-dormant") is not None
+
+
+async def test_relaunch_for_an_unconnected_owner_is_a_409_and_keeps_the_host(
+    db_uri: str,
+) -> None:
+    host_store = HostStore(db_uri)
+    host = _dormant_owner_host(host_store)
+    cfg = _owner_deployment({"databricks": lambda _user: None})
+
+    with pytest.raises(HTTPException) as info:
+        await relaunch_managed_host(config=cfg, host=host, host_store=host_store)
+
+    assert info.value.status_code == 409
+    assert "Connect Databricks" in str(info.value.detail)
+    _assert_dormant_host_kept(host_store)
+
+
+async def test_resume_for_an_unconnected_owner_is_a_409_and_keeps_the_host(
+    db_uri: str,
+) -> None:
+    host_store = HostStore(db_uri)
+    _dormant_owner_host(host_store)
+    cfg = _owner_deployment({"databricks": lambda _user: None})
+
+    with pytest.raises(HTTPException) as info:
+        await resume_managed_host(_DORMANT_HOST_ID, host_store, cfg)
+
+    assert info.value.status_code == 409
+    assert "Connect Databricks" in str(info.value.detail)
+    _assert_dormant_host_kept(host_store)

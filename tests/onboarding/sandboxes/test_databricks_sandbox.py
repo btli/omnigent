@@ -294,6 +294,24 @@ def test_keep_alive_refreshes_bearer_via_envs_only_when_running() -> None:
     assert "umask 077" in call["body"]["args"][1]
 
 
+def test_keep_alive_soft_fails_when_the_bearer_write_fails() -> None:
+    api = _FakeApi()
+    api.set_states("sb-1", "SANDBOX_STATE_RUNNING")
+    api.exec_results = [
+        {"status": "EXECUTE_COMMAND_STATUS_COMPLETED", "exit_code": 1, "stderr": "disk full"}
+    ]
+    assert _launcher(api, proxy_bearer=True).keep_alive("sb-1") is False
+
+
+def test_keep_alive_soft_fails_without_writing_when_no_bearer_can_be_minted() -> None:
+    api = _FakeApi()
+    api.set_states("sb-1", "SANDBOX_STATE_RUNNING")
+    launcher = _launcher(api, proxy_bearer=True)
+    launcher._client.config = SimpleNamespace(authenticate=dict)
+    assert launcher.keep_alive("sb-1") is False
+    assert api.exec_calls() == []
+
+
 def test_keep_alive_never_execs_into_a_stopped_sandbox() -> None:
     """exec-sync auto-starts a stopped sandbox; keepalive must not wake it."""
     api = _FakeApi()
