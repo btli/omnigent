@@ -264,6 +264,7 @@ import {
   writeSwipeActions,
 } from "@/lib/swipeActionPreferences";
 import {
+  DEFAULT_SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH,
   SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
   useShowProjectHeaderActionsOnTouch,
   writeShowProjectHeaderActionsOnTouch,
@@ -1108,7 +1109,6 @@ function ProjectHeaderActionsOnTouchControl() {
   const enabled = useShowProjectHeaderActionsOnTouch();
   const labelId = useId();
   const descriptionId = useId();
-  const toggle = useCallback((next: boolean) => writeShowProjectHeaderActionsOnTouch(next), []);
 
   return (
     <div className="flex items-start justify-between gap-6">
@@ -1124,7 +1124,7 @@ function ProjectHeaderActionsOnTouchControl() {
         aria-labelledby={labelId}
         aria-describedby={descriptionId}
         checked={enabled}
-        onCheckedChange={toggle}
+        onCheckedChange={writeShowProjectHeaderActionsOnTouch}
         data-testid="show-project-header-actions-on-touch-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.show_project_header_actions_on_touch"
@@ -1171,7 +1171,7 @@ function AppearanceSection() {
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
 
     writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
-    writeShowProjectHeaderActionsOnTouch(false);
+    writeShowProjectHeaderActionsOnTouch(DEFAULT_SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
