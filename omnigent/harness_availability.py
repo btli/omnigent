@@ -18,9 +18,9 @@ HarnessAvailability = Literal[
     "version-too-low",
 ]
 
-# Readiness and model-family checks must agree on every Codex spelling.
+# Codex-compatible harnesses share model checks; forks probe their own CLI.
 CODEX_CANONICAL_HARNESSES: Final[frozenset[str]] = frozenset(
-    {"codex", "codex-native", "native-codex"}
+    {"codex", "codex-native", "native-codex", "genie"}
 )
 
 
