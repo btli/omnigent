@@ -102,12 +102,15 @@ async def test_cached_environment_grants_skills_populated_after_first_use(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex", "genie"])
 @pytest.mark.parametrize("skills_filter", ["all", "none", ["implementation-planning"]])
 async def test_codex_spawn_transports_the_cached_environments_root(
-    tmp_path: Path, skills_filter: str | list[str]
+    tmp_path: Path, harness: str, skills_filter: str | list[str]
 ) -> None:
     registry = SessionResourceRegistry(runner_workspace=tmp_path)
     agent = _agent(tmp_path, skills_filter)
+    agent.executor.config["harness"] = harness
+    prefix = f"HARNESS_{harness.upper()}"
     original = deepcopy(agent)
     try:
         environment = registry.resolve_environment("session", DEFAULT_ENVIRONMENT_ID, agent)
@@ -115,30 +118,34 @@ async def test_codex_spawn_transports_the_cached_environments_root(
         skills_root = registry.codex_skills_dir("session")
         with inference_config_scope({}):
             first_env = _build_spawn_env_from_spec(
-                agent, "codex", session_id="session", resource_registry=registry, cwd=tmp_path
+                agent, harness, session_id="session", resource_registry=registry, cwd=tmp_path
             )
             restarted_env = _build_spawn_env_from_spec(
-                agent, "codex", session_id="session", resource_registry=registry, cwd=tmp_path
+                agent, harness, session_id="session", resource_registry=registry, cwd=tmp_path
             )
         assert first_env is not None and restarted_env is not None
-        assert first_env["HARNESS_CODEX_SKILLS_DIR"] == str(skills_root)
-        assert restarted_env["HARNESS_CODEX_SKILLS_DIR"] == str(skills_root)
-        assert json.loads(first_env["HARNESS_CODEX_SKILLS_FILTER"]) == skills_filter
+        assert first_env[f"{prefix}_SKILLS_DIR"] == str(skills_root)
+        assert restarted_env[f"{prefix}_SKILLS_DIR"] == str(skills_root)
+        assert json.loads(first_env[f"{prefix}_SKILLS_FILTER"]) == skills_filter
         assert environment.sandbox.read_roots == [skills_root]
         assert agent == original
     finally:
         await registry.cleanup_session("session")
 
 
+@pytest.mark.parametrize("harness", ["codex", "genie"])
 def test_codex_spawn_without_registry_cannot_inherit_a_parent_skill_grant(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
 ) -> None:
-    monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", "/parent-session-skills")
+    prefix = f"HARNESS_{harness.upper()}"
+    agent = _agent(tmp_path)
+    agent.executor.config["harness"] = harness
+    monkeypatch.setenv(f"{prefix}_SKILLS_DIR", "/parent-session-skills")
     with inference_config_scope({}):
-        env = _build_spawn_env_from_spec(_agent(tmp_path), "codex", session_id="unowned")
+        env = _build_spawn_env_from_spec(agent, harness, session_id="unowned")
     assert env is not None
-    assert env["HARNESS_CODEX_SKILLS_DIR"] == ""
-    assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
+    assert env[f"{prefix}_SKILLS_DIR"] == ""
+    assert _build_harness_spawn_env(env)[f"{prefix}_SKILLS_DIR"] == ""
 
 
 @pytest.mark.asyncio

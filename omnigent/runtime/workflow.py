@@ -159,7 +159,15 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk",
+    "codex",
+    "genie",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+    "goose",
 ]
 
 
@@ -213,6 +221,20 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_CODEX_GATEWAY_HOST",
         auth_key="HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+        catalog_family="openai",
+    ),
+    # Genie is Databricks' codex fork; same gateway transport as codex, its
+    # own ``HARNESS_GENIE_*`` env vars. ``agent_name="genie"`` means a host
+    # with no ucode ``genie`` agent simply skips ucode enrichment.
+    "genie": UcodeHarnessConfig(
+        agent_name="genie",
+        model_key="HARNESS_GENIE_MODEL",
+        base_url_key="HARNESS_GENIE_GATEWAY_BASE_URL",
+        base_url_family="codex",
+        base_urls_key=None,
+        host_key="HARNESS_GENIE_GATEWAY_HOST",
+        auth_key="HARNESS_GENIE_GATEWAY_AUTH_COMMAND",
+        refresh_key="HARNESS_GENIE_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="openai",
     ),
     "pi": UcodeHarnessConfig(
@@ -490,6 +512,7 @@ def _inject_ucode_agent_state(
 _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
+    "genie": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
@@ -508,6 +531,7 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
 _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
+    "genie": "HARNESS_GENIE_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
     "qwen": "HARNESS_QWEN_GATEWAY",
 }
@@ -528,6 +552,7 @@ _PI_FAMILY_KEY: dict[str, str] = {
 _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE",
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
+    "genie": "HARNESS_GENIE_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
@@ -671,6 +696,17 @@ def configure_agent_harness_with_provider(
             "For agents / 'omnigent run', use a 'gateway' provider "
             "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
             "provider.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if (
+        harness_type == "genie"
+        and entry.cli == "codex"
+        and entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND)
+    ):
+        raise OmnigentError(
+            f"provider {entry.name!r} (kind {entry.kind!r}) uses the codex CLI's "
+            "own credentials and cannot drive the 'genie' harness. Configure a "
+            "key/gateway or databricks provider for Genie in ~/.omnigent/config.yaml.",
             code=ErrorCode.INVALID_INPUT,
         )
     if entry.kind == SUBSCRIPTION_KIND:
@@ -840,9 +876,9 @@ def _apply_provider_family(
         the family declares one), or if a Codex provider is configured for
         the unsupported Chat Completions wire API.
     """
-    if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
+    if harness_type in ("codex", "genie") and family.wire_api == CHAT_WIRE_API:
         raise OmnigentError(
-            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+            f"The {harness_type!r} harness requires an OpenAI Responses API endpoint, but "
             f"provider endpoint {family.base_url!r} is configured with "
             "'wire_api: chat'. Choose a Responses-capable endpoint and set "
             "'wire_api: responses', or use a harness that supports Chat Completions.",
@@ -1143,7 +1179,7 @@ def _resolve_provider_for_build(
        harness; elsewhere it returns ``None`` so the readout / native /
        openai-agents paths keep their own handling.
     3. An :class:`ApiKeyAuth` (spec or global) → a synthesized key provider
-       for a Codex launch; otherwise ``None`` (the claude-sdk / openai-agents
+       for a Codex or Genie launch; otherwise ``None`` (the claude-sdk / openai-agents
        builders thread the key themselves).
     4. The per-family global default (``providers: … default: true``), then an
        ambient-detected default.
@@ -1205,7 +1241,7 @@ def _resolve_provider_for_build(
             auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if auth is not None:
-        if isinstance(auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+        if isinstance(auth, ApiKeyAuth) and for_launch and harness_type in ("codex", "genie"):
             return _synthesize_codex_api_key_provider(auth)
         # ApiKeyAuth — threaded by the claude-sdk / openai-agents builders.
         return None
@@ -1229,7 +1265,11 @@ def _resolve_provider_for_build(
             global_auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if global_auth is not None:
-        if isinstance(global_auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+        if (
+            isinstance(global_auth, ApiKeyAuth)
+            and for_launch
+            and harness_type in ("codex", "genie")
+        ):
             return _synthesize_codex_api_key_provider(global_auth)
         # Global ApiKeyAuth — threaded by the builder's global-auth branch.
         return None
@@ -1471,6 +1511,7 @@ def _build_codex_spawn_env(
     *,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    harness_type: Literal["codex", "genie"] = "codex",
 ) -> dict[str, str]:
     """
     Build the env-var dict the codex harness wrap reads.
@@ -1500,53 +1541,64 @@ def _build_codex_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_bound_launch_model(spec, "codex")
+    prefix = f"HARNESS_{harness_type.upper()}"
+    model = _resolve_bound_launch_model(spec, harness_type)
     if model is not None:
-        env["HARNESS_CODEX_MODEL"] = model
+        env[f"{prefix}_MODEL"] = model
 
     # Generic-provider branch (slotted ahead of the legacy-profile /
     # databricks-prefix path): a ProviderAuth on the spec, or — when the spec
     # declares no auth — the per-family global default. See
     # :func:`_resolve_provider_for_build`. Otherwise the existing path is
     # unchanged.
-    provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+    provider = _resolve_provider_for_build(spec, harness_type=harness_type, for_launch=True)
     if provider is not None:
-        if provider.kind == DATABRICKS_KIND:
+        if harness_type == "codex" and provider.kind == DATABRICKS_KIND:
             _configure_brokered_codex_with_ucode(env, spec, provider)
         else:
-            configure_agent_harness_with_provider(env, provider, harness_type="codex")
-    elif codex_config_provider_dismissed(load_config()):
+            configure_agent_harness_with_provider(env, provider, harness_type=harness_type)
+    elif harness_type == "codex" and codex_config_provider_dismissed(load_config()):
         # No credential resolved. If the user Removed codex's custom
         # ~/.codex/config.toml provider (dismissed), pin the built-in ``openai``
         # provider so the dismissal holds at run time — the executor's bridged
         # config.toml would otherwise still route this launch through that removed
         # default model_provider. (Gateway mode never reaches here: it resolves a
         # provider above, and the executor rejects a double pin.)
-        env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+        env[f"{prefix}_MODEL_PROVIDER"] = "openai"
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
-    env["HARNESS_CODEX_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    env[f"{prefix}_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
     if spec.name:
-        env["HARNESS_CODEX_AGENT_NAME"] = spec.name
+        env[f"{prefix}_AGENT_NAME"] = spec.name
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the codex subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CODEX_CWD`` in ``omnigent/inner/codex_harness.py``.
     if cwd is not None:
-        env["HARNESS_CODEX_CWD"] = str(cwd)
+        env[f"{prefix}_CWD"] = str(cwd)
     if workdir is not None:
-        env["HARNESS_CODEX_BUNDLE_DIR"] = str(workdir)
+        env[f"{prefix}_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
-        env["HARNESS_CODEX_OS_ENV"] = os_env_payload
+        env[f"{prefix}_OS_ENV"] = os_env_payload
     # Phase 1f: thread the spec's RetryPolicy through to the
     # codex subprocess. See :func:`_build_claude_sdk_spawn_env`
     # for the rationale.
     retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
     if retry_payload is not None:
-        env["HARNESS_CODEX_RETRY_POLICY"] = retry_payload
-    _apply_harness_path_override(env, "codex")
+        env[f"{prefix}_RETRY_POLICY"] = retry_payload
+    _apply_harness_path_override(env, harness_type)
     return env
+
+
+def _build_genie_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build Genie's launch settings through the shared Codex protocol path."""
+    return _build_codex_spawn_env(spec, cwd=cwd, workdir=workdir, harness_type="genie")
 
 
 def _build_pi_spawn_env(

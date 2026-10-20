@@ -3612,6 +3612,7 @@ def _run_configure_harnesses_interactive() -> None:
         COPILOT_KEY,
         CURSOR_KEY,
         DEVIN_KEY,
+        GENIE_KEY,
         GOOSE_KEY,
         HERMES_KEY,
         KIMI_KEY,
@@ -3684,6 +3685,8 @@ def _run_configure_harnesses_interactive() -> None:
     # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
+    # Genie uses its own CLI and shares Codex's OpenAI-family provider manager.
+    _GENIE = "\x00genie"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row
     # (``_ACP_AGENT_PREFIX + slug`` → per-agent remove drill-in); import/add rows
     # jump straight into those flows. Not a provider family — each ACP agent owns
@@ -3773,6 +3776,42 @@ def _run_configure_harnesses_interactive() -> None:
         rows: list[tuple[str, str, str, str, str]] = []
         rows.append(_family_row(ANTHROPIC_FAMILY))
         rows.append(_family_row(OPENAI_FAMILY))
+
+        # Gate Genie on its own binary and show the shared OpenAI-family credential.
+        if not harness_cli_installed(GENIE_KEY):
+            rows.append(
+                (
+                    _GENIE,
+                    "Genie",
+                    "CLI not installed",
+                    "missing",
+                    _install_hint(harness_install_display(GENIE_KEY)),
+                )
+            )
+        else:
+            genie_default = surface_default_provider(config, OPENAI_FAMILY)
+            if genie_default is None:
+                rows.append(
+                    (
+                        _GENIE,
+                        "Genie",
+                        "Not configured",
+                        "warn",
+                        "Open to add a Databricks/OpenAI credential (shared with Codex).",
+                    )
+                )
+            else:
+                rows.append(
+                    (
+                        _GENIE,
+                        "Genie",
+                        _family_credential_label(
+                            config, OPENAI_FAMILY, genie_default.name, genie_default
+                        ),
+                        "ready",
+                        "",
+                    )
+                )
 
         # Cursor setup covers both surfaces, but readiness prioritizes the CLI
         # used by the built-in web agent. An SDK key never hides a CLI problem.
@@ -4232,6 +4271,9 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_copilot_harness()
         elif isinstance(selected_target, str) and selected_target in families:
             _manage_harness_providers(selected_target)
+        elif selected_target == _GENIE:
+            # Genie shares the OpenAI-family provider with Codex — manage it there.
+            _manage_harness_providers(OPENAI_FAMILY)
         elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()
         elif selected_target == _QWEN:
