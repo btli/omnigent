@@ -5594,7 +5594,7 @@ describe("NewChatLandingScreen", () => {
   // claude-native (a1, fully supported) plus cursor-native (a_cursor, not) so
   // the preference has a "More" row to act on: the host below reports
   // cursor-native as unconfigured on this machine.
-  function mockHostWithHarnessReadiness() {
+  function mockHostWithHarnessReadiness(harness = "cursor-native") {
     mockAgents([
       testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
@@ -5602,40 +5602,46 @@ describe("NewChatLandingScreen", () => {
       }),
       testAgent("a_cursor", "cursor-native-ui", {
         display_name: "Cursor",
-        harness: "cursor-native",
+        harness,
       }),
     ]);
     mockHosts([
       {
         ...host("online"),
-        configured_harnesses: { "claude-native": true, "cursor-native": false },
+        configured_harnesses: { "claude-native": true, [harness]: false },
       } as Host,
     ]);
   }
 
-  it("demotes unconfigured primary harnesses to the Other submenu when hiding is off", () => {
-    mockHostWithHarnessReadiness();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    // Unconfigured primaries leave the inline list but stay discoverable.
-    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
-  });
+  it.each(["cursor-native", "genie"])(
+    "demotes unconfigured %s to Other when hiding is off",
+    (harness) => {
+      mockHostWithHarnessReadiness(harness);
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+      // Unconfigured primaries leave the inline list but stay discoverable.
+      expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
+    },
+  );
 
-  it("hides harnesses unconfigured on the selected host when the preference is on", () => {
-    // Preference on → cursor-native (unconfigured on host_1) drops out of the
-    // picker entirely, taking the now-empty "More" trigger with it, while
-    // claude-native (configured, fully supported) stays inline.
-    writeHideUnconfiguredHarnesses(true);
-    mockHostWithHarnessReadiness();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
-  });
+  it.each(["cursor-native", "genie"])(
+    "hides unconfigured %s when the preference is on",
+    (harness) => {
+      // Preference on → cursor-native (unconfigured on host_1) drops out of the
+      // picker entirely, taking the now-empty "More" trigger with it, while
+      // claude-native (configured, fully supported) stays inline.
+      writeHideUnconfiguredHarnesses(true);
+      mockHostWithHarnessReadiness(harness);
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+      expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
+    },
+  );
 
   it("demotes primary harnesses that need setup on the host to the Other submenu", () => {
     // Readiness gates the primary list: an unconfigured Codex demotes to
@@ -9147,23 +9153,26 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     }
   });
 
-  it("lists your own agent on a native harness under Other..., not among the harnesses", async () => {
-    mockAgents([
-      ...DEFAULT_LANDING_AGENTS,
-      testAgent("ag_orion", "orion", {
-        display_name: "Orion",
-        harness: "claude-native",
-        builtin: false,
-        mine: true,
-      }),
-    ]);
-    renderLanding({ agent_install: true });
+  it.each(["claude-native", "genie"])(
+    "lists your own agent on %s under Other..., not among the harnesses",
+    async (harness) => {
+      mockAgents([
+        ...DEFAULT_LANDING_AGENTS,
+        testAgent("ag_orion", "orion", {
+          display_name: "Orion",
+          harness,
+          builtin: false,
+          mine: true,
+        }),
+      ]);
+      renderLanding({ agent_install: true });
 
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-ag_orion")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
-    expect(await screen.findByTestId("new-chat-landing-agent-ag_orion")).toBeVisible();
-  });
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      expect(screen.queryByTestId("new-chat-landing-agent-ag_orion")).toBeNull();
+      fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+      expect(await screen.findByTestId("new-chat-landing-agent-ag_orion")).toBeVisible();
+    },
+  );
 
   it("cancels a custom agent without replacing the selected agent", async () => {
     renderLanding();
