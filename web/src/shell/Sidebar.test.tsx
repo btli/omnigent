@@ -29,6 +29,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { writeShowProjectHeaderActionsOnTouch } from "@/lib/projectHeaderActionPreferences";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -2551,7 +2552,11 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.pointerDown(screen.getByTestId("project-actions"), { button: 0, ctrlKey: false });
+    fireEvent.pointerDown(screen.getByTestId("project-actions"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
     fireEvent.click(await screen.findByTestId("project-new-session-menu"));
     expect(onClose).toHaveBeenCalled();
   });
@@ -2778,6 +2783,7 @@ describe("Sidebar project sections", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
+      pointerType: "mouse",
     });
     fireEvent.click(await screen.findByTestId("delete-project"));
 
@@ -2791,31 +2797,75 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps project header actions to fine hover so touch uses the long-press menu", async () => {
+  it("applies the touch actions preference live and opens the touch menu on click", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
-    expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
     const menuButton = screen.getByTestId("project-actions");
-    const cluster = menuButton.parentElement!;
-    expect(cluster).toContainElement(shortcut);
-    expect(cluster).toHaveClass("hidden", "fine-hover:flex");
-    // Without the painted cluster, the title keeps the row's own padding.
+    const revealWrapper = menuButton.closest("div[class*=transition-opacity]")!;
     const header = document.querySelector<HTMLElement>('[data-project-order-name="Customer X"]')!;
-    expect(header).not.toHaveClass("pr-8");
-    expect(header).toHaveClass("fine-hover:pr-14", "fine-hover:md:pr-2");
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    expect(revealWrapper).toHaveClass("no-fine-hover:sr-only");
+    expect(header).not.toHaveClass("no-fine-hover:min-h-11");
+
+    act(() => writeShowProjectHeaderActionsOnTouch(true));
+    expect(revealWrapper).not.toHaveClass("no-fine-hover:sr-only");
+    expect(header).toHaveClass("no-fine-hover:min-h-11");
+
+    const expectMenuOpen = (open: boolean) =>
+      expect(menuButton).toHaveAttribute("aria-expanded", String(open));
+    const pressTouch = () =>
+      fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
+    const closeMenu = () => {
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+      expectMenuOpen(false);
+    };
+
+    // Assistive tech may activate with a bare click (detail 0, no press): it opens.
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    closeMenu();
+    // Enter and Space open on keydown; a following keyboard click keeps the menu open.
+    for (const key of ["Enter", " "]) {
+      fireEvent.keyDown(menuButton, { key });
+      fireEvent.click(menuButton, { detail: 0 });
+      expectMenuOpen(true);
+      closeMenu();
+    }
+    // A mouse press toggles once; its click does not toggle again.
+    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(menuButton, { detail: 1 });
+    expectMenuOpen(true);
+    closeMenu();
+    // A touch press that turns into a scroll is cancelled; a later bare click still opens.
+    pressTouch();
+    fireEvent.pointerCancel(menuButton, { pointerType: "touch" });
+    expectMenuOpen(false);
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    closeMenu();
+    // A stray touch press (a long press) does not turn a bare click into a toggle.
+    pressTouch();
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    closeMenu();
+    // A touch tap toggles on click, never on the press alone.
+    pressTouch();
+    expectMenuOpen(false);
+    fireEvent.click(menuButton, { detail: 1 });
+    expectMenuOpen(true);
+    pressTouch();
+    fireEvent.click(menuButton, { detail: 1 });
+    expectMenuOpen(false);
+    pressTouch();
+    fireEvent.click(menuButton, { detail: 1 });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).not.toHaveClass("hidden");
-    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(header).toHaveAttribute("aria-expanded", "false");
   });
 
   it("reveals project actions on hover only on wide fine-pointer layouts", () => {
@@ -3051,7 +3101,7 @@ describe("Sidebar collapsed project marker", () => {
 
     const header = screen.getByRole("button", { name: /^Customer X/ });
     const trigger = screen.getByRole("button", { name: "Project actions for Customer X" });
-    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
     await screen.findByTestId("rename-project");
 
     fireEvent.pointerLeave(header.closest("section")!);
