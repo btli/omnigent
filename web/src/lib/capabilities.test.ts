@@ -146,6 +146,12 @@ describe("resolveServerInfo sandbox_providers", () => {
 });
 
 describe("resolveServerInfo release features", () => {
+  it("recognizes the webfonts capability from /v1/info", async () => {
+    const { isFeatureEnabled } = await import("./capabilities");
+    const parsed = await probe({ features: { webfonts: true } });
+    expect(isFeatureEnabled(parsed, "webfonts")).toBe(true);
+  });
+
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
       features: { usage_page: true, harness_install: false, malformed: "yes" },
@@ -159,6 +165,7 @@ describe("resolveServerInfo release features", () => {
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
     expect(isFeatureEnabled(parsed, "canvas")).toBe(false);
+    expect(isFeatureEnabled(parsed, "webfonts")).toBe(false);
   });
 
   it("falls back to the legacy harness field from an older server", async () => {
@@ -173,6 +180,7 @@ describe("resolveServerInfo release features", () => {
     const parsed = await resolveServerInfo();
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+    expect(isFeatureEnabled(parsed, "webfonts")).toBe(false);
   });
 });
 
