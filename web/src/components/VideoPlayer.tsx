@@ -25,6 +25,7 @@ import {
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
 import { withBasePath } from "@/lib/basePath";
+import { isHostRoutingEnabled } from "@/lib/host";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
@@ -51,7 +52,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const path = "path" in props ? props.path : undefined;
   const [requested, setRequested] = useState(false);
   const [blobSrc, setBlobSrc] = useState<string>();
-  const direct = usesDirectFileDownload();
+  const direct = usesDirectFileDownload() && !isHostRoutingEnabled();
   const directSrc =
     conversationId && path && direct
       ? withBasePath(workspaceFileDownloadUrl(conversationId, path))
