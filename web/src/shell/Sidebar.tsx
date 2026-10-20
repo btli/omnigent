@@ -216,6 +216,7 @@ import { isMobileViewport } from "@/lib/breakpoints";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import { useShowProjectHeaderActionsOnTouch } from "@/lib/projectHeaderActionPreferences";
 import {
   finishActiveRowGesture,
   ROW_MENU_SYNTHETIC,
@@ -1521,6 +1522,7 @@ function ProjectFolder({
   onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
 }) {
   const { registerFolder, sortBy } = useSidebarData();
+  const showProjectHeaderActionsOnTouch = useShowProjectHeaderActionsOnTouch();
   const query = useProjectSessions(name, expanded, sortBy);
   const watchedRows = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? [],
@@ -1662,8 +1664,10 @@ function ProjectFolder({
             projectName={name}
             onNavigate={onRowClick}
             actions={orderedMenuActions}
+            showOnTouch={showProjectHeaderActionsOnTouch}
           />
         }
+        showProjectHeaderActionsOnTouch={showProjectHeaderActionsOnTouch}
         headerContextMenu={
           <ContextMenuContent className="min-w-40" onCloseAutoFocus={menuActions.onCloseAutoFocus}>
             <ProjectFolderMenuItems
@@ -3162,6 +3166,7 @@ function SectionHeader({
   active = false,
   hasAction,
   hasPersistentAction,
+  showProjectHeaderActionsOnTouch,
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
@@ -3181,6 +3186,8 @@ function SectionHeader({
       paint theirs only with fine hover. At rest on hover-capable desktops the
       badges return to the rows' badge column. */
   hasAction?: boolean;
+  /** Project-header controls stay visible on touch when this is enabled. */
+  showProjectHeaderActionsOnTouch?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
       hover-capable desktops. */
@@ -3206,6 +3213,12 @@ function SectionHeader({
         ? "fine-hover:md:-mr-1"
         : "fine-hover:md:mr-1"
       : "fine-hover:md:mr-2";
+  const touchActionMargin =
+    showProjectHeaderActionsOnTouch === undefined
+      ? undefined
+      : showProjectHeaderActionsOnTouch
+        ? "no-fine-hover:mr-24"
+        : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:mr-24";
   const markerFade =
     "fine-hover:md:group-hover/section:opacity-0 fine-hover:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
@@ -3252,7 +3265,14 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                cn(
+                  "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                  showProjectHeaderActionsOnTouch === undefined
+                    ? undefined
+                    : showProjectHeaderActionsOnTouch
+                      ? "no-fine-hover:pr-24"
+                      : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24",
+                ),
             )
           : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
         status && "w-auto min-w-0 max-w-1/2 shrink-0",
@@ -3295,12 +3315,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            // Project actions exist only with fine hover (touch uses the
-            // long-press menu); section headers keep their select/filter slots.
+            // Project actions reserve their column only when visible or focused.
             hasAction
               ? cn(
                   icon ? cn(clusterRestMargin, "fine-hover:mr-14") : "mr-14",
                   clusterHoverDesktopMargin,
+                  touchActionMargin,
                 )
               : hasPersistentAction
                 ? "mr-7"
@@ -3710,6 +3730,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  showProjectHeaderActionsOnTouch,
   headerStatus,
   headerContextMenu,
   persistentHeaderAction,
@@ -3745,6 +3766,7 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
+  showProjectHeaderActionsOnTouch?: boolean;
   /** Progress displayed beside the title, including while collapsed. */
   headerStatus?: ReactNode;
   /** Optional context-menu content opened from the header button. */
@@ -3781,6 +3803,7 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
+            showProjectHeaderActionsOnTouch={showProjectHeaderActionsOnTouch}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -3806,6 +3829,8 @@ function ConversationSection({
                 headerStatus
                   ? "ml-auto flex shrink-0 items-center gap-0.5 pr-1"
                   : "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+                showProjectHeaderActionsOnTouch === false &&
+                  "no-fine-hover:pointer-events-none no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto",
                 protectsCollapsedBadge &&
                   "fine-hover:md:pointer-events-none fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto fine-hover:md:group-hover/header:pointer-events-auto fine-hover:md:group-has-[[data-state=open]]/header:pointer-events-auto fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto fine-hover:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
@@ -3819,6 +3844,11 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
+                    showProjectHeaderActionsOnTouch === undefined
+                      ? undefined
+                      : showProjectHeaderActionsOnTouch
+                        ? "no-fine-hover:opacity-100"
+                        : "no-fine-hover:opacity-0 no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
                     "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
@@ -5928,14 +5958,15 @@ function ProjectFolderActions({
   projectName,
   onNavigate,
   actions,
+  showOnTouch,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  showOnTouch: boolean;
 }) {
-  // Touch devices of any width reach these through the header's long-press menu.
   return (
-    <div className="hidden items-center gap-0.5 fine-hover:flex">
+    <div className="flex items-center gap-0.5">
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -5944,7 +5975,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="text-muted-foreground"
+            className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -5959,7 +5990,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        actions={actions}
+        showOnTouch={showOnTouch}
+      />
     </div>
   );
 }
@@ -6392,10 +6428,12 @@ function ProjectFolderMenu({
   projectName,
   onNavigate,
   actions,
+  showOnTouch,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  showOnTouch: boolean;
 }) {
   return (
     <DropdownMenu>
@@ -6406,7 +6444,7 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="text-muted-foreground"
+          className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
