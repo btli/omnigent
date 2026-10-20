@@ -219,3 +219,17 @@ def test_genie_decodes_nested_sandbox_bindings(monkeypatch: pytest.MonkeyPatch) 
     assert os_env.sandbox.credential_proxy is not None
     assert os_env.sandbox.credential_proxy.databricks is not None
     assert os_env.sandbox.credential_proxy.databricks.profiles[0].profile == "test"
+
+
+@pytest.mark.parametrize("session_skills", [False, True])
+def test_genie_harness_uses_session_skills_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_skills: bool
+) -> None:
+    from omnigent.inner.genie_harness import _build_genie_executor
+
+    skills_dir = tmp_path / "session-skills"
+    monkeypatch.setenv("HARNESS_GENIE_GATEWAY", "0")
+    monkeypatch.setenv("HARNESS_GENIE_SKILLS_DIR", str(skills_dir) if session_skills else "")
+    monkeypatch.setenv("OMNIGENT_GENIE_PATH", "/usr/bin/genie")
+    executor = _build_genie_executor()
+    assert executor._skills_dir == (skills_dir if session_skills else None)

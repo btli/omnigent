@@ -1551,3 +1551,23 @@ def test_antigravity_sdk_readiness_keys_off_gemini_credential(
         )
     )
     assert configured_harness_map()["antigravity"] is True
+
+
+@pytest.mark.parametrize("use_override", [False, True])
+def test_genie_readiness_honors_binary_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_override: bool
+) -> None:
+    from omnigent.inner.genie_executor import _find_genie_cli
+    from omnigent.onboarding.harness_readiness import _harness_availability
+
+    binary = tmp_path / "custom-genie"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o700)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.delenv("OMNIGENT_GENIE_PATH", raising=False)
+    if use_override:
+        monkeypatch.setenv("OMNIGENT_GENIE_PATH", str(binary))
+
+    assert _find_genie_cli() == (str(binary) if use_override else None)
+    assert harness_is_configured("genie") is use_override
+    assert _harness_availability("genie") == (True if use_override else HARNESS_BINARY_MISSING)

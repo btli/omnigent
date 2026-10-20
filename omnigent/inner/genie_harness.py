@@ -73,6 +73,7 @@ _ENV_DISABLE_NATIVE_TOOLS = "HARNESS_GENIE_DISABLE_NATIVE_TOOLS"
 _ENV_OS_ENV = "HARNESS_GENIE_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_GENIE_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_GENIE_SKILLS_FILTER"
+_ENV_SKILLS_DIR = "HARNESS_GENIE_SKILLS_DIR"
 _ENV_BUNDLE_DIR = "HARNESS_GENIE_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_GENIE_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_GENIE_GATEWAY_BASE_URL"
@@ -185,6 +186,9 @@ def _build_genie_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        skills_dir=Path(raw_skills_dir)
+        if (raw_skills_dir := os.environ.get(_ENV_SKILLS_DIR))
+        else None,
     )
 
 

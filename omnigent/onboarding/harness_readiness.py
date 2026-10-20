@@ -49,6 +49,7 @@ from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
     DEVIN_KEY,
+    GENIE_KEY,
     GOOSE_KEY,
     HERMES_KEY,
     KIMI_KEY,
@@ -208,6 +209,8 @@ def _install_key(canonical: str) -> str:
         :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
         :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
     """
+    if canonical == "genie":
+        return GENIE_KEY
     if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
         return KIMI_KEY
     if canonical in _OPENCODE_HARNESSES:
@@ -950,8 +953,6 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         return False
     if canonical == "genie":
         # Genie uses its own binary and Databricks auth, so skip Codex's login probe.
-        from omnigent.onboarding.harness_install import GENIE_KEY
-
         return _binary_availability_reason(GENIE_KEY)
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
