@@ -11,7 +11,7 @@ import click
 import httpx
 import pytest
 from omnigent_client import OmnigentError as ClientOmnigentError
-from omnigent_client import QueryResult
+from omnigent_client import PaginatedList, QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
@@ -42,7 +42,7 @@ from omnigent.chat import (
 )
 from omnigent.cli import _build_resume_parts
 from omnigent.inner.databricks_executor import DatabricksCredentials
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
 
@@ -86,7 +86,7 @@ def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPa
     def _capture(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main.run_kiro_native", _capture)
 
     redirected = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -216,8 +216,19 @@ def test_validate_agent_spec_valid_returns_none(
     assert _validate_agent_spec(agent_dir) is None
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        httpx.ConnectError,
+        httpx.ReadError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+    ],
+)
 def test_wait_for_server_uses_fast_poll_before_backoff(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.TransportError],
 ) -> None:
     """
     Local chat startup should probe aggressively during the initial
@@ -260,7 +271,7 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         assert trust_env is False
         http_calls["count"] += 1
         if http_calls["count"] < 3:
-            raise __import__("httpx").ConnectError("not ready")
+            raise error_type("not ready")
         return _Resp(200)
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
@@ -346,8 +357,13 @@ def test_raise_server_failed_handles_unreadable_log(tmp_path: Path) -> None:
     assert "python -m omnigent server" in msg
 
 
+@pytest.mark.parametrize(
+    "first_status",
+    [False, httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+)
 def test_wait_for_server_waits_for_runner_tunnel_status(
     monkeypatch: pytest.MonkeyPatch,
+    first_status: bool | type[httpx.TransportError],
 ) -> None:
     """
     Local chat startup waits until the runner's WS tunnel is online.
@@ -377,7 +393,7 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
     )
     monotonic_values = iter([0.0, 0.0, 0.2, 0.2, 0.3])
     sleep_calls: list[float] = []
-    status_bodies = iter([{"online": False}, {"online": True}])
+    status_results = iter([first_status, True])
     requested_urls: list[str] = []
 
     def _fake_monotonic() -> float:
@@ -397,7 +413,10 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         if url.endswith("/health"):
             return _Resp(200)
         if url.endswith("/v1/runners/runner_wait_test/status"):
-            return _Resp(200, next(status_bodies))
+            result = next(status_results)
+            if isinstance(result, type):
+                raise result("runner status is starting")
+            return _Resp(200, {"online": result})
         raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
@@ -413,6 +432,98 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         "http://127.0.0.1:8123/health",
         "http://127.0.0.1:8123/v1/runners/runner_wait_test/status",
     ]
+
+
+@pytest.mark.parametrize("probe", ["health", "runner"])
+@pytest.mark.parametrize("failure", [httpx.ReadError, httpx.ReadTimeout, 401, 403])
+def test_wait_for_server_keeps_deadline_after_failed_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    probe: str,
+    failure: type[httpx.TransportError] | int,
+) -> None:
+    log = tmp_path / "server.log"
+    log.write_text("server still initializing\n")
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: None, args=["server"]),
+        runner_id="starting" if probe == "runner" else None,
+        log_path=log,
+    )
+    times = iter([0.0, 0.0, 0.1, 0.1, 0.9, 0.9, 1.0])
+    requested: list[str] = []
+
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        assert kwargs["trust_env"] is False
+        requested.append(url)
+        if probe == "runner" and url.endswith("/health"):
+            return httpx.Response(200)
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        raise failure("not ready")
+
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(chat_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(chat_module.httpx, "get", get)
+
+    with pytest.raises(click.ClickException, match="server still initializing"):
+        _wait_for_server(8123, server, timeout=1.0)
+
+    assert len(requested) == (4 if probe == "runner" else 2)
+
+
+def test_wait_for_server_detects_process_exit_after_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    log = tmp_path / "server.log"
+    log.write_text("server exited during startup\n")
+    exits = iter([None, 7])
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: next(exits), args=["server"]),
+        runner_id=None,
+        log_path=log,
+    )
+    requests: list[str] = []
+
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        requests.append(url)
+        raise httpx.ReadError("connection reset")
+
+    monkeypatch.setattr(chat_module.httpx, "get", get)
+    monkeypatch.setattr(chat_module.time, "sleep", lambda _: None)
+
+    with pytest.raises(click.ClickException, match="server exited during startup"):
+        _wait_for_server(8123, server)
+
+    assert requests == ["http://127.0.0.1:8123/health"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("invalid response"),
+        RuntimeError("authentication context unavailable"),
+        httpx.HTTPStatusError(
+            "authentication rejected",
+            request=httpx.Request("GET", "http://localhost/health"),
+            response=httpx.Response(401),
+        ),
+    ],
+)
+def test_wait_for_server_preserves_non_transport_errors(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    server = SimpleNamespace(proc=SimpleNamespace(poll=lambda: None), runner_id=None)
+
+    def get(*args: object, **kwargs: object) -> httpx.Response:
+        raise error
+
+    monkeypatch.setattr(chat_module.httpx, "get", get)
+    monkeypatch.setattr(chat_module.time, "sleep", lambda _: pytest.fail("unexpected retry"))
+
+    with pytest.raises(type(error)) as exc:
+        _wait_for_server(8123, server)
+
+    assert exc.value is error
 
 
 def test_start_local_server_spawns_runner_as_sibling(
@@ -495,7 +606,7 @@ def test_start_local_server_spawns_runner_as_sibling(
 
     # Server subprocess was spawned.
     assert len(server_popen_calls) == 1
-    assert server_popen_calls[0].args[2:6] == [
+    assert server_popen_calls[0].args[3:7] == [
         "omnigent.cli",
         "server",
         "--host",
@@ -1006,8 +1117,8 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
     """One-shot local prompt mode also preserves directory-agent siblings.
 
     This covers ``omnigent run bundle/config.yaml -p ...``. Without the
-    canonicalization in the headless helper, interactive runs would upload the
-    full bundle while one-shot runs would silently upload only ``config.yaml``.
+    canonicalization in the headless helper, startup registration would lose
+    the sibling directories. Session creation reuses the registered agent.
     """
     agent_dir = tmp_path / "orchestrator"
     agent_dir.mkdir()
@@ -1075,13 +1186,13 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
 
     assert captured["server_spec_path"] == agent_dir
     assert captured["server_ephemeral"] is True
-    assert captured["bundle_path"] == agent_dir
+    assert "bundle_path" not in captured
     headless = captured["headless"]
     assert isinstance(headless, dict)
     assert headless["agent_name"] == "orchestrator"
     assert headless["prompt"] == "say hi"
     assert headless["runner_id"] == "runner_headless"
-    assert headless["session_bundle"] == b"bundle-bytes"
+    assert headless["session_bundle"] is None
 
 
 def test_chat_local_uses_directory_bundle_for_root_config_yaml(
@@ -1092,8 +1203,8 @@ def test_chat_local_uses_directory_bundle_for_root_config_yaml(
 
     This covers the ``_chat_local`` path used by local non-daemon REPL runs.
     If the helper passes ``bundle/config.yaml`` through unchanged, the local
-    server and session bundle lose sibling directories such as ``agents/`` and
-    ``skills/``.
+    server registration loses sibling directories such as ``agents/`` and
+    ``skills/``. The REPL reuses that registration without an HTTP upload.
     """
     agent_dir = tmp_path / "orchestrator"
     (agent_dir / "skills" / "investigate").mkdir(parents=True)
@@ -1159,7 +1270,7 @@ def test_chat_local_uses_directory_bundle_for_root_config_yaml(
     assert captured["server_spec_path"] == agent_dir
     assert captured["server_port"] == 45678
     assert captured["server_ephemeral"] is True
-    assert captured["bundle_path"] == agent_dir
+    assert "bundle_path" not in captured
     chat_args = captured["chat_args"]
     assert isinstance(chat_args, tuple)
     assert chat_args[0] == "http://127.0.0.1:45678"
@@ -1170,7 +1281,7 @@ def test_chat_local_uses_directory_bundle_for_root_config_yaml(
     assert chat_kwargs["initial_message"] == "say hi"
     assert chat_kwargs["resume_conversation_id"] == "conv_resume"
     assert chat_kwargs["runner_id"] == "runner_local"
-    assert chat_kwargs["session_bundle"] == b"bundle-bytes"
+    assert chat_kwargs.get("session_bundle") is None
     skills = chat_kwargs["skills"]
     assert isinstance(skills, list)
     assert "investigate" in {skill.name for skill in skills}
@@ -1433,7 +1544,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_host_online", _no_host_wait)
     monkeypatch.setattr("omnigent.host.daemon_launch.launch_or_reuse_daemon_runner", _fake_launch)
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_runner_online", _no_runner_wait)
-    monkeypatch.setattr("omnigent.native_terminal.bind_session_runner", _fake_bind)
+    monkeypatch.setattr("omnigent.native.native_terminal.bind_session_runner", _fake_bind)
 
 
 def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
@@ -2026,6 +2137,82 @@ def test_apply_overrides_harness_only_clears_pinned_model() -> None:
     assert isinstance(executor, dict)
     assert executor["config"]["harness"] == "pi"
     assert executor.get("model") is None
+
+
+def test_apply_overrides_same_harness_keeps_pinned_model() -> None:
+    """Repeating the spec's harness preserves its pinned model."""
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "my-agent",
+        "prompt": "repro",
+        "executor": {
+            "type": "omnigent",
+            "model": "my-model-id",
+            "config": {"harness": "pi"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    assert executor["model"] == "my-model-id"
+
+
+def test_apply_overrides_flat_same_harness_keeps_pinned_model() -> None:
+    """A canonical harness alias preserves the single-file spec's model."""
+    raw: dict[str, object] = {
+        "name": "single_file",
+        "prompt": "hi",
+        "executor": {"harness": "claude-sdk", "model": "sonnet"},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="claude"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["model"] == "sonnet"
+
+
+@pytest.mark.parametrize("bundled", [False, True], ids=["flat", "bundle"])
+@pytest.mark.parametrize(
+    ("model_location", "cli_model", "expected_model"),
+    [
+        (None, None, "from-env"),
+        ("executor", None, "from-spec"),
+        ("llm", None, "from-spec"),
+        (None, "from-cli", "from-cli"),
+        ("executor", "from-cli", "from-cli"),
+        ("llm", "from-cli", "from-cli"),
+    ],
+)
+def test_apply_overrides_same_harness_model_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    bundled: bool,
+    model_location: str | None,
+    cli_model: str | None,
+    expected_model: str,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    executor: dict[str, object] = (
+        {"type": "omnigent", "config": {"harness": "claude-sdk"}}
+        if bundled
+        else {"harness": "claude-sdk"}
+    )
+    raw: dict[str, object] = {"name": "model-precedence", "prompt": "hi", "executor": executor}
+    if bundled:
+        raw["spec_version"] = 1
+    if model_location == "executor":
+        executor["model"] = "from-spec"
+    elif model_location == "llm":
+        raw["llm"] = {"model": "from-spec"}
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="claude", model=cli_model))
+
+    llm = raw.get("llm")
+    llm_model = llm.get("model") if isinstance(llm, dict) else None
+    assert (executor.get("model") or llm_model) == expected_model
 
 
 def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
@@ -3106,6 +3293,7 @@ async def test_resolve_latest_conversation_id_async_scopes_by_agent_name() -> No
         "limit": 1,
         "order": "desc",
         "sort_by": "updated_at",
+        "visibility": "mine",
     }
 
 
@@ -3125,6 +3313,7 @@ async def test_resolve_latest_conversation_id_async_returns_none_for_unknown_nam
         "limit": 1,
         "order": "desc",
         "sort_by": "updated_at",
+        "visibility": "mine",
     }
 
 
@@ -3229,6 +3418,48 @@ def test_databricks_token_auth_resolves_sdk_once(
     # authenticate() runs per request (4) — cheap in-memory SDK cache hits,
     # NOT CLI shell-outs. That's the behavior the fix preserves.
     assert cfg.authenticate_calls == 4
+
+
+def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client replaces stale SDK auth before retrying a mint."""
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Cfg:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.stale = False
+
+        def authenticate(self) -> dict[str, str]:
+            if self.stale:
+                raise FileNotFoundError("baked CLI binary path was deleted")
+            return {"Authorization": f"Bearer {self.token}"}
+
+    cfgs: list[_Cfg] = []
+
+    def _fake_resolve(
+        profile: str | None = None, *, host: str | None = None
+    ) -> tuple[object, str]:
+        cfgs.append(_Cfg(f"tok-{len(cfgs) + 1}"))
+        return dbx._DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.databricks.com"
+
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)  # skip static path
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)  # skip OIDC path
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+
+    auth = chat_module._DatabricksTokenAuth(server_url="https://ex.databricks.com")
+
+    assert _first_auth_header(auth, "https://ex.databricks.com/v1/x") == "Bearer tok-1"
+
+    cfgs[0].stale = True
+
+    assert _first_auth_header(auth, "https://ex.databricks.com/v1/x") == "Bearer tok-2", (
+        "the client kept the stale SDK auth instead of re-resolving, so every "
+        "request after a CLI upgrade goes out unauthenticated"
+    )
+    assert len(cfgs) == 2
 
 
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3857,9 +4088,7 @@ class _FakeSessionsNamespace:
         """Pretend to bind a runner; echo back the session id."""
         return SimpleNamespace(id=session_id)
 
-    async def list_items(
-        self, session_id: str, *, limit: int, order: str
-    ) -> list[dict[str, object]]:
+    async def list_items(self, session_id: str, *, limit: int, order: str) -> PaginatedList:
         """
         Return the controlled transcript honoring ``order``.
 
@@ -3881,7 +4110,8 @@ class _FakeSessionsNamespace:
                 "list_items must NOT be read when the live turn returned "
                 "text — reconcile is a failure-only fallback."
             )
-        return list(reversed(self._items)) if order == "desc" else list(self._items)
+        data = list(reversed(self._items)) if order == "desc" else list(self._items)
+        return PaginatedList(data=data, has_more=False)
 
 
 class _FakeAPClient:
@@ -4424,7 +4654,9 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     def _fake_run_cursor_native(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _fake_run_cursor_native)
+    monkeypatch.setattr(
+        "omnigent.harnesses.cursor_native.main.run_cursor_native", _fake_run_cursor_native
+    )
 
     handled = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -4460,7 +4692,7 @@ def test_redirect_native_resume_covers_every_native_agent(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.goose_native.run_goose_native",
+        "omnigent.harnesses.goose_native.main.run_goose_native",
         lambda **kwargs: captured.update(kwargs),
     )
 
@@ -4520,7 +4752,7 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
     redirected: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.cursor_native.run_cursor_native",
+        "omnigent.harnesses.cursor_native.main.run_cursor_native",
         lambda **kwargs: redirected.update(kwargs),
     )
 

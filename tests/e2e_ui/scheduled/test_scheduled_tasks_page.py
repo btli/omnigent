@@ -18,9 +18,13 @@ never exercised.
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Iterator
+from contextlib import suppress
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -36,15 +40,24 @@ def _builtin_agent_id(base_url: str, name: str) -> str:
     :param name: Built-in agent name, e.g. ``"hello_world"``.
     :returns: The agent id.
     """
-    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
-    resp.raise_for_status()
-    agents = resp.json()["data"]
-    matches = [a["id"] for a in agents if a["name"] == name]
-    assert matches, (
+    names: list[str] = []
+    after: str | None = None
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        while True:
+            resp = client.get("/v1/agents", params={"after": after} if after else {})
+            resp.raise_for_status()
+            result = resp.json()
+            for agent in result["data"]:
+                if agent["name"] == name:
+                    return agent["id"]
+                names.append(agent["name"])
+            if not result["has_more"]:
+                break
+            after = result["last_id"]
+    pytest.fail(
         f"built-in agent {name!r} not listed in /v1/agents "
-        f"(got {[a['name'] for a in agents]}) — nothing to seed a task against."
+        f"(got {names}) — nothing to seed a task against."
     )
-    return matches[0]
 
 
 def _create_task(
@@ -94,6 +107,32 @@ def _create_task(
     )
     resp.raise_for_status()
     return resp.json()["id"]
+
+
+def _list_task_ids(base_url: str) -> set[str]:
+    """The id of every scheduled task currently on the server."""
+    resp = httpx.get(f"{base_url}/v1/scheduled-tasks", timeout=10.0)
+    resp.raise_for_status()
+    return {t["id"] for t in resp.json()["scheduled_tasks"]}
+
+
+@pytest.fixture(autouse=True)
+def _delete_scheduled_tasks_created_by_test(live_server: str) -> Iterator[None]:
+    """Delete every scheduled task a test creates, tracked or not.
+
+    ``live_server`` is one server for the whole pytest session, so a task a
+    test forgets to track outlives it — and a fixed literal name re-created on
+    a ``--reruns`` retry then collides with the leftover row under a strict
+    locator. Diffing the id set before/after the test closes that gap without
+    relying on each test to register what it created.
+    """
+    before = _list_task_ids(live_server)
+    yield
+    for task_id in _list_task_ids(live_server) - before:
+        with suppress(httpx.HTTPError):
+            httpx.delete(
+                f"{live_server}/v1/scheduled-tasks/{task_id}", timeout=10.0
+            ).raise_for_status()
 
 
 def _row_by_name(page: Page, name: str):
@@ -162,7 +201,9 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     agent_id = _builtin_agent_id(live_server, "hello_world")
 
     # Daily at 9:00 AM → "Every day at 9:00 AM".
-    _create_task(live_server, agent_id, "Daily digest", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+    daily_id = _create_task(
+        live_server, agent_id, "Daily digest", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+    )
     # Mon–Fri at 8:00 AM → "Weekdays at 8:00 AM".
     _create_task(
         live_server,
@@ -173,6 +214,12 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     # Hourly at :30 → "Hourly at :30" (the interval-1 non-zero-BYMINUTE fix).
     _create_task(live_server, agent_id, "Half-past sweep", "FREQ=HOURLY;BYMINUTE=30")
 
+    created = httpx.get(f"{live_server}/v1/scheduled-tasks/{daily_id}", timeout=10.0)
+    created.raise_for_status()
+    next_run_at = created.json()["next_run_at"]
+    assert next_run_at, "seeded active task should have an armed next_run_at"
+    # Keep the label away from the valid "soon" state near the scheduled instant.
+    page.clock.install(time=_parse_iso(next_run_at) - timedelta(hours=1))
     page.goto(f"{live_server}/tasks")
 
     # All three rows render (the list query resolves against the seeded tasks).
@@ -195,11 +242,7 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     hourly = _row_by_name(page, "Half-past sweep")
     expect(hourly.get_by_test_id("task-schedule-line")).to_contain_text("Hourly at :30")
 
-    # The next-run label IS shown now — but as a DELTA from the server's
-    # next_run_at ("Next run in Xh/Xd"), not a client-recomputed instant. An
-    # armed daily task is always <24h out, so its label is "Next run in …".
-    # (The forbidden thing was a client recompute of WHICH instant is next; a
-    # delta off the server value is fine.)
+    # The label is relative to the server's timestamp and the controlled clock.
     expect(daily.get_by_test_id("task-next-run")).to_contain_text("Next run in", timeout=30_000)
 
 
@@ -266,12 +309,17 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     REST + client state, and no scheduled run fires.
     """
     agent_id = _builtin_agent_id(live_server, "hello_world")
+    # Unique per attempt: a rerun's strict row lookup must not collide with
+    # rows a failed attempt left behind.
+    name_suffix = uuid.uuid4().hex[:8]
+    typed_name = f"Typed time daily {name_suffix}"
+    edit_name = f"Edit footer task {name_suffix}"
 
     page.goto(f"{live_server}/tasks")
 
     page.get_by_test_id("new-task-button").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
-    page.get_by_test_id("task-name-input").fill("Typed time daily")
+    page.get_by_test_id("task-name-input").fill(typed_name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
@@ -297,7 +345,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(time_input).to_have_value("09:45 AM")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
-    created_row = _row_by_name(page, "Typed time daily")
+    created_row = _row_by_name(page, typed_name)
     expect(created_row).to_be_visible(timeout=30_000)
     # `to_contain_text`: the line may also carry the server next-run suffix.
     expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
@@ -305,16 +353,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
         timeout=30_000,
     )
 
-    _create_task(
-        live_server,
-        agent_id,
-        "Edit footer task",
-        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-    )
+    _create_task(live_server, agent_id, edit_name, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
     page.set_viewport_size({"width": 900, "height": 520})
     page.reload()
 
-    edit_row = _row_by_name(page, "Edit footer task")
+    edit_row = _row_by_name(page, edit_name)
     expect(edit_row).to_be_visible(timeout=30_000)
     edit_row.hover()
     edit_row.get_by_test_id("task-row-menu").click()
@@ -614,15 +657,16 @@ def test_scheduled_task_edit_switches_the_harness(
     """
     codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
     claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
+    task_name = f"Switch me {uuid.uuid4().hex[:8]}"
     task_id = _create_task(
         live_server,
         codex_agent_id,
-        "Switch me",
+        task_name,
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
     )
 
     page.goto(f"{live_server}/tasks")
-    row = _row_by_name(page, "Switch me")
+    row = _row_by_name(page, task_name)
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
     row.get_by_test_id("task-row-menu").click()
@@ -636,6 +680,8 @@ def test_scheduled_task_edit_switches_the_harness(
     # Seeded from the task's own agent, not the first listed one.
     expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
     agent_trigger.click()
+    expect(agent_trigger).to_have_attribute("aria-expanded", "true")
+    expect(page.get_by_role("menuitem", name="Codex", exact=True)).to_be_focused()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
     expect(agent_trigger).to_contain_text("Claude Code")
     page.get_by_test_id("create-scheduled-task-submit").click()

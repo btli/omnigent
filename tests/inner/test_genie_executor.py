@@ -8,6 +8,8 @@ and the gateway-config inheritance, plus the ``genie`` harness registry entry.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -71,6 +73,7 @@ class TestGenieExecutor:
         # the shared CodexExecutor path unchanged.
         ex = _genie_executor(
             gateway=True,
+            gateway_host="https://example.databricks.com",
             databricks_profile="eng-ml-agent-platform",
             base_url_override="https://example.databricks.com/ai-gateway/codex/v1",
             gateway_auth_command="printf token",
@@ -101,3 +104,118 @@ class TestGenieRegistration:
         assert w._HARNESS_DATABRICKS_PROFILE["genie"] == "HARNESS_GENIE_DATABRICKS_PROFILE"
         assert w._PROVIDER_HARNESS_FAMILY["genie"] == "openai"
         assert "genie" in w._UCODE_HARNESS_CONFIGS
+
+
+@pytest.mark.parametrize("gateway_provider", [False, True])
+def test_genie_launch_receives_spec_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway_provider: bool
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.app import _build_spawn_env_from_spec
+    from omnigent.spec import AgentSpec, ExecutorSpec
+    from tests._helpers.providers import isolate_provider_resolution
+
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    if gateway_provider:
+        monkeypatch.setenv("GENIE_TEST_KEY", "test-genie-key")
+        (tmp_path / "config.yaml").write_text(
+            "providers:\n"
+            "  gateway:\n"
+            "    kind: gateway\n"
+            "    default: true\n"
+            "    openai:\n"
+            "      base_url: https://gateway.example/v1\n"
+            "      api_key_ref: env:GENIE_TEST_KEY\n"
+            "      wire_api: responses\n"
+            "      models:\n"
+            "        default: gpt-5.4\n"
+        )
+    spec = AgentSpec(
+        spec_version=1,
+        name="genie",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "genie"}),
+        skills_filter="none",
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+    )
+    env = _build_spawn_env_from_spec(
+        spec, "genie", cwd=tmp_path, workdir=tmp_path, model_override="gpt-5.4"
+    )
+    assert env is not None, "Genie has no spawn environment builder"
+    assert env["HARNESS_GENIE_MODEL"] == "gpt-5.4"
+    if gateway_provider:
+        assert env["HARNESS_GENIE_GATEWAY"] == "true"
+        assert env["HARNESS_GENIE_GATEWAY_BASE_URL"] == "https://gateway.example/v1"
+        assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+    assert env["HARNESS_GENIE_CWD"] == str(tmp_path)
+    assert env["HARNESS_GENIE_BUNDLE_DIR"] == str(tmp_path)
+    assert json.loads(env["HARNESS_GENIE_SKILLS_FILTER"]) == "none"
+    assert json.loads(env["HARNESS_GENIE_OS_ENV"])["sandbox"]["type"] == "none"
+
+
+def test_genie_private_home_uses_genie_config_and_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from omnigent.inner import codex_executor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = tmp_path / "custom-genie"
+    source.mkdir()
+    (source / "auth.json").write_text('{"token": "genie"}')
+    skill = source / "skills" / "genie-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("Genie skill")
+    monkeypatch.setenv("GENIE_HOME", str(source))
+    captured: list[Path] = []
+
+    async def capture_spawn(*args: str, **kwargs: object) -> None:
+        process_env = kwargs["env"]
+        assert isinstance(process_env, dict)
+        private_home = Path(process_env["GENIE_HOME"])
+        captured.append(private_home)
+        assert private_home != source
+        assert private_home.parent != tmp_path
+        assert (private_home / "auth.json").read_text() == '{"token": "genie"}'
+        assert (private_home / "skills" / "genie-skill" / "SKILL.md").read_text() == "Genie skill"
+        raise RuntimeError("captured launch")
+
+    monkeypatch.setattr(codex_executor, "_create_subprocess_exec", capture_spawn)
+    session = codex_executor._CodexAppServerSession(
+        codex_path="/usr/bin/genie",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        home_env_var="GENIE_HOME",
+        home_dir_name=".genie",
+    )
+    with pytest.raises(RuntimeError, match="captured launch"):
+        asyncio.run(session.start())
+    assert len(captured) == 1
+    assert not captured[0].exists()
+    assert (source / "auth.json").read_text() == '{"token": "genie"}'
+
+
+def test_genie_decodes_nested_sandbox_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.inner.genie_harness import _resolve_os_env
+
+    monkeypatch.setenv(
+        "HARNESS_GENIE_OS_ENV",
+        json.dumps(
+            {
+                "type": "caller_process",
+                "sandbox": {
+                    "type": "linux_bwrap",
+                    "credential_proxy": {
+                        "entries": [],
+                        "databricks": {"profiles": [{"profile": "test"}]},
+                    },
+                },
+            }
+        ),
+    )
+    os_env = _resolve_os_env()
+    assert os_env.sandbox is not None
+    assert os_env.sandbox.credential_proxy is not None
+    assert os_env.sandbox.credential_proxy.databricks is not None
+    assert os_env.sandbox.credential_proxy.databricks.profiles[0].profile == "test"
