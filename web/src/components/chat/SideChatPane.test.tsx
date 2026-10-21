@@ -6,6 +6,8 @@ import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as filesApi from "@/lib/filesApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -973,7 +975,23 @@ it.each([false, true])(
     const entry = conversationRegistry.acquire(childId);
     entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
     useChatStore.setState({ send: initialStoreState.send });
-    renderPane(<SideChatPane childId={childId} fullSession />);
+    renderPane(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachment_policy: {
+            allowed_extensions: [".zip"],
+            denied_extensions: [".exe"],
+            max_bytes: 100,
+            max_files: 2,
+            max_total_bytes: 200,
+            harnesses: ["codex-native"],
+          },
+        }}
+      >
+        <SideChatPane childId={childId} fullSession />
+      </CapabilitiesProvider>,
+    );
     if (hasNewDraft)
       act(() =>
         useChatStore

@@ -451,6 +451,10 @@ function SideChatComposer({
   const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
     fullSession ? childId : null,
   );
+  // Configurable attachment policy from server; use it to validate and set accept attribute
+  const info = useServerInfo();
+  const policy = info === "loading" ? undefined : info.filesystem_attachment_policy;
+  const accept = attachmentAccept(policy);
   useEffect(() => {
     if (!fullSession || !failedSendDraft) return;
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
@@ -459,7 +463,7 @@ function SideChatComposer({
       !!(current.text.trim() || current.files.length || current.quotes?.length),
     );
     if (!failed) return;
-    const { accepted, errors } = validateAttachments(failed.files);
+    const { accepted, errors } = validateAttachments(failed.files, policy);
     errors.forEach((message) => toast.error(message));
     updateComposer(childId, () => ({ text: failed.text, files: accepted }));
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
@@ -470,7 +474,7 @@ function SideChatComposer({
         restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
         pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
       });
-  }, [fullSession, childId, failedSendDraft, updateComposer]);
+  }, [fullSession, childId, failedSendDraft, updateComposer, policy]);
   useEffect(() => {
     if (!fullSession || !restoredSendDraft?.delivered) return;
     const entry = conversationRegistry.peek(childId);
@@ -499,10 +503,6 @@ function SideChatComposer({
       updateComposer(childId, (current) => ({ ...current, files: mutate(current.files) })),
     [childId, updateComposer],
   );
-  // Configurable attachment policy from server; use it to validate and set accept attribute
-  const info = useServerInfo();
-  const policy = info === "loading" ? undefined : info.filesystem_attachment_policy;
-  const accept = attachmentAccept(policy);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   const [interrupting, setInterrupting] = useState(false);
