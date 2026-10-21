@@ -1,6 +1,6 @@
 """Server wiring for Databricks Sandboxes that run as their owner.
 
-``create_app`` turns the Databricks Connect store into a blocking per-user
+``create_app`` turns the Databricks account connection store into a blocking per-user
 resolver on the sandbox deployment, so an owner-identity launcher acts with
 the session owner's own (server-refreshed) token.
 """
@@ -85,10 +85,13 @@ async def test_owner_resolver_refreshes_a_token_that_would_lapse_before_the_next
 
     assert payload == {"token": "fresh", "workspace_host": _WS}
     client.refresh_token.assert_awaited_once_with(_WS, "refresh-alice")
-    # The broker path keeps its own, shorter margin.
-    broker = await provider.credential_resolver("alice", store=store, client=client)
-    assert broker == {"token": "fresh", "workspace_host": _WS}
-    assert await asyncio.to_thread(resolve, "bob") is None
+    # The broker path keeps its own, shorter margin: 10 minutes left is no refresh.
+    _connect(store, "bob", "bob-current", ttl_s=600)
+    client.refresh_token.reset_mock()
+    broker = await provider.credential_resolver("bob", store=store, client=client)
+    assert broker == {"token": "bob-current", "workspace_host": _WS}
+    client.refresh_token.assert_not_awaited()
+    assert await asyncio.to_thread(resolve, "carol") is None
 
 
 def _app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:
@@ -97,7 +100,7 @@ def _app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:
         {
             "provider": "databricks",
             "server_url": "https://srv.example",
-            "databricks": {"identity": "owner", "workspace_host": _WS},
+            "databricks": {"workspace_host": _WS},
         }
     )
     return create_app(

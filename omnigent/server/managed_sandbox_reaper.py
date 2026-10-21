@@ -9,6 +9,7 @@ from contextlib import suppress
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     _launcher_for_teardown,
@@ -252,6 +253,13 @@ class ManagedSandboxReaper:
                             sandbox_id=sandbox_id,
                         ):
                             reaped += 1
+                    except OwnerCredentialMissingError:
+                        # Expected until the owner reconnects; retried next sweep.
+                        _logger.warning(
+                            "Managed sandbox reaper cannot act as the owner of host %s "
+                            "(not connected); retrying later",
+                            candidate.host_id,
+                        )
                     except Exception:
                         _logger.exception(
                             "Managed sandbox reaper failed for host %s; continuing",

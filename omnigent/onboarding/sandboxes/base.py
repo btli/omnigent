@@ -1048,6 +1048,45 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
 
         :returns: The absolute in-sandbox workspace path.
         """
+        workspace = self.prepare_workspace(sandbox_id, repos=repos, on_stage=on_stage)
+        if on_stage is not None:
+            on_stage("starting")
+        if host_config is not None or self.capabilities.resume_stopped:
+            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
+        env_prefix = " ".join(
+            f"{key}={shlex.quote(value)}"
+            for key, value in (
+                (HOST_TOKEN_ENV_VAR, token),
+                (HOST_ID_ENV_VAR, host_id),
+                (HOST_NAME_ENV_VAR, host_name),
+            )
+        )
+        try:
+            self.run_background(
+                sandbox_id,
+                f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+            )
+        except click.ClickException as exc:
+            # Provider errors echo the failed command, and this one carries the token.
+            # Redact in place so subclasses such as SandboxGoneError keep their type.
+            exc.message = exc.message.replace(token, "[redacted]")  # type: ignore[read-only]
+            exc.args = (exc.message,)
+            raise exc from None
+        return workspace
+
+    def prepare_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        repos: Sequence[RepoWorkspace] = (),
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Create ``<HOME>/workspace``, clone *repos* into it, and return the agent cwd.
+
+        The cwd is the single clone directory when exactly one repo is cloned,
+        else the workspace root parenting them all.
+        """
         if any(repo.git_clone != _sandbox_types.GitCloneOptions() for repo in repos):
             if not self.capabilities.git_clone_options:
                 raise click.ClickException(
@@ -1085,29 +1124,6 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             # One repo → drop the agent straight into it; several → the
             # workspace root that parents them all.
             workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
-        if on_stage is not None:
-            on_stage("starting")
-        if host_config is not None or self.capabilities.resume_stopped:
-            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
-        env_prefix = " ".join(
-            f"{key}={shlex.quote(value)}"
-            for key, value in (
-                (HOST_TOKEN_ENV_VAR, token),
-                (HOST_ID_ENV_VAR, host_id),
-                (HOST_NAME_ENV_VAR, host_name),
-            )
-        )
-        try:
-            self.run_background(
-                sandbox_id,
-                f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-            )
-        except click.ClickException as exc:
-            # Provider errors echo the failed command, and this one carries the token.
-            # Redact in place so subclasses such as SandboxGoneError keep their type.
-            exc.message = exc.message.replace(token, "[redacted]")  # type: ignore[read-only]
-            exc.args = (exc.message,)
-            raise exc from None
         return workspace
 
     def materialize_workspace(

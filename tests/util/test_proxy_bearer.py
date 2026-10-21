@@ -35,13 +35,13 @@ def test_reads_and_strips_and_rereads_after_refresh(bearer_file: Path) -> None:
     assert read_proxy_bearer() == "refreshed-token"
 
 
-@pytest.mark.parametrize("contents", [None, "", "  \n"])
-def test_missing_or_empty_file_means_no_bearer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: str | None
+@pytest.mark.parametrize("contents", [None, b"", b"  \n", b"\xff\xfe"])
+def test_missing_empty_or_undecodable_file_means_no_bearer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: bytes | None
 ) -> None:
     path = tmp_path / "proxy-bearer"
     if contents is not None:
-        path.write_text(contents)
+        path.write_bytes(contents)
     monkeypatch.setenv(PROXY_BEARER_FILE_ENV_VAR, str(path))
     assert read_proxy_bearer() is None
 
@@ -118,4 +118,7 @@ def test_cli_remote_headers_use_proxy_bearer_but_explicit_token_wins(
     url = "https://omnigent.example.com"
     assert _remote_headers(url, host_id=None)["Authorization"] == "Bearer front-door-token"
     monkeypatch.setenv(_REMOTE_AUTH_TOKEN_ENV, "explicit")
+    assert _remote_headers(url, host_id=None)["Authorization"] == "Bearer explicit"
+    # An explicit token never touches the bearer file, so a corrupt one can't break it.
+    bearer_file.write_bytes(b"\xff\xfe")
     assert _remote_headers(url, host_id=None)["Authorization"] == "Bearer explicit"

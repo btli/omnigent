@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -760,13 +761,19 @@ async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
     assert current["bob"].terminated == ["bob:sb-b"]
 
 
-async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped() -> None:
+async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     now = 4_000_000
     connected = {"bob"}
     hosts = _alice_and_bob_stale_hosts(now)
     reaper, current = _owner_reaper(hosts, connected=connected)
 
-    assert await reaper.sweep_once(now=now) == 1
+    with caplog.at_level(logging.WARNING):
+        assert await reaper.sweep_once(now=now) == 1
+    # An expected wait for the owner, logged once per sweep without a traceback.
+    (record,) = [r for r in caplog.records if "h_a" in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
 
     assert current["bob"].terminated == ["bob:sb-b"]
     assert current["alice"].terminated == []

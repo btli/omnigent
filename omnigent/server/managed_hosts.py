@@ -146,15 +146,13 @@ stores into ``create_app``):
    or ``sandbox.openshell.cluster``), so the server process needs
    OpenShell gateway access. The microsandbox launcher needs no
    credentials at all: VMs run embedded on the server host itself
-   (Apple Silicon macOS / KVM Linux). The ``databricks`` launcher uses
-   the workspace REST API through ``databricks-sdk`` credential resolution
-   (``sandbox.databricks.profile``, or ``DATABRICKS_*`` env such as a
-   Databricks App's service principal); behind the Databricks Apps OAuth
-   proxy set ``sandbox.databricks.proxy_bearer: true`` (see
-   :mod:`omnigent.util.proxy_bearer`). ``sandbox.databricks.identity:
-   owner`` instead runs each sandbox as the user who owns it, through that
-   user's Databricks Connect credential (``OMNIGENT_DATABRICKS_CLIENT_ID``
-   / ``_CLIENT_SECRET``); optionally pin ``sandbox.databricks.workspace_host``.
+   (Apple Silicon macOS / KVM Linux). The ``databricks`` launcher runs
+   each sandbox as the user who owns it, through that user's Databricks
+   account connection (``OMNIGENT_DATABRICKS_CLIENT_ID`` /
+   ``_CLIENT_SECRET``); optionally pin ``sandbox.databricks.workspace_host``.
+   Behind the Databricks Apps OAuth proxy set
+   ``sandbox.databricks.proxy_bearer: true`` (see
+   :mod:`omnigent.util.proxy_bearer`).
    Every provider except
    ``lakebox`` has managed-launch support; ``lakebox`` parses but
    rejects at launch.
@@ -1696,36 +1694,21 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             _reject_unknown_keys(
                 section,
                 {
-                    "profile",
                     "sandbox_id_prefix",
                     "inactivity_timeout_s",
                     "bootstrap_command",
                     "proxy_bearer",
-                    "identity",
                     "workspace_host",
                 },
                 "sandbox.databricks",
             )
-        identity = _parse_provider_string(raw, "databricks", "identity") or "server"
-        if identity not in ("server", "owner"):
-            raise ValueError(
-                f"sandbox.databricks.identity must be 'server' or 'owner', got {identity!r}"
-            )
-        databricks_profile = _parse_provider_string(raw, "databricks", "profile")
-        if identity == "owner" and databricks_profile:
-            raise ValueError(
-                "sandbox.databricks.identity 'owner' runs every sandbox as its owner; "
-                "remove sandbox.databricks.profile"
-            )
         launcher_factory = _databricks_launcher_factory(
-            profile=databricks_profile,
             sandbox_id_prefix=_parse_provider_string(raw, "databricks", "sandbox_id_prefix"),
             inactivity_timeout_s=_parse_provider_positive_int(
                 raw, "databricks", "inactivity_timeout_s"
             ),
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
             proxy_bearer=bool(_parse_provider_bool(raw, "databricks", "proxy_bearer")),
-            identity=identity,
             workspace_host=_parse_provider_string(raw, "databricks", "workspace_host"),
         )
         # Sandboxes stop on idle and resume under the same id; the token must
@@ -2544,12 +2527,10 @@ def _parse_islo_idle_pause_after_s(raw: dict[str, object]) -> int | None:
 
 def _databricks_launcher_factory(
     *,
-    profile: str | None,
     sandbox_id_prefix: str | None,
     inactivity_timeout_s: int | None,
     bootstrap_command: str | None,
     proxy_bearer: bool = False,
-    identity: str = "server",
     workspace_host: str | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: databricks`` path."""
@@ -2558,12 +2539,10 @@ def _databricks_launcher_factory(
         from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
 
         return DatabricksSandboxLauncher(
-            profile=profile,
             sandbox_id_prefix=sandbox_id_prefix,
             inactivity_timeout_s=inactivity_timeout_s,
             bootstrap_command=bootstrap_command,
             proxy_bearer=proxy_bearer,
-            identity="owner" if identity == "owner" else "server",
             workspace_host=workspace_host,
         )
 

@@ -36,6 +36,6 @@ def read_proxy_bearer() -> str | None:
         return None
     try:
         token = Path(path).read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     return token or None

@@ -319,51 +319,45 @@ the Web UI's New Sandbox option) in [Databricks
 Sandbox](https://docs.databricks.com/aws/en/compute/serverless/sandbox) over the
 workspace REST API. The Sandbox preview must be enabled in the workspace.
 
-> [!NOTE]
-> The Databricks Apps entry point (`src/app.py`) passes the server config's
-> `sandbox:` section to `create_app`, so `identity: server` works there. It does
-> not yet set up Databricks Connect, which `identity: owner` needs. Run owner
-> mode on a server started with `omnigent server -c config.yaml` or the Docker
-> entry point.
+Each Sandbox is created and driven by the user who started the session, with the
+token they connected under **Settings → Connections → Databricks** (a Databricks
+account connection). The token inside the Sandbox and its proxy bearer are that
+user's, and the server's own identity is never used: a user who has not connected
+is refused with a "Connect Databricks first" message and no Sandbox is created.
 
 ```yaml
 sandbox:
   provider: databricks
   server_url: https://your-host        # public URL the Sandbox host dials back to
   databricks:
-    identity: owner                    # or "server" (the default)
     workspace_host: https://<workspace>.cloud.databricks.com   # optional pin
     proxy_bearer: true                 # only behind the Databricks Apps OAuth proxy
     inactivity_timeout_s: 3600         # optional idle stop; resumed on the next turn
     sandbox_id_prefix: omnigent        # optional
 ```
 
-**Identity.** With `identity: server`, every Sandbox is created and driven by the
-server's own Databricks identity (`sandbox.databricks.profile`, or `DATABRICKS_*`
-env). The Sandbox's workspace credential, and with `proxy_bearer: true` its bearer
-file, are then that identity's. Code in any user's Sandbox can act as the server:
-it can reach every other user's Sandbox and anything else the identity can access,
-which on Databricks Apps includes the app's Lakebase database. Use it only when
-every user may act as the server identity, such as on a single-user server.
+`workspace_host` refuses a connection to any other workspace.
 
-With `identity: owner`, each Sandbox is created and driven by the user who started
-the session, with the token they connected under **Settings → Connections →
-Databricks**. The token inside the Sandbox and its proxy bearer are that user's,
-and the server's identity cannot `get` or `exec` the Sandbox. A user who has not
-connected is refused with a "Connect Databricks first" message: no Sandbox is
-created and nothing falls back to the server identity. `workspace_host` refuses a
-connection to any other workspace. `profile` cannot be combined with `owner`.
-
-`identity: owner` needs [Databricks Connect](../../designs/DATABRICKS_CONNECT.md)
-configured on the server: an account-level [custom OAuth app
-integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
+**Databricks account connection.** The server needs an account-level [custom OAuth
+app integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
 with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
-scopes `all-apis offline_access`. Its client id and secret go in
-`OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`.
+scopes `all-apis offline_access` (see
+[DATABRICKS_CONNECT.md](../../designs/DATABRICKS_CONNECT.md)). Set its client id and
+secret in `OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`,
+and a credential-store key (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
+`OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The Apps entry
+point (`src/app.py`), `omnigent server`, and the Docker entry point all read these.
 
 **Stop and resume.** A Sandbox stopped by its idle timeout is started in place on
-the session's next turn, and its host is re-bootstrapped. The keepalive refreshes
-the proxy bearer while a runner is connected.
+the session's next turn, and its host is re-bootstrapped. While a runner is
+connected, the keepalive runs a command in the Sandbox so it does not idle-stop,
+and refreshes the proxy bearer.
+
+**Cleanup after a user disconnects.** Teardown also acts as the owner, so if the
+owner has disconnected, their Sandbox stays after the session is deleted. The
+server retries the delete and finishes it once the owner reconnects. To remove it
+sooner, a workspace admin deletes it by id (logged as `Creating Databricks Sandbox
+'<id>'`): `databricks api delete /api/2.0/sandboxes/<id>`.
 
 ## Troubleshooting
 

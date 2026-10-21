@@ -1,6 +1,6 @@
-"""Owner-identity mode of the Databricks Sandbox launcher.
+"""The Databricks Sandbox launcher acts as the host owner.
 
-With ``identity="owner"`` every Sandbox API call and the in-sandbox proxy
+Every Sandbox API call and the in-sandbox proxy
 bearer use the host owner's connected Databricks token — never the server's
 own identity — and an unconnected owner is refused. The SDK client is replaced
 by fakes that capture how the launcher builds it, so these tests pin which
@@ -99,7 +99,7 @@ class _Resolver:
 def _owner_launcher(
     payload: dict[str, object] | None = None, **kwargs: Any
 ) -> tuple[DatabricksSandboxLauncher, _Resolver]:
-    launcher = DatabricksSandboxLauncher(identity="owner", **kwargs)
+    launcher = DatabricksSandboxLauncher(**kwargs)
     resolver = _Resolver(payload)
     launcher.bind_owner_credential(resolver)
     return launcher, resolver
@@ -109,16 +109,8 @@ def _api(launcher: DatabricksSandboxLauncher) -> _FakeApiClient:
     return launcher._workspace_client().api_client
 
 
-def test_identity_selects_the_owner_credential_provider() -> None:
-    assert DatabricksSandboxLauncher().owner_credential_provider is None
-    assert DatabricksSandboxLauncher(identity="owner").owner_credential_provider == "databricks"
-
-
-def test_constructor_rejects_owner_with_profile_and_unknown_identity() -> None:
-    with pytest.raises(ValueError, match="profile"):
-        DatabricksSandboxLauncher(identity="owner", profile="sp")
-    with pytest.raises(ValueError, match="identity"):
-        DatabricksSandboxLauncher(identity="robot")  # type: ignore[arg-type]
+def test_launcher_always_needs_the_owners_databricks_credential() -> None:
+    assert DatabricksSandboxLauncher().owner_credential_provider == "databricks"
 
 
 def test_every_call_runs_on_the_owner_workspace_with_the_owner_token() -> None:
@@ -177,7 +169,7 @@ def test_unconnected_owner_is_refused_before_any_call() -> None:
 
 
 def test_unbound_owner_launcher_names_the_missing_server_config() -> None:
-    launcher = DatabricksSandboxLauncher(identity="owner")
+    launcher = DatabricksSandboxLauncher()
 
     with pytest.raises(OwnerCredentialMissingError, match="OMNIGENT_DATABRICKS_CLIENT_ID"):
         launcher.prepare()
@@ -205,16 +197,3 @@ def test_disconnect_mid_life_surfaces_unwrapped(monkeypatch: pytest.MonkeyPatch)
         launcher.terminate("sb-1")
     # Status probes keep their "unknown" contract rather than raising.
     assert launcher.is_running("sb-1") is None
-
-
-def test_server_identity_mode_never_consults_a_resolver() -> None:
-    launcher = DatabricksSandboxLauncher(profile="sp")
-    resolver = _Resolver({"token": "OWNER-1", "workspace_host": _HOST})
-    launcher.bind_owner_credential(resolver)
-
-    launcher.is_running("sb-1")
-
-    (config,) = _FakeConfig.built
-    assert config.kwargs["profile"] == "sp"
-    assert "credentials_strategy" not in config.kwargs
-    assert resolver.calls == 0

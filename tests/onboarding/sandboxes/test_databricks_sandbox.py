@@ -247,7 +247,7 @@ def test_resume_missing_sandbox_raises_gone() -> None:
         ("SANDBOX_STATE_RUNNING", True),
         ("SANDBOX_STATE_STOPPED", False),
         ("SANDBOX_STATE_STOPPING", False),
-        ("SANDBOX_STATE_PENDING", False),
+        ("SANDBOX_STATE_PENDING", True),
         ("SANDBOX_STATE_SOMETHING_NEW", None),
     ],
 )
@@ -271,10 +271,13 @@ def test_terminate_is_idempotent_and_surfaces_other_errors() -> None:
         launcher.terminate("sb-1")
 
 
-def test_keep_alive_without_proxy_bearer_does_nothing() -> None:
+def test_keep_alive_without_proxy_bearer_still_runs_a_command() -> None:
+    """Any exec resets the platform's idle timer while the session is live."""
     api = _FakeApi()
-    assert _launcher(api).keep_alive("sb-1") is None
-    assert api.calls == []
+    api.set_states("sb-1", "SANDBOX_STATE_RUNNING")
+    assert _launcher(api).keep_alive("sb-1") is True
+    (call,) = api.exec_calls()
+    assert call["body"]["args"][1].endswith("true")
 
 
 def test_keep_alive_refreshes_bearer_via_envs_only_when_running() -> None:
@@ -384,6 +387,7 @@ def test_start_host_without_proxy_bearer_sets_no_bearer_env() -> None:
 def test_host_launch_logs_under_home_and_holds_a_lock() -> None:
     """$HOME survives a stop; the lock makes a replayed launch exit, not double-start."""
     api = _FakeApi()
+    api.exec_results = [_stdout(""), _stdout("/home/u")]  # pkill, $HOME probe
     _launcher(api).start_host(
         "sb-1",
         token="launch-token",

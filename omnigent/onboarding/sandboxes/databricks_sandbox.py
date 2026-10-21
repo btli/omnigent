@@ -1,36 +1,14 @@
 """
 Databricks Sandbox launcher over the SDK's Sandbox service.
 
-Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher` for
-`Databricks Sandbox <https://docs.databricks.com/aws/en/compute/serverless/sandbox>`_
-through ``databricks-sdk``'s ``WorkspaceClient.sandbox`` service
-(``databricks-sdk>=0.153``): create / get / start / delete for lifecycle,
-``execute_command_sync`` for remote commands, and the streaming
-``execute_command`` for :meth:`~DatabricksSandboxLauncher.stream_exec` and
-:meth:`~DatabricksSandboxLauncher.exec_foreground`. Using the SDK client means
-a server-side contract change is absorbed by an SDK bump.
+Drives `Databricks Sandbox <https://docs.databricks.com/aws/en/compute/serverless/sandbox>`_
+through ``databricks-sdk``'s ``WorkspaceClient.sandbox`` (``>=0.153``) over
+HTTPS only, so the server works anywhere it can reach the workspace API.
 
-There is no SSH, no CLI subprocess, and no gateway port to reach, so the
-server works anywhere that can call the workspace API over HTTPS
-(including Databricks Apps compute, whose DNS stubs the SSH gateway).
-
-Identity. By default the launcher acts as one deployment-wide identity (a
-config profile, or ``DATABRICKS_*`` env such as a Databricks App's service
-principal). With ``identity="owner"`` it instead acts *as the user who owns the
-host*: the server binds a resolver for that user's connected Databricks
-credential (:meth:`bind_owner_credential`, fed by Databricks Connect), and every
-create / get / start / stop / delete / exec call — plus the proxy bearer written
-into the sandbox — uses that user's own token. Each sandbox is therefore owned
-by, and only holds a credential for, its owner. A user who has not connected
-Databricks is refused with :class:`OwnerCredentialMissingError`; there is no
-fallback to the server identity.
-
-The SDK retries a request after a connection error or timeout, so an exec can
-run twice. Commands are therefore safe to repeat or fail loudly (a re-run clone
-hits its existing directory), and the host launch holds a lock
-(:data:`_HOST_LOCK`) so a replayed launch exits instead of starting a second
-host. The HTTP timeout sits above the longest execution timeout so a slow
-command is not cut off and retried client-side.
+Every call acts as the user who owns the host, through their connected
+Databricks account (:meth:`~DatabricksSandboxLauncher.bind_owner_credential`).
+A user who has not connected is refused with :class:`OwnerCredentialMissingError`;
+there is no shared server identity. See ``deploy/databricks/README.md``.
 """
 
 from __future__ import annotations
@@ -39,7 +17,7 @@ import secrets
 import shlex
 import threading
 import time
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import click
 
@@ -53,7 +31,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
     supervise_host_command,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
 
 if TYPE_CHECKING:
@@ -88,9 +66,6 @@ _SDK_TOO_OLD = (
 #: expiry, so a token cached this long is always still valid; the cache only
 #: saves a store read (and a thread hop) per REST call while polling state.
 _OWNER_TOKEN_CACHE_S: float = 60.0
-
-#: The ``identity`` values :class:`DatabricksSandboxLauncher` accepts.
-DatabricksIdentity = Literal["server", "owner"]
 
 # Run before every command: commands start outside $HOME, so begin there.
 _HOME_PRELUDE: str = (
@@ -210,12 +185,8 @@ class _DatabricksRemoteProcess(RemoteProcess):
 
 class DatabricksSandboxLauncher(SandboxLauncher):
     """
-    Managed-host launcher for Databricks Sandbox over the SDK Sandbox service.
+    Managed-host launcher for Databricks Sandbox, acting as each host's owner.
 
-    :param profile: Databricks config profile (``~/.databrickscfg``), e.g.
-        ``"DEFAULT"``. ``None`` uses the SDK's default resolution
-        (``DATABRICKS_*`` env, which is how a Databricks App's service
-        principal authenticates).
     :param sandbox_id_prefix: Prefix for client-chosen sandbox ids, e.g.
         ``"omnigent"`` → ``omnigent-1a2b3c4d5e``.
     :param inactivity_timeout_s: Idle seconds before the platform stops the
@@ -230,13 +201,9 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         host at it (:data:`~omnigent.util.proxy_bearer.PROXY_BEARER_FILE_ENV_VAR`).
         Required when the server sits behind the Databricks Apps OAuth proxy,
         which rejects the sandbox's own PAT. Refreshed on every start, resume,
-        and keepalive. With ``identity="owner"`` this is the owner's token.
-    :param identity: ``"server"`` (default) acts as the deployment identity
-        (*profile* / ``DATABRICKS_*`` env). ``"owner"`` acts as the host's owner
-        through their connected Databricks credential (see the module
-        docstring); *profile* must then be unset.
-    :param workspace_host: With ``identity="owner"``, the only workspace an
-        owner's connection may target, e.g.
+        and keepalive. The bearer is the owner's own token.
+    :param workspace_host: The only workspace an owner's connection may
+        target, e.g.
         ``"https://my-workspace.cloud.databricks.com"``. A connection to any
         other workspace is refused (its sandbox could not reach this server's
         front door). ``None`` accepts the connection's workspace as-is.
@@ -249,24 +216,16 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     def __init__(
         self,
         *,
-        profile: str | None = None,
         sandbox_id_prefix: str | None = None,
         inactivity_timeout_s: int | None = None,
         bootstrap_command: str | None = None,
         proxy_bearer: bool = False,
-        identity: DatabricksIdentity = "server",
         workspace_host: str | None = None,
     ) -> None:
-        if identity not in ("server", "owner"):
-            raise ValueError(f"identity must be 'server' or 'owner', got {identity!r}")
-        if identity == "owner" and profile:
-            raise ValueError("identity='owner' acts as the host owner; do not also set a profile")
-        self._profile = profile
         self._proxy_bearer = proxy_bearer
         self._prefix = sandbox_id_prefix or "omnigent"
         self._inactivity_timeout_s = inactivity_timeout_s
         self._bootstrap_command = bootstrap_command
-        self._identity: DatabricksIdentity = identity
         self._workspace_host = _normalize_host(workspace_host) if workspace_host else None
         self._owner_resolver: Callable[[], Mapping[str, object] | None] | None = None
         self._owner_token: tuple[str, float] | None = None
@@ -292,8 +251,8 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     @property
     def owner_credential_provider(self) -> str | None:
-        """``"databricks"`` in owner-identity mode, else ``None``."""
-        return "databricks" if self._identity == "owner" else None
+        """Always ``"databricks"``: every call acts as the host owner."""
+        return "databricks"
 
     def bind_owner_credential(self, resolve: Callable[[], Mapping[str, object] | None]) -> None:
         """Bind the resolver for the host owner's Databricks credential."""
@@ -305,14 +264,14 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         """Return the owner's ``(access_token, workspace_host)`` or refuse.
 
         :raises OwnerCredentialMissingError: No resolver is bound (the server
-            has no Databricks Connect), the owner has not connected, or their
+            has no Databricks account connection configured), the owner has not connected, or their
             connection targets a workspace other than :attr:`_workspace_host`.
         """
         if self._owner_resolver is None:
             raise OwnerCredentialMissingError(
-                "this server runs Databricks Sandboxes as each user's own identity "
-                "(sandbox.databricks.identity: owner) but Databricks Connect is not "
-                "configured — set OMNIGENT_DATABRICKS_CLIENT_ID / _CLIENT_SECRET"
+                "Databricks Sandboxes run as each user's own Databricks identity, but "
+                "this server has no Databricks account connection configured — set "
+                "OMNIGENT_DATABRICKS_CLIENT_ID / _CLIENT_SECRET"
             )
         payload = self._owner_resolver()
         token = payload.get("token") if payload else None
@@ -352,20 +311,20 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                     "the 'databricks' sandbox provider needs databricks-sdk "
                     "(pip install 'omnigent[databricks]')"
                 ) from exc
-            kwargs: dict[str, Any] = {"http_timeout_seconds": _EXEC_HTTP_TIMEOUT_S}
-            if self._identity == "owner":
-                # Resolve up front: refuses an unconnected owner before any call,
-                # and pins the client to the owner's workspace. Explicit
-                # host + credentials_strategy win over any DATABRICKS_* env (the
-                # server's own identity), so nothing here can act as the server.
-                token, host = self._resolve_owner()
-                with self._owner_lock:
-                    self._owner_token = (token, time.monotonic())
-                kwargs["host"] = host
-                kwargs["credentials_strategy"] = _owner_token_strategy(self._owner_access_token)
-            elif self._profile:
-                kwargs["profile"] = self._profile
-            self._client = WorkspaceClient(config=Config(**kwargs))
+            # Resolve up front: refuses an unconnected owner before any call,
+            # and pins the client to the owner's workspace. Explicit
+            # host + credentials_strategy win over any DATABRICKS_* env (the
+            # server's own identity), so nothing here can act as the server.
+            token, host = self._resolve_owner()
+            with self._owner_lock:
+                self._owner_token = (token, time.monotonic())
+            self._client = WorkspaceClient(
+                config=Config(
+                    host=host,
+                    credentials_strategy=_owner_token_strategy(self._owner_access_token),
+                    http_timeout_seconds=_EXEC_HTTP_TIMEOUT_S,
+                )
+            )
         return self._client
 
     def _sandboxes(self) -> Any:
@@ -411,8 +370,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         except Exception as exc:
             _reraise_owner_refusal(exc)
             raise click.ClickException(
-                f"could not reach the Databricks Sandbox API "
-                f"(profile={self._profile or '<default>'}): {exc}"
+                f"could not reach the Databricks Sandbox API: {exc}"
             ) from exc
 
     def provision(self, name: str) -> str:
@@ -474,13 +432,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             return False
         except click.ClickException:
             return None
-        if state == states.SANDBOX_STATE_RUNNING:
+        # PENDING is still coming up, and commands wait for RUNNING.
+        if state in (states.SANDBOX_STATE_RUNNING, states.SANDBOX_STATE_PENDING):
             return True
-        if state in (
-            states.SANDBOX_STATE_STOPPED,
-            states.SANDBOX_STATE_STOPPING,
-            states.SANDBOX_STATE_PENDING,
-        ):
+        if state in (states.SANDBOX_STATE_STOPPED, states.SANDBOX_STATE_STOPPING):
             return False
         return None
 
@@ -508,6 +463,9 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     ) -> RemoteCommandResult:
         """
         Run *command* under ``bash -c`` via ``execute_command_sync``.
+
+        The SDK retries after a connection error or timeout, so *command* may
+        run twice; the host launch holds :data:`_HOST_LOCK` for that reason.
 
         :param envs: Extra environment for the remote process. Carried in the
             API request body, so secrets passed here never appear in the
@@ -614,7 +572,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     # ── Front-door bearer (Databricks Apps OAuth proxy) ──
 
     def _current_bearer(self) -> str:
-        """Return the launcher identity's current access token (from its SDK auth)."""
+        """Return the owner's current access token (from the SDK auth)."""
         header = self._workspace_client().config.authenticate().get("Authorization", "")
         token = header.removeprefix("Bearer ").strip()
         if not token:
@@ -635,21 +593,22 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     def keep_alive(self, sandbox_id: str) -> bool | None:
         """
-        Refresh the proxy bearer on a RUNNING sandbox (no-op otherwise).
+        Run a command on a RUNNING sandbox so it is not idle-stopped mid-session.
 
+        The command refreshes the proxy bearer when enabled, else is a no-op.
         Never execs into a stopped sandbox: exec-sync auto-starts it, which
-        would defeat the platform's idle stop. A stopped host is revived by the
-        wake path, whose :meth:`start_host` writes a fresh bearer anyway.
+        would defeat the platform's idle stop once the session is idle.
         """
-        if not self._proxy_bearer:
-            return None
         states = _sandbox_sdk().SandboxState
         try:
             if _state_of(self._get(sandbox_id)) != states.SANDBOX_STATE_RUNNING:
                 return None
-            self._write_proxy_bearer(sandbox_id)
+            if self._proxy_bearer:
+                self._write_proxy_bearer(sandbox_id)
+            else:
+                self.run(sandbox_id, "true")
         except (click.ClickException, SandboxGoneError) as exc:
-            click.echo(f"  → warning: could not refresh proxy bearer on {sandbox_id}: {exc}")
+            click.echo(f"  → warning: could not keep Databricks Sandbox {sandbox_id} alive: {exc}")
             return False
         return True
 
@@ -688,7 +647,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             if on_stage is not None:
                 on_stage("starting")
             self.run(sandbox_id, self._bootstrap_command)
-        workspace = self._prepare_workspace(sandbox_id, repos=repos, on_stage=on_stage)
+        workspace = self.prepare_workspace(sandbox_id, repos=repos, on_stage=on_stage)
         if on_stage is not None:
             on_stage("starting")
         # Resumable: always (re)write, so a removed host_config is cleaned up.
@@ -716,31 +675,3 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             },
         )
         return workspace
-
-    def _prepare_workspace(
-        self,
-        sandbox_id: str,
-        *,
-        repos: Sequence[RepoWorkspace],
-        on_stage: Callable[[str], None] | None,
-    ) -> str:
-        """Create ``$HOME/workspace`` and clone *repos*; return the agent cwd."""
-        home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
-        workspace = f"{home}/workspace"
-        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
-        if not repos:
-            return workspace
-        if on_stage is not None:
-            on_stage("cloning")
-        clone_dirs = [
-            self.materialize_workspace(
-                sandbox_id,
-                workspace=workspace,
-                repo_url=repo.url,
-                repo_branch=repo.branch,
-                repo_name=dirname,
-                git_clone=repo.git_clone,
-            )
-            for repo, dirname in zip(repos, clone_dir_names(repos), strict=True)
-        ]
-        return clone_dirs[0] if len(clone_dirs) == 1 else workspace

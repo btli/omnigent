@@ -1972,7 +1972,7 @@ def create_app(
             _provider.client_factory(_cfg) if _on else None,
         )
     # Managed-sandbox owner identity: a launcher that acts as the host's owner
-    # (e.g. `sandbox.databricks.identity: owner`) resolves that user's
+    # (e.g. the `databricks` provider) resolves that user's
     # connected credential through these, keyed by connection provider.
     if sandbox_config is not None:
         from dataclasses import replace as _dc_replace
