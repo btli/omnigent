@@ -6,6 +6,8 @@ import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as filesApi from "@/lib/filesApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -216,6 +218,7 @@ describe("side chat opened from a text selection", () => {
     } else {
       expect(send).toHaveBeenCalledExactlyOnceWith(text, "agent_side", undefined, {
         pinnedConversationId: childId,
+        onError: expect.any(Function),
       });
     }
   });
@@ -254,8 +257,28 @@ describe("side chat opened from a text selection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
     expect(send).toHaveBeenCalledWith("> second selection\n\nwhy?", "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+  });
+
+  it("restores the quotes with the text when a live send fails", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: "why?", files: [], quotes: ["the selection"] } },
+    });
+    renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+    act(() => send.mock.calls[0]?.[3]?.onError?.("Send failed"));
+
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
+      text: "why?",
+      quotes: ["the selection"],
+    });
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("the selection");
+    expect(screen.getByRole("alert")).toHaveTextContent("Send failed");
   });
 
   it("clears the selection target when the pane is hidden or read-only", () => {
@@ -441,6 +464,7 @@ describe("side-chat interrupt", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
     expect(send).toHaveBeenCalledExactlyOnceWith("Keep this follow-up", "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(useChatStore.getState().sessionStatus).toBe("running");
   });
@@ -776,7 +800,7 @@ describe("side-chat slash commands", () => {
       "> a selection\n\n/review",
       "agent_side",
       undefined,
-      { pinnedConversationId: childId },
+      { pinnedConversationId: childId, onError: expect.any(Function) },
     );
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
@@ -795,6 +819,7 @@ describe("side-chat slash commands", () => {
     fireEvent.click(screen.getByTestId("side-chat-send"));
     expect(send).toHaveBeenCalledExactlyOnceWith(input, "agent_side", undefined, {
       pinnedConversationId: childId,
+      onError: expect.any(Function),
     });
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
@@ -950,7 +975,23 @@ it.each([false, true])(
     const entry = conversationRegistry.acquire(childId);
     entry.setState({ sessionStatus: "idle", abortController: new AbortController() });
     useChatStore.setState({ send: initialStoreState.send });
-    renderPane(<SideChatPane childId={childId} fullSession />);
+    renderPane(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachment_policy: {
+            allowed_extensions: [".zip"],
+            denied_extensions: [".exe"],
+            max_bytes: 100,
+            max_files: 2,
+            max_total_bytes: 200,
+            harnesses: ["codex-native"],
+          },
+        }}
+      >
+        <SideChatPane childId={childId} fullSession />
+      </CapabilitiesProvider>,
+    );
     if (hasNewDraft)
       act(() =>
         useChatStore
