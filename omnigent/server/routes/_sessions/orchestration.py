@@ -237,6 +237,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _unbound_managed_launch_tasks,
     get_caps,
     get_server_runner_router,
     session_stream,
@@ -372,6 +373,7 @@ from omnigent.server.schemas import (
     ElicitationResult,
     ErrorDetail,
     NativeModelOption,
+    NativeUsageBaseline,
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
@@ -1447,6 +1449,15 @@ def _build_session_response(
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
     harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    native_usage_baseline = None
+    if harness == "pi-native":
+        own_usage = conv.session_usage or {}
+        cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
+        native_usage_baseline = NativeUsageBaseline(
+            cumulative_input_tokens=int(own_usage.get("input_tokens", 0) or 0) + cached,
+            cumulative_output_tokens=int(own_usage.get("output_tokens", 0) or 0),
+            cumulative_cache_read_input_tokens=cached,
+        )
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
@@ -1503,6 +1514,7 @@ def _build_session_response(
         # Per-model breakdown over the same subtree usage. None (omitted)
         # when no per-model usage was recorded.
         usage_by_model=_usage_by_model_for_display(display_usage),
+        native_usage_baseline=native_usage_baseline,
         last_task_error=last_task_error,
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
@@ -4457,13 +4469,23 @@ async def _bind_and_launch_managed_runner(
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
-    try:
-        conv = await asyncio.to_thread(
+    bind = asyncio.ensure_future(
+        asyncio.to_thread(
             conversation_store.set_host_id,
             session_id,
             managed.host_id,
             managed.workspace,
         )
+    )
+    try:
+        conv = await asyncio.shield(bind)
+    except asyncio.CancelledError:
+        # Shutdown cancelled the launch mid-write. Let the write land so the
+        # row, which the cancelled launch reads to decide whether it failed,
+        # says whether the session is bound.
+        with contextlib.suppress(Exception):
+            await bind
+        raise
     except ConversationNotFoundError:
         # The session was deleted while its sandbox provisioned. The
         # delete route couldn't see the host binding yet, so tear the
@@ -4484,6 +4506,9 @@ async def _bind_and_launch_managed_runner(
             session_id, "failed", "session was deleted while its sandbox was provisioning"
         )
         return
+    # From here a shutdown may cancel the launch: the host's replica finishes it.
+    if (launch_task := asyncio.current_task()) is not None:
+        _unbound_managed_launch_tasks.discard(launch_task)
     if relaunch_host is not None:
         await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
@@ -6504,14 +6529,22 @@ async def _native_turn_catalog(
     :param runner_client: HTTP client pointed at the bound runner, used to
         replace a stale pre-launch catalog with the launch-exact one.
         ``None`` serves whatever is cached.
+    A pi-native pane is the same story: ``setModel`` resolves only its own
+    registry's ``provider/id`` spellings (what the extension pushed as
+    ``external_model_options``), never the runner's ``databricks-*`` catalog.
+
     :returns: Model ids, or ``None`` when the session is not a native
         terminal with a known vocabulary (the caller keeps its own
         candidate resolution).
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
+        options = _pushed_model_options_cache.get(session_id)
+    elif wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+        await _refresh_stale_native_model_options(session_id, runner_client)
+        options = _model_options_cache.get(session_id)
+    else:
         return None
-    await _refresh_stale_native_model_options(session_id, runner_client)
-    options = _model_options_cache.get(session_id)
     if not options:
         return None
     # ``model`` is optional on a picker row and ``model_dump(exclude_none=True)``
