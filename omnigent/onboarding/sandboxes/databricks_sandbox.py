@@ -13,6 +13,7 @@ there is no shared server identity. See ``deploy/databricks/README.md``.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import shlex
 import threading
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
     from databricks.sdk.service.sandbox import SandboxState
 
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
+
+_logger = logging.getLogger(__name__)
 
 # Longest single remote command (git clone of a large repo, a bootstrap
 # install). The server clamps execution_timeout to its own ceiling.
@@ -179,9 +182,14 @@ class _DatabricksRemoteProcess(RemoteProcess):
         self._closed = True
         # The SDK's close() only drops the client stream; the command keeps
         # running, so stop it by the pid its start event reported.
-        if self._process.exit_code is None and self._process.pid:
-            self._kill(int(self._process.pid))
-        self._process.close()
+        try:
+            if self._process.exit_code is None and self._process.pid:
+                self._kill(int(self._process.pid))
+        except Exception as exc:
+            # Logged, not raised: it would otherwise mask the caller's Ctrl-C.
+            _logger.warning("Could not stop remote Databricks Sandbox command: %s", exc)
+        finally:
+            self._process.close()
 
 
 class DatabricksSandboxLauncher(SandboxLauncher):

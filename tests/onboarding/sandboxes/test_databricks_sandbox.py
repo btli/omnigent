@@ -513,6 +513,24 @@ def test_stream_exec_close_stops_a_running_command_once() -> None:
     assert command.closed == 1
 
 
+def test_stream_exec_close_drops_the_stream_when_the_kill_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    command = _FakeCommand([], exit_code=None)
+    launcher, _ = _streaming(_FakeApi(), command)
+
+    def _failing_kill(sandbox_id: str, pid: int) -> None:
+        raise click.ClickException("owner disconnected")
+
+    launcher._kill_tree = _failing_kill
+    process = launcher.stream_exec("sb-1", "sleep 600")
+    process.close()
+    process.close()
+
+    assert command.closed == 1
+    assert "owner disconnected" in caplog.text
+
+
 def test_stream_exec_refuses_a_pty() -> None:
     launcher, started = _streaming(_FakeApi(), _FakeCommand([]))
     with pytest.raises(SandboxCapabilityError):
