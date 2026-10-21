@@ -583,6 +583,11 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
+# Genie uses the same protocol with its own configuration home.
+_DEFAULT_HOME_ENV_VAR = "CODEX_HOME"
+_DEFAULT_HOME_DIR_NAME = ".codex"
+
+
 async def _codex_cli_version_text(codex_path: str) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
     try:
@@ -1086,7 +1091,10 @@ def _resolve_codex_home_config_source(source_dir: Path, home_codex_home: Path) -
     return source_dir
 
 
-def _codex_home_config_source_from_env() -> Path:
+def _codex_home_config_source_from_env(
+    home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+    home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
+) -> Path:
     """
     Return the Codex home whose auth/config should be bridged.
 
@@ -1096,12 +1104,16 @@ def _codex_home_config_source_from_env() -> Path:
     can inherit a parent private home, so this resolver maps that specific
     inherited session-state home back to the user's default ``~/.codex``.
 
+    :param home_env_var: The env var naming the user's source home, e.g.
+        ``"CODEX_HOME"`` (codex) or ``"GENIE_HOME"`` (the genie fork).
+    :param home_dir_name: The default home dir under ``~`` when the env var is
+        unset, e.g. ``".codex"`` or ``".genie"``.
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
-    home_codex_home = Path.home() / ".codex"
+    home_codex_home = Path.home() / home_dir_name
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
+        Path(os.environ.get(home_env_var) or str(home_codex_home)),
         home_codex_home,
     )
 
@@ -2778,6 +2790,8 @@ class _CodexAppServerSession:
         signer_factory: Callable[[], ModelSignerSession] | None = None,
         provider_auth_authority: tuple[str, str] | None = None,
         thread_model_provider: str | None = None,
+        home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+        home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2801,6 +2815,9 @@ class _CodexAppServerSession:
         self._closing = False
         self._cleaned = True
         self._cleanup_task: asyncio.Task[None] | None = None
+        # Genie reads GENIE_HOME / ~/.genie; keep the shared private-home staging.
+        self._home_env_var = home_env_var
+        self._home_dir_name = home_dir_name
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -2940,11 +2957,21 @@ class _CodexAppServerSession:
                 self._codex_home_dir / "skills",
                 exc,
             )
+        config_source = (
+            _codex_home_config_source_from_env()
+            if self._home_env_var == _DEFAULT_HOME_ENV_VAR
+            else _codex_home_config_source_from_env(self._home_env_var, self._home_dir_name)
+        )
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,
             self._skills_filter,
             copy_skills=True,
+            **(
+                {"source_codex_home": config_source}
+                if self._home_env_var != _DEFAULT_HOME_ENV_VAR
+                else {}
+            ),
         )
         # Bridge the user's authentication and provider config into the
         # temp CODEX_HOME. The codex CLI reads ``auth.json`` (OAuth tokens
@@ -2952,7 +2979,6 @@ class _CodexAppServerSession:
         # definitions) from ``$CODEX_HOME``; without this step a freshly-
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
-        config_source = _codex_home_config_source_from_env()
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
@@ -3012,7 +3038,7 @@ class _CodexAppServerSession:
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
-        proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        proc_env = {**self._env, self._home_env_var: str(self._codex_home_dir)}
         if self._signer is not None:
             # Newer Codex builds keep some SQLite stores relative to HOME even
             # when CODEX_HOME is set. Keep those stores inside the same private,
@@ -4512,6 +4538,8 @@ class _AppSessionFactory(Protocol):
         skills_filter: str | list[str],
         skills_dir: Path | None,
         os_env: OSEnvSpec | None,
+        home_env_var: str,
+        home_dir_name: str,
     ) -> _CodexAppServerSession: ...
 
 
@@ -4529,6 +4557,8 @@ def _default_app_session_factory(
     skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
+    home_env_var: str,
+    home_dir_name: str,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -4555,6 +4585,8 @@ def _default_app_session_factory(
         thread_model_provider=(
             _BROKERED_CODEX_PROVIDER_NAME if signer_launch_config is not None else None
         ),
+        home_env_var=home_env_var,
+        home_dir_name=home_dir_name,
     )
 
 
@@ -4582,6 +4614,8 @@ class CodexExecutor(Executor):
         skills_filter: str | list[str] = "all",
         skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
+        home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+        home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -4679,13 +4713,12 @@ class CodexExecutor(Executor):
         self._skills_dir = skills_dir
         self._signer_backed = signer_launch_config is not None
         self._brokered_version_identity: tuple[int, int, int, int] | None = None
-        resolved_codex = codex_path or _find_codex_cli()
+        # Each CLI reads its own home variable for private session state.
+        self._home_env_var = home_env_var
+        self._home_dir_name = home_dir_name
+        resolved_codex = codex_path or self._find_cli()
         if not resolved_codex:
-            raise ImportError(
-                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
-                "installed on a PATH the host daemon didn't inherit (e.g. an "
-                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
-            )
+            raise ImportError(self._cli_missing_message())
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
@@ -4839,6 +4872,25 @@ class CodexExecutor(Executor):
                 ),
             )
 
+    def _find_cli(self) -> str | None:
+        """Resolve the wrapped CLI binary when no explicit path was given.
+
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor` to
+        search for ``genie`` instead of ``codex``.
+        """
+        return _find_codex_cli()
+
+    def _cli_missing_message(self) -> str:
+        """Error text when the wrapped CLI cannot be resolved.
+
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor`.
+        """
+        return (
+            "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+            "installed on a PATH the host daemon didn't inherit (e.g. an "
+            f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+        )
+
     def supports_streaming(self) -> bool:
         return True
 
@@ -4979,6 +5031,8 @@ class CodexExecutor(Executor):
             skills_filter=self._skills_filter,
             skills_dir=self._skills_dir,
             os_env=self._os_env_spec,
+            home_env_var=self._home_env_var,
+            home_dir_name=self._home_dir_name,
         )
         state.app_session = app_session
         state.signature = signature
