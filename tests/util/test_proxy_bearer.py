@@ -148,3 +148,13 @@ def test_bearer_is_only_sent_to_the_server_it_was_issued_for(
     # Without the launcher's server URL, the bearer is never sent to a named server.
     monkeypatch.delenv(PROXY_BEARER_SERVER_URL_ENV_VAR)
     assert read_proxy_bearer("https://omnigent.example.com") is None
+
+
+def test_managed_host_withholds_the_bearer_from_another_server(
+    bearer_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    monkeypatch.setenv(PROXY_BEARER_SERVER_URL_ENV_VAR, "https://other.example.com")
+    host = _host()
+    assert "Authorization" not in host._build_connect_headers()
+    assert host._current_auth_token() is None

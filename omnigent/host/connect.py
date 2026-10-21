@@ -4692,7 +4692,7 @@ class HostProcess:
             # provisioned proxy bearer gets the request through the proxy.
             from omnigent.util.proxy_bearer import read_proxy_bearer
 
-            proxy_bearer = read_proxy_bearer()
+            proxy_bearer = read_proxy_bearer(self._server_url)
             if proxy_bearer:
                 headers["Authorization"] = f"Bearer {proxy_bearer}"
             return headers
@@ -4719,7 +4719,7 @@ class HostProcess:
         if os.environ.get(HOST_TOKEN_ENV_VAR):
             from omnigent.util.proxy_bearer import read_proxy_bearer
 
-            return read_proxy_bearer()
+            return read_proxy_bearer(self._server_url)
         try:
             if not self._auth_token_factory_resolved:
                 if not initialize:
