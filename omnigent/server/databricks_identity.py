@@ -22,10 +22,8 @@ _logger = logging.getLogger(__name__)
 # mid-launch (or shortly after) inside the sandbox.
 _REFRESH_MARGIN_S = 300
 
-# Margin for the managed-sandbox owner identity (``sandbox.databricks.identity:
-# owner``). The token the server acts with is also written into the sandbox as
-# its front-door proxy bearer, refreshed by the keepalive every ~10 minutes, so
-# it must stay valid for longer than one keepalive interval.
+# Margin for Databricks Sandbox owner tokens. They double as the in-sandbox
+# proxy bearer, refreshed by the keepalive, so keep them valid past one interval.
 OWNER_IDENTITY_REFRESH_MARGIN_S = 900
 
 

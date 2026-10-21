@@ -32,7 +32,10 @@ from omnigent.onboarding.sandboxes.base import (
     supervise_host_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
-from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
+from omnigent.util.proxy_bearer import (
+    PROXY_BEARER_FILE_ENV_VAR,
+    PROXY_BEARER_SERVER_URL_ENV_VAR,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -61,10 +64,8 @@ _SDK_TOO_OLD = (
     "(pip install -U 'omnigent[databricks]')"
 )
 
-#: Seconds an owner-identity launcher reuses one resolved owner token before
-#: asking the server again. The server's resolver refreshes tokens well before
-#: expiry, so a token cached this long is always still valid; the cache only
-#: saves a store read (and a thread hop) per REST call while polling state.
+#: Seconds the launcher reuses one resolved owner token before asking the
+#: server again, to limit store reads while polling state.
 _OWNER_TOKEN_CACHE_S: float = 60.0
 
 # Run before every command: commands start outside $HOME, so begin there.
@@ -392,7 +393,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         try:
             waited = self._wait_for(sandbox_id, sdk.SandboxState.SANDBOX_STATE_RUNNING)
         except Exception:
-            self.terminate(sandbox_id)
+            try:
+                self.terminate(sandbox_id)
+            except Exception as cleanup_exc:  # keep the original error
+                click.echo(f"  → warning: could not delete Sandbox '{sandbox_id}': {cleanup_exc}")
             raise
         click.echo(f"  → {sandbox_id} running after {waited:.1f}s")
         return sandbox_id
@@ -643,6 +647,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         launch_envs: dict[str, str] = {}
         if self._proxy_bearer:
             launch_envs[PROXY_BEARER_FILE_ENV_VAR] = self._write_proxy_bearer(sandbox_id)
+            launch_envs[PROXY_BEARER_SERVER_URL_ENV_VAR] = server_url
         if self._bootstrap_command:
             if on_stage is not None:
                 on_stage("starting")

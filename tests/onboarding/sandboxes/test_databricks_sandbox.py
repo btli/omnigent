@@ -21,7 +21,7 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes import databricks_sandbox as mod
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError, SandboxGoneError
 from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
-from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
+from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR, PROXY_BEARER_SERVER_URL_ENV_VAR
 
 _EXEC_PREFIX = "/api/2.0/sandbox-exec/sandboxes/"
 
@@ -136,6 +136,26 @@ def test_provision_terminates_when_sandbox_never_runs(monkeypatch: pytest.Monkey
     with pytest.raises(click.ClickException, match="did not reach"):
         launcher.provision("managed-abc")
     assert api.calls[-1]["method"] == "DELETE"
+
+
+def test_provision_keeps_the_original_error_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakeApi()
+    monkeypatch.setattr(mod, "_STATE_TIMEOUT_S", 0.0)
+    launcher = _launcher(api)
+    original = api.do
+
+    def do(method: str, path: str, **kw: Any) -> dict[str, Any]:
+        if method == "POST" and path == "/api/2.0/sandboxes":
+            api.set_states(kw["query"]["sandbox_id"], "SANDBOX_STATE_PENDING")
+        if method == "DELETE":
+            raise RuntimeError("delete failed")
+        return original(method, path, **kw)
+
+    api.do = do  # type: ignore[method-assign]
+    with pytest.raises(click.ClickException, match="did not reach"):
+        launcher.provision("managed-abc")
 
 
 def test_run_sends_bash_with_home_prelude_timeout_and_envs() -> None:
@@ -362,6 +382,7 @@ def test_start_host_bootstraps_and_launches_with_secrets_in_envs() -> None:
         HOST_ID_ENV_VAR: "host-1",
         HOST_NAME_ENV_VAR: "managed-host-1",
         PROXY_BEARER_FILE_ENV_VAR: "/home/u/.omnigent/proxy-bearer",
+        PROXY_BEARER_SERVER_URL_ENV_VAR: "https://omnigent.example.com",
     }
     for call in calls:
         argv = " ".join(call["body"]["args"])
@@ -381,6 +402,7 @@ def test_start_host_without_proxy_bearer_sets_no_bearer_env() -> None:
     )
     launch = api.exec_calls()[-1]["body"]
     assert PROXY_BEARER_FILE_ENV_VAR not in launch["envs"]
+    assert PROXY_BEARER_SERVER_URL_ENV_VAR not in launch["envs"]
     assert not any("proxy-bearer" in " ".join(c["body"]["args"]) for c in api.exec_calls())
 
 

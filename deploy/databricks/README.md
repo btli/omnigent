@@ -336,7 +336,12 @@ sandbox:
     sandbox_id_prefix: omnigent        # optional
 ```
 
-`workspace_host` refuses a connection to any other workspace.
+`workspace_host` refuses a connection to any other workspace. Set it on shared
+servers: without it, a user who reconnects to a different workspace can no longer
+reach (or clean up) Sandboxes created in the first one. With `proxy_bearer: true`,
+the Sandbox's `omnigent` must include proxy-bearer support, so pin it with a
+`bootstrap_command` (e.g. `uv tool install omnigent==<server version>`) if the
+image's built-in copy is older than the server.
 
 **Databricks account connection.** The server needs an account-level [custom OAuth
 app integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)

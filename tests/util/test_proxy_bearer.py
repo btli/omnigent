@@ -9,6 +9,7 @@ import pytest
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
 from omnigent.util.proxy_bearer import (
     PROXY_BEARER_FILE_ENV_VAR,
+    PROXY_BEARER_SERVER_URL_ENV_VAR,
     proxy_bearer_configured,
     read_proxy_bearer,
 )
@@ -19,6 +20,7 @@ def bearer_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "proxy-bearer"
     path.write_text("front-door-token\n")
     monkeypatch.setenv(PROXY_BEARER_FILE_ENV_VAR, str(path))
+    monkeypatch.setenv(PROXY_BEARER_SERVER_URL_ENV_VAR, "https://omnigent.example.com")
     return path
 
 
@@ -84,10 +86,11 @@ def test_managed_host_hands_proxy_bearer_to_runners(
     assert _host()._current_auth_token() == "front-door-token"
 
 
-def test_runner_env_allowlist_keeps_the_file_path() -> None:
+def test_runner_env_allowlist_keeps_the_file_path_and_its_server() -> None:
     from omnigent.host.connect import _RUNNER_ENV_ALLOWLIST
 
     assert PROXY_BEARER_FILE_ENV_VAR in _RUNNER_ENV_ALLOWLIST
+    assert PROXY_BEARER_SERVER_URL_ENV_VAR in _RUNNER_ENV_ALLOWLIST
 
 
 def test_runner_factory_reads_the_file_and_drops_the_seeded_token(
@@ -122,3 +125,23 @@ def test_cli_remote_headers_use_proxy_bearer_but_explicit_token_wins(
     # An explicit token never touches the bearer file, so a corrupt one can't break it.
     bearer_file.write_bytes(b"\xff\xfe")
     assert _remote_headers(url, host_id=None)["Authorization"] == "Bearer explicit"
+
+
+def test_bearer_is_only_sent_to_the_server_it_was_issued_for(
+    bearer_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV, _remote_headers
+    from omnigent.runner import _entry
+
+    assert read_proxy_bearer("https://OMNIGENT.example.com/") == "front-door-token"
+    assert read_proxy_bearer("https://elsewhere.example.com") is None
+    monkeypatch.delenv(_REMOTE_AUTH_TOKEN_ENV, raising=False)
+    headers = _remote_headers("https://elsewhere.example.com", host_id=None)
+    assert headers.get("Authorization") != "Bearer front-door-token"
+    monkeypatch.setattr(_entry, "_runner_auth_factory", None)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    factory = _entry._make_auth_token_factory("https://elsewhere.example.com")
+    assert factory is None or factory() != "front-door-token"
+    # Without the launcher's server URL, the bearer is never sent to a named server.
+    monkeypatch.delenv(PROXY_BEARER_SERVER_URL_ENV_VAR)
+    assert read_proxy_bearer("https://omnigent.example.com") is None

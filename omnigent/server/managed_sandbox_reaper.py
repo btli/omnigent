@@ -209,14 +209,14 @@ class ManagedSandboxReaper:
             per_owner = getattr(launcher, "owner_credential_provider", None) is not None
             with launcher.reaper_identity(workspace_id):
                 for candidate in candidates:
-                    acting = (
-                        _launcher_for_teardown(candidate, self._sandbox_config)
-                        if per_owner
-                        else launcher
-                    )
-                    if acting is None:
-                        continue
                     try:
+                        acting = (
+                            _launcher_for_teardown(candidate, self._sandbox_config)
+                            if per_owner
+                            else launcher
+                        )
+                        if acting is None:
+                            continue
                         if candidate.deleted_at is not None:
                             sandbox_id = candidate.terminating_sandbox_id or candidate.sandbox_id
                             if sandbox_id is None:

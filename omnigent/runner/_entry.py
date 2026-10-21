@@ -686,12 +686,12 @@ def _make_auth_token_factory(
 
     # A managed sandbox runner behind an authenticating front door: the
     # launcher-refreshed proxy bearer is the credential every runner->server
-    # surface must present. Re-read per call so refreshes take effect.
+    # surface must present, and only to the server it was issued for.
     from omnigent.util.proxy_bearer import proxy_bearer_configured, read_proxy_bearer
 
-    if proxy_bearer_configured():
+    if proxy_bearer_configured() and resolved_server_url:
         os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, None)
-        return read_proxy_bearer
+        return lambda: read_proxy_bearer(resolved_server_url)
 
     initial_token = (
         os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()

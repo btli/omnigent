@@ -721,7 +721,7 @@ def _remote_headers(
     if token and (token := token.strip()):
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
-    elif proxy_bearer := read_proxy_bearer():
+    elif server_url and (proxy_bearer := read_proxy_bearer(server_url)):
         # 1b. A managed sandbox host behind an authenticating front door: the
         # launcher-refreshed proxy bearer (see omnigent.util.proxy_bearer).
         headers["Authorization"] = f"Bearer {proxy_bearer}"

@@ -725,13 +725,18 @@ def _alice_and_bob_stale_hosts(now: int) -> _FakeHostStore:
 
 
 def _owner_reaper(
-    hosts: _FakeHostStore, *, connected: set[str] | None = None
+    hosts: _FakeHostStore,
+    *,
+    connected: set[str] | None = None,
+    broken: str | None = None,
 ) -> tuple[ManagedSandboxReaper, dict[str, _OwnerLauncher]]:
     """Build a reaper whose launchers record, per owner, the last one bound to them."""
     built: list[_OwnerLauncher] = []
     current: dict[str, _OwnerLauncher] = {}
 
     def resolve(user: str) -> None:
+        if user == broken:
+            raise RuntimeError("connection store unavailable")
         built[-1].owner = user
         current[user] = built[-1]
 
@@ -785,3 +790,13 @@ async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(
 
     assert current["alice"].terminated == ["alice:sb-a"]
     assert hosts.hosts[7]["h_a"].terminating_sandbox_id is None
+
+
+async def test_one_owner_launcher_failing_to_build_does_not_stop_the_sweep() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now), broken="alice")
+
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert "alice" not in current
