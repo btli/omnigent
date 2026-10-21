@@ -195,7 +195,11 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError, SandboxGoneError
+from omnigent.onboarding.sandboxes.base import (
+    OwnerCredentialMissingError,
+    SandboxGoneError,
+    resolve_managed_keepalive_interval_s,
+)
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -1710,11 +1714,19 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 "server config 'sandbox.databricks.workspace_host' is required — the "
                 "workspace URL Sandboxes run in, e.g. https://<workspace>.cloud.databricks.com"
             )
+        inactivity_timeout_s = _parse_provider_positive_int(
+            raw, "databricks", "inactivity_timeout_s"
+        )
+        # The keepalive must land before the idle stop, or a Sandbox stops mid-run.
+        min_timeout_s = 2 * resolve_managed_keepalive_interval_s("databricks")
+        if inactivity_timeout_s is not None and inactivity_timeout_s < min_timeout_s:
+            raise ValueError(
+                "server config 'sandbox.databricks.inactivity_timeout_s' must be at least "
+                f"{min_timeout_s:.0f} (twice the keepalive interval), got {inactivity_timeout_s}"
+            )
         launcher_factory = _databricks_launcher_factory(
             sandbox_id_prefix=_parse_provider_string(raw, "databricks", "sandbox_id_prefix"),
-            inactivity_timeout_s=_parse_provider_positive_int(
-                raw, "databricks", "inactivity_timeout_s"
-            ),
+            inactivity_timeout_s=inactivity_timeout_s,
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
             proxy_bearer=bool(_parse_provider_bool(raw, "databricks", "proxy_bearer")),
             workspace_host=workspace_host,

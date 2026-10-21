@@ -261,3 +261,20 @@ async def test_first_launch_failure_terminates_the_sandbox_as_its_owner(db_uri: 
     assert terminated_as == [("sb-fake-1", "tok-alice@example.com")]
     assert marked == ["sb-fake-1"]
     assert host_store.list_hosts("alice@example.com") == []
+
+
+@pytest.mark.parametrize(("timeout_s", "ok"), [(1199, False), (1200, True)])
+def test_inactivity_timeout_must_outlast_the_keepalive(
+    monkeypatch: pytest.MonkeyPatch, timeout_s: int, ok: bool
+) -> None:
+    monkeypatch.delenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", raising=False)
+    raw = {
+        "provider": "databricks",
+        "server_url": "https://x.example",
+        "databricks": {"workspace_host": _WS, "inactivity_timeout_s": timeout_s},
+    }
+    if ok:
+        assert parse_sandbox_config(raw) is not None
+    else:
+        with pytest.raises(ValueError, match="twice the keepalive interval"):
+            parse_sandbox_config(raw)

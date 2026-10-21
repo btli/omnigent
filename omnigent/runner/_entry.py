@@ -684,9 +684,9 @@ def _make_auth_token_factory(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     )
 
-    # A managed sandbox runner behind an authenticating front door: the
-    # launcher-refreshed proxy bearer is the credential every runner->server
-    # surface must present, and only to the server it was issued for.
+    # Behind the Databricks Apps proxy (header auth) the server cannot mint a
+    # runner token and the proxy admits only the owner's own Databricks token,
+    # so that launcher-refreshed bearer is the runner's credential, for its server only.
     from omnigent.util.proxy_bearer import (
         proxy_bearer_allowed_for,
         proxy_bearer_configured,
