@@ -360,10 +360,12 @@ connected, the keepalive runs a command in the Sandbox so it does not idle-stop,
 and refreshes the proxy bearer.
 
 **Cleanup after a user disconnects.** Teardown also acts as the owner, so if the
-owner has disconnected, their Sandbox stays after the session is deleted. The
-server retries the delete and finishes it once the owner reconnects. To remove it
-sooner, a workspace admin deletes it by id (logged as `Creating Databricks Sandbox
-'<id>'`): `databricks api delete /api/2.0/sandboxes/<id>`.
+owner has disconnected, their Sandbox stays after the session is deleted. With
+the managed-sandbox reaper enabled (`sandbox.reaper.enabled: true`; it is off by
+default), each sweep retries the delete and finishes it once the owner
+reconnects. Otherwise, or to remove it sooner, a workspace admin deletes it by id
+(logged as `Creating Databricks Sandbox '<id>'`):
+`databricks api delete /api/2.0/sandboxes/<id>`.
 
 ## Troubleshooting
 

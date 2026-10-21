@@ -3764,6 +3764,7 @@ async def launch_managed_host(
         agent_name=agent_name,
         on_stage=on_stage,
         slice_key_enabled=slice_key_enabled,
+        owner_credentials=config.owner_credentials,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
@@ -3987,6 +3988,7 @@ async def _register_and_start_host(
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
     slice_key_enabled: bool = False,
+    owner_credentials: Mapping[str, Callable[[str], Mapping[str, object] | None]] | None = None,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -4024,6 +4026,10 @@ async def _register_and_start_host(
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
     :param slice_key_enabled: Whether the host routes by its own id.
+    :param owner_credentials: The deployment's per-user credential resolvers
+        (:attr:`ManagedSandboxDeployment.owner_credentials`), so a first
+        launch's failure teardown still acts as the owner. ``None`` binds
+        none.
     :returns: The absolute in-sandbox workspace path.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
@@ -4107,9 +4113,13 @@ async def _register_and_start_host(
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
         else:
             # The row was just armed with THIS single-provider config, so a
-            # one-provider deployment tears it back down with the same launcher.
+            # one-provider deployment tears it back down as the same owner.
             await terminate_managed_host(
-                record, host_store, ManagedSandboxDeployment.single(config)
+                record,
+                host_store,
+                ManagedSandboxDeployment(
+                    configs=(config,), owner_credentials=owner_credentials or {}
+                ),
             )
         if isinstance(exc, HTTPException):
             raise

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 import pytest
@@ -13,6 +13,7 @@ from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
 from omnigent.server.managed_hosts import (
     DATABRICKS_MANAGED_TOKEN_TTL_S,
+    ManagedSandboxConfig,
     ManagedSandboxDeployment,
     build_owner_launcher,
     launch_managed_host,
@@ -21,6 +22,7 @@ from omnigent.server.managed_hosts import (
     resume_managed_host,
 )
 from omnigent.stores.host_store import Host, HostStore
+from tests.server.helpers import FakeSandboxLauncher
 
 _WS = "https://ws.cloud.databricks.com"
 
@@ -202,3 +204,60 @@ async def test_resume_for_an_unconnected_owner_is_a_409_and_keeps_the_host(
     assert info.value.status_code == 409
     assert "Connect Databricks" in str(info.value.detail)
     _assert_dormant_host_kept(host_store)
+
+
+class _OwnerBoundFakeLauncher(FakeSandboxLauncher):
+    """Fake launcher that, like Databricks, acts only as its bound owner."""
+
+    def __init__(self, terminated_as: list[tuple[str, object]]) -> None:
+        super().__init__(fail_on_host_start=True)
+        self._terminated_as = terminated_as
+        self._resolve: Callable[[], Mapping[str, object] | None] | None = None
+
+    @property
+    def owner_credential_provider(self) -> str | None:
+        return "databricks"
+
+    def bind_owner_credential(self, resolve: Callable[[], Mapping[str, object] | None]) -> None:
+        self._resolve = resolve
+
+    def terminate(self, sandbox_id: str) -> None:
+        if self._resolve is None:
+            raise OwnerCredentialMissingError("no owner credential bound")
+        credential = self._resolve()
+        assert credential is not None
+        self._terminated_as.append((sandbox_id, credential["token"]))
+        super().terminate(sandbox_id)
+
+
+async def test_first_launch_failure_terminates_the_sandbox_as_its_owner(db_uri: str) -> None:
+    # A failure after the host row is armed must still tear the Sandbox down
+    # with the owner's credential, not an unbound launcher that refuses.
+    terminated_as: list[tuple[str, object]] = []
+    cfg = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://x.example",
+                launcher_factory=lambda: _OwnerBoundFakeLauncher(terminated_as),
+                token_ttl_s=3600,
+            ),
+        ),
+        owner_credentials={"databricks": lambda user: {"token": f"tok-{user}"}},
+    )
+    host_store = HostStore(db_uri)
+    marked: list[str] = []
+    mark = host_store.mark_sandbox_terminated
+
+    def _spy_mark(host_id: str, *, sandbox_id: str) -> bool:
+        marked.append(sandbox_id)
+        return mark(host_id, sandbox_id=sandbox_id)
+
+    host_store.mark_sandbox_terminated = _spy_mark  # type: ignore[method-assign]
+
+    with pytest.raises(HTTPException) as info:
+        await launch_managed_host(config=cfg, owner="alice@example.com", host_store=host_store)
+
+    assert info.value.status_code == 502
+    assert terminated_as == [("sb-fake-1", "tok-alice@example.com")]
+    assert marked == ["sb-fake-1"]
+    assert host_store.list_hosts("alice@example.com") == []
