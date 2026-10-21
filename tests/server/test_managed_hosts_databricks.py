@@ -22,6 +22,8 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.stores.host_store import Host, HostStore
 
+_WS = "https://ws.cloud.databricks.com"
+
 
 def test_full_section_reaches_the_launcher() -> None:
     cfg = parse_sandbox_config(
@@ -33,6 +35,7 @@ def test_full_section_reaches_the_launcher() -> None:
                 "inactivity_timeout_s": 3600,
                 "bootstrap_command": "true",
                 "proxy_bearer": True,
+                "workspace_host": _WS + "/",
             },
         }
     )
@@ -47,10 +50,22 @@ def test_full_section_reaches_the_launcher() -> None:
     assert launcher._inactivity_timeout_s == 3600
     assert launcher._bootstrap_command == "true"
     assert launcher._proxy_bearer is True
+    assert launcher._workspace_host == _WS
 
 
-def test_provider_and_server_url_alone_use_defaults() -> None:
-    cfg = parse_sandbox_config({"provider": "databricks", "server_url": "https://x.example"})
+def test_workspace_host_is_required() -> None:
+    with pytest.raises(ValueError, match="workspace_host' is required"):
+        parse_sandbox_config({"provider": "databricks", "server_url": "https://x.example"})
+
+
+def test_workspace_host_alone_uses_defaults() -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://x.example",
+            "databricks": {"workspace_host": _WS},
+        }
+    )
     assert cfg is not None
     launcher = cfg.default.launcher_factory()
     assert isinstance(launcher, DatabricksSandboxLauncher)
@@ -82,21 +97,13 @@ def _owner_deployment(
         {
             "provider": "databricks",
             "server_url": "https://x.example",
-            "databricks": section,
+            "databricks": {"workspace_host": _WS, **section},
         }
     )
     assert cfg is not None
     if resolvers is not None:
         cfg = replace(cfg, owner_credentials=resolvers)
     return cfg
-
-
-def test_owner_identity_and_workspace_host_reach_the_launcher() -> None:
-    cfg = _owner_deployment(workspace_host="https://ws.cloud.databricks.com/")
-    launcher = cfg.default.launcher_factory()
-    assert isinstance(launcher, DatabricksSandboxLauncher)
-    assert launcher.owner_credential_provider == "databricks"
-    assert launcher._workspace_host == "https://ws.cloud.databricks.com"
 
 
 @pytest.mark.parametrize("section", [{"identity": "server"}, {"profile": "sp"}])

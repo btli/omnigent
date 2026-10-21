@@ -132,6 +132,7 @@ def test_bearer_is_only_sent_to_the_server_it_was_issued_for(
 ) -> None:
     from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV, _remote_headers
     from omnigent.runner import _entry
+    from omnigent.runner.identity import RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR
 
     assert read_proxy_bearer("https://OMNIGENT.example.com/") == "front-door-token"
     assert read_proxy_bearer("https://elsewhere.example.com") is None
@@ -140,8 +141,10 @@ def test_bearer_is_only_sent_to_the_server_it_was_issued_for(
     assert headers.get("Authorization") != "Bearer front-door-token"
     monkeypatch.setattr(_entry, "_runner_auth_factory", None)
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    # Another server falls through to the runner's other credentials.
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "seeded")
     factory = _entry._make_auth_token_factory("https://elsewhere.example.com")
-    assert factory is None or factory() != "front-door-token"
+    assert factory is not None and factory() == "seeded"
     # Without the launcher's server URL, the bearer is never sent to a named server.
     monkeypatch.delenv(PROXY_BEARER_SERVER_URL_ENV_VAR)
     assert read_proxy_bearer("https://omnigent.example.com") is None

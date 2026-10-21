@@ -330,15 +330,14 @@ sandbox:
   provider: databricks
   server_url: https://your-host        # public URL the Sandbox host dials back to
   databricks:
-    workspace_host: https://<workspace>.cloud.databricks.com   # optional pin
+    workspace_host: https://<workspace>.cloud.databricks.com   # required
     proxy_bearer: true                 # only behind the Databricks Apps OAuth proxy
     inactivity_timeout_s: 3600         # optional idle stop; resumed on the next turn
     sandbox_id_prefix: omnigent        # optional
 ```
 
-`workspace_host` refuses a connection to any other workspace. Set it on shared
-servers: without it, a user who reconnects to a different workspace can no longer
-reach (or clean up) Sandboxes created in the first one. With `proxy_bearer: true`,
+`workspace_host` is the workspace Sandboxes run in; a user connected to any other
+workspace is refused, so their existing Sandboxes are never lost track of. With `proxy_bearer: true`,
 the Sandbox's `omnigent` must include proxy-bearer support, so pin it with a
 `bootstrap_command` (e.g. `uv tool install omnigent==<server version>`) if the
 image's built-in copy is older than the server.

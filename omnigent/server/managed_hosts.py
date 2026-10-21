@@ -149,7 +149,7 @@ stores into ``create_app``):
    (Apple Silicon macOS / KVM Linux). The ``databricks`` launcher runs
    each sandbox as the user who owns it, through that user's Databricks
    account connection (``OMNIGENT_DATABRICKS_CLIENT_ID`` /
-   ``_CLIENT_SECRET``); optionally pin ``sandbox.databricks.workspace_host``.
+   ``_CLIENT_SECRET``), in the workspace ``sandbox.databricks.workspace_host`` names.
    Behind the Databricks Apps OAuth proxy set
    ``sandbox.databricks.proxy_bearer: true`` (see
    :mod:`omnigent.util.proxy_bearer`).
@@ -1702,6 +1702,14 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 },
                 "sandbox.databricks",
             )
+        workspace_host = _parse_provider_string(raw, "databricks", "workspace_host")
+        if workspace_host is None:
+            # Sandboxes are only reachable in the workspace that created them, so
+            # pin it: an owner reconnected elsewhere is then refused, not orphaned.
+            raise ValueError(
+                "server config 'sandbox.databricks.workspace_host' is required — the "
+                "workspace URL Sandboxes run in, e.g. https://<workspace>.cloud.databricks.com"
+            )
         launcher_factory = _databricks_launcher_factory(
             sandbox_id_prefix=_parse_provider_string(raw, "databricks", "sandbox_id_prefix"),
             inactivity_timeout_s=_parse_provider_positive_int(
@@ -1709,7 +1717,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             ),
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
             proxy_bearer=bool(_parse_provider_bool(raw, "databricks", "proxy_bearer")),
-            workspace_host=_parse_provider_string(raw, "databricks", "workspace_host"),
+            workspace_host=workspace_host,
         )
         # Sandboxes stop on idle and resume under the same id; the token must
         # outlive an idle weekend. A wake re-arms a fresh token anyway.

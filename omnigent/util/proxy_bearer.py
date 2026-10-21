@@ -26,6 +26,12 @@ def _normalize_url(url: str) -> str:
     return f"{parts.scheme.lower()}://{parts.netloc.lower()}{parts.path.rstrip('/')}"
 
 
+def proxy_bearer_allowed_for(server_url: str) -> bool:
+    """Whether the bearer may be sent to *server_url* (the launcher-configured server)."""
+    allowed = os.environ.get(PROXY_BEARER_SERVER_URL_ENV_VAR, "").strip()
+    return bool(allowed) and _normalize_url(allowed) == _normalize_url(server_url)
+
+
 def read_proxy_bearer(server_url: str | None = None) -> str | None:
     """Return the current proxy bearer, or ``None`` when unset or unreadable.
 
@@ -37,10 +43,8 @@ def read_proxy_bearer(server_url: str | None = None) -> str | None:
     path = os.environ.get(PROXY_BEARER_FILE_ENV_VAR, "").strip()
     if not path:
         return None
-    if server_url is not None:
-        allowed = os.environ.get(PROXY_BEARER_SERVER_URL_ENV_VAR, "").strip()
-        if not allowed or _normalize_url(allowed) != _normalize_url(server_url):
-            return None
+    if server_url is not None and not proxy_bearer_allowed_for(server_url):
+        return None
     try:
         token = Path(path).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
