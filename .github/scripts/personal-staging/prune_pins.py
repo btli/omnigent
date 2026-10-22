@@ -473,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", help="write the plan as JSON here")
     args = parser.parse_args(argv)
 
-    today = _date(args.date) if args.date else dt.datetime.now(dt.timezone.utc).date()
+    today = _date(args.date) if args.date else dt.datetime.now(dt.UTC).date()
     if today is None:
         parser.error(f"--date {args.date!r} is not a YYYYMMDD calendar date")
 

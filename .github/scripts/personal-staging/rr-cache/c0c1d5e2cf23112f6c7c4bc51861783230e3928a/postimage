@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#1E2742</color>
+
+    <!-- Not generated: keep in sync with the CSS destructive colour in web/src/index.css. -->
+    <color name="brand_error">#e65b77</color>
+    <color name="omnigents_wordmark">#FFFFFF</color>
+</resources>

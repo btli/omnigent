@@ -20,7 +20,8 @@ from omnigent.db.db_models import Uuid16
 revision: str = "c8e4f2a6b901"
 down_revision: str | None = "nf12ab34cd56"
 branch_labels: tuple[str, ...] | None = None
-depends_on: tuple[str, ...] | None = None
+# Fork-only: a5363b7c9d2e (#5381, already shipped to the rings) owns project_id here.
+depends_on: tuple[str, ...] | None = ("a5363b7c9d2e",)
 
 
 _TASK_TIMESTAMPS = ("last_run_at", "created_at", "updated_at")
@@ -38,7 +39,6 @@ def upgrade() -> None:
                 existing_nullable=column != "created_at",
             )
         batch.add_column(sa.Column("next_run_at", sa.BigInteger(), nullable=True))
-        batch.add_column(sa.Column("project_id", Uuid16(), nullable=True))
         batch.add_column(sa.Column("delegation_ref", sa.String(1024), nullable=True))
         batch.create_index(
             "ix_scheduled_tasks_due", ["state", "next_run_at", "workspace_id", "id"]
@@ -128,7 +128,6 @@ def downgrade() -> None:
     with op.batch_alter_table("scheduled_tasks") as batch:
         batch.drop_index("ix_scheduled_tasks_due")
         batch.drop_column("delegation_ref")
-        batch.drop_column("project_id")
         batch.drop_column("next_run_at")
         # CRDB cannot narrow indexed timestamps; keep their widened types.
         if op.get_bind().dialect.name != "cockroachdb":
