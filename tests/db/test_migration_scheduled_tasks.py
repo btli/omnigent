@@ -108,7 +108,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "created_at",
         "updated_at",
         "next_run_at",
-        "project_id",
         "delegation_ref",
     }
 

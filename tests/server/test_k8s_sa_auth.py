@@ -311,7 +311,7 @@ class TestResolveK8sSaAuthConfig:
 
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-ca")])
-        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        now = datetime.datetime.now(tz=datetime.UTC)
         cert = (
             x509.CertificateBuilder()
             .subject_name(name)

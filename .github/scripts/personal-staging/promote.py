@@ -14,7 +14,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -463,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
     p_plan.add_argument("--approve-migration", default="")
     p_plan.add_argument("--allow-older", action="store_true")
     p_plan.add_argument(
-        "--date", default=datetime.now(timezone.utc).strftime("%Y%m%d"), help="promote date (UTC)"
+        "--date", default=datetime.now(UTC).strftime("%Y%m%d"), help="promote date (UTC)"
     )
     p_plan.add_argument("--out", type=Path)
     p_verify = sub.add_parser("verify-assets", help="check downloaded assets against a manifest")

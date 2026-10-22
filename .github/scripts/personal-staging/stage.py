@@ -1751,7 +1751,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.date:
         date = dt.date(int(args.date[:4]), int(args.date[4:6]), int(args.date[6:8]))
     else:
-        date = dt.datetime.now(dt.timezone.utc).date()
+        date = dt.datetime.now(dt.UTC).date()
     ring = RINGS[args.ring]
     # The hourly mode force-pushes the ring branch with none of the nightly's
     # gates (production's migration gate above all) — it exists for staging
