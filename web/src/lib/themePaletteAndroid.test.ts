@@ -28,8 +28,11 @@ it("generates Android colours from the default Omni palette", () => {
     expect(dark).toContain('<color name="brand_background">#0e1013</color>');
     expect(dark).toContain('<color name="brand_foreground">#f2f4f5</color>');
     expect(dark).toContain('<color name="brand_border">#27292b</color>');
-    expect(light.match(/<color name=/g)).toHaveLength(6);
-    expect(dark.match(/<color name=/g)).toHaveLength(6);
+    expect(light).toContain('<color name="brand_secondary">#eceef1</color>');
+    expect(dark).toContain('<color name="brand_on_secondary">#e8ecf0</color>');
+    expect(light).toContain('<color name="brand_accent">#df3c85</color>');
+    expect(light.match(/<color name=/g)).toHaveLength(9);
+    expect(dark.match(/<color name=/g)).toHaveLength(9);
 
     writeFileSync(darkPath, dark.replace("#0e1013", "#0e1014"));
     const stale = spawnSync(process.execPath, [...args, "--check"], { encoding: "utf8" });
