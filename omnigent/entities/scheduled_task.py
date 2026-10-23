@@ -63,6 +63,7 @@ class ScheduledTask:
         ``"managed_sandbox"`` for a fresh sandbox per occurrence.
     :param host_id: Specific connected host to run on. ``None`` only for legacy
         or invalid rows.
+    :param project_id: First-class Project membership. ``None`` means unfiled.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
         ``"deleted"``, or ``"completed"`` once a schedule has no remaining
         occurrences. Defaults to ``"active"``.
