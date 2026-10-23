@@ -1641,21 +1641,20 @@ def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -
     assert loaded.spec.executor.config.get("harness") == "antigravity-native"
 
 
-def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) -> None:
-    """
-    The startup seeder registers the antigravity built-in alongside the others.
-
-    ``_ensure_default_agents`` is the single call the server lifespan makes; a
-    regression that drops the antigravity line would silently remove it from the
-    picker even though its helper still works.
-    """
+@pytest.mark.parametrize("agent_name", [ANTIGRAVITY_NATIVE_AGENT_NAME, "genie"])
+def test_ensure_default_agents_includes_harness(seed_stores: _SeedStores, agent_name: str) -> None:
+    """Startup seeds each harness card with a loadable, correctly routed bundle."""
     server_app._ensure_default_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
+    seeded = seed_stores.agent_store.get_by_name(agent_name)
+    assert seeded is not None
+    loaded = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location, expand_env=False)
+    expected_harness = "genie" if agent_name == "genie" else "antigravity-native"
+    assert loaded.spec.executor.config["harness"] == expected_harness
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
