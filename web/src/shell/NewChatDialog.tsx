@@ -233,6 +233,7 @@ import {
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isAcpHarnessAgent,
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -1745,7 +1746,8 @@ export function AgentHarnessPicker({
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      const primary =
+        primaryOrder.includes(key) || isHeadlessCliHarness(agent) || agent.id === promotedHarnessId;
       // Unavailable primaries demote to "Other..." — the main list stays
       // launch-ready; the selected harness always keeps its slot.
       if (primary && (selected || !unavailable)) {
@@ -2292,11 +2294,19 @@ export function NewChatLandingScreen() {
   // user's own agents stay under "Agents" even on a native harness, so one never
   // passes for a harness row (or for the Claude Code wrapper Smart Routing binds).
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a))),
+    () =>
+      agentList.filter(
+        (a) =>
+          !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a) || isHeadlessCliHarness(a)),
+      ),
     [agentList],
   );
   const agentEntries = useMemo(
-    () => agentList.filter((a) => a.mine || (!isNativeCodingAgent(a) && !isAcpHarnessAgent(a))),
+    () =>
+      agentList.filter(
+        (a) =>
+          a.mine || (!isNativeCodingAgent(a) && !isAcpHarnessAgent(a) && !isHeadlessCliHarness(a)),
+      ),
     [agentList],
   );
 
