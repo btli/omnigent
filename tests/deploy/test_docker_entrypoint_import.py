@@ -18,6 +18,8 @@ from typing import NoReturn
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.artifact_store.s3 import S3ArtifactStore
@@ -235,3 +237,91 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
     from deploy.docker.entrypoint import _resolve_execution_timeout
 
     assert _resolve_execution_timeout(cfg) == expected_timeout
+
+
+# ── managed MCP registry wiring ──────────────────────────────────────────
+# OMNIGENT_MCP_REGISTRY must reach create_app as it does under `omnigent
+# server`; otherwise /v1/info omits "mcp" and the web UI hides MCP settings.
+
+
+@pytest.fixture
+def _sqlite_entrypoint_env(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_entrypoint_env`` on a migrated SQLite DB with no credential cipher."""
+    from deploy.docker.entrypoint import run_migrations
+
+    database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    for name in (
+        "OMNIGENT_CREDENTIAL_CIPHER",
+        "OMNIGENT_CREDENTIAL_KMS_KEY_ID",
+        "OMNIGENT_CREDENTIAL_VAULT_KEY",
+        "OMNIGENT_MCP_REGISTRY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    run_migrations(database_url)
+
+
+def _registry_service(auth: str) -> str:
+    return (
+        "services:\n"
+        "  - id: docs\n"
+        "    title: Docs\n"
+        "    url: https://mcp.example.com/mcp\n"
+        f"    auth: {auth}\n"
+        "    tools: [search]\n"
+    )
+
+
+def _build_with_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, registry_yaml: str | None
+) -> FastAPI:
+    from deploy.docker.entrypoint import build_app
+
+    if registry_yaml is not None:
+        registry_path = tmp_path / "mcp-registry.yaml"
+        registry_path.write_text(registry_yaml)
+        monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_path))
+    return build_app().app
+
+
+@pytest.mark.parametrize(
+    ("registry_yaml", "mcp_enabled"),
+    [(_registry_service("none"), True), (None, False)],
+    ids=["auth-none-registry", "no-registry"],
+)
+def test_build_app_wires_the_managed_mcp_registry(
+    _sqlite_entrypoint_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry_yaml: str | None,
+    mcp_enabled: bool,
+) -> None:
+    app = _build_with_registry(monkeypatch, tmp_path, registry_yaml)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/info")
+
+    assert response.status_code == 200
+    assert ("mcp" in response.json()["enabled_connections"]) is mcp_enabled
+    assert (app.state.mcp_registry is not None) is mcp_enabled
+
+
+@pytest.mark.parametrize(
+    ("registry_yaml", "error"),
+    [
+        (_registry_service("bearer"), "cipher"),
+        (_registry_service("none") + "unknown_key: true\n", "unknown_key"),
+    ],
+    ids=["bearer-without-cipher", "invalid-registry"],
+)
+def test_build_app_fails_startup_on_an_unusable_mcp_registry(
+    _sqlite_entrypoint_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry_yaml: str,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        _build_with_registry(monkeypatch, tmp_path, registry_yaml)

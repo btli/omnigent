@@ -487,6 +487,22 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
 
+    # Managed MCP registry: same env-driven wiring as `omnigent server`. An
+    # invalid OMNIGENT_MCP_REGISTRY or a missing cipher fails startup.
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+
+    mcp_registry = None
+    registry_config = McpRegistryConfig.from_env()
+    if registry_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+
+        registry_cipher = build_secret_cipher()
+        mcp_registry = McpRegistry(
+            registry_config,
+            CredentialStore(database_url, registry_cipher) if registry_cipher else None,
+        )
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -510,6 +526,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
         github_config=github_config,
         github_store=github_store,
+        mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )
