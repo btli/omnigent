@@ -269,6 +269,7 @@ import {
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
+import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permissionModeCycle";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
@@ -2037,6 +2038,7 @@ export function buildSlashCommandMap(
   skillPrefix: "/" | "$" = "/",
   supportsModelReset = false,
   showMcp = false,
+  showClear = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2044,6 +2046,7 @@ export function buildSlashCommandMap(
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
     if (name === "/mcp" && !showMcp) continue;
+    if (name === "/clear" && !showClear) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2437,6 +2440,7 @@ function ComposerImpl(
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const nativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
   const subAgentName = useChatStore((s) => s.subAgentName);
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessLabel = composerHarnessLabel(
@@ -2572,8 +2576,26 @@ function ComposerImpl(
         claudePermissionMode)
       : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
-  const changePermission = async (mode: string) => {
-    if (isReadOnly || unreachable || configBusyRef.current) return;
+  const selectedPermissionMode = showClaudePermissionMode
+    ? claudePermissionMode
+    : codexApprovalMode;
+  const permissionControlInteractive =
+    (showClaudePermissionMode || showCodexApprovalMode) &&
+    !isReadOnly &&
+    !unreachable &&
+    isOwnerLevel(permissionLevel);
+  // After a Shift+Tab press that didn't land (refused, downgraded or failed),
+  // the next press continues past that mode instead of retrying it.
+  const cycleCursorRef = useRef<{ sessionId: string | null; from: string; past: string } | null>(
+    null,
+  );
+  const currentPermissionMode = (): string => {
+    const state = useChatStore.getState();
+    return showClaudePermissionMode ? state.claudePermissionMode : state.codexApprovalMode;
+  };
+  /** Applies *mode*; resolves whether the session landed on it. */
+  const changePermission = async (mode: string): Promise<boolean> => {
+    if (isReadOnly || unreachable || configBusyRef.current) return false;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
@@ -2581,13 +2603,50 @@ function ComposerImpl(
       const store = useChatStore.getState();
       if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
+      if (useChatStore.getState().conversationId !== sourceSessionId) return false;
+      // The store reconciles to the mode the server confirms the session reached.
+      const landed = currentPermissionMode() === mode;
+      if (landed) cycleCursorRef.current = null;
+      return landed;
     } catch (error) {
       if (useChatStore.getState().conversationId === sourceSessionId)
         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");
+      return false;
     } finally {
       configBusyRef.current = false;
       setConfigBusy(false);
     }
+  };
+  // Leaving a mode the chip can't switch back to (e.g. Codex read-only) stays a menu pick.
+  const isSwitchableMode = (mode: string) =>
+    permissionOptions.some((option) => option.value === mode);
+  const nextFromSelected =
+    permissionControlInteractive && !configBusy && isSwitchableMode(selectedPermissionMode)
+      ? nextCycledPermissionMode(permissionOptions, selectedPermissionMode)
+      : null;
+  /** Shift+Tab: step to the next permission mode. Returns whether it took the key. */
+  const cyclePermissionMode = (): boolean => {
+    if (!permissionControlInteractive) return false;
+    // Hold the key while a change is in flight so focus doesn't jump away.
+    if (configBusyRef.current) return true;
+    const sessionId = useChatStore.getState().conversationId;
+    // Read the store, not the render: a change may have landed since the last render.
+    const selected = currentPermissionMode();
+    if (!isSwitchableMode(selected)) return false;
+    const cursor = cycleCursorRef.current;
+    const resume = cursor?.sessionId === sessionId && cursor.from === selected ? cursor.past : null;
+    const resumed =
+      resume === null
+        ? null
+        : nextCycledPermissionMode(permissionOptions, resume, new Set([selected]));
+    // With nothing else to move to, retry the failed mode.
+    const next = resumed ?? nextCycledPermissionMode(permissionOptions, selected);
+    if (next === null) return false;
+    void changePermission(next).then((landed) => {
+      if (!landed && useChatStore.getState().conversationId === sessionId)
+        cycleCursorRef.current = { sessionId, from: currentPermissionMode(), past: next };
+    });
+    return true;
   };
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
   const { goal, setGoal: setGoalState } = useGoalState(
@@ -2747,6 +2806,9 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
+  // /clear runs the harness's own /clear in the session terminal, which moves
+  // the terminal onto a fresh session the view then follows.
+  const showClear = sessionHarness === "claude-native" || sessionHarness === "codex-native";
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -2768,6 +2830,7 @@ function ComposerImpl(
         skillPrefix,
         supportsModelReset,
         composerSessionId !== null,
+        showClear,
       ),
     [
       skills,
@@ -2779,6 +2842,7 @@ function ComposerImpl(
       skillPrefix,
       supportsModelReset,
       composerSessionId,
+      showClear,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -2985,6 +3049,26 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
         onNewSession();
+        return true;
+      }
+      case "/clear": {
+        if (!showClear) {
+          setCommandError("/clear is not supported for this agent type");
+          return true;
+        }
+        if (arg) {
+          setCommandError("/clear does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        void useChatStore
+          .getState()
+          .clearContext()
+          .catch((err: unknown) => {
+            setCommandError(err instanceof Error ? err.message : "Clear failed");
+          });
         return true;
       }
       case "/compact": {
@@ -3525,6 +3609,11 @@ function ComposerImpl(
     // submission.
     if (slashCompletion.handleKey(e, { shouldPreferSendOverCompletion })) return;
 
+    if (isPermissionModeCycleKey(e) && cyclePermissionMode()) {
+      e.preventDefault();
+      return;
+    }
+
     // Mobile Enter behavior takes precedence over this desktop preference:
     // software-keyboard Enter inserts a newline and Send remains an explicit tap.
     if (shouldSubmitFromKeyboard) {
@@ -3747,6 +3836,7 @@ function ComposerImpl(
             if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
           },
           "aria-label": "Message the agent",
+          "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
           placeholder: composerLockedByBtw
             ? "Side chat open — press Esc to close"
             : readOnlyReason !== null
@@ -3972,13 +4062,9 @@ function ComposerImpl(
                   label="Permission mode"
                   value={permissionLabel || "Permission mode"}
                   harness={sessionHarness}
-                  selectedValue={
-                    showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
-                  }
+                  selectedValue={selectedPermissionMode}
                   options={permissionOptions}
-                  disabled={
-                    isReadOnly || unreachable || configBusy || !isOwnerLevel(permissionLevel)
-                  }
+                  disabled={!permissionControlInteractive || configBusy}
                   disabledReason={
                     isOwnerLevel(permissionLevel)
                       ? undefined
@@ -4014,6 +4100,7 @@ function ComposerImpl(
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
+                  modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
                   // stays live wherever a message could be sent — including
@@ -4653,6 +4740,7 @@ function SessionHarnessPicker({
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
+  modelPickWakesSession,
   disabled,
   openNonce = 0,
 }: {
@@ -4672,12 +4760,15 @@ function SessionHarnessPicker({
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
+  /** A model pick must first wake this native session's runner, which can take a while. */
+  modelPickWakesSession: boolean;
   disabled: boolean;
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4749,10 +4840,11 @@ function SessionHarnessPicker({
     setMenuOpen(false);
     setConfigOpen(false);
   }, [conversationId]);
-  const apply = async (change: () => Promise<unknown>) => {
+  const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
     busyRef.current = true;
     setBusy(true);
+    setStartingSession(wakesSession);
     try {
       await change();
     } catch {
@@ -4760,6 +4852,7 @@ function SessionHarnessPicker({
     } finally {
       busyRef.current = false;
       setBusy(false);
+      setStartingSession(false);
     }
   };
   const selectModel = (modelId: string | null) =>
@@ -4782,7 +4875,7 @@ function SessionHarnessPicker({
         useChatStore.getState().conversationId === sourceSessionId
       )
         await store.setCostControlMode("off");
-    });
+    }, modelPickWakesSession);
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
   const composerFusionOption = fusionOption(modelOptions);
@@ -4795,9 +4888,18 @@ function SessionHarnessPicker({
       await store.setModel(modelUid, { expectConfirmation: false });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (selectedEffort !== null) await store.setEffort(null);
-    });
+    }, modelPickWakesSession);
   const configContent = (
     <>
+      {startingSession && (
+        <div
+          className="px-2 py-1 text-xs whitespace-normal text-muted-foreground"
+          role="status"
+          data-testid="composer-agent-starting-session"
+        >
+          Starting the session to switch models…
+        </div>
+      )}
       {costRoutingEligible && showModels && (
         <>
           <DropdownMenuItem
