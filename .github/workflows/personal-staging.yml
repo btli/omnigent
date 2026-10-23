@@ -226,11 +226,12 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Verify composed MCP routes and credential policies
+      - name: Verify composed server routes and credential policies
         env:
           OMNIGENT_SKIP_WEB_UI: "true"
         run: |
           uv run --frozen --extra all --group test python -m pytest --reruns 0 \
+            tests/server/integration/test_scheduled_tasks_routes.py \
             tests/server/integration/test_mcp_proxy.py \
             tests/server/integration/test_mcp_gateway_http.py \
             tests/server/routes/test_sessions_mcp_proxy_policy_retry.py
