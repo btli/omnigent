@@ -8184,9 +8184,11 @@ def _build_spawn_env_from_spec(
 
         if harness == "claude-sdk":
             env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
-        elif harness == "codex":
-            env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
-            env["HARNESS_CODEX_SKILLS_DIR"] = (
+        elif harness in ("codex", "genie"):
+            env = _build_codex_spawn_env(
+                effective_spec, cwd=cwd, workdir=workdir, harness_type=harness
+            )
+            env[f"HARNESS_{harness.upper()}_SKILLS_DIR"] = (
                 str(resource_registry.codex_skills_dir(session_id))
                 if resource_registry is not None and session_id is not None
                 else ""
