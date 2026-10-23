@@ -105,10 +105,13 @@ async def _runner_client(app):
 
 
 @pytest.mark.asyncio
-async def test_background_title_uses_isolated_codex_process(
+@pytest.mark.parametrize("harness_name", ["codex", "genie"])
+async def test_background_title_uses_isolated_cli_process(
     monkeypatch: pytest.MonkeyPatch,
+    harness_name: str,
 ) -> None:
-    monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", "/ambient-parent-session-skills")
+    prefix = f"HARNESS_{harness_name.upper()}"
+    monkeypatch.setenv(f"{prefix}_SKILLS_DIR", "/ambient-parent-session-skills")
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
 
@@ -116,9 +119,11 @@ async def test_background_title_uses_isolated_codex_process(
         assert kwargs["agent_id"] == "agent_test"
         assert kwargs["session_id"] == "conv_test"
         assert kwargs["model_override"] == "gpt-5.4-mini"
-        return "codex", {
-            "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
-            "HARNESS_CODEX_SKILLS_DIR": "/parent-session-skills",
+        return harness_name, {
+            f"{prefix}_MODEL": "gpt-5.4-mini",
+            f"{prefix}_SKILLS_DIR": "/parent-session-skills",
+            f"{prefix}_AGENT_NAME": "parent-agent",
+            f"{prefix}_BUNDLE_DIR": "/parent-bundle",
         }
 
     monkeypatch.setattr(
@@ -150,16 +155,16 @@ async def test_background_title_uses_isolated_codex_process(
     assert uuid.UUID(process_key).hex == process_key
     assert len(process_key) == 32
     assert process_key != "conv_test"
-    assert harness == "codex"
+    assert harness == harness_name
     assert env == {
-        "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "1",
-        "HARNESS_CODEX_ENABLE_WEB_SEARCH": "0",
+        f"{prefix}_DISABLE_NATIVE_TOOLS": "1",
+        f"{prefix}_ENABLE_WEB_SEARCH": "0",
         "HARNESS_CODEX_MINIMAL_CONFIG": "1",
-        "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
-        "HARNESS_CODEX_SKILLS_FILTER": '"none"',
-        "HARNESS_CODEX_SKILLS_DIR": "",
+        f"{prefix}_MODEL": "gpt-5.4-mini",
+        f"{prefix}_SKILLS_FILTER": '"none"',
+        f"{prefix}_SKILLS_DIR": "",
     }
-    assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
+    assert _build_harness_spawn_env(env)[f"{prefix}_SKILLS_DIR"] == ""
     assert process_manager.released == [process_key]
 
     [(url, body)] = harness_client.requests
