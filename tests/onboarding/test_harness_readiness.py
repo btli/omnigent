@@ -187,6 +187,7 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "claude-native",
         "native-claude",
         "codex",
+        "genie",
         "codex-native",
         "native-codex",
         "pi",
@@ -446,6 +447,7 @@ def test_configured_harness_map_covers_all_spellings(
         "codex",
         "codex-native",
         "native-codex",
+        "genie",
         "openai-agents",
         "openai-agents-sdk",
         "open-responses",
@@ -574,10 +576,12 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # this group — it is now auth-aware like the other native CLI harnesses, so
     # its missing binary surfaces as ``"binary-missing"`` too. Pi is also here —
     # it reports the credential axis (no CLI login; its credential is a provider).
+    # Genie is binary-gated like codex (but with the genie binary, not codex's).
     for missing in (
         "codex",
         "codex-native",
         "native-codex",
+        "genie",
         "claude-native",
         "native-claude",
         "opencode-native",
@@ -729,7 +733,8 @@ def test_malformed_acp_config_does_not_log_secret_value(
 def test_configured_harness_map_probes_codex_readiness_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex aliases share one potentially expensive readiness probe."""
+    """Codex aliases share one probe, while Genie checks its own binary."""
+    _no_clis_installed(monkeypatch)
     calls = 0
 
     def _codex_reason() -> str:
@@ -748,6 +753,7 @@ def test_configured_harness_map_probes_codex_readiness_once(
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
+    assert result["genie"] == HARNESS_BINARY_MISSING
 
 
 def test_configured_harness_map_runs_independent_probes_concurrently(
@@ -1666,3 +1672,23 @@ def test_antigravity_sdk_readiness_keys_off_gemini_credential(
         )
     )
     assert configured_harness_map()["antigravity"] is True
+
+
+@pytest.mark.parametrize("use_override", [False, True])
+def test_genie_readiness_honors_binary_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_override: bool
+) -> None:
+    from omnigent.inner.genie_executor import _find_genie_cli
+    from omnigent.onboarding.harness_readiness import _harness_availability
+
+    binary = tmp_path / "custom-genie"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o700)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.delenv("OMNIGENT_GENIE_PATH", raising=False)
+    if use_override:
+        monkeypatch.setenv("OMNIGENT_GENIE_PATH", str(binary))
+
+    assert _find_genie_cli() == (str(binary) if use_override else None)
+    assert harness_is_configured("genie") is use_override
+    assert _harness_availability("genie") == (True if use_override else HARNESS_BINARY_MISSING)
