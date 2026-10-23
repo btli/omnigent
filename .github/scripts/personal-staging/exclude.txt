@@ -2,4 +2,3 @@
 #
 # PR numbers only. Blank lines and `#` comments are ignored. A listed PR is
 # held out of every ring's composition until removed.
-11185             # conflicts with #8770 in MainActivity.kt (session-cookie loads vs the new status screen); needs a hand-merged seed
