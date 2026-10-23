@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
   isAcpHarnessAgent,
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -91,5 +92,13 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: "claude-native" })).toBe(false); // native harness
     expect(isAcpHarnessAgent({ harness: null })).toBe(false);
     expect(isAcpHarnessAgent(null)).toBe(false);
+  });
+});
+
+describe("isHeadlessCliHarness", () => {
+  it("groups Genie with harnesses while leaving composed SDK agents separate", () => {
+    expect(isHeadlessCliHarness(agent({ name: "genie", harness: "genie" }))).toBe(true);
+    expect(isHeadlessCliHarness(agent({ name: "polly", harness: "claude-sdk" }))).toBe(false);
+    expect(isHeadlessCliHarness(null)).toBe(false);
   });
 });
