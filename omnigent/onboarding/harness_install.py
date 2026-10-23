@@ -163,6 +163,10 @@ _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install
 DEVIN_KEY = "devin"
 
 _DEVIN_INSTALL_HINT = "curl -fsSL https://cli.devin.ai/install.sh | bash"
+# Genie is Databricks' fork of the Codex CLI. Like Codex, it wraps a binary
+# called ``genie`` with no separate login command (authenticates via Databricks
+# profile / AI Gateway). Binary-only readiness; no npm package.
+GENIE_KEY = "genie"
 
 # Anthropic recommends its native installer over ``npm install -g``: it writes
 # to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
@@ -332,6 +336,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
         auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
     ),
+    GENIE_KEY: HarnessInstallSpec(
+        "Genie",
+        "genie",
+        package=None,
+        login_args=None,
+        install_hint=(
+            "Genie is Databricks' fork of Codex. "
+            "Install via the Databricks internal package manager."
+        ),
+    ),
 }
 _HARNESS_INSTALL[KIMI_NATIVE_KEY] = replace(
     _HARNESS_INSTALL[KIMI_KEY],
@@ -407,6 +421,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
+    # Genie is Databricks' fork of Codex. The headless ``genie`` harness wraps
+    # the ``genie`` CLI and gates on the same binary as any future genie-native TUI.
+    GENIE_KEY: GENIE_KEY,
 }
 
 
@@ -947,10 +964,14 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
 
 
 def harness_cli_binary(key: str) -> str | None:
-    """Resolve the CLI selected for an install key, including Pi's path override."""
+    """Resolve the CLI selected for an install key, including Pi/Genie path overrides."""
     spec = harness_install_spec(key)
     if spec is None:
         return None
+    if key == GENIE_KEY:
+        from omnigent.inner.genie_executor import _find_genie_cli
+
+        return _find_genie_cli()
     command = spec.binary
     if key == PI_KEY:
         from omnigent.harness_startup_config import resolve_harness_path
