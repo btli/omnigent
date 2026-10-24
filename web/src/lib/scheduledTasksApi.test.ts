@@ -60,7 +60,7 @@ afterEach(() => {
 describe("listScheduledTasks", () => {
   it("GETs /v1/scheduled-tasks and camelCases the rows", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [TASK_WIRE] }));
-    const tasks = await listScheduledTasks({ kind: "all" });
+    const tasks = await listScheduledTasks();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks");
     expect(tasks).toHaveLength(1);
     expect(tasks[0]).toMatchObject({
@@ -74,20 +74,6 @@ describe("listScheduledTasks", () => {
       workspace: null,
       projectId: "project_1",
     });
-  });
-
-  it("maps Project filters to distinct list URLs", async () => {
-    fetchMock.mockResolvedValue(mockResponse({ scheduled_tasks: [] }));
-
-    await listScheduledTasks({ kind: "all" });
-    await listScheduledTasks({ kind: "unfiled" });
-    await listScheduledTasks({ kind: "project", projectId: "project a" });
-
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "/v1/scheduled-tasks",
-      "/v1/scheduled-tasks?unfiled=true",
-      "/v1/scheduled-tasks?project_id=project+a",
-    ]);
   });
 
   it("returns [] when the server omits the key", async () => {

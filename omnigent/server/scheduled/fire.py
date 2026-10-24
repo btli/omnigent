@@ -771,87 +771,27 @@ async def _resolve_fire_project(
     deps: FireDeps,
     task: ScheduledTask,
 ) -> str | None:
-    """Resolve one fire's Project and repair only a proven-missing pointer."""
+    """Resolve one fire's Project; an unverifiable or missing one runs unfiled."""
     if task.project_id is None:
         return None
-    project_store = deps.project_store
-    if project_store is None:
+    resolved = None
+    if deps.project_store is not None:
+        try:
+            resolved = await _resolve_owned_fire_project(deps.project_store, task)
+        except Exception:
+            _logger.warning(
+                "scheduled fire: task %s project %s lookup failed",
+                task.id,
+                task.project_id,
+                exc_info=True,
+            )
+    if resolved is None:
         _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "run is unfiled; assignment preserved",
+            "scheduled fire: task %s project %s not found for its owner; run is unfiled",
             task.id,
             task.project_id,
         )
-        return None
-    try:
-        resolved = await _resolve_owned_fire_project(project_store, task)
-    except Exception:
-        _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "run is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            exc_info=True,
-        )
-        return None
-    if resolved is not None:
-        return resolved
-
-    try:
-        exists = await asyncio.to_thread(project_store.exists, task.project_id)
-    except Exception:
-        _logger.warning(
-            "scheduled fire: task %s project %s existence could not be verified; "
-            "run is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            exc_info=True,
-        )
-        return None
-    if exists:
-        _logger.warning(
-            "scheduled fire: task %s project %s is not owned by the current identity; "
-            "run is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-        )
-        return None
-
-    _logger.warning(
-        "scheduled fire: task %s project %s no longer exists; run is unfiled",
-        task.id,
-        task.project_id,
-    )
-    await _self_heal_task_project(deps, task)
-    return None
-
-
-async def _self_heal_task_project(deps: FireDeps, task: ScheduledTask) -> None:
-    """Best-effort clear of the exact stale Project pointer."""
-    if task.project_id is None:
-        return
-    try:
-        repaired = await asyncio.to_thread(
-            deps.scheduled_task_store.compare_and_set_project,
-            task.id,
-            expected_project_id=task.project_id,
-            project_id=None,
-        )
-    except Exception:
-        _logger.warning(
-            "scheduled fire: task %s project %s self-heal failed; run continues",
-            task.id,
-            task.project_id,
-            exc_info=True,
-        )
-        return
-    if not repaired:
-        _logger.debug(
-            "scheduled fire: task %s project %s self-heal skipped; "
-            "assignment changed or task deleted",
-            task.id,
-            task.project_id,
-        )
+    return resolved
 
 
 async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
