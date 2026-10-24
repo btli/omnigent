@@ -19,4 +19,5 @@
 #
 9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
 10032             # bot replacement for closed #10024 (desktop downloads keep request headers)
+11105             # deploy entrypoints wire server config like `omnigent server` (RCA #11104)
 branch:genie-harness  # fork port of upstream #6109 (headless genie CLI harness); re-port when upstream drifts
