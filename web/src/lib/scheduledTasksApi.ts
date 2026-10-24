@@ -20,8 +20,6 @@ export type ScheduledTaskState = "active" | "paused";
  * firing (no host/workspace), using the server's normal sandbox lifecycle.
  */
 export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
-export type ScheduledTaskProjectFilter =
-  { kind: "all" } | { kind: "unfiled" } | { kind: "project"; projectId: string };
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
@@ -268,14 +266,8 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
 }
 
 /** List the caller's scheduled tasks (owner-scoped server-side). */
-export async function listScheduledTasks(
-  filter: ScheduledTaskProjectFilter = { kind: "all" },
-): Promise<ScheduledTask[]> {
-  const params = new URLSearchParams();
-  if (filter.kind === "unfiled") params.set("unfiled", "true");
-  if (filter.kind === "project") params.set("project_id", filter.projectId);
-  const query = params.toString();
-  const res = await authenticatedFetch(`/v1/scheduled-tasks${query ? `?${query}` : ""}`);
+export async function listScheduledTasks(): Promise<ScheduledTask[]> {
+  const res = await authenticatedFetch("/v1/scheduled-tasks");
   const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }

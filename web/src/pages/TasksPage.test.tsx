@@ -10,10 +10,10 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EmptyState, TasksPage } from "./TasksPage";
+import { TasksPage } from "./TasksPage";
 import * as hooks from "@/hooks/useScheduledTasks";
 import * as conversationHooks from "@/hooks/useConversations";
-import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
+import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
@@ -89,37 +89,7 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
     isLoading: state.isLoading ?? false,
     isError: state.isError ?? false,
     refetch: vi.fn(),
-    error: state.isError ? new Error("load failed") : null,
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
-}
-
-interface QueryState {
-  data?: ScheduledTask[];
-  isLoading?: boolean;
-  isError?: boolean;
-  error?: Error | null;
-  refetch?: ReturnType<typeof vi.fn>;
-}
-
-function setTaskQueries({
-  all,
-  project = all,
-  unfiled = all,
-}: {
-  all: QueryState;
-  project?: QueryState;
-  unfiled?: QueryState;
-}) {
-  vi.mocked(hooks.useScheduledTasks).mockImplementation((filter = { kind: "all" }) => {
-    const selected = filter.kind === "all" ? all : filter.kind === "unfiled" ? unfiled : project;
-    return {
-      data: selected.data,
-      isLoading: selected.isLoading ?? false,
-      isError: selected.isError ?? false,
-      error: selected.error ?? null,
-      refetch: selected.refetch ?? vi.fn(),
-    } as unknown as ReturnType<typeof hooks.useScheduledTasks>;
-  });
 }
 
 async function chooseProjectFilter(name: string) {
@@ -128,7 +98,6 @@ async function chooseProjectFilter(name: string) {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -170,26 +139,6 @@ function renderPage() {
     </MemoryRouter>,
   );
 }
-
-describe("EmptyState", () => {
-  it("keeps the rich global layout when its display copy changes", () => {
-    render(
-      <EmptyState
-        variant="global"
-        message="Start your first automation"
-        showSuggestions={false}
-        onPickSuggestion={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText("Start your first automation")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Create an automation to run an agent session automatically on a recurring schedule.",
-      ),
-    ).toBeInTheDocument();
-  });
-});
 
 describe("TasksPage list", () => {
   it("renders the title, subtitle and task rows with schedule text", () => {
@@ -363,59 +312,37 @@ describe("filtering + search", () => {
 });
 
 describe("Project filtering", () => {
-  it("mounts only one scheduled-task polling subscription", async () => {
-    setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
-    renderPage();
-    vi.mocked(hooks.useScheduledTasks).mockClear();
+  const inA = task({ id: "a", name: "In A", projectId: "p_a" });
+  const inB = task({ id: "b", name: "In B", projectId: "p_b" });
+  const unfiled = task({ id: "u", name: "Unfiled one", projectId: null });
+  const dangling = task({ id: "d", name: "Dangling", projectId: "deleted" });
 
-    await chooseProjectFilter("Project A");
-
-    expect(hooks.useScheduledTasks).toHaveBeenCalledTimes(1);
-    expect(hooks.useScheduledTasks).toHaveBeenLastCalledWith({
-      kind: "project",
-      projectId: "p_a",
-    });
-  });
-
-  it("switches the subscription to the selected server slice", async () => {
-    const inA = task({ id: "a", name: "In A", projectId: "p_a" });
-    const inB = task({ id: "b", name: "In B", projectId: "p_b" });
-    setTaskQueries({ all: { data: [inA, inB] }, project: { data: [inA] } });
+  it("filters to the selected Project or to unfiled and unresolved tasks", async () => {
+    setTasks([inA, inB, unfiled, dangling]);
     renderPage();
 
     await chooseProjectFilter("Project A");
-
-    expect(hooks.useScheduledTasks).toHaveBeenCalledWith({ kind: "all" });
-    expect(hooks.useScheduledTasks).toHaveBeenCalledWith({ kind: "project", projectId: "p_a" });
     expect(screen.getByText("In A")).toBeInTheDocument();
     expect(screen.queryByText("In B")).toBeNull();
     expect(screen.queryByTestId("task-project-chip")).toBeNull();
+
+    await chooseProjectFilter("Unfiled");
+    expect(screen.getByText("Unfiled one")).toBeInTheDocument();
+    expect(screen.getByText("Dangling")).toBeInTheDocument();
+    expect(screen.queryByText("In A")).toBeNull();
   });
 
-  it("renders a nonempty Project slice when the cached All slice is empty", async () => {
-    const inA = task({ id: "a", name: "First automation", projectId: "p_a" });
-    setTaskQueries({ all: { data: [] }, project: { data: [inA] } });
+  it("shows resolved chips in All and hides null or dangling assignments", () => {
+    setTasks([inA, unfiled, dangling]);
     renderPage();
-
-    await chooseProjectFilter("Project A");
-
-    expect(screen.getByText("First automation")).toBeInTheDocument();
-    expect(screen.queryByTestId("tasks-empty-state")).toBeNull();
+    const chip = screen.getByTestId("task-project-chip");
+    expect(screen.getAllByTestId("task-project-chip")).toHaveLength(1);
+    expect(chip).toHaveTextContent("Project A");
+    expect(within(chip).getByTestId("project-label-icon")).toHaveTextContent("📊");
   });
 
-  it("uses narrowed Project copy when All is still loading", async () => {
-    setTaskQueries({ all: { data: undefined, isLoading: true }, project: { data: [] } });
-    renderPage();
-    expect(screen.getByText("Loading automations…")).toBeInTheDocument();
-
-    await chooseProjectFilter("Project A");
-
-    expect(screen.getByText("No automations in Project A")).toBeInTheDocument();
-    expect(screen.queryByText("No automations yet")).toBeNull();
-  });
-
-  it("prefills create from a selected first-class Project", async () => {
-    setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
+  it("prefills create from the selected Project", async () => {
+    setTasks([inA]);
     renderPage();
     await chooseProjectFilter("Project A");
     fireEvent.click(screen.getByTestId("new-task-button"));
@@ -425,105 +352,33 @@ describe("Project filtering", () => {
     );
   });
 
-  it("shows resolved chips in All and hides null or dangling assignments", () => {
-    setTasks([
-      task({ id: "a", projectId: "p_a" }),
-      task({ id: "null", name: "Null", projectId: null }),
-      task({ id: "dangling", name: "Dangling", projectId: "deleted" }),
-    ]);
-    renderPage();
-    expect(screen.getAllByTestId("task-project-chip")).toHaveLength(1);
-    expect(screen.getByTestId("task-project-chip")).toHaveTextContent("Project A");
-    expect(
-      screen.getByTestId("tasks-list").querySelectorAll('[data-testid="tasks-list"]'),
-    ).toHaveLength(0);
-  });
-
-  it("uses the exact global, Project, Unfiled, and client-no-match precedence", async () => {
-    setTaskQueries({ all: { data: [] }, project: { data: [] } });
-    const { unmount } = renderPage();
-    await chooseProjectFilter("Project A");
-    expect(screen.getByText("No automations yet")).toBeInTheDocument();
-    unmount();
-
-    cleanup();
-    setTaskQueries({ all: { data: [task()] }, project: { data: [] }, unfiled: { data: [] } });
-    renderPage();
-    await chooseProjectFilter("Project A");
-    expect(screen.getByText("No automations in Project A")).toBeInTheDocument();
-    await chooseProjectFilter("Unfiled");
-    expect(screen.getByText("No unfiled automations")).toBeInTheDocument();
-
-    cleanup();
-    setTasks([task({ state: "active" })]);
-    renderPage();
-    fireEvent.click(screen.getByTestId("tasks-filter-paused"));
-    expect(screen.getByText("No automations found")).toBeInTheDocument();
-  });
-
-  it("gives task error and loading states precedence only without cached data", () => {
-    setTaskQueries({ all: { data: undefined, isError: true, error: new Error("boom") } });
-    const { unmount } = renderPage();
-    expect(screen.getByText("Couldn’t load automations.")).toBeInTheDocument();
-    unmount();
-
-    cleanup();
-    setTaskQueries({ all: { data: undefined, isLoading: true } });
-    renderPage();
-    expect(screen.getByText("Loading automations…")).toBeInTheDocument();
-  });
-
-  it("keeps Project-list loading and errors inline without replacing task content", () => {
-    setTasks([task()]);
-    vi.mocked(conversationHooks.useProjects).mockReturnValue({
-      data: undefined,
-      isLoading: true,
-      isError: false,
-      refetch: vi.fn(),
-    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
-    const { rerender } = renderPage();
-    expect(screen.getByTestId("tasks-project-filter")).toBeDisabled();
-    expect(screen.getByText("Nightly triage")).toBeInTheDocument();
-
-    vi.mocked(conversationHooks.useProjects).mockReturnValue({
-      data: undefined,
-      isLoading: false,
-      isError: true,
-      refetch: vi.fn(),
-    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
-    rerender(
-      <MemoryRouter>
-        <TasksPage />
-      </MemoryRouter>,
-    );
-    expect(screen.getByText(/Couldn't load projects/)).toBeInTheDocument();
-    expect(screen.getByText("Nightly triage")).toBeInTheDocument();
-  });
-
-  it("hides Suggestions for Project, Unfiled, search, and status filters", async () => {
-    setTaskQueries({
-      all: { data: [task()] },
-      project: { data: [task()] },
-      unfiled: { data: [task()] },
-    });
+  it("hides Suggestions while a Project or Unfiled filter is selected", async () => {
+    setTasks([inA, unfiled]);
     renderPage();
     expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
     await chooseProjectFilter("Project A");
     expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
-    await chooseProjectFilter("All projects");
-    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "night" } });
-    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
-    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "" } });
-    fireEvent.click(screen.getByTestId("tasks-filter-active"));
-    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
-    fireEvent.click(screen.getByTestId("tasks-filter-all"));
     await chooseProjectFilter("Unfiled");
     expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
   });
 
-  it("resets a deleted selection and a transient 404 to All", async () => {
-    const allRefetch = vi.fn();
-    setTaskQueries({ all: { data: [task()], refetch: allRefetch }, project: { data: [] } });
+  it("shows a retryable error when Projects fail to load", () => {
+    setTasks([inA]);
+    const refetch = vi.fn();
+    vi.mocked(conversationHooks.useProjects).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch,
+    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+    renderPage();
+    expect(screen.getByText(/Couldn't load projects/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets a deleted Project selection to All", async () => {
+    setTasks([inA]);
     const { rerender } = renderPage();
     await chooseProjectFilter("Project A");
     vi.mocked(conversationHooks.useProjects).mockReturnValue({
@@ -540,72 +395,6 @@ describe("Project filtering", () => {
     await waitFor(() =>
       expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
     );
-
-    vi.mocked(conversationHooks.useProjects).mockReturnValue({
-      data: [{ id: "p_a", name: "Project A" }],
-      isLoading: false,
-      isError: false,
-      refetch: vi.fn(),
-    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
-    setTaskQueries({
-      all: { data: [task()], refetch: allRefetch },
-      project: {
-        data: undefined,
-        isError: true,
-        error: new ScheduledTaskApiError("Project not found", 404, "not_found"),
-      },
-    });
-    rerender(
-      <MemoryRouter>
-        <TasksPage />
-      </MemoryRouter>,
-    );
-    await chooseProjectFilter("Project A");
-    await waitFor(() =>
-      expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
-    );
-    expect(allRefetch).toHaveBeenCalled();
-  });
-});
-
-describe("Project emoji icons", () => {
-  it("shows each project's emoji (or the folder fallback) in the filter options", async () => {
-    setTasks([task()]);
-    renderPage();
-    fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
-    // The emoji is aria-hidden, so the option's accessible NAME stays the plain
-    // project name — the same selector the rest of the suite relies on.
-    const optionA = await screen.findByRole("option", { name: "Project A" });
-    expect(within(optionA).getByTestId("project-label-icon")).toHaveTextContent("📊");
-    const optionB = screen.getByRole("option", { name: "Project B" });
-    expect(within(optionB).getByTestId("project-label-fallback")).toBeInTheDocument();
-    expect(within(optionB).queryByTestId("project-label-icon")).toBeNull();
-  });
-
-  it("shows the selected project's emoji in the filter trigger", async () => {
-    setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
-    renderPage();
-    await chooseProjectFilter("Project A");
-    const trigger = screen.getByTestId("tasks-project-filter");
-    expect(trigger).toHaveTextContent("📊");
-    expect(trigger).toHaveTextContent("Project A");
-  });
-
-  it("shows the project emoji in the row chip", () => {
-    setTasks([task({ id: "a", projectId: "p_a" })]);
-    renderPage();
-    const chip = screen.getByTestId("task-project-chip");
-    expect(within(chip).getByTestId("project-label-icon")).toHaveTextContent("📊");
-    expect(chip).toHaveTextContent("Project A");
-  });
-
-  it("renders the folder fallback (not a blank gap) for an emoji-less project's chip", () => {
-    setTasks([task({ id: "b", projectId: "p_b" })]);
-    renderPage();
-    const chip = screen.getByTestId("task-project-chip");
-    expect(within(chip).getByTestId("project-label-fallback")).toBeInTheDocument();
-    expect(within(chip).queryByTestId("project-label-icon")).toBeNull();
-    expect(chip).toHaveTextContent("Project B");
   });
 });
 

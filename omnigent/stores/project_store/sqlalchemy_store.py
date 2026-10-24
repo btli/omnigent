@@ -17,7 +17,12 @@ from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
-from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
+from omnigent.db.db_models import (
+    SqlPreference,
+    SqlProject,
+    SqlScheduledTask,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -145,8 +150,8 @@ class SqlAlchemyProjectStore(ProjectStore):
     SQLAlchemy-backed implementation of :class:`ProjectStore`.
 
     Persists projects in a relational database via the SQLAlchemy ORM. Every
-    query is scoped by ``workspace_id``; user-facing operations also scope by
-    ``user_id`` because Projects are owner-private.
+    query is scoped by ``workspace_id`` (tenant partition) and ``user_id``
+    (projects are owner-private).
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -247,11 +252,6 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return None
             return _to_entity(row)
 
-    def exists(self, project_id: str) -> bool:
-        """Return whether a Project id exists, regardless of owner."""
-        with self._session("check_project_exists") as session:
-            return session.get(SqlProject, (current_workspace_id(), project_id)) is not None
-
     def list(self, *, user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
         with self._session("list_projects") as session:
@@ -318,6 +318,14 @@ class SqlAlchemyProjectStore(ProjectStore):
             if row is None or row.user_id != user_id:
                 return False
             session.delete(row)
+            session.execute(
+                update(SqlScheduledTask)
+                .where(
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.project_id == project_id,
+                )
+                .values(project_id=None, updated_at=now_epoch())
+            )
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project", write)
