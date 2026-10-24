@@ -7,17 +7,15 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
-    SqlProject,
     SqlScheduledTask,
     SqlScheduledTaskRun,
     current_workspace_id,
@@ -39,7 +37,6 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_ERROR_CODE,
     STALE_RUN_MAX_AGE_SECONDS,
@@ -255,21 +252,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
-    def list(
-        self,
-        *,
-        owner_user_id: str | None = None,
-        project_id: str | None = _UNSET,
-    ) -> list[ScheduledTask]:
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         When *owner_user_id* is given, only tasks owned by that user are returned.
         """
-        if project_id is not _UNSET:
-            session_context = self._session("list_tasks_by_project")
-        else:
-            session_context = self._session("list_tasks")
-        with session_context as session:
+        with self._session("list_tasks") as session:
             stmt = (
                 select(SqlScheduledTask)
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
@@ -278,31 +266,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if owner_user_id is not None:
                 stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
-            if project_id is None:
-                stmt = stmt.outerjoin(
-                    SqlProject,
-                    and_(
-                        SqlProject.workspace_id == SqlScheduledTask.workspace_id,
-                        SqlProject.id == SqlScheduledTask.project_id,
-                        or_(
-                            SqlProject.user_id == SqlScheduledTask.user_id,
-                            and_(
-                                SqlScheduledTask.user_id.is_(None),
-                                or_(
-                                    SqlProject.user_id.is_(None),
-                                    SqlProject.user_id == RESERVED_USER_LOCAL,
-                                ),
-                            ),
-                        ),
-                    ),
-                ).where(
-                    or_(
-                        SqlScheduledTask.project_id.is_(None),
-                        SqlProject.id.is_(None),
-                    )
-                )
-            elif project_id is not _UNSET:
-                stmt = stmt.where(SqlScheduledTask.project_id == project_id)
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
@@ -475,36 +438,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_task", write)
-
-    def compare_and_set_project(
-        self,
-        scheduled_task_id: str,
-        *,
-        expected_project_id: str,
-        project_id: str | None,
-    ) -> bool:
-        """Replace a Project id only while the expected assignment is current."""
-
-        def write(session: Session) -> bool:
-            result = cast(
-                CursorResult[tuple[object]],
-                session.execute(
-                    update(SqlScheduledTask)
-                    .where(
-                        SqlScheduledTask.workspace_id == current_workspace_id(),
-                        SqlScheduledTask.id == scheduled_task_id,
-                        SqlScheduledTask.project_id == expected_project_id,
-                    )
-                    .values(project_id=project_id, updated_at=now_epoch())
-                ),
-            )
-            return result.rowcount == 1
-
-        return run_write_transaction(
-            self._session_immediate,
-            "compare_and_set_task_project",
-            write,
-        )
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""

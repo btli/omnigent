@@ -10,7 +10,7 @@
  * endpoint.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -22,8 +22,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useOmnigentAnalytics } from "@/lib/analytics";
 import { ProjectLabel } from "@/components/ProjectLabel";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
@@ -38,11 +38,7 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useProjects } from "@/hooks/useConversations";
-import {
-  ScheduledTaskApiError,
-  type ScheduledTask,
-  type ScheduledTaskProjectFilter,
-} from "@/lib/scheduledTasksApi";
+import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -54,39 +50,12 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "paused", label: "Paused" },
 ];
 
+/** Project filter sentinels; any other value is a Project id. Radix Select disallows "". */
+const ALL_PROJECTS = "__all_projects__";
+const UNFILED = "__unfiled__";
+
 export function TasksPage() {
-  const [projectFilterValue, setProjectFilterValue] = useState("all");
-  const projectFilter = useMemo<ScheduledTaskProjectFilter>(() => {
-    if (projectFilterValue === "unfiled") return { kind: "unfiled" };
-    if (projectFilterValue.startsWith("project:")) {
-      const projectId = projectFilterValue.slice("project:".length);
-      if (projectId) return { kind: "project", projectId };
-    }
-    return { kind: "all" };
-  }, [projectFilterValue]);
-  const taskQuery = useScheduledTasks(projectFilter);
-  const lastAllTasks = useRef<ScheduledTask[] | undefined>(undefined);
-  if (projectFilter.kind === "all" && taskQuery.data !== undefined) {
-    lastAllTasks.current = taskQuery.data;
-  }
-  const refetchAllAfterProjectReset = useRef(false);
-  const {
-    data: projects,
-    isLoading: projectsLoading,
-    isError: projectsError,
-    refetch: refetchProjects,
-  } = useProjects();
-  const assignableProjects = useMemo(
-    () => (projects ?? []).filter((project) => project.id !== null),
-    [projects],
-  );
-  // Keyed by id to the WHOLE summary (not just the name) so consumers can
-  // render the project's emoji icon alongside its name.
-  const projectsById = useMemo(
-    () => new Map(assignableProjects.map((project) => [project.id as string, project])),
-    [assignableProjects],
-  );
-  const tasks = taskQuery.data;
+  const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
@@ -104,30 +73,30 @@ export function TasksPage() {
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
   // stale prefill never leaks into a subsequent plain "New automation" open.
   const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
+  const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS);
+  const {
+    data: projects,
+    isLoading: projectsLoading,
+    isError: projectsError,
+    refetch: refetchProjects,
+  } = useProjects();
+  // Keyed by id to the whole summary so rows can render the project's emoji.
+  const projectsById = useMemo(
+    () =>
+      new Map(
+        (projects ?? []).flatMap((project) => (project.id ? [[project.id, project] as const] : [])),
+      ),
+    [projects],
+  );
+  const selectedProjectId =
+    projectFilter === ALL_PROJECTS || projectFilter === UNFILED ? null : projectFilter;
 
+  // A deleted Project can't stay selected.
   useEffect(() => {
-    if (projectFilter.kind !== "project" || projects === undefined || projectsError) return;
-    if (!assignableProjects.some((project) => project.id === projectFilter.projectId)) {
-      setProjectFilterValue("all");
+    if (selectedProjectId && projects !== undefined && !projectsById.has(selectedProjectId)) {
+      setProjectFilter(ALL_PROJECTS);
     }
-  }, [assignableProjects, projectFilter, projects, projectsError]);
-
-  useEffect(() => {
-    if (
-      projectFilter.kind === "project" &&
-      taskQuery.error instanceof ScheduledTaskApiError &&
-      taskQuery.error.status === 404
-    ) {
-      refetchAllAfterProjectReset.current = true;
-      setProjectFilterValue("all");
-    }
-  }, [projectFilter, taskQuery.error]);
-
-  useEffect(() => {
-    if (projectFilter.kind !== "all" || !refetchAllAfterProjectReset.current) return;
-    refetchAllAfterProjectReset.current = false;
-    void taskQuery.refetch();
-  }, [projectFilter.kind, taskQuery]);
+  }, [selectedProjectId, projects, projectsById]);
 
   function openManual() {
     setPrefill(null);
@@ -156,6 +125,11 @@ export function TasksPage() {
       if (filter === "active" && t.state !== "active") return false;
       if (filter === "paused" && t.state !== "paused") return false;
       if (q && !t.name.toLowerCase().includes(q)) return false;
+      if (selectedProjectId) return t.projectId === selectedProjectId;
+      // Unfiled includes an id whose Project no longer resolves.
+      if (projectFilter === UNFILED) {
+        return t.projectId === null || (projects !== undefined && !projectsById.has(t.projectId));
+      }
       return true;
     });
     const nextRunByTaskId = new Map(
@@ -179,7 +153,7 @@ export function TasksPage() {
       if (bNext == null) return -1;
       return aNext - bNext;
     });
-  }, [tasks, search, filter]);
+  }, [tasks, search, filter, projectFilter, selectedProjectId, projects, projectsById]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
   // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
@@ -214,22 +188,9 @@ export function TasksPage() {
     setManualOpen(true);
   }
 
-  const rawSlice = tasks ?? [];
-  const allTasks = projectFilter.kind === "all" ? taskQuery.data : lastAllTasks.current;
-  const hasAnyGlobally = rawSlice.length > 0 || (allTasks ?? []).length > 0;
-  const taskError = taskQuery.isError && taskQuery.data === undefined;
-  const taskLoading = taskQuery.isLoading && taskQuery.data === undefined;
-  const allSucceeded =
-    projectFilter.kind === "all" &&
-    !taskQuery.isError &&
-    !taskQuery.isLoading &&
-    taskQuery.data !== undefined;
-  const showSuggestions =
-    projectFilter.kind === "all" && filter === "all" && search.trim() === "" && allSucceeded;
-
-  function retryTasks() {
-    void taskQuery.refetch();
-  }
+  const hasAnyTasks = (tasks ?? []).length > 0;
+  // Suggestions are hidden whenever any filter narrows the list.
+  const showSuggestions = filter === "all" && projectFilter === ALL_PROJECTS;
 
   return (
     <PageScroll contentClassName="px-4 md:px-6">
@@ -265,43 +226,32 @@ export function TasksPage() {
             className="pl-9"
           />
         </div>
-        <div className="flex flex-wrap items-center gap-3">
-          {hasAnyGlobally && (
-            <div aria-label="Filter automations" className="flex items-center gap-1">
-              {FILTER_TABS.map((tab) => (
-                <button
-                  key={tab.value}
-                  type="button"
-                  aria-pressed={filter === tab.value}
-                  data-testid={`tasks-filter-${tab.value}`}
-                  onClick={() => {
-                    trackClick(`tasks.filter_${tab.value}`, "button");
-                    setFilter(tab.value);
-                  }}
-                  className={cn(
-                    "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                    filter === tab.value
-                      ? "bg-muted text-foreground"
-                      : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-                  )}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-          )}
-          <Select
-            value={projectFilterValue}
-            onValueChange={(value) => {
-              const normalized =
-                value === "all" ||
-                value === "unfiled" ||
-                (value.startsWith("project:") && value.slice("project:".length) !== "")
-                  ? value
-                  : "all";
-              setProjectFilterValue(normalized);
-            }}
-          >
+        {hasAnyTasks && (
+          <div aria-label="Filter automations" className="flex items-center gap-1">
+            {FILTER_TABS.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                aria-pressed={filter === tab.value}
+                data-testid={`tasks-filter-${tab.value}`}
+                onClick={() => {
+                  trackClick(`tasks.filter_${tab.value}`, "button");
+                  setFilter(tab.value);
+                }}
+                className={cn(
+                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                  filter === tab.value
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {hasAnyTasks && (
+          <Select value={projectFilter} onValueChange={setProjectFilter}>
             <SelectTrigger
               data-testid="tasks-project-filter"
               className="min-w-40"
@@ -310,31 +260,27 @@ export function TasksPage() {
               {projectsLoading ? "Loading projects…" : <SelectValue />}
             </SelectTrigger>
             <SelectContent position="popper" align="start">
-              <SelectItem value="all">All projects</SelectItem>
-              <SelectItem value="unfiled">Unfiled</SelectItem>
-              {assignableProjects.map((project) => (
-                <SelectItem
-                  key={project.id}
-                  value={`project:${project.id}`}
-                  disabled={projectsError}
-                >
+              <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+              <SelectItem value={UNFILED}>Unfiled</SelectItem>
+              {[...projectsById.values()].map((project) => (
+                <SelectItem key={project.id} value={project.id as string}>
                   <ProjectLabel name={project.name} icon={project.icon} />
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-          {projectsError && (
-            <p className="text-sm text-destructive">
-              Couldn&apos;t load projects.{" "}
-              <button type="button" className="underline" onClick={() => void refetchProjects()}>
-                Retry
-              </button>
-            </p>
-          )}
-        </div>
+        )}
+        {hasAnyTasks && projectsError && (
+          <p className="text-sm text-destructive">
+            Couldn&apos;t load projects.{" "}
+            <button type="button" className="underline" onClick={() => void refetchProjects()}>
+              Retry
+            </button>
+          </p>
+        )}
       </div>
 
-      {taskError ? (
+      {isError ? (
         <div
           role="alert"
           data-testid="tasks-load-error"
@@ -342,41 +288,24 @@ export function TasksPage() {
         >
           <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">Couldn’t load automations.</span>
-          <Button variant="outline" size="sm" onClick={retryTasks} componentId="tasks.retry">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetch()}
+            componentId="tasks.retry"
+          >
             Retry
           </Button>
         </div>
-      ) : taskLoading ? (
+      ) : isLoading ? (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading automations…
         </div>
-      ) : rawSlice.length === 0 && allTasks !== undefined && !hasAnyGlobally ? (
-        <EmptyState
-          variant="global"
-          message="No automations yet"
-          showSuggestions={showSuggestions}
-          onPickSuggestion={openFromSuggestion}
-        />
-      ) : rawSlice.length === 0 && projectFilter.kind === "project" ? (
-        <EmptyState
-          variant="narrowed"
-          message={`No automations in ${projectsById.get(projectFilter.projectId)?.name ?? "this Project"}`}
-          showSuggestions={false}
-          onPickSuggestion={openFromSuggestion}
-        />
-      ) : rawSlice.length === 0 && projectFilter.kind === "unfiled" ? (
-        <EmptyState
-          variant="narrowed"
-          message="No unfiled automations"
-          showSuggestions={false}
-          onPickSuggestion={openFromSuggestion}
-        />
       ) : filtered.length === 0 ? (
         <EmptyState
-          variant="narrowed"
-          message="No automations found"
-          showSuggestions={false}
+          hasAny={hasAnyTasks}
+          showSuggestions={showSuggestions}
           onPickSuggestion={openFromSuggestion}
         />
       ) : (
@@ -389,7 +318,7 @@ export function TasksPage() {
               key={task.id}
               task={task}
               project={
-                projectFilter.kind === "all" && task.projectId
+                projectFilter === ALL_PROJECTS && task.projectId
                   ? projectsById.get(task.projectId)
                   : undefined
               }
@@ -415,31 +344,31 @@ export function TasksPage() {
         onOpenChange={handleManualOpenChange}
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
-        initialProjectId={projectFilter.kind === "project" ? projectFilter.projectId : undefined}
+        initialProjectId={selectedProjectId ?? undefined}
         editingTask={editingTask}
       />
     </PageScroll>
   );
 }
 
-export function EmptyState({
-  variant,
-  message,
+function EmptyState({
+  hasAny,
   showSuggestions,
   onPickSuggestion,
 }: {
-  variant: "global" | "narrowed";
-  message: string;
+  hasAny: boolean;
   showSuggestions: boolean;
   onPickSuggestion: (s: ScheduledTaskSuggestion) => void;
 }) {
-  const globalEmpty = variant === "global";
   return (
     <div className="py-8" data-testid="tasks-empty-state">
-      {globalEmpty ? (
+      {hasAny && (
+        <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
+      )}
+      {!hasAny && (
         <div className="flex flex-col items-center gap-2 py-12 text-center">
           <ClockIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">{message}</p>
+          <p className="text-ui font-medium">No automations yet</p>
           <p className="max-w-sm text-sm text-muted-foreground">
             Create an automation to run an agent session automatically on a recurring schedule.
           </p>
@@ -451,8 +380,6 @@ export function EmptyState({
             />
           )}
         </div>
-      ) : (
-        <div className="py-10 text-center text-ui text-muted-foreground">{message}</div>
       )}
     </div>
   );
