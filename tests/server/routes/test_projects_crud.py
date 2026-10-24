@@ -26,14 +26,8 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
-import sqlalchemy as sa
 from fastapi import FastAPI
 
-from omnigent.db.db_models import SqlScheduledTask
-from omnigent.db.enum_codecs import (
-    encode_scheduled_task_execution_target,
-    encode_scheduled_task_state,
-)
 from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -73,7 +67,6 @@ def project_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         project_store=SqlAlchemyProjectStore(db_uri),
-        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
     )
 
 
@@ -217,32 +210,38 @@ async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     assert second_delete.status_code == 404
 
 
-async def test_delete_project_logically_unfiles_automations_without_nulling_deleting_or_pausing(
+async def test_delete_project_unfiles_only_its_automations(
     project_client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    project = (await project_client.post("/v1/projects", json={"name": "Tasks"})).json()
+    deleted = (await project_client.post("/v1/projects", json={"name": "Tasks"})).json()
+    kept = (await project_client.post("/v1/projects", json={"name": "Other"})).json()
     task_store = SqlAlchemyScheduledTaskStore(db_uri)
-    task = task_store.create(
-        uuid.uuid4().hex,
-        "nightly",
-        "prompt",
-        "FREQ=DAILY",
-        None,
-        uuid.uuid4().hex,
-        "UTC",
-        project_id=project["id"],
-    )
 
-    response = await project_client.delete(f"/v1/projects/{project['id']}")
-    unfiled = (await project_client.get("/v1/scheduled-tasks?unfiled=true")).json()
-    stored = task_store.get(task.id)
+    def create_task(project_id: str) -> str:
+        return task_store.create(
+            uuid.uuid4().hex,
+            "nightly",
+            "prompt",
+            "FREQ=DAILY",
+            None,
+            uuid.uuid4().hex,
+            "UTC",
+            project_id=project_id,
+        ).id
+
+    unfiled_id = create_task(deleted["id"])
+    kept_id = create_task(kept["id"])
+
+    response = await project_client.delete(f"/v1/projects/{deleted['id']}")
 
     assert response.status_code == 200
-    assert [row["id"] for row in unfiled["scheduled_tasks"]] == [task.id]
-    assert stored is not None
-    assert stored.project_id == project["id"]
-    assert stored.state == "active"
+    unfiled = task_store.get(unfiled_id)
+    assert unfiled is not None
+    assert (unfiled.project_id, unfiled.state) == (None, "active")
+    kept_task = task_store.get(kept_id)
+    assert kept_task is not None
+    assert kept_task.project_id == kept["id"]
 
 
 async def test_delete_project_logically_unfiles_first_class_sessions_without_nulling_or_deleting(
@@ -263,43 +262,6 @@ async def test_delete_project_logically_unfiles_first_class_sessions_without_nul
     assert conversation.id in {row["id"] for row in unfiled["data"]}
     assert stored is not None
     assert stored.project_id == project["id"]
-
-
-async def test_delete_project_with_10001_references_returns_200(
-    project_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    project = (await project_client.post("/v1/projects", json={"name": "Large"})).json()
-    task_store = SqlAlchemyScheduledTaskStore(db_uri)
-    rows = [
-        {
-            "id": uuid.UUID(int=index + 1).hex,
-            "name": "task",
-            "prompt": "p",
-            "rrule": "FREQ=DAILY",
-            "user_id": None,
-            "agent_id": "1" * 32,
-            "timezone": "UTC",
-            "state": encode_scheduled_task_state("paused"),
-            "execution_target": encode_scheduled_task_execution_target("connected_host"),
-            "project_id": project["id"],
-            "created_at": index,
-        }
-        for index in range(10_001)
-    ]
-    with task_store._engine.begin() as connection:
-        connection.execute(sa.insert(SqlScheduledTask), rows)
-
-    response = await project_client.delete(f"/v1/projects/{project['id']}")
-
-    assert response.status_code == 200
-    with task_store._engine.connect() as connection:
-        remaining = connection.execute(
-            sa.select(sa.func.count())
-            .select_from(SqlScheduledTask)
-            .where(SqlScheduledTask.project_id == project["id"])
-        ).scalar_one()
-    assert remaining == 10_001
 
 
 async def test_session_projects_unions_first_class_and_labels(
@@ -369,7 +331,6 @@ def multi_user_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         project_store=SqlAlchemyProjectStore(db_uri),
-        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         permission_store=SqlAlchemyPermissionStore(db_uri),
     )

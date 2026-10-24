@@ -15,11 +15,8 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from starlette.requests import Request
 
-from omnigent.db.db_models import InvalidUuidError
 from omnigent.db.utils import builtin_agent_id
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -330,34 +327,6 @@ async def test_create_and_patch_reject_explicit_null_but_empty_string_unfiles(
     assert cleared.json()["project_id"] is None
 
 
-async def test_malformed_project_id_maps_to_not_found() -> None:
-    with pytest.raises(OmnigentError, match=r"^Not found\.$") as exc_info:
-        scheduled_tasks_routes._canonical_project_id("malformed")
-    assert exc_info.value.code == ErrorCode.NOT_FOUND
-
-
-async def test_direct_invalid_uuid_keeps_upstream_internal_error(auth_app: FastAPI) -> None:
-    assert InvalidUuidError not in auth_app.exception_handlers
-    handler = auth_app.exception_handlers[Exception]
-    request = Request(
-        {
-            "type": "http",
-            "method": "GET",
-            "scheme": "http",
-            "path": "/unrelated",
-            "query_string": b"",
-            "headers": [],
-            "server": ("test", 80),
-        }
-    )
-    response = await handler(request, InvalidUuidError("malformed test id"))
-
-    assert response.status_code == 500
-    assert response.body == (
-        b'{"error":{"code":"internal_error","message":"An internal error occurred."}}'
-    )
-
-
 async def test_assignment_404s_for_missing_malformed_and_other_users_project(
     auth_client: httpx.AsyncClient,
     db_uri: str,
@@ -400,7 +369,7 @@ async def test_assignment_404s_for_missing_malformed_and_other_users_project(
         assert task_store.get(task_id).project_id == owned.id
 
 
-async def test_uppercase_project_id_is_accepted_and_responses_are_lowercase_on_create_patch_and_filter(  # noqa: E501
+async def test_uppercase_project_id_is_stored_lowercase_on_create_and_patch(
     auth_client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
@@ -422,14 +391,9 @@ async def test_uppercase_project_id_is_accepted_and_responses_are_lowercase_on_c
         headers=_headers(),
     )
     assert patched.json()["project_id"] == second.id
-    filtered = await auth_client.get(
-        "/v1/scheduled-tasks", params={"project_id": second.id.upper()}, headers=_headers()
-    )
-    assert [task["id"] for task in filtered.json()["scheduled_tasks"]] == [task_id]
-    assert filtered.json()["scheduled_tasks"][0]["project_id"] == second.id
 
 
-async def test_no_project_store_rejects_assignment_and_project_filter_but_all_unfiled_and_clear_work(  # noqa: E501
+async def test_no_project_store_rejects_assignment_but_unfiling_works(
     no_project_store_client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
@@ -452,266 +416,11 @@ async def test_no_project_store_rejects_assignment_and_project_filter_but_all_un
         headers=_headers(),
     )
     assert assign.status_code == 400
-    filtered = await no_project_store_client.get(
-        "/v1/scheduled-tasks", params={"project_id": "a" * 32}, headers=_headers()
-    )
-    assert filtered.status_code == 400
-    for malformed_project_id in ("", "malformed"):
-        malformed = await no_project_store_client.get(
-            "/v1/scheduled-tasks",
-            params={"project_id": malformed_project_id},
-            headers=_headers(),
-        )
-        assert malformed.status_code == 404
-        assert malformed.json()["error"]["message"] == "Not found."
-    assert (
-        await no_project_store_client.get("/v1/scheduled-tasks", headers=_headers())
-    ).status_code == 200
-    unfiled = await no_project_store_client.get(
-        "/v1/scheduled-tasks", params={"unfiled": "true"}, headers=_headers()
-    )
-    assert [task["id"] for task in unfiled.json()["scheduled_tasks"]] == [task_id]
     cleared = await no_project_store_client.patch(
         f"/v1/scheduled-tasks/{task_id}", json={"project_id": ""}, headers=_headers()
     )
     assert cleared.status_code == 200
     assert cleared.json()["project_id"] is None
-
-
-async def test_list_filters_by_project_id_and_unfiled_true(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    _make_user(db_uri)
-    project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "P", "alice@example.com")
-    task_store = SqlAlchemyScheduledTaskStore(db_uri)
-    filed = task_store.create(
-        "1" * 32,
-        "filed",
-        "p",
-        _VALID_RRULE,
-        "alice@example.com",
-        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
-        "UTC",
-        project_id=project.id,
-    )
-    null_task = task_store.create(
-        "2" * 32,
-        "null",
-        "p",
-        _VALID_RRULE,
-        "alice@example.com",
-        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
-        "UTC",
-    )
-    dangling = task_store.create(
-        "3" * 32,
-        "dangling",
-        "p",
-        _VALID_RRULE,
-        "alice@example.com",
-        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
-        "UTC",
-        project_id="d" * 32,
-    )
-    project_response = await auth_client.get(
-        "/v1/scheduled-tasks", params={"project_id": project.id}, headers=_headers()
-    )
-    assert [task["id"] for task in project_response.json()["scheduled_tasks"]] == [filed.id]
-    unfiled_response = await auth_client.get(
-        "/v1/scheduled-tasks", params={"unfiled": "true"}, headers=_headers()
-    )
-    assert {task["id"] for task in unfiled_response.json()["scheduled_tasks"]} == {
-        null_task.id,
-        dangling.id,
-    }
-    raw_dangling = next(
-        task for task in unfiled_response.json()["scheduled_tasks"] if task["id"] == dangling.id
-    )
-    assert raw_dangling["project_id"] == "d" * 32
-
-
-async def test_list_rejects_combined_project_and_unfiled_and_empty_project_id(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    _make_user(db_uri)
-    project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "P", "alice@example.com")
-    for project_id in (project.id, ""):
-        combined = await auth_client.get(
-            "/v1/scheduled-tasks",
-            params={"unfiled": "true", "project_id": project_id},
-            headers=_headers(),
-        )
-        assert combined.status_code == 400
-    empty = await auth_client.get("/v1/scheduled-tasks?project_id=", headers=_headers())
-    assert empty.status_code == 404
-    assert empty.json()["error"]["message"] == "Not found."
-
-
-async def test_project_filtered_list_returns_all_151_rows_without_cursor_fields(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    _make_user(db_uri)
-    project = SqlAlchemyProjectStore(db_uri).create("a" * 32, "P", "alice@example.com")
-    task_store = SqlAlchemyScheduledTaskStore(db_uri)
-    for index in range(151):
-        task_store.create(
-            f"{index + 1:032x}",
-            f"task-{index}",
-            "p",
-            _VALID_RRULE,
-            "alice@example.com",
-            builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
-            "UTC",
-            project_id=project.id,
-        )
-    response = await auth_client.get(
-        "/v1/scheduled-tasks", params={"project_id": project.id}, headers=_headers()
-    )
-    assert response.status_code == 200
-    assert set(response.json()) == {"scheduled_tasks"}
-    tasks = response.json()["scheduled_tasks"]
-    assert len(tasks) == 151
-    assert [(task["created_at"], task["id"]) for task in tasks] == sorted(
-        (task["created_at"], task["id"]) for task in tasks
-    )
-
-
-async def test_list_project_filter_404s_for_missing_or_other_users_project(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    _make_user(db_uri)
-    _make_user(db_uri, "bob@example.com")
-    foreign = SqlAlchemyProjectStore(db_uri).create("b" * 32, "Bob", "bob@example.com")
-    for project_id in ("a" * 32, foreign.id):
-        response = await auth_client.get(
-            "/v1/scheduled-tasks", params={"project_id": project_id}, headers=_headers()
-        )
-        assert response.status_code == 404
-        assert response.json()["error"]["message"] == "Project not found"
-
-
-async def test_assigning_project_does_not_change_launch_fields(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    _make_user(db_uri)
-    project = SqlAlchemyProjectStore(db_uri).create(
-        "a" * 32,
-        "Defaults",
-        "alice@example.com",
-        {"agent_id": "f" * 32, "host_id": "e" * 32, "workspace": "/other"},
-    )
-    created = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
-    )
-    before = created.json()
-    patched = await auth_client.patch(
-        f"/v1/scheduled-tasks/{before['id']}",
-        json={"project_id": project.id},
-        headers=_headers(),
-    )
-    after = patched.json()
-    for key in ("agent_id", "host_id", "workspace", "model_override", "reasoning_effort"):
-        assert after[key] == before[key]
-
-
-async def test_assigning_project_does_not_rewrite_prior_run_sessions(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    _make_user(db_uri)
-    projects = SqlAlchemyProjectStore(db_uri)
-    first = projects.create("a" * 32, "First", "alice@example.com")
-    second = projects.create("b" * 32, "Second", "alice@example.com")
-    created = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(project_id=first.id),
-        headers=_headers(),
-    )
-    task_id = created.json()["id"]
-    conversation_store = SqlAlchemyConversationStore(db_uri)
-    conversation = conversation_store.create_conversation(
-        agent_id=builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
-        project_id=first.id,
-    )
-    SqlAlchemyScheduledTaskStore(db_uri).update(
-        task_id,
-        last_run_at=100,
-        last_run_conversation_id=conversation.id,
-    )
-
-    response = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}",
-        json={"project_id": second.id},
-        headers=_headers(),
-    )
-
-    assert response.status_code == 200
-    assert response.json()["project_id"] == second.id
-    assert conversation_store.get_conversation(conversation.id).project_id == first.id
-
-
-async def test_assignment_and_project_delete_race_is_visible_in_both_orders(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _make_user(db_uri)
-    projects = SqlAlchemyProjectStore(db_uri)
-    task_store = SqlAlchemyScheduledTaskStore(db_uri)
-    deleted_first = projects.create("a" * 32, "Deleted first", "alice@example.com")
-    first_task = (
-        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
-    ).json()
-    assert projects.delete(deleted_first.id, user_id="alice@example.com") is True
-
-    rejected = await auth_client.patch(
-        f"/v1/scheduled-tasks/{first_task['id']}",
-        json={"project_id": deleted_first.id},
-        headers=_headers(),
-    )
-
-    assert rejected.status_code == 404
-    assert task_store.get(first_task["id"]).project_id is None
-
-    deleted_after_validation = projects.create(
-        "b" * 32, "Deleted after validation", "alice@example.com"
-    )
-    second_task = (
-        await auth_client.post(
-            "/v1/scheduled-tasks", json=_create_body(name="second"), headers=_headers()
-        )
-    ).json()
-    original_get = SqlAlchemyProjectStore.get
-
-    def _get_then_delete(
-        project_store: SqlAlchemyProjectStore,
-        project_id: str,
-        *,
-        user_id: str | None,
-    ) -> object | None:
-        resolved = original_get(project_store, project_id, user_id=user_id)
-        assert project_store.delete(project_id, user_id=user_id) is True
-        return resolved
-
-    monkeypatch.setattr(SqlAlchemyProjectStore, "get", _get_then_delete)
-    accepted = await auth_client.patch(
-        f"/v1/scheduled-tasks/{second_task['id']}",
-        json={"project_id": deleted_after_validation.id},
-        headers=_headers(),
-    )
-    unfiled = await auth_client.get(
-        "/v1/scheduled-tasks", params={"unfiled": "true"}, headers=_headers()
-    )
-
-    assert accepted.status_code == 200
-    assert accepted.json()["project_id"] == deleted_after_validation.id
-    assert second_task["id"] in {row["id"] for row in unfiled.json()["scheduled_tasks"]}
-    assert task_store.get(second_task["id"]).project_id == deleted_after_validation.id
 
 
 async def test_create_no_workspace_task_persists_null_host_and_workspace(

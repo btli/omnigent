@@ -96,12 +96,15 @@ export function CreateScheduledTaskDialog({
   const [prompt, setPrompt] = useState("");
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [pickedProject, setPickedProject] = useState(NO_PROJECT);
-  const initialProjectSelectionRef = useRef(NO_PROJECT);
-  const projectSelectionInitializedRef = useRef(false);
   const assignableProjects = useMemo(
     () => (projects ?? []).filter((project) => project.id !== null),
     [projects],
   );
+  // A stored id whose Project no longer resolves runs unfiled; say so without unfiling it on save.
+  const unresolvedProject =
+    pickedProject !== NO_PROJECT &&
+    projects !== undefined &&
+    !assignableProjects.some((project) => project.id === pickedProject);
 
   // ── Agent / harness picker (shared with NewChatDialog) ─────────────────────
   // The picker's "Harnesses" (Claude Code / Codex / Pi …) and "Agents"
@@ -269,25 +272,10 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
       }
       setError(null);
-      setPickedProject(NO_PROJECT);
-      initialProjectSelectionRef.current = NO_PROJECT;
-      projectSelectionInitializedRef.current = false;
+      setPickedProject((editingTask ? editingTask.projectId : initialProjectId) ?? NO_PROJECT);
     }
-    if (!open) projectSelectionInitializedRef.current = false;
     wasOpen.current = open;
-  }, [open, initialName, initialPrompt, editingTask]);
-
-  useEffect(() => {
-    if (!open || projects === undefined) return;
-    if (projectSelectionInitializedRef.current) return;
-    const requested = editingTask?.projectId ?? initialProjectId ?? null;
-    const selection = assignableProjects.some((project) => project.id === requested)
-      ? (requested ?? NO_PROJECT)
-      : NO_PROJECT;
-    setPickedProject(selection);
-    initialProjectSelectionRef.current = selection;
-    projectSelectionInitializedRef.current = true;
-  }, [assignableProjects, editingTask, initialProjectId, open, projects]);
+  }, [open, initialName, initialPrompt, initialProjectId, editingTask]);
 
   const hostOptions = hosts ?? [];
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
@@ -329,8 +317,6 @@ export function CreateScheduledTaskDialog({
     setPickedPermission("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setPickedProject(NO_PROJECT);
-    initialProjectSelectionRef.current = NO_PROJECT;
-    projectSelectionInitializedRef.current = false;
     setHostId("");
     setWorkspace("");
     setWorkspaceBrowserOpen(false);
@@ -388,7 +374,7 @@ export function CreateScheduledTaskDialog({
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
-            ...(pickedProject === initialProjectSelectionRef.current
+            ...(pickedProject === (editingTask.projectId ?? NO_PROJECT)
               ? {}
               : pickedProject === NO_PROJECT
                 ? { projectId: "" }
@@ -476,7 +462,13 @@ export function CreateScheduledTaskDialog({
                 className="w-full"
                 disabled={projectsLoading}
               >
-                {projectsLoading ? "Loading projects…" : <SelectValue />}
+                {projectsLoading ? (
+                  "Loading projects…"
+                ) : unresolvedProject ? (
+                  "No project"
+                ) : (
+                  <SelectValue />
+                )}
               </SelectTrigger>
               <SelectContent position="popper" align="start">
                 <SelectItem value={NO_PROJECT}>No project</SelectItem>
@@ -491,7 +483,6 @@ export function CreateScheduledTaskDialog({
                 ))}
               </SelectContent>
             </Select>
-            {projectsLoading && <p className="text-sm text-muted-foreground">Loading projects…</p>}
             {!projectsLoading && projectsError && (
               <p className="text-sm text-destructive">
                 Couldn&apos;t load projects.{" "}

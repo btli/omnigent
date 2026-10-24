@@ -482,11 +482,7 @@ def create_scheduled_tasks_router(
         )
 
     @router.get("/scheduled-tasks")
-    async def list_scheduled_tasks(
-        request: Request,
-        project_id: str | None = Query(default=None),
-        unfiled: bool = Query(default=False),
-    ) -> dict[str, list[dict[str, Any]]]:
+    async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
@@ -500,19 +496,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        if unfiled and project_id is not None:
-            raise OmnigentError(
-                "project_id and unfiled=true cannot be combined",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if unfiled:
-            tasks = store.list(owner_user_id=owner_id, project_id=None)
-        elif project_id is not None:
-            resolved = await _resolve_requested_project(project_id, _project_owner(owner))
-            tasks = store.list(owner_user_id=owner_id, project_id=resolved)
-        else:
-            tasks = store.list(owner_user_id=owner_id)
-        tasks = [task for task in tasks if _owns_task(task, owner_id)]
+        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a

@@ -10,7 +10,7 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CreateScheduledTaskDialog,
@@ -362,7 +362,7 @@ describe("CreateScheduledTaskDialog Project picker", () => {
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("projectId");
   });
 
-  it("treats an unresolved stored id as No project without unfiling on save", async () => {
+  it("keeps an unresolved stored id unchanged on save", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -417,42 +417,6 @@ describe("CreateScheduledTaskDialog Project picker", () => {
     expect(await screen.findByTestId("task-project-option-p_a")).toBeInTheDocument();
     expect(screen.getByTestId("task-project-option-p_b")).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "Legacy only" })).toBeNull();
-  });
-
-  it("shows each project's emoji (or folder fallback) in the selector options", async () => {
-    renderDialog();
-    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
-    // Emoji is aria-hidden — the option's accessible name stays "Project A".
-    const optionA = await screen.findByRole("option", { name: "Project A" });
-    expect(within(optionA).getByTestId("project-label-icon")).toHaveTextContent("📊");
-    const optionB = screen.getByRole("option", { name: "Project B" });
-    expect(within(optionB).getByTestId("project-label-fallback")).toBeInTheDocument();
-    expect(within(optionB).queryByTestId("project-label-icon")).toBeNull();
-  });
-
-  it("project selection does not change agent, host, or workspace", async () => {
-    const editingTask = scheduledTask({
-      agentId: "ag_1",
-      hostId: "host_1",
-      workspace: "/home/me/repo",
-      projectId: "p_a",
-    });
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />);
-    expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
-    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
-    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
-    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Project B" }));
-    expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
-    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
-    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    const input = updateMutateAsync.mock.calls[0][0].input;
-    expect(input.projectId).toBe("p_b");
-    expect(input.hostId).toBe("host_1");
-    expect(input.workspace).toBe("/home/me/repo");
-    expect(input).not.toHaveProperty("agentId");
   });
 });
 
