@@ -3133,7 +3133,11 @@ function ArchivedSection() {
                 align="start"
                 className="w-80 max-w-(--radix-popover-content-available-width) gap-0 p-0"
               >
-                <Command shouldFilter={false} label="Search projects">
+                <Command
+                  shouldFilter={false}
+                  label="Search projects"
+                  defaultValue={projectToSelectValue(project)}
+                >
                   <CommandInput
                     autoFocus
                     aria-label="Search projects"
@@ -3144,6 +3148,7 @@ function ArchivedSection() {
                   <CommandList>
                     <CommandItem
                       value={ALL_PROJECTS_VALUE}
+                      data-checked={project === undefined}
                       onSelect={() => selectArchivedProject(undefined)}
                     >
                       All projects
@@ -3153,6 +3158,7 @@ function ArchivedSection() {
                         key={name}
                         value={projectToSelectValue(name)}
                         data-testid={`archived-project-option-${name}`}
+                        data-checked={project === name}
                         onSelect={() => selectArchivedProject(name)}
                       >
                         <ProjectRowIcon icon={projectIcons.get(name)} />
@@ -3160,9 +3166,16 @@ function ArchivedSection() {
                       </CommandItem>
                     ))}
                   </CommandList>
-                  {filteredProjectNames.length === 0 && (
-                    <p className="px-2 py-6 text-center text-ui">No projects found</p>
-                  )}
+                  <p
+                    role="status"
+                    aria-live="polite"
+                    className={cn(
+                      "px-2 py-6 text-center text-ui",
+                      filteredProjectNames.length > 0 && "hidden",
+                    )}
+                  >
+                    {filteredProjectNames.length === 0 ? "No projects found" : ""}
+                  </p>
                 </Command>
               </PopoverContent>
             </Popover>
