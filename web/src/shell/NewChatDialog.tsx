@@ -266,6 +266,7 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   partitionPickerEntries,
   selectableSessionAgents,
@@ -2231,10 +2232,15 @@ export function NewChatLandingScreen() {
   // under "Agents". ACP agents aren't native, so they fold into "More". The
   // user's own agents stay under "Agents" even on a native harness, so one never
   // passes for a harness row (or for the Claude Code wrapper Smart Routing binds).
-  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
-    () => partitionPickerEntries(agentList),
-    [agentList],
-  );
+  const { harnesses: harnessEntries, agents: agentEntries } = useMemo(() => {
+    // Headless CLI harnesses (genie) list with the harnesses, not the agents.
+    const { harnesses, agents } = partitionPickerEntries(agentList);
+    const headless = agents.filter((a) => !a.mine && isHeadlessCliHarness(a));
+    return {
+      harnesses: [...harnesses, ...headless],
+      agents: agents.filter((a) => !headless.includes(a)),
+    };
+  }, [agentList]);
 
   // "Create custom agent" dialog state and pending bundle. When the user
   // creates a custom agent via the dialog, the bundle input is stored
