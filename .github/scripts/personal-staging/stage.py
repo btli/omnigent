@@ -748,7 +748,7 @@ def merge_prs(
                 if source == "upstream":
                     raise StageError("staging entry zero conflicts: " + ", ".join(paths))
                 base_ref = pr.get("baseRefName", "main")
-                if source == "open" and base_ref != "main":
+                if source == "open" and upstream_sha and ring.rebase_rescue and base_ref != "main":
                     skipped.append(
                         {
                             "pr": num,

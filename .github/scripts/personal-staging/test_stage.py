@@ -399,13 +399,18 @@ def test_rescue_refuses_a_merge_containing_branch(env):
 
 
 def test_production_ring_never_rescues(env):
-    pr = _rescuable_pr(env)
+    pr = {**_rescuable_pr(env), "baseRefName": "stack/genie-cli-harness"}
     stage_mod.sync_main(env.work)
     good = env.add_pr(6, "good.txt", "good\n")
     report = env.run([pr, good], ring=stage_mod.PRODUCTION)
     assert [p["pr"] for p in report["applied"]] == [6]
     assert report["base_sha"] == env.fork_ref("refs/heads/main")
-    assert [p["pr"] for p in report["skipped"]] == [5]
+    assert report["skipped"] == [
+        {"pr": 5, "branch": "pr-5", "conflict_paths": ["a.txt"], "source": "open"}
+    ]
+    assert "merge conflict: `a.txt`" in stage_mod.notes(
+        report, signed=True, ring=stage_mod.PRODUCTION
+    )
     # the PR branch is untouched — production composes what the PRs say
     assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
 
