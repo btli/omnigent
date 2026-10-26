@@ -3,8 +3,8 @@
 
 Builds branch ``staging`` = fork main + fresh upstream main + every open btli PR plus the
 ``extras.txt`` pins, merged sequentially (ascending PR number; conflicting
-PRs are skipped and reported — but an open PR whose merge conflicts gets
-one rebase rescue onto upstream main first, and a clean rescue is pushed
+PRs are skipped and reported — but a main-based open PR whose merge conflicts
+gets one rebase rescue onto upstream main first, and a clean rescue is pushed
 back to the PR's fork branch so the PR stays current). The nightly mode
 then pins an immutable ``nightly-YYYYMMDD`` tag and a PEP 440
 ``vX.Y.Z.devYYYYMMDD`` tag at the same commit; same-name compatibility
@@ -263,7 +263,7 @@ def list_prs() -> list[dict]:
             "--limit",
             str(PR_LIST_LIMIT),
             "--json",
-            "number,headRefName,headRefOid,isDraft,author",
+            "number,headRefName,headRefOid,baseRefName,isDraft,author",
         ],
         check=True,
         text=True,
@@ -747,6 +747,21 @@ def merge_prs(
                 git(cwd, "merge", "--abort")
                 if source == "upstream":
                     raise StageError("staging entry zero conflicts: " + ", ".join(paths))
+                base_ref = pr.get("baseRefName", "main")
+                if source == "open" and base_ref != "main":
+                    skipped.append(
+                        {
+                            "pr": num,
+                            "branch": branch,
+                            "conflict_paths": paths,
+                            "source": source,
+                            "reason": (
+                                f"stacked PR (base {base_ref}): "
+                                "rebase rescue skipped; restack it onto its base"
+                            ),
+                        }
+                    )
+                    continue
                 # One rescue per conflicting open PR: rebase its head onto
                 # upstream main and retry the merge with the rescued head.
                 # Extras stay verbatim — their refs are frozen pins.

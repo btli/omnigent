@@ -259,6 +259,46 @@ def test_conflicting_pr_rescued_by_rebase(env):
     assert "merge PR #5" in env.fork_log("staging")
 
 
+def test_conflicting_stacked_pr_skips_rebase_rescue(env, monkeypatch, pushes):
+    pr = {
+        **_rescuable_pr(env),
+        "baseRefName": "stack/genie-cli-harness",
+        "isDraft": False,
+        "author": {"login": "btli"},
+    }
+    real_run = subprocess.run
+
+    def list_prs(args, **kwargs):
+        if args[:3] == ["gh", "pr", "list"]:
+            fields = args[args.index("--json") + 1].split(",")
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps([{field: pr[field] for field in fields}]), ""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(stage_mod.subprocess, "run", list_prs)
+
+    report = env.run(stage_mod.list_prs())
+
+    assert report["applied"] == []
+    assert report["skipped"] == [
+        {
+            "pr": 5,
+            "branch": "pr-5",
+            "conflict_paths": ["a.txt"],
+            "source": "open",
+            "reason": (
+                "stacked PR (base stack/genie-cli-harness): "
+                "rebase rescue skipped; restack it onto its base"
+            ),
+        }
+    ]
+    assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
+    assert not any(arg.endswith(":refs/heads/pr-5") for push in pushes for arg in push)
+    assert "merge PR #5" not in env.fork_log("staging")
+    assert report["skipped"][0]["reason"] in stage_mod.notes(report, signed=True)
+
+
 def test_rebase_retry_git_lock_failure_is_loud(env, monkeypatch):
     pr = _rescuable_pr(env)
     real_git = stage_mod.git
