@@ -80,8 +80,9 @@ from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.schemas import SessionEventInput
 =======
 from omnigent.server.schemas import ProjectSessionCreateRequest, SessionEventInput
-from omnigent.stores.project_store import ProjectStore
 >>>>>>>
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -235,13 +236,11 @@ def build_run_now(
 ) -> Callable[[int, str], Awaitable[bool]]:
     """Build the manual "run now" trigger — an immediate fire of a task.
 
-    Reuses the exact scheduled-fire machinery (the same
-    :func:`_run_fire_for_task` body, dispatch/preflight seams, and the shared
-    ``_IN_FLIGHT_TASKS`` overlap guard) so a manual run cannot duplicate the fire
-    logic and cannot collide with a scheduled fire of the same task. It differs
-    from :func:`build_on_fire` in ONE way: a **paused** task is still runnable
-    (``require_active=False``), because run-now is an explicit manual override.
-    A deleted / missing row is still a no-op.
+    Reuses the legacy :func:`_run_fire_for_task` path and its process-local
+    ``_IN_FLIGHT_TASKS`` overlap guard. Persistent scheduled runs use database
+    claims and do not share this guard, so they can overlap a manual run.
+    Unlike :func:`build_on_fire`, a paused task is runnable here
+    (``require_active=False``). A deleted or missing task is still a no-op.
 
     Fire-and-forget like the scheduler path: the session create + launch runs in
     the background and the returned callback resolves as soon as the fire is
@@ -778,87 +777,27 @@ async def _resolve_fire_project(
     deps: FireDeps,
     task: ScheduledTask,
 ) -> str | None:
-    """Resolve one fire's Project and repair only a proven-missing pointer."""
+    """Resolve one fire's Project; an unverifiable or missing one runs unfiled."""
     if task.project_id is None:
         return None
-    project_store = deps.project_store
-    if project_store is None:
+    resolved = None
+    if deps.project_store is not None:
+        try:
+            resolved = await _resolve_owned_fire_project(deps.project_store, task)
+        except Exception:
+            _logger.warning(
+                "scheduled fire: task %s project %s lookup failed",
+                task.id,
+                task.project_id,
+                exc_info=True,
+            )
+    if resolved is None:
         _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "run is unfiled; assignment preserved",
+            "scheduled fire: task %s project %s not found for its owner; run is unfiled",
             task.id,
             task.project_id,
         )
-        return None
-    try:
-        resolved = await _resolve_owned_fire_project(project_store, task)
-    except Exception:
-        _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "run is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            exc_info=True,
-        )
-        return None
-    if resolved is not None:
-        return resolved
-
-    try:
-        exists = await asyncio.to_thread(project_store.exists, task.project_id)
-    except Exception:
-        _logger.warning(
-            "scheduled fire: task %s project %s existence could not be verified; "
-            "run is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            exc_info=True,
-        )
-        return None
-    if exists:
-        _logger.warning(
-            "scheduled fire: task %s project %s is not owned by the current identity; "
-            "run is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-        )
-        return None
-
-    _logger.warning(
-        "scheduled fire: task %s project %s no longer exists; run is unfiled",
-        task.id,
-        task.project_id,
-    )
-    await _self_heal_task_project(deps, task)
-    return None
-
-
-async def _self_heal_task_project(deps: FireDeps, task: ScheduledTask) -> None:
-    """Best-effort clear of the exact stale Project pointer."""
-    if task.project_id is None:
-        return
-    try:
-        repaired = await asyncio.to_thread(
-            deps.scheduled_task_store.compare_and_set_project,
-            task.id,
-            expected_project_id=task.project_id,
-            project_id=None,
-        )
-    except Exception:
-        _logger.warning(
-            "scheduled fire: task %s project %s self-heal failed; run continues",
-            task.id,
-            task.project_id,
-            exc_info=True,
-        )
-        return
-    if not repaired:
-        _logger.debug(
-            "scheduled fire: task %s project %s self-heal skipped; "
-            "assignment changed or task deleted",
-            task.id,
-            task.project_id,
-        )
+    return resolved
 
 
 async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
@@ -1024,6 +963,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask, scheduled_at: int
         workspace=task.workspace,
         project_id=task.project_id,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
     )
     reasoning_effort = task.reasoning_effort
     if reasoning_effort is None:
