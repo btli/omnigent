@@ -245,8 +245,9 @@ def _rescuable_pr(env) -> dict:
     return {"number": 5, "headRefName": "pr-5", "headRefOid": oid}
 
 
-def test_conflicting_pr_rescued_by_rebase(env):
-    pr = _rescuable_pr(env)
+@pytest.mark.parametrize("base_metadata", [{}, {"baseRefName": None}], ids=["missing", "null"])
+def test_conflicting_pr_rescued_by_rebase(env, base_metadata):
+    pr = {**_rescuable_pr(env), **base_metadata}
 
     report = env.run([pr])
     [entry] = report["applied"]
@@ -262,7 +263,7 @@ def test_conflicting_pr_rescued_by_rebase(env):
 def test_conflicting_stacked_pr_skips_rebase_rescue(env, monkeypatch, pushes):
     pr = {
         **_rescuable_pr(env),
-        "baseRefName": "stack/genie-cli-harness",
+        "baseRefName": "stack/a|b`c",
         "isDraft": False,
         "author": {"login": "btli"},
     }
@@ -281,22 +282,26 @@ def test_conflicting_stacked_pr_skips_rebase_rescue(env, monkeypatch, pushes):
     report = env.run(stage_mod.list_prs())
 
     assert report["applied"] == []
+    rendered_reason = (
+        "stacked PR (base `stack/a/b'c`): rebase rescue skipped; restack it onto its base"
+    )
+    assert rendered_reason in stage_mod.notes(report, signed=True)
+    assert f"| Skipped #5 | {rendered_reason} |" in stage_mod.summarize(report).splitlines()
     assert report["skipped"] == [
         {
             "pr": 5,
             "branch": "pr-5",
             "conflict_paths": ["a.txt"],
             "source": "open",
+            "base_ref": "stack/a|b`c",
             "reason": (
-                "stacked PR (base stack/genie-cli-harness): "
-                "rebase rescue skipped; restack it onto its base"
+                "stacked PR (base stack/a|b`c): rebase rescue skipped; restack it onto its base"
             ),
         }
     ]
     assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
     assert not any(arg.endswith(":refs/heads/pr-5") for push in pushes for arg in push)
     assert "merge PR #5" not in env.fork_log("staging")
-    assert report["skipped"][0]["reason"] in stage_mod.notes(report, signed=True)
 
 
 def test_rebase_retry_git_lock_failure_is_loud(env, monkeypatch):

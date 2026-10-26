@@ -747,7 +747,7 @@ def merge_prs(
                 git(cwd, "merge", "--abort")
                 if source == "upstream":
                     raise StageError("staging entry zero conflicts: " + ", ".join(paths))
-                base_ref = pr.get("baseRefName", "main")
+                base_ref = pr.get("baseRefName") or "main"
                 if source == "open" and upstream_sha and ring.rebase_rescue and base_ref != "main":
                     skipped.append(
                         {
@@ -755,6 +755,7 @@ def merge_prs(
                             "branch": branch,
                             "conflict_paths": paths,
                             "source": source,
+                            "base_ref": base_ref,
                             "reason": (
                                 f"stacked PR (base {base_ref}): "
                                 "rebase rescue skipped; restack it onto its base"
@@ -1461,6 +1462,11 @@ def stage(
 
 
 def _skip_reason(p: dict) -> str:
+    if p.get("base_ref"):
+        return (
+            f"stacked PR (base {md_code(p['base_ref'])}): "
+            "rebase rescue skipped; restack it onto its base"
+        )
     if p.get("reason"):
         return str(p["reason"])
     paths = ", ".join(md_code(c) for c in p["conflict_paths"])
