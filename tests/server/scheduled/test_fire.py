@@ -38,6 +38,7 @@ from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_no
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -693,7 +694,7 @@ async def test_fire_sets_project_once_in_initial_insert_without_followup_write()
     await _drain()
 
     assert conv_store.created[0]["project_id"] == project_id
-    assert "labels" not in conv_store.created[0]
+    assert conv_store.created[0]["labels"] == {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"}
     assert project_store.calls == [(project_id, None)]
     assert conv_store.project_updates == []
     assert events == ["project", "create", "grant"]
