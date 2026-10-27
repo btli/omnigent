@@ -209,20 +209,24 @@ describe("sessionUpdatesSocket visibility-aware reconnect", () => {
     expect(FakeWebSocket.instances.length).toBe(dialsBefore + 2);
   });
 
-  it("stretches even a healthy close to the hidden cadence while the page is hidden", () => {
+  it("redials a healthy close at once while hidden and stretches only failed reopens", () => {
     sessionUpdatesSocket.start();
     latestWs().open();
 
-    // A clean drop while hidden (not a failed open) still reschedules on the
-    // stretched cadence: the socket backs off every hidden close this way, the
-    // documented trade-off for a backgrounded tab.
+    // A clean drop while hidden (e.g. the ingress recycle) keeps the visible
+    // first-retry delay, so background notifications aren't held back.
     setPageHidden(true);
     const dialsBefore = FakeWebSocket.instances.length;
     latestWs().close();
-    vi.advanceTimersByTime(HIDDEN_FLOOR_MS - 1);
-    expect(FakeWebSocket.instances.length).toBe(dialsBefore);
-    vi.advanceTimersByTime(HIDDEN_RECONNECT_MS - HIDDEN_FLOOR_MS + 1);
+    vi.advanceTimersByTime(RECONNECT_BASE_MS);
     expect(FakeWebSocket.instances.length).toBe(dialsBefore + 1);
+
+    // That reopen fails before opening, so the next retry waits the hidden cadence.
+    latestWs().close();
+    vi.advanceTimersByTime(HIDDEN_FLOOR_MS - 1);
+    expect(FakeWebSocket.instances.length).toBe(dialsBefore + 1);
+    vi.advanceTimersByTime(HIDDEN_RECONNECT_MS - HIDDEN_FLOOR_MS + 1);
+    expect(FakeWebSocket.instances.length).toBe(dialsBefore + 2);
   });
 
   it("reconnects at once when the page becomes visible with a hidden retry pending", () => {

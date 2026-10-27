@@ -216,10 +216,11 @@ class SessionUpdatesSocket {
       // `onerror` is always followed by `onclose`; let close drive retry.
     };
     ws.onclose = () => {
+      const wasOpen = this.connected;
       this.ws = null;
       this.clearWatchdog();
       this.setConnected(false);
-      if (this.started) this.scheduleReconnect();
+      if (this.started) this.scheduleReconnect(wasOpen);
     };
   }
 
@@ -273,10 +274,15 @@ class SessionUpdatesSocket {
     }
   };
 
-  private scheduleReconnect(): void {
+  /**
+   * @param afterOpen - The closed socket had opened. Its first retry keeps the
+   *   visible ramp even while hidden: the socket is a hidden tab's only feed for
+   *   notifications, so only failed opens wait the hidden cadence.
+   */
+  private scheduleReconnect(afterOpen = false): void {
     if (!this.started || this.reconnectTimer !== null) return;
     this.failedAttempts += 1;
-    const hidden = isPageHidden();
+    const hidden = !afterOpen && isPageHidden();
     this.hiddenRetryPending = hidden;
     const delay = nextReconnectDelay(this.failedAttempts, hidden);
     this.reconnectTimer = setTimeout(() => {
