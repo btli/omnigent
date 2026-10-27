@@ -29,6 +29,7 @@ vi.mock("@/lib/identity", () => ({
 vi.mock("@/lib/nativeBridge", () => ({
   isIOSShell: () => isIOSShell(),
   isAndroidShell: () => isAndroidShell(),
+  isElectronShell: () => false,
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   browseLocationBase: (path: string) => (path.startsWith("/") ? "host" : ""),
