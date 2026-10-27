@@ -245,8 +245,9 @@ def _rescuable_pr(env) -> dict:
     return {"number": 5, "headRefName": "pr-5", "headRefOid": oid}
 
 
-def test_conflicting_pr_rescued_by_rebase(env):
-    pr = _rescuable_pr(env)
+@pytest.mark.parametrize("base_metadata", [{}, {"baseRefName": None}], ids=["missing", "null"])
+def test_conflicting_pr_rescued_by_rebase(env, base_metadata):
+    pr = {**_rescuable_pr(env), **base_metadata}
 
     report = env.run([pr])
     [entry] = report["applied"]
@@ -257,6 +258,50 @@ def test_conflicting_pr_rescued_by_rebase(env):
     # the fork branch was refreshed to the rescued head this run composed
     assert env.fork_ref("refs/heads/pr-5") == entry["oid"]
     assert "merge PR #5" in env.fork_log("staging")
+
+
+def test_conflicting_stacked_pr_skips_rebase_rescue(env, monkeypatch, pushes):
+    pr = {
+        **_rescuable_pr(env),
+        "baseRefName": "stack/a|b`c",
+        "isDraft": False,
+        "author": {"login": "btli"},
+    }
+    real_run = subprocess.run
+
+    def list_prs(args, **kwargs):
+        if args[:3] == ["gh", "pr", "list"]:
+            fields = args[args.index("--json") + 1].split(",")
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps([{field: pr[field] for field in fields}]), ""
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(stage_mod.subprocess, "run", list_prs)
+
+    report = env.run(stage_mod.list_prs())
+
+    assert report["applied"] == []
+    rendered_reason = (
+        "stacked PR (base `stack/a/b'c`): rebase rescue skipped; restack it onto its base"
+    )
+    assert rendered_reason in stage_mod.notes(report, signed=True)
+    assert f"| Skipped #5 | {rendered_reason} |" in stage_mod.summarize(report).splitlines()
+    assert report["skipped"] == [
+        {
+            "pr": 5,
+            "branch": "pr-5",
+            "conflict_paths": ["a.txt"],
+            "source": "open",
+            "base_ref": "stack/a|b`c",
+            "reason": (
+                "stacked PR (base stack/a|b`c): rebase rescue skipped; restack it onto its base"
+            ),
+        }
+    ]
+    assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
+    assert not any(arg.endswith(":refs/heads/pr-5") for push in pushes for arg in push)
+    assert "merge PR #5" not in env.fork_log("staging")
 
 
 def test_rebase_retry_git_lock_failure_is_loud(env, monkeypatch):
@@ -359,13 +404,18 @@ def test_rescue_refuses_a_merge_containing_branch(env):
 
 
 def test_production_ring_never_rescues(env):
-    pr = _rescuable_pr(env)
+    pr = {**_rescuable_pr(env), "baseRefName": "stack/genie-cli-harness"}
     stage_mod.sync_main(env.work)
     good = env.add_pr(6, "good.txt", "good\n")
     report = env.run([pr, good], ring=stage_mod.PRODUCTION)
     assert [p["pr"] for p in report["applied"]] == [6]
     assert report["base_sha"] == env.fork_ref("refs/heads/main")
-    assert [p["pr"] for p in report["skipped"]] == [5]
+    assert report["skipped"] == [
+        {"pr": 5, "branch": "pr-5", "conflict_paths": ["a.txt"], "source": "open"}
+    ]
+    assert "merge conflict: `a.txt`" in stage_mod.notes(
+        report, signed=True, ring=stage_mod.PRODUCTION
+    )
     # the PR branch is untouched — production composes what the PRs say
     assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
 
