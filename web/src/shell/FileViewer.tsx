@@ -775,14 +775,15 @@ function FileViewerBody({
       : undefined;
     setMarkdownRouting({ conversationId, path, source: markdownSourceFallback });
   }
-  const isPreviewable =
-    (lang === "markdown" && !markdownSourceFallback) || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
   const isVideo = isVideoFile(path, fileQuery.data?.content_type);
+  const isPreviewable =
+    !isVideo &&
+    ((lang === "markdown" && !markdownSourceFallback) || lang === "html" || isNotebookPath(path));
   // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
@@ -799,6 +800,7 @@ function FileViewerBody({
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  const canDownload = !isDeletedFile && (!!fileQuery.data || isVideo);
   const revealTarget = useRevealTarget(path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
@@ -1141,7 +1143,7 @@ function FileViewerBody({
     menu?: ToolbarOption[];
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
+  if (lang === "markdown" && isPreviewable && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
     // Editor (default), the rendered Preview, and raw Source. Switching away
     // from the editor must guard unsaved edits; the read-only preview/source
@@ -1204,7 +1206,7 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
+  } else if (isPreviewable && (lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
     // HTML and notebooks have no rich-text editor — a single toggle flips
     // preview ↔ source.
     toolbarActions.push({
@@ -1283,8 +1285,9 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
-  // whitespace toggle to save toolbar width; toggles keep the menu open.
+  // One "⋯" menu holds Find, Wrap lines (Monaco views) and the diff-only
+  // whitespace toggle to save toolbar width; Download stays visible in the toolbar.
+  // Toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1301,16 +1304,6 @@ function FileViewerBody({
       icon: <FolderOpenIcon className="size-4" />,
       active: false,
       onSelect: () => revealInFileManager(revealTarget),
-    });
-  }
-  if (!isDeletedFile && (fileQuery.data || isVideo)) {
-    settingsMenu.push({
-      key: "download",
-      label: "Download file",
-      tooltip: "Download",
-      icon: <DownloadIcon className="size-4" />,
-      active: false,
-      onSelect: downloadFile,
     });
   }
   // One wrap preference covers the source editor and the diff. Other views
@@ -1373,12 +1366,34 @@ function FileViewerBody({
     // path-aware title reserve). Each shifts the constants the effect reads.
     [
       toolbarActions.map((a) => a.key).join(","),
+      `download:${canDownload ? 1 : 0}`,
       `back:${!frameless || mobileOverlay}`,
       `chip:${saveStatus !== "idle"}`,
       `nav:${showNavButtons}`,
       `path:${path}`,
     ].join("|"),
   );
+
+  const renderDownloadButton = (interactive: boolean) =>
+    canDownload && (
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Download file"
+              tabIndex={interactive ? undefined : -1}
+              onClick={interactive ? downloadFile : undefined}
+            >
+              <DownloadIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Download file</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
 
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
@@ -1631,6 +1646,7 @@ function FileViewerBody({
               then a single "⋯" menu with the same options. The offscreen clone
               below measures the full row's natural width. */}
           <div className="flex items-center justify-end gap-1">
+            {renderDownloadButton(true)}
             {toolbarCollapsed ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -1719,6 +1735,7 @@ function FileViewerBody({
             aria-hidden
             className="pointer-events-none absolute left-[-9999px] top-0 flex flex-nowrap items-center gap-1"
           >
+            {renderDownloadButton(false)}
             {renderActionButtons(false)}
           </div>
           <span
@@ -1839,7 +1856,9 @@ function FileViewerBody({
               wrapLines={wrapLines}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
-              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              onRequestEditMode={
+                lang === "markdown" && !isVideo ? handleRequestEditMode : undefined
+              }
             />
           )}
         </div>
