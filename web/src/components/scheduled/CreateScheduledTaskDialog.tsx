@@ -233,6 +233,7 @@ export function CreateScheduledTaskDialog({
   initialTrigger = null,
   initialTemplateId,
   sessionLink = "",
+  initialProject,
   editingTask = null,
   sourceSession = null,
   onCreated,
@@ -247,6 +248,8 @@ export function CreateScheduledTaskDialog({
   initialTemplateId?: AutomationTemplateId;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
+  /** Project a new automation starts filed into (e.g. the Automations page's filter). */
+  initialProject?: { id: string; name: string };
   editingTask?: ScheduledTask | null;
   /** Create the automation from this session: every run starts from a copy of it. */
   sourceSession?: AutomationSourceSession | null;
@@ -606,8 +609,9 @@ export function CreateScheduledTaskDialog({
         setWorkspace("");
         setBaseBranch(null);
         setSandboxMode(false);
-        setProjectChoice(null);
-        setPickedProjectId(null);
+        const seededProject = projectsSupported ? initialProject : undefined;
+        setProjectChoice(seededProject?.name ?? null);
+        setPickedProjectId(seededProject?.id ?? null);
       }
       setError(null);
     }
@@ -618,6 +622,8 @@ export function CreateScheduledTaskDialog({
     initialPrompt,
     initialTrigger,
     defaultTriggerSchedule,
+    initialProject,
+    projectsSupported,
     editingTask,
     savedSchedule,
     savedWorkspace,
