@@ -2,3 +2,4 @@
 #
 # PR numbers only. Blank lines and `#` comments are ignored. A listed PR is
 # held out of every ring's composition until removed.
+5381              # superseded by upstream #11833 (automation project filing); held out pending a close/re-scope decision
