@@ -21,6 +21,12 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
+  action opens the shared Reconfigure flow in place for native agents on
+  connected user hosts when a fix is available. Missing binaries install before
+  authentication; success refreshes readiness without leaving the composer. SDK
+  agents and managed-host agents keep the setup checklist. With the flag off,
+  New Chat shows the CLI setup guidance.
 - `account-management`: Settings harness cards show the non-secret account label
   reported by the connected host (email, plan, organization, or provider names).
   An expired Codex account offers **Sign in again**. Codex sign-in opens a
@@ -384,7 +390,8 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
   model context, distinct native threads on one runner, transcript isolation,
-  follow-ups, and a working parent after side-chat closure.
+  follow-ups that switch model and effort on the same thread, and a working
+  parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus

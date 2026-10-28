@@ -1,12 +1,16 @@
 # Composer
 
 The composer is where a user writes a message and chooses how the agent runs
-it. It appears in two places that look alike but are separate surfaces: the
-in-session composer at the bottom of a chat, and the new-session composer on
+it. The main surfaces are the in-session composer at the bottom of a chat
+and the new-session composer on
 the landing page. Both show a model/effort pill with a hover tooltip, open a
 configuration menu for harness, model, reasoning effort, and permission mode,
 and accept attachments and slash commands. The in-session composer also queues
 and steers messages while the agent is busy.
+
+Side chats have their own composer. Supported generic side chats reuse the
+model/effort picker before their first message and for later turns; changes
+apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
@@ -41,6 +45,13 @@ and steers messages while the agent is busy.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
+- `side-chat-settings`: the side-chat model/effort pill uses the same catalog
+  and capability rules. Draft selections apply when the child is created;
+  live selections update that child's session. A live Claude picker follows
+  the runner's reported model if a requested change is refused. Native Codex
+  side chats show these controls after creation; selections apply to the next
+  turn without changing the parent;
+  older runners hide these controls.
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
@@ -143,6 +154,10 @@ and steers messages while the agent is busy.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
+- `prompt-history`: Up starts history recall only from empty text in an existing
+  session. Up/Down at the text boundaries browse recalled messages; editing one
+  returns to normal caret navigation. Whitespace and queued messages recalled
+  for editing remain drafts.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -212,6 +227,8 @@ and steers messages while the agent is busy.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
+- With the in-session message box empty, press Up to recall a previous prompt
+  (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue
   as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
@@ -294,6 +311,14 @@ and steers messages while the agent is busy.
   resumes after the first input is delivered.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session.
+- With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
+  and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
+  catalog; selecting a skill completes the prompt while the launch stays on Arclet.
+  Runtime availability follows Arclet's existing skill sync and plugin installation;
+  custom skill roots or plugins installed only on Arca may be absent on Arclet.
+  With no connected Arca, host skills become available after the sandbox starts.
+  SDK agents continue using their bundled skills before the sandbox starts.
+  Browser coverage: `tests/browser_ui/chat/test_arclet_skills.py`.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections
@@ -319,7 +344,13 @@ pickers, seeded from the source session when its harness family is kept.
 collapsed labels.
 
 **Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, then click the microphone beside **Ask a side question...**.
+in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
+text. For native Codex, send the first message before using its model/effort
+pill; later selections apply on the next turn. For other supported harnesses,
+open the side-chat model pill to choose model/effort before or after its
+first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
+for draft persistence and parent-isolation checks. The microphone beside
+**Ask a side question...** starts dictation.
 
 ## Driving it with the repro environment
 
@@ -625,6 +656,12 @@ Other connection providers alone do not enable the managed MCP picker.
   once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
+- **`prompt-history`, in-session composer with a keyboard:**
+  `tests/browser_ui/chat/test_composer_acceptance.py::test_prompt_history_preserves_drafts_during_real_arrow_navigation`
+  checks wrapped-text caret movement, empty-composer recall, and edited recall.
+  Multiline, whitespace, quotes, and queued drafts have component coverage in
+  `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
+  composers have no prompt recall; the vendor terminal owns its own history.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
