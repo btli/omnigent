@@ -116,6 +116,7 @@ from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     EFFORT_ORDER,
     clamp_effort_for_model,
+    effort_for_model_switch,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1095,6 +1096,29 @@ def is_missing_rollout_error(exc: BaseException) -> bool:
         and exc.code == _CODEX_INVALID_REQUEST_CODE
         and exc.message is not None
         and _CODEX_NO_ROLLOUT_ERROR in exc.message
+    )
+
+
+#: Substring in codex's ``-32600`` message when another app-server still holds
+#: the thread being resumed.
+_CODEX_ACTIVE_WRITER_ERROR = "already has an active writer"
+
+
+def is_active_writer_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure says another app-server holds the thread.
+
+    A runner replaced moments ago may still be starting its own app-server for
+    the same session, so the conflict clears once that process is reaped.
+
+    :param exc: The exception raised by the resume request.
+    :returns: ``True`` for codex's ``-32600 … already has an active writer``.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and _CODEX_ACTIVE_WRITER_ERROR in exc.message
     )
 
 
@@ -4922,6 +4946,57 @@ async def apply_codex_thread_effort(
             )
     finally:
         # A wedged server can stall the closing handshake; it must not mask the result.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
+
+
+async def apply_codex_thread_collaboration_mode(
+    transport: str,
+    thread_id: str,
+    mode: str,
+    *,
+    model: str,
+    effort: str | None = None,
+) -> None:
+    """
+    Set a loaded thread's collaboration mode via ``thread/settings/update``.
+
+    Null ``developer_instructions`` keeps the mode's built-in prompt.
+
+    :param transport: App-server transport, e.g. ``"ws://127.0.0.1:9876"``.
+    :param thread_id: Loaded Codex thread id, e.g. ``"019e96aa-..."``.
+    :param mode: Codex collaboration mode, e.g. ``"plan"``.
+    :param model: Model the thread runs; Codex requires it in the mode settings.
+    :param effort: Session-persisted effort, or ``None``; resolved to a level
+        ``model`` accepts, as :func:`apply_codex_thread_effort` does.
+    :raises Exception: If the app-server rejects the update.
+    """
+    client = client_for_transport(transport, client_name="omnigent-codex-native-plan-mode")
+    try:
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
+        applied_effort = (
+            await resolve_codex_effort_for_model(client, effort, model, transport=transport)
+            if effort is not None
+            else effort_for_model_switch(None, model)
+        )
+        await asyncio.wait_for(
+            client.request(
+                "thread/settings/update",
+                {
+                    "threadId": thread_id,
+                    "collaborationMode": {
+                        "mode": mode,
+                        "settings": {
+                            "model": model,
+                            "reasoning_effort": applied_effort,
+                            "developer_instructions": None,
+                        },
+                    },
+                },
+            ),
+            timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
+        )
+    finally:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
 

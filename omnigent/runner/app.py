@@ -1172,6 +1172,7 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    native_pane_idle_timeout_s: float | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -1207,6 +1208,8 @@ def create_runner_app(
     :param auth_token_factory: Refresh-capable server bearer factory owned by
         the runner process. Native terminal helpers reuse it instead of
         resolving host credentials again for every terminal launch.
+    :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
+        disables reaping; ``None`` uses the pane environment override or default.
     """
     import hmac
 
@@ -1490,6 +1493,31 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+        """Whether a native pane shows the live work the pane reaper spares it for.
+
+        A pane parked on a permission prompt is quiet and can read ``idle``, and a
+        pane still redrawing output can too, so the status edge alone misses them.
+        Reads the same in-memory signals the reaper uses, not its tmux calls.
+
+        :param terminals: Terminal registry holding the pane instance.
+        :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
+        :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
+        :returns: ``True`` when a permission hook is parked or the pane shows recent
+            input or output.
+        """
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
+
+        if approval_wait_is_fresh(session_id):
+            return True
+        instance = terminals.get(session_id, terminal_name, "main")
+        if instance is None:
+            return False
+        if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
+            return True
+        return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -1508,15 +1536,16 @@ def create_runner_app(
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
         if terminals is not None:
-            session_ids.update(
-                session_id
-                for session_id, name, _ in terminals.native_panes()
-                if is_native_harness(
+            for session_id, name, _ in terminals.native_panes():
+                if not is_native_harness(
                     resource_registry.terminal_resource_role(
                         session_id, terminal_resource_id(name, "main")
                     )
-                )
-            )
+                ):
+                    continue
+                session_ids.add(session_id)
+                if _native_pane_shows_live_work(terminals, session_id, name):
+                    return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
@@ -5250,6 +5279,9 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        _authorized_shell = msg_body.get("authorized_native_shell_command")
+        if isinstance(_authorized_shell, str):
+            harness_body["authorized_native_shell_command"] = _authorized_shell
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -6492,6 +6524,19 @@ def create_runner_app(
             )
 
         body = await request.json()
+        if isinstance(body, dict):
+            from omnigent.harnesses.codex_native.shell_input import (
+                CODEX_SHELL_AUTHORIZED_HEADER,
+                shell_command_from_input,
+            )
+
+            # Only the authenticated server transport can authorize direct shell
+            # execution; legacy or caller-supplied body fields confer no authority.
+            body.pop("authorized_native_shell_command", None)
+            if request.headers.get(CODEX_SHELL_AUTHORIZED_HEADER) == "1":
+                authorized_command = shell_command_from_input(body.get("content"))
+                if authorized_command is not None:
+                    body["authorized_native_shell_command"] = authorized_command
         body_type = body.get("type") if isinstance(body, dict) else None
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
@@ -7003,8 +7048,20 @@ def create_runner_app(
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            # Killing Claude's pane fails a turn still waiting to deliver into it;
+            # mark that turn interrupted first so it ends cancelled, not failed.
+            _cancels_turn = _harness == "claude-native" and isinstance(
+                _active_turns.get(conversation_id), asyncio.Task
+            )
+            if _cancels_turn:
+                _interrupted_sessions.add(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
+                if _cancels_turn:
+                    if _stop_resp.status_code == 204:
+                        await _cancel_inprocess_turn(conversation_id)
+                    else:
+                        _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
@@ -8114,6 +8171,7 @@ def create_runner_app(
             list_native_panes=_native_panes_for_reaper,
             is_busy=_native_pane_is_busy,
             reap=_reap_native_pane,
+            idle_timeout_s=native_pane_idle_timeout_s,
         )
     else:
         app.state.native_pane_reaper = None

@@ -68,6 +68,7 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
+  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -276,6 +277,7 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
+import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
@@ -297,6 +299,7 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
+import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
 import {
   fetchUserAgents,
   USER_AGENTS_QUERY_KEY,
@@ -528,9 +531,12 @@ function ConnectingText({ className }: { className?: string }) {
 export function ConnectHostInstructions({
   serverUrl,
   label,
+  onSshConnected,
 }: {
   serverUrl: string;
   label?: string;
+  /** After the desktop shell connects a machine over SSH, with its host id. */
+  onSshConnected?: (hostId: string) => void;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -540,6 +546,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
+  const sshConnectAvailable = useSshConnectAvailable();
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -576,6 +583,7 @@ export function ConnectHostInstructions({
           testIdPrefix="connect-host"
         />
       )}
+      {sshConnectAvailable && <SshConnectForm onConnected={onSshConnected} />}
     </div>
   );
 }
@@ -2190,6 +2198,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  codexPlanMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   devinPermissionMode: string;
@@ -2725,6 +2734,11 @@ export function NewChatLandingScreen() {
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
+  // Codex Plan mode armed before the first prompt; sent as the session's
+  // collaboration-mode label, which the in-session Plan toggle also drives.
+  const [codexPlanMode, setCodexPlanMode] = useState<boolean>(
+    () => restoredDraft?.codexPlanMode ?? false,
+  );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
@@ -2852,6 +2866,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    codexPlanMode,
     cursorExecMode,
     agySkipMode,
     devinPermissionMode,
@@ -4283,6 +4298,18 @@ export function NewChatLandingScreen() {
             : supportsDevinPermission
               ? DEVIN_NATIVE_PERMISSION_MODES
               : [];
+  // Unsaved custom agents launch through the host runners route, which cannot
+  // refuse a host too old to start Codex in Plan mode.
+  const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
+  const codexPlanModeSelectable =
+    codexPlanLaunchEnabled &&
+    !smartRoutingHarnessSelected &&
+    selectedNativeHarness === "codex-native" &&
+    effectiveAgentId !== PENDING_AGENT_ID;
+  const toggleCodexPlanMode = codexPlanModeSelectable
+    ? () => setCodexPlanMode((armed) => !armed)
+    : undefined;
+  const codexPlanToggleLabel = codexPlanMode ? "Exit Plan mode" : "Enter Plan mode";
   const selectDirectMode = (mode: string) => {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
@@ -4321,6 +4348,7 @@ export function NewChatLandingScreen() {
     userPickedModelRef.current = false;
     userPickedEffortRef.current = false;
     setBypassSandbox(false);
+    setCodexPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -5026,6 +5054,7 @@ export function NewChatLandingScreen() {
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
+    skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
@@ -5853,10 +5882,15 @@ export function NewChatLandingScreen() {
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
-      const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-          : nativeLabels;
+      const baseLabels = {
+        ...(nativeLabels ?? {}),
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        ...(codexPlanModeSelectable && codexPlanMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
       // files the session atomically at create (born filed, no follow-up
@@ -7039,6 +7073,7 @@ export function NewChatLandingScreen() {
                         builtinNames={slashCompletion.builtinNames}
                         labels={slashCompletion.labels}
                         skillsStatus={skillsStatus}
+                        skillsWarnings={skillsWarnings}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
                       />
@@ -7121,11 +7156,22 @@ export function NewChatLandingScreen() {
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
-                            : undefined
+                            : toggleCodexPlanMode
                         }
                         planActive={
                           (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
+                          (supportsCursorMode && cursorExecMode === "plan") ||
+                          (codexPlanModeSelectable && codexPlanMode)
+                        }
+                        planLabel={codexPlanModeSelectable ? codexPlanToggleLabel : undefined}
+                        planUnavailableReason={
+                          selectedNativeHarness === "codex-native"
+                            ? !codexPlanLaunchEnabled
+                              ? "This server does not support starting Codex in Plan mode"
+                              : effectiveAgentId === PENDING_AGENT_ID
+                                ? "Turn Plan mode on after this custom agent's session starts"
+                                : undefined
+                            : undefined
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
@@ -7415,6 +7461,15 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                       />
                     ) : null}
+                    {codexPlanModeSelectable && codexPlanMode && (
+                      <span
+                        data-testid="new-chat-landing-plan-mode"
+                        className="inline-flex shrink-0 items-center gap-1 px-1 text-sm font-medium text-foreground"
+                      >
+                        <FileTextIcon className="ui-icon" />
+                        <span>Plan mode</span>
+                      </span>
+                    )}
 
                     {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on
@@ -7788,6 +7843,10 @@ export function NewChatLandingScreen() {
           <ConnectHostInstructions
             serverUrl={serverUrl}
             label="Run this on the machine you want to use, then pick it from the host menu:"
+            onSshConnected={(hostId) => {
+              setConnectOpen(false);
+              selectHost(hostId);
+            }}
           />
         </DialogContent>
       </Dialog>
