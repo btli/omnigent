@@ -237,6 +237,47 @@ def _pick_minute(page: Page, minute: int) -> None:
     expect(popover_content).to_have_count(0)
 
 
+def _open_automations_page(page: Page, base_url: str) -> None:
+    """Open Automations and dismiss the first-visit introduction."""
+    page.goto(f"{base_url}/tasks")
+    intro = page.get_by_role("dialog", name="Introducing Automations")
+    expect(intro).to_be_visible(timeout=30_000)
+    intro.get_by_role("button", name="Maybe later").click()
+    expect(intro).not_to_be_visible()
+
+
+@pytest.mark.parametrize(
+    "viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}]
+)
+def test_automations_introduction_first_visit(
+    page: Page, live_server: str, viewport: dict[str, int]
+) -> None:
+    """Walk through first-visit onboarding and keep it dismissed after a reload."""
+    page.set_viewport_size(viewport)
+    if viewport["width"] < 768:
+        page.goto(f"{live_server}/tasks")
+    else:
+        page.goto(live_server)
+        page.get_by_test_id("scheduled-tasks-nav").click()
+    intro = page.get_by_role("dialog", name="Introducing Automations")
+    expect(intro).to_be_visible(timeout=30_000)
+    expect(intro.get_by_role("listitem")).to_have_count(4)
+    page.mouse.click(2, 2)
+    expect(intro).to_be_visible()
+    for _ in range(3):
+        intro.get_by_role("button", name="Next", exact=True).click()
+    expect(intro.get_by_text("4 of 4 · Make it yours")).to_be_visible()
+    intro.get_by_role("button", name="Done", exact=True).click()
+    expect(intro).not_to_be_visible()
+    expect(page.get_by_test_id("new-task-button")).to_be_focused()
+    page.reload()
+    expect(page.get_by_test_id("new-task-button")).to_be_visible()
+    page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create manually", exact=True).click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
+    expect(intro).not_to_be_visible()
+
+
 def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     page: Page,
     live_server: str,
@@ -271,7 +312,7 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     assert next_run_at, "seeded active task should have an armed next_run_at"
     # Keep the label away from the valid "soon" state near the scheduled instant.
     page.clock.install(time=_parse_iso(next_run_at) - timedelta(hours=1))
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
 
     # All three rows render (the list query resolves against the seeded tasks).
     rows = page.locator('[data-testid="scheduled-task-row"]')
@@ -335,7 +376,7 @@ def test_scheduled_task_next_run_label_live_ticks_without_navigation(
     # navigation so the SPA's first `Date.now()` (and every `useNow` read) is faked.
     page.clock.install(time=fire - timedelta(minutes=40))
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
 
     row = _row_by_name(page, "Ticking task")
     expect(row).to_be_visible(timeout=30_000)
@@ -367,9 +408,10 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     typed_name = f"Typed time daily {name_suffix}"
     edit_name = f"Edit footer task {name_suffix}"
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
 
     page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(typed_name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
@@ -465,7 +507,7 @@ def test_scheduled_task_row_run_controls(
         live_server, agent_id, "Run-now target", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
     )
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     row = _row_by_name(page, "Run-now target")
     expect(row).to_be_visible(timeout=30_000)
 
@@ -522,6 +564,7 @@ def _open_create_dialog(page: Page) -> None:
     :param page: Playwright page already navigated to ``/tasks``.
     """
     page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
@@ -556,7 +599,7 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     Claude Code) renders ``task-model-effort-row`` with both the model and
     effort triggers defaulting to the "Default" sentinel — nothing overridden.
     """
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     expect(page.get_by_test_id("task-model-effort-row")).to_be_visible(timeout=30_000)
@@ -591,7 +634,7 @@ def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
     codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
     _create_task(live_server, codex_agent_id, "Codex daily", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     row = _row_by_name(page, "Codex daily")
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
@@ -622,7 +665,7 @@ def test_scheduled_task_create_persists_model_and_effort(
     task pins the host, so Opus is that host's Claude Code option of that name,
     and High is the ``"high"`` effort; a pick sends the option's id verbatim.
     """
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     # Until the host's options load, the picker shows the static aliases.
     with page.expect_response(lambda r: r.url.endswith("/harnesses/claude-native/model-options")):
         _open_create_dialog(page)
@@ -660,7 +703,7 @@ def test_scheduled_task_create_default_omits_model_and_effort(
     so the row inherits the agent's configured model + effort. Confirms the
     "Default" sentinel maps to a null override (not the literal sentinel string).
     """
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Default model effort")
@@ -697,7 +740,7 @@ def test_scheduled_task_edit_prefills_model_and_effort(
         reasoning_effort="high",
     )
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     row = _row_by_name(page, "Prefill target")
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
@@ -733,7 +776,7 @@ def test_scheduled_task_edit_switches_the_harness(
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
     )
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     row = _row_by_name(page, task_name)
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
@@ -785,7 +828,7 @@ def test_scheduled_task_create_persists_permission_mode(
     persisted pick (``"acceptEdits"`` — the wire value behind the "Accept edits"
     label).
     """
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Permission create")
@@ -811,7 +854,7 @@ def test_scheduled_task_create_default_omits_permission_mode(
     the row inherits the agent's configured mode. Confirms the "Default"
     sentinel maps to a null override, not the literal sentinel string.
     """
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Default permission")
@@ -845,7 +888,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
         permission_mode="bypassPermissions",
     )
 
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     row = _row_by_name(page, "Permission prefill")
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
@@ -864,7 +907,7 @@ def test_scheduled_task_create_persists_continuing_one_session(
     live_server: str,
 ) -> None:
     """Choosing "Continue in the same session" on create persists the session mode."""
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Continue create")
@@ -889,7 +932,12 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
 ) -> None:
     """The Jira trigger chip saves an hourly continue task with the rendered prompt."""
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
-    page.goto(f"{live_server}/tasks")
+    _open_automations_page(page, live_server)
+    page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create from template", exact=True).click()
+    expect(page).to_have_url(f"{live_server}/tasks/templates")
+    page.reload()
+    expect(page.get_by_role("heading", name="Automation templates")).to_be_visible()
     page.get_by_test_id("suggestion-trigger-jira").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(name)
@@ -899,6 +947,8 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
+    page.get_by_role("link", name="Back to automations").click()
     expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
