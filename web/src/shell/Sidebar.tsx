@@ -233,6 +233,7 @@ import { isMobileViewport } from "@/lib/breakpoints";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import { useShowProjectHeaderActionsOnTouch } from "@/lib/projectHeaderActionPreferences";
 import {
   finishActiveRowGesture,
   ROW_GESTURE_HOLD_MS,
@@ -364,9 +365,9 @@ import {
 export { isMobileViewport };
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
-// right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
-// archive + kebab take its place; elsewhere the controls are gone and the badge
-// holds the edge, fading only under a held shortcut hint.
+// Anchored at the row's right-1 edge. On fine-hover desktop it fades on hover or
+// focus so the pin, archive and kebab take its place; a held shortcut hint fades
+// it too. Without fine hover it holds that edge and never fades.
 const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
 
@@ -380,7 +381,6 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
-
 // Per trailing slot: the title's right reserve, and with the w-6 shared icon,
 // a wider reserve plus the icon offset that sits it just left of the slot.
 const TRAILING_SLOT_LAYOUT = {
@@ -1168,7 +1168,7 @@ function SidebarImpl({
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
-          "conversations-sidebar flex flex-col md:bg-card md:flex-row md:select-none",
+          "conversations-sidebar flex flex-col md:flex-row md:bg-card md:select-none",
           nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
           !isElectronShell() && !nativeSidebarSurface && (open || peek) && "md:pl-1",
           // Mobile (default): a fixed drawer that slides in via translate-x
@@ -1663,6 +1663,7 @@ function ProjectFolder({
   ) => void;
 }) {
   const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
+  const showProjectHeaderActionsOnTouch = useShowProjectHeaderActionsOnTouch();
   const viewerId = useViewerId();
   const query = useProjectSessions(name, expanded, sortBy, archived);
   const watchedRows = useMemo(
@@ -1908,8 +1909,10 @@ function ProjectFolder({
             projectName={name}
             onNavigate={onRowClick}
             actions={orderedMenuActions}
+            showOnTouch={showProjectHeaderActionsOnTouch}
           />
         }
+        showProjectHeaderActionsOnTouch={showProjectHeaderActionsOnTouch}
         headerContextMenu={
           <ContextMenuContent className="min-w-40" onCloseAutoFocus={menuActions.onCloseAutoFocus}>
             <ProjectFolderMenuItems
@@ -3637,6 +3640,7 @@ function SectionHeader({
   active = false,
   hasAction,
   hasPersistentAction,
+  showProjectHeaderActionsOnTouch,
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
@@ -3656,6 +3660,8 @@ function SectionHeader({
       paint theirs only with fine hover. At rest on hover-capable desktops the
       badges return to the rows' badge column. */
   hasAction?: boolean;
+  /** Project-header controls stay visible on touch when this is enabled. */
+  showProjectHeaderActionsOnTouch?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
       hover-capable desktops. */
@@ -3681,6 +3687,12 @@ function SectionHeader({
         ? "fine-hover:md:-mr-1"
         : "fine-hover:md:mr-1"
       : "fine-hover:md:mr-2";
+  const touchActionMargin =
+    showProjectHeaderActionsOnTouch === undefined
+      ? undefined
+      : showProjectHeaderActionsOnTouch
+        ? "no-fine-hover:mr-24"
+        : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:mr-24 no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:mr-24";
   const markerFade =
     "fine-hover:md:group-hover/section:opacity-0 fine-hover:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
@@ -3722,12 +3734,21 @@ function SectionHeader({
           ? cn(
               SIDEBAR_ROW,
               "group flex w-full items-center border-0 text-left text-foreground transition-colors",
+              // The row grows to fit 44px touch actions so neighbors never overlap.
+              showProjectHeaderActionsOnTouch && "no-fine-hover:min-h-11",
               SIDEBAR_HOVER_HIGHLIGHT,
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                cn(
+                  "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                  showProjectHeaderActionsOnTouch === undefined
+                    ? undefined
+                    : showProjectHeaderActionsOnTouch
+                      ? "no-fine-hover:pr-24"
+                      : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24 no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:pr-24",
+                ),
             )
           : cn(
               "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
@@ -3775,12 +3796,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity mobile-app:mr-0 mobile-app:opacity-100",
-            // Project actions exist only with fine hover (touch uses the
-            // long-press menu); section headers keep their select/filter slots.
+            // Project actions reserve their column only when visible or focused.
             hasAction
               ? cn(
                   icon ? cn(clusterRestMargin, "fine-hover:mr-14") : "mr-14",
                   clusterHoverDesktopMargin,
+                  touchActionMargin,
                 )
               : hasPersistentAction
                 ? "mr-7"
@@ -4208,6 +4229,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  showProjectHeaderActionsOnTouch,
   headerStatus,
   headerContextMenu,
   persistentHeaderAction,
@@ -4251,6 +4273,7 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
+  showProjectHeaderActionsOnTouch?: boolean;
   /** Progress displayed beside the title, including while collapsed. */
   headerStatus?: ReactNode;
   /** Optional context-menu content opened from the header button. */
@@ -4311,6 +4334,7 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
+            showProjectHeaderActionsOnTouch={showProjectHeaderActionsOnTouch}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -4349,6 +4373,10 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
+                    // Hidden touch actions stay in the accessibility tree and tab
+                    // order without a hit area; keyboard focus or their open menu reveals them.
+                    showProjectHeaderActionsOnTouch === false &&
+                      "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:not-sr-only",
                     "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
@@ -6819,14 +6847,15 @@ function ProjectFolderActions({
   projectName,
   onNavigate,
   actions,
+  showOnTouch,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  showOnTouch: boolean;
 }) {
-  // Touch devices of any width reach these through the header's long-press menu.
   return (
-    <div className="hidden items-center gap-0.5 fine-hover:flex">
+    <div className="flex items-center gap-0.5">
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -6835,7 +6864,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="text-muted-foreground"
+            className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -6850,7 +6879,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        actions={actions}
+        showOnTouch={showOnTouch}
+      />
     </div>
   );
 }
@@ -7283,13 +7317,17 @@ function ProjectFolderMenu({
   projectName,
   onNavigate,
   actions,
+  showOnTouch,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  showOnTouch: boolean;
 }) {
+  const [open, setOpen] = useState(false);
+  const pressPointerRef = useRef<"mouse" | "touch" | null>(null);
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <Button
           type="button"
@@ -7297,8 +7335,26 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="text-muted-foreground"
-          onClick={(e) => e.stopPropagation()}
+          className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
+          onPointerDown={(e) => {
+            // Only treat as touch if explicitly a touch or pen event; default to mouse.
+            const isTouchLike = e.pointerType === "touch" || e.pointerType === "pen";
+            pressPointerRef.current = isTouchLike ? "touch" : "mouse";
+            // Touch and pen skip Radix's press toggle so a scroll start never opens the menu.
+            if (isTouchLike) e.preventDefault();
+          }}
+          onPointerCancel={() => {
+            pressPointerRef.current = null;
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            // Mouse presses already toggled and touch taps toggle here; keyboard and
+            // assistive-tech clicks (detail 0) only open, so a Space click is a no-op.
+            const press = e.detail > 0 ? pressPointerRef.current : null;
+            pressPointerRef.current = null;
+            if (press === "touch") setOpen((wasOpen) => !wasOpen);
+            else if (press === null) setOpen(true);
+          }}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
         </Button>
