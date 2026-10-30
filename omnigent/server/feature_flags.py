@@ -26,6 +26,7 @@ class Feature(StrEnum):
     SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
+    WORKSPACE_UPLOAD = "workspace_upload"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
@@ -104,6 +105,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.15.0",
         frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_UPLOAD,
+        description="Resumable uploads into session workspaces",
+        owner="server",
+        review_by_release="0.20.0",
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
