@@ -383,7 +383,7 @@ describe("New automation menu", () => {
     fireEvent.click(screen.getByRole("button", { name: "PR sweep" }));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
       "data-initial-name",
-      "PR sweep",
+      "PR sweep - {{YYYY-MM-DD}}",
     );
   });
 });
