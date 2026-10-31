@@ -70,7 +70,6 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
-  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   Trash2Icon,
@@ -152,7 +151,6 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
@@ -190,7 +188,7 @@ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
-import { EmojiPicker } from "@/components/ProjectIconPicker";
+import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -324,6 +322,13 @@ import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/c
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import {
+  type ProjectAppearance,
+  projectAppearance,
+  projectColorValue,
+  withProjectAppearance,
+} from "@/lib/projectColors";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import {
   CompactShortcutKeys,
   newSessionAriaShortcut,
   newSessionShortcutKeys,
@@ -375,9 +380,9 @@ const SCROLLBAR_HIDE_DELAY_MS = 700;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
-// Maps a first-class project id → its chosen emoji icon (only projects that
-// have one), sharing the names map lookup for the pinned flyout and session tooltip.
-const ProjectIconsContext = createContext<Map<string, string>>(new Map());
+// Maps a first-class project id → its mark (only projects with an emoji or
+// color), sharing the names map lookup for the pinned flyout and session tooltip.
+const ProjectMarksContext = createContext<Map<string, ProjectAppearance>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
@@ -416,7 +421,7 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
 
 function SidebarRowDataProvider({
   projectNamesById,
-  projectIconsById,
+  projectMarksById,
   hostsById,
   show,
   isMobile,
@@ -426,7 +431,7 @@ function SidebarRowDataProvider({
   children,
 }: {
   projectNamesById: Map<string, string>;
-  projectIconsById: Map<string, string>;
+  projectMarksById: Map<string, ProjectAppearance>;
   hostsById: ReadonlyMap<string, Host>;
   show: readonly SidebarShowField[];
   isMobile: boolean;
@@ -437,7 +442,7 @@ function SidebarRowDataProvider({
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <ProjectIconsContext.Provider value={projectIconsById}>
+      <ProjectMarksContext.Provider value={projectMarksById}>
         <HostsByIdContext.Provider value={hostsById}>
           <SidebarShowContext.Provider value={show}>
             <IsMobileContext.Provider value={isMobile}>
@@ -451,7 +456,7 @@ function SidebarRowDataProvider({
             </IsMobileContext.Provider>
           </SidebarShowContext.Provider>
         </HostsByIdContext.Provider>
-      </ProjectIconsContext.Provider>
+      </ProjectMarksContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -1477,6 +1482,7 @@ function ProjectFolder({
   name,
   projectId,
   icon,
+  color,
   windowConversations,
   archived,
   activeConversationId,
@@ -1508,6 +1514,8 @@ function ProjectFolder({
   /** Chosen emoji icon (unicode grapheme), or null/absent for the default
       folder glyph. */
   icon?: string | null;
+  /** Chosen color (a theme palette id), or null/absent for the muted folder. */
+  color?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
@@ -1651,7 +1659,9 @@ function ProjectFolder({
     name,
     projectId,
     icon,
+    color,
   );
+  const folderColor = projectColorValue(color, useResolvedThemeMode());
 
   const headerDrag = useSortable({
     id: projectDragId(name),
@@ -1684,6 +1694,8 @@ function ProjectFolder({
             <span className="text-[14px] leading-none">{icon}</span>
           ) : expanded ? (
             <FolderOpenIcon
+              data-project-color={color ?? undefined}
+              style={{ color: folderColor }}
               className={cn(
                 "ui-icon",
                 active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
@@ -1691,6 +1703,8 @@ function ProjectFolder({
             />
           ) : (
             <FolderIcon
+              data-project-color={color ?? undefined}
+              style={{ color: folderColor }}
               className={cn(
                 "ui-icon",
                 active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
@@ -2037,12 +2051,13 @@ function ConversationList({
     return map;
   }, [projects]);
 
-  // id → emoji icon for rows that want to show the real project glyph (e.g. the
+  // id → mark for rows that want to show the real project glyph (e.g. the
   // pinned flyout); built alongside the names map and shared the same way.
-  const projectIconsById = useMemo(() => {
-    const map = new Map<string, string>();
+  const projectMarksById = useMemo(() => {
+    const map = new Map<string, ProjectAppearance>();
     for (const p of projects) {
-      if (p.id !== null && p.icon) map.set(p.id, p.icon);
+      const mark = projectAppearance({ icon: p.icon ?? undefined, color: p.color ?? undefined });
+      if (p.id !== null && (mark.icon || mark.color)) map.set(p.id, mark);
     }
     return map;
   }, [projects]);
@@ -2148,8 +2163,9 @@ function ConversationList({
       id: string | null;
       name: string;
       icon?: string | null;
+      color?: string | null;
       conversations: Conversation[];
-    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
+    }[] = (grouped ? [] : projects).map(({ id, name, icon, color }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -2161,6 +2177,7 @@ function ConversationList({
         id,
         name,
         icon,
+        color,
         conversations: sortConversations(inProject, activeOverride, frozenKeys, sortBy),
       };
     });
@@ -2827,7 +2844,7 @@ function ConversationList({
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
-      projectIconsById={projectIconsById}
+      projectMarksById={projectMarksById}
       hostsById={hostsById}
       show={view.show}
       isMobile={isMobile}
@@ -3045,6 +3062,7 @@ function ConversationList({
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}
+                            color={group.color}
                             windowConversations={group.conversations}
                             archived={activeTab === "archived"}
                             activeConversationId={displayedActiveId}
@@ -4649,11 +4667,11 @@ function SessionTooltipDetail({
 function SessionTooltipDetails({
   conversation,
   projectName,
-  projectIcon,
+  projectMark,
 }: {
   conversation: Conversation;
   projectName: string | null;
-  projectIcon: string | null;
+  projectMark: ProjectAppearance | null;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
@@ -4711,7 +4729,7 @@ function SessionTooltipDetails({
       {projectName !== null && (
         <SessionTooltipDetail
           label="Project"
-          iconContent={<ProjectRowIcon icon={projectIcon} />}
+          iconContent={<ProjectRowIcon icon={projectMark?.icon} color={projectMark?.color} />}
           testId="session-tooltip-project"
         >
           {projectName}
@@ -4803,13 +4821,13 @@ function SessionTooltipContent({
   hostsById,
   hasError,
   projectName,
-  projectIcon,
+  projectMark,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   projectName: string | null;
-  projectIcon: string | null;
+  projectMark: ProjectAppearance | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -4876,7 +4894,7 @@ function SessionTooltipContent({
       <SessionTooltipDetails
         conversation={conversation}
         projectName={projectName}
-        projectIcon={projectIcon}
+        projectMark={projectMark}
       />
       {hasError && <SessionErrorHint />}
       {host && showRunnerStats && (
@@ -5032,12 +5050,12 @@ function ConversationRowImpl({
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && !groupingUi && isPinned ? currentProject : null;
-  // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the project icon falls back to the folder glyph.
-  const projectIconsById = useContext(ProjectIconsContext);
-  const projectIcon =
+  // First-class projects can carry an emoji or color; label-only projects have
+  // neither, so the project icon falls back to the muted folder glyph.
+  const projectMarksById = useContext(ProjectMarksContext);
+  const projectMark =
     conversation.project_id != null
-      ? (projectIconsById.get(conversation.project_id) ?? null)
+      ? (projectMarksById.get(conversation.project_id) ?? null)
       : null;
 
   // The title the user just committed. The rename's cache write reaches this
@@ -5659,7 +5677,7 @@ function ConversationRowImpl({
               <PinnedProjectFlyoutContent
                 title={conversation.title ?? conversation.id}
                 projectName={projectFlyoutName}
-                projectIcon={projectIcon}
+                projectMark={projectMark}
                 gitBranch={gitBranch}
                 hasError={sessionState?.kind === "error"}
               />
@@ -5674,7 +5692,7 @@ function ConversationRowImpl({
                 hostsById={hostsById}
                 hasError={sessionState?.kind === "error"}
                 projectName={projectTooltipName}
-                projectIcon={projectIcon}
+                projectMark={projectMark}
               />
             </Tooltip>
           )
@@ -5684,7 +5702,7 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
-              projectIcon={projectIcon}
+              projectMark={projectMark}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
             />
@@ -5703,7 +5721,7 @@ function ConversationRowImpl({
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
               projectName={projectTooltipName}
-              projectIcon={projectIcon}
+              projectMark={projectMark}
             />
           </Tooltip>
         )}
@@ -6138,13 +6156,13 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
 function PinnedProjectFlyoutContent({
   title,
   projectName,
-  projectIcon,
+  projectMark,
   gitBranch,
   hasError,
 }: {
   title: string;
   projectName: string;
-  projectIcon: string | null;
+  projectMark: ProjectAppearance | null;
   gitBranch: string | null;
   hasError: boolean;
 }) {
@@ -6161,7 +6179,7 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <ProjectRowIcon icon={projectIcon} />
+        <ProjectRowIcon icon={projectMark?.icon} color={projectMark?.color} />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
@@ -6329,47 +6347,48 @@ function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
   icon?: string | null,
+  color?: string | null,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const menuOpenedDialogRef = useRef(false);
-  // The icon staged in the rename modal, committed only on Confirm:
-  //   undefined = untouched (show the saved icon), string = a picked emoji,
-  //   null = staged removal. Reset to `undefined` each time the modal opens.
-  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
+  // The mark staged in the rename modal, committed only on Confirm; undefined
+  // while untouched (shows the saved mark). Reset each time the modal opens.
+  const [pendingAppearance, setPendingAppearance] = useState<ProjectAppearance | undefined>(
+    undefined,
+  );
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
   const updateConfig = useUpdateProjectConfig();
   // Fetch the full config only while the menu or rename modal is open, so we can
-  // merge the icon onto the other stored defaults (host / workspace / agent)
+  // merge the mark onto the other stored defaults (host / workspace / agent)
   // without a per-folder request on every sidebar render — and without wiping
   // those defaults on save.
   const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
     menuOpen || renameOpen ? projectId : null,
   );
-  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
+  // The config PATCH replaces the whole blob, so a MARK save must merge onto a
   // fully-loaded config or it silently wipes the other defaults. "Ready" means
   // the config actually resolved (`!== undefined` — `isLoading` alone is false
   // on a query *error* too, leaving no data to merge onto) — except a
   // label-only folder (`projectId === null`), whose base is legitimately `{}`.
-  // This gates only the icon path; renaming the name never needs the config.
+  // This gates only the mark path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
-  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
-  // What the modal's tile shows: the staged pick when touched, else the saved
-  // icon. `null` (staged removal) renders as the empty folder.
-  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
+  const savedAppearance = projectAppearance(
+    iconConfig ?? { icon: icon ?? undefined, color: color ?? undefined },
+  );
+  const displayAppearance = pendingAppearance ?? savedAppearance;
 
   const actions = useMemo<ProjectFolderMenuActions>(
     () => ({
       openRename: () => {
         menuOpenedDialogRef.current = true;
         setRenameValue(projectName);
-        setPendingIcon(undefined);
+        setPendingAppearance(undefined);
         setRenameOpen(true);
       },
       openSettings: () => {
@@ -6403,20 +6422,6 @@ function useProjectFolderMenu(
             renameInputRef.current?.focus();
             renameInputRef.current?.select();
           }}
-          // emoji-mart preventDefaults the pointer event, so Radix's own
-          // outside-dismissal never fires for clicks elsewhere in the modal.
-          // Catch them in the capture phase and close the picker ourselves,
-          // unless the pointer is inside the picker or on its trigger tile.
-          onPointerDownCapture={(e) => {
-            if (!emojiOpen) return;
-            const target = e.target as Element;
-            if (
-              target.closest('[data-slot="popover-content"]') ||
-              target.closest('[data-testid="rename-project-icon"]')
-            )
-              return;
-            setEmojiOpen(false);
-          }}
         >
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
@@ -6429,118 +6434,61 @@ function useProjectFolderMenu(
               e.preventDefault();
               const newName = renameValue.trim();
               const nameChanged = newName !== "" && newName !== projectName;
-              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
-              // Only the icon write needs a loaded config to merge onto; a
+              const appearanceChanged =
+                pendingAppearance !== undefined &&
+                (pendingAppearance.icon !== savedAppearance.icon ||
+                  pendingAppearance.color !== savedAppearance.color);
+              // Only the mark write needs a loaded config to merge onto; a
               // name-only rename must proceed even if the config fetch failed.
-              if (iconChanged && !configReady) return;
+              if (appearanceChanged && !configReady) return;
               try {
                 // Name first: it promotes a label-only folder (creating the
                 // first-class row) and reconciles members. Capture the resolved
-                // id so the icon write below targets that row — passing the
+                // id so the mark write below targets that row — passing the
                 // stale render-time `null` would make the config write try to
                 // create the project a second time and 409 on the duplicate.
+                // Promoting a label-only folder carries the mark in its create:
+                // a follow-up PATCH would replace the create's config (its color).
+                const markInCreate = nameChanged && projectId === null && appearanceChanged;
                 let targetId = projectId;
                 if (nameChanged) {
                   targetId = await renameProject.mutateAsync({
                     id: projectId,
                     oldName: projectName,
                     newName,
+                    config:
+                      markInCreate && pendingAppearance
+                        ? withProjectAppearance({}, pendingAppearance)
+                        : undefined,
                   });
                 }
-                if (iconChanged) {
-                  const next = { ...(iconConfig ?? {}) };
-                  if (pendingIcon === null) delete next.icon;
-                  else next.icon = pendingIcon;
+                if (appearanceChanged && !markInCreate && pendingAppearance) {
                   await updateConfig.mutateAsync({
                     id: targetId,
                     name: nameChanged ? newName : projectName,
-                    config: next,
+                    config: withProjectAppearance(iconConfig ?? {}, pendingAppearance),
                   });
                 }
               } catch {
                 // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
+                // lands before a failed mark write is already persisted; only
+                // the mark needs retrying.
                 return;
               }
               setRenameOpen(false);
               setMenuOpen(false);
             }}
           >
-            {/* One combined control: emoji tile (left) + name (right) share a
-                single border, so it reads as a single input. The tile opens a
-                picker popover; the pick is staged and committed on Confirm. */}
+            {/* One combined control: the mark tile (left) + name (right) share
+                a single border, so it reads as a single input. The tile opens
+                the color / emoji picker; the pick is committed on Confirm. */}
             <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="Change project icon"
-                    data-testid="rename-project-icon"
-                    disabled={!configReady}
-                    className={cn(
-                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
-                      displayIcon ? "bg-muted" : "bg-tag-pink",
-                    )}
-                  >
-                    {displayIcon ? (
-                      <span className="text-xl leading-none">{displayIcon}</span>
-                    ) : (
-                      <SmilePlusIcon className="size-4 text-brand-accent" />
-                    )}
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent
-                  align="start"
-                  // Publish the collision-aware available viewport height (Radix
-                  // exposes it as a CSS var), less the optional "Remove icon"
-                  // header and capped at the picker's natural size, so the
-                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
-                  // fit — it then scrolls its grid internally (nav + search
-                  // pinned) instead of clipping on short screens.
-                  collisionPadding={8}
-                  style={
-                    {
-                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
-                    } as CSSProperties
-                  }
-                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-                  // The rename Dialog's scroll lock (react-remove-scroll)
-                  // preventDefaults wheel events over the picker — it can't see
-                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
-                  // from reaching the document-level lock so the grid scrolls.
-                  onWheel={(e) => e.stopPropagation()}
-                  // Nested in the rename Dialog, emoji-mart's own focus handling
-                  // swallows Radix's default outside-pointer dismissal, so a
-                  // click elsewhere in the modal wouldn't close the picker.
-                  // Close it explicitly on any outside interaction.
-                >
-                  {displayIcon ? (
-                    <div className="shrink-0 border-b p-1">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="w-full justify-start"
-                        data-testid="rename-project-remove-icon"
-                        onClick={() => {
-                          setPendingIcon(null);
-                          setEmojiOpen(false);
-                        }}
-                      >
-                        <Trash2Icon className="size-3.5" />
-                        Remove icon
-                      </Button>
-                    </div>
-                  ) : null}
-                  <EmojiPicker
-                    onSelect={(native) => {
-                      setPendingIcon(native);
-                      setEmojiOpen(false);
-                    }}
-                  />
-                </PopoverContent>
-              </Popover>
+              <ProjectAppearanceButton
+                value={displayAppearance}
+                onChange={setPendingAppearance}
+                disabled={!configReady}
+                testId="rename-project-icon"
+              />
               <input
                 ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
@@ -6550,8 +6498,8 @@ function useProjectFolderMenu(
             </div>
             {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
-                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
-                changing the icon is unavailable until this loads.
+                Couldn&apos;t load this project&apos;s color and icon. You can still rename it;
+                changing them is unavailable until this loads.
               </p>
             )}
             {(renameProject.isError || updateConfig.isError) && (
@@ -6740,7 +6688,7 @@ function ProjectPickerMenu({
   // Offer create only when the typed name isn't already an exact project.
   const canCreate =
     trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
-  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
+  const current = projects.find((p) => p.name === currentProject);
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -6768,7 +6716,7 @@ function ProjectPickerMenu({
             textValue={p.name}
             onSelect={() => onSelect(p.name)}
           >
-            <ProjectRowIcon icon={p.icon} />
+            <ProjectRowIcon icon={p.icon} color={p.color} />
             <span className="flex-1 truncate text-left">{p.name}</span>
             {currentProject === p.name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -6797,7 +6745,7 @@ function ProjectPickerMenu({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={currentProjectIcon} />
+            <ProjectRowIcon icon={current?.icon} color={current?.color} />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
