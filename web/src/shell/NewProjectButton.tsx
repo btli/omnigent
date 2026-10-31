@@ -15,7 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
 import { useCreateHostDirectory } from "@/hooks/useHostFilesystem";
-import type { ProjectAppearance } from "@/lib/projectColors";
+import { type ProjectAppearance, withProjectAppearance } from "@/lib/projectColors";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -165,9 +165,7 @@ export function NewProjectButton({
     }
 
     if (submission !== submissionGeneration.current) return;
-    const config: ProjectConfig = {};
-    if (appearance.icon) config.icon = appearance.icon;
-    else if (appearance.color) config.color = appearance.color;
+    const config: ProjectConfig = withProjectAppearance({}, appearance);
     if (selectedWorkspace) {
       config.host_id = selectedWorkspace.hostId;
       config.workspace = selectedWorkspace.path;
