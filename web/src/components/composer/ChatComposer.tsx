@@ -11,6 +11,7 @@ import {
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   isComposerAltNewlineKey,
@@ -231,19 +232,6 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
   }, [barRef]);
 }
 
-/**
- * Insert a line break at the caret as typed input, so onChange sees it. The
- * ``insertText`` command also keeps it on the undo stack; the fallback covers
- * environments without it.
- */
-function insertLineBreak(textarea: HTMLTextAreaElement) {
-  const inserted =
-    typeof document.execCommand === "function" && document.execCommand("insertText", false, "\n");
-  if (inserted) return;
-  textarea.setRangeText("\n", textarea.selectionStart, textarea.selectionEnd, "end");
-  textarea.dispatchEvent(new Event("input", { bubbles: true }));
-}
-
 export function ComposerTextInput({
   input,
   keyboard,
@@ -255,10 +243,21 @@ export function ComposerTextInput({
         // A newline in every mode and on touch devices; completion menus never see it.
         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
           event.preventDefault();
-          insertLineBreak(event.currentTarget);
+          insertComposerText(event.currentTarget, "\n");
           return;
         }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const insertNewline =
+          event.key === "Enter" &&
+          (event.shiftKey || keyboard.submitWithModEnter) &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey;
+        const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
+        const listStartEdit =
+          event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
+            ? composerListStartEdit(event.currentTarget)
+            : null;
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
@@ -274,9 +273,50 @@ export function ComposerTextInput({
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
+        if (event.defaultPrevented) return;
+        const edit = listStartEdit ?? listEdit;
+        if (edit) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
+        }
       }}
     />
   );
+}
+
+function composerListStartEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  if (selectionStart !== selectionEnd) return null;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*]|\d+[.)])$/);
+  if (!match) return null;
+  const [, indent, marker] = match;
+  return {
+    start: lineStart,
+    end: selectionStart,
+    text: `${indent || "  "}${marker} `,
+  };
+}
+
+function composerListEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const lineEndIndex = value.indexOf("\n", selectionEnd);
+  const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/);
+  if (!match) return null;
+  const [, indent, marker, spacing, content] = match;
+  const suffix = value.slice(selectionEnd, lineEnd);
+  if (selectionStart === selectionEnd && !content.trim() && !suffix.trim()) {
+    return { start: lineStart, end: lineEnd, text: "" };
+  }
+  // Keep the typed bullet so the draft stays valid Markdown.
+  const nextMarker = /^\d/.test(marker)
+    ? `${Number.parseInt(marker, 10) + 1}${marker.at(-1)}`
+    : marker;
+  return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
@@ -296,12 +336,14 @@ export function ComposerInputArea({ className, ...props }: ComponentPropsWithout
  * One wrapping row of chips (attachment tiles, mention chips) on the shared
  * inset line. Chips are measured through their own boxes, so the row pads
  * rather than margins; the chip type picks its gap via ``className``.
+ * Past three tile rows the row scrolls, so many chips cannot push the input
+ * and Send off screen; ``-mt-1 pt-1`` keeps corner remove buttons unclipped.
  */
 export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
     <div
       className={cn(
-        "flex flex-wrap items-start gap-2 pb-2",
+        "-mt-1 flex max-h-[208px] flex-wrap items-start gap-2 overflow-y-auto pt-1 pb-2",
         COMPOSER_CONTENT_INSET_CLASS,
         className,
       )}
