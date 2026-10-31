@@ -20,4 +20,4 @@
 9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
 10032             # bot replacement for closed #10024 (desktop downloads keep request headers)
 11105             # deploy entrypoints wire server config like `omnigent server` (RCA #11104)
-6109              # upstream headless genie CLI harness by bbqiu; btli genie PRs stack on it; expected head 070ba1ca
+branch:genie-harness-v2  # #6109 (bbqiu genie CLI harness, head 070ba1ca) merged with upstream 824d804c + Codex signer-key fix; btli genie PRs stack on it
