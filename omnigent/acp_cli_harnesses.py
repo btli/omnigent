@@ -87,10 +87,13 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
-    # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
-    # curl installer (not npm) and authenticates through its own ``grok login``
+    # Grok Build (xAI's ``grok`` CLI) drives
+    # ``grok agent --always-approve stdio``. Ships via a curl installer (not
+    # npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no
-    # credential.
+    # credential. ``--always-approve`` makes Grok approve tool calls itself, so
+    # Omnigent's TOOL_CALL policy (DENY/ASK, approval cards, permission_mode)
+    # never sees them.
     "grok": AcpCliHarness(
         install=HarnessInstallSpec(
             "Grok Build",
@@ -100,7 +103,7 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             install_hint="curl -fsSL https://x.ai/cli/install.sh | bash",
             auth_hint="run `grok login --device-auth` (xAI OAuth) or set XAI_API_KEY",
         ),
-        args=("agent", "stdio"),
+        args=("agent", "--always-approve", "stdio"),
         aliases=("grok-build",),
     ),
     # jcode (https://jcode.sh) drives ``jcode acp``. Ships via a curl
