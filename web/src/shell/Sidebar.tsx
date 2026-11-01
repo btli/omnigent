@@ -365,8 +365,8 @@ import {
   type PullRequestStatusSummary,
 } from "@/lib/pullRequestStatus";
 import {
-  SessionEnvironmentLabel,
   SessionHarnessIcon,
+  sessionLocationIcon,
   sessionLocationLabel,
   sessionRepoName,
   SessionUpdatedLabel,
@@ -5837,7 +5837,7 @@ function SessionMetaLine({
   branch,
 }: {
   project: { name: string; icon: string | null } | null;
-  environment: ReactNode;
+  environment: { icon: LucideIcon; label: string } | null;
   repo: string | null;
   branch: string | null;
 }) {
@@ -5849,8 +5849,9 @@ function SessionMetaLine({
       icon: <ProjectRowIcon icon={project.icon} />,
       value: project.name,
     });
-  if (environment != null)
-    parts.push({ key: "environment", icon: metaIcon(LaptopIcon), value: environment });
+  if (environment !== null) {
+    parts.push({ key: "environment", icon: metaIcon(environment.icon), value: environment.label });
+  }
   if (repo !== null) parts.push({ key: "repo", icon: metaIcon(FolderGit2Icon), value: repo });
   if (branch !== null) parts.push({ key: "branch", icon: metaIcon(GitBranchIcon), value: branch });
   if (parts.length === 0) return null;
@@ -5864,7 +5865,7 @@ function SessionMetaLine({
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             {icon}
-            <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
+            <span className="truncate">{value}</span>
           </span>
         </Fragment>
       ))}
@@ -6160,6 +6161,7 @@ function SessionTooltipContent({
   // Runner stats section replaces the location line when available.
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
+  const LocationIcon = sessionLocationIcon(conversation, hostsById);
 
   return (
     <TooltipContent
@@ -6187,7 +6189,7 @@ function SessionTooltipContent({
             data-testid="session-tooltip-location"
             className="flex min-w-0 items-center gap-1.5"
           >
-            <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+            <LocationIcon aria-hidden className="size-3.5 shrink-0" />
             <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
           </span>
         )}
@@ -6514,9 +6516,12 @@ function ConversationRowImpl({
     show.includes("project") && !inOwnProjectFolder && currentProject !== null
       ? { name: currentProject, icon: projectIcon }
       : null;
-  const metaEnvironment = show.includes("environment") ? (
-    <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
-  ) : null;
+  const metaEnvironment = show.includes("environment")
+    ? {
+        icon: sessionLocationIcon(conversation, hostsById),
+        label: sessionLocationLabel(conversation, hostsById),
+      }
+    : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const metaBranch = useSessionBranch(conversation, show.includes("branch"));
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
