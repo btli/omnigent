@@ -7,15 +7,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMoveToProject } from "@/hooks/useConversations";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { cn } from "@/lib/utils";
+import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { ProjectPicker, ProjectRowIcon } from "./ProjectPicker";
 
 /**
  * The breadcrumb's leading folder segment, as a Slack-style "Move
- * conversation" shortcut. Clicking the folder icon opens a searchable project
- * picker so the session can be filed, moved, or unfiled straight from the title
- * — no trip to the kebab menu. Desktop only (the tag is `hidden md:flex`);
- * mobile keeps the equivalent item in the header session menu, since the native
- * mobile shells hide the breadcrumb.
+ * conversation" shortcut. Clicking or tapping the folder icon opens a
+ * searchable project picker so the session can be filed, moved, or unfiled
+ * straight from the title — no trip to the kebab menu.
  *
  * Filed sessions show `[folder] /` with a "Currently in: ‹project›" tooltip;
  * unfiled ones show an add-to-project folder with a "Move session" tooltip.
@@ -30,6 +31,7 @@ export function HeaderProjectTag({
   /** The filed project's emoji icon, or `null`/absent for the folder glyph. */
   projectIcon?: string | null;
 }) {
+  const isMobile = useIsMobileViewport();
   const moveToProject = useMoveToProject();
   const [open, setOpen] = useState(false);
 
@@ -39,8 +41,10 @@ export function HeaderProjectTag({
   };
 
   return (
-    <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
-      <DropdownMenu open={open} onOpenChange={setOpen}>
+    <div className="flex min-w-0 items-center gap-1.5 text-ui shrink-0">
+      {/* Non-modal on mobile so an outside tap can dismiss it (see
+          HeaderConversationMenu). */}
+      <DropdownMenu open={open} onOpenChange={setOpen} modal={!isMobile}>
         <Tooltip>
           {/* Wrap the dropdown trigger in a real span for the tooltip: two
               `asChild` triggers merged onto the same button drop the tooltip's
@@ -52,7 +56,7 @@ export function HeaderProjectTag({
                   type="button"
                   data-testid="header-project-tag"
                   aria-label={projectName ? `Project: ${projectName}` : "Add to project"}
-                  className="breadcrumb-folder flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-100 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none"
+                  className="breadcrumb-folder mobile-touch-target flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-100 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none max-md:size-11"
                 >
                   {projectName ? (
                     <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
@@ -72,7 +76,7 @@ export function HeaderProjectTag({
         </Tooltip>
         <DropdownMenuContent
           align="start"
-          className="min-w-56"
+          className={cn("min-w-56", MOBILE_GLASS_SURFACE)}
           // Don't return focus to the folder button on close: Radix opens the
           // tooltip on focus, so refocusing the trigger makes "Move session"
           // pop up every time the dropdown is dismissed (even by an outside

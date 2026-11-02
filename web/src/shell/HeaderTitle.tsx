@@ -14,8 +14,8 @@ import { startSidebarRename } from "./sidebarRename";
  * Clicking the title swaps it for an inline input so the session can be renamed
  * straight from the header — no trip to the kebab menu. Enter commits, Escape
  * cancels, blur commits (matching the sidebar's inline rename). Desktop only
- * and only for owner-managed top-level sessions; mobile keeps the Rename item
- * in the header session menu, since the native shells hide the breadcrumb.
+ * and only for owner-managed top-level sessions; mobile shows the title as
+ * plain text and keeps the Rename item in the header session menu.
  */
 export function HeaderTitle({ conversationId, title }: { conversationId: string; title: string }) {
   const rename = useRenameConversation();

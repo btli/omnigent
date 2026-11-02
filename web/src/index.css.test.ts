@@ -1508,19 +1508,11 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 });
 
 describe("index.css native conversation breadcrumb", () => {
-  it("does not hide the parent-session link on iOS/Android native shells", () => {
-    // Native chrome is a server switcher, not session back. A blanket
-    // `.conversation-breadcrumb { display: none }` would also drop the only
-    // in-header climb-out of a sub-agent (native back is off; edge-pan opens
-    // the sidebar). Folder / title / sub-agent may hide; the parent link must
-    // stay.
-    const blanket = cssSource.match(
-      /\[data-ios-native\] \.conversation-breadcrumb\s*,\s*\[data-android-native\] \.conversation-breadcrumb\s*\{[^}]*display:\s*none/,
-    );
-    expect(blanket).toBeNull();
-    expect(cssSource).toMatch(
-      /\[data-ios-native\][\s\S]*breadcrumb-parent-link[\s\S]*\[data-android-native\][\s\S]*breadcrumb-parent-link/,
-    );
+  it("leaves the session breadcrumb visible on iOS/Android native shells", () => {
+    // The glass header names the session on every shell, and its parent link
+    // is the only in-header climb-out of a sub-agent (native back is off;
+    // edge-pan opens the sidebar). No native-only rule may hide any segment.
+    expect(cssSource).not.toMatch(/\[data-(?:ios|android)-native\][^{}]*\.conversation-breadcrumb/);
   });
 });
 

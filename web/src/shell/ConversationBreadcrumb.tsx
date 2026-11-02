@@ -96,17 +96,23 @@ export function ConversationBreadcrumb({
       boundAgent?.name ??
       null)
     : null;
-  // iOS/Android native chrome already identifies the session. Restore the
-  // compact "< Back" climb-out there; web / Electron keep the parent name.
+  // iOS/Android use a compact "< Back" climb-out; web / Electron keep the
+  // parent name. A sub-agent's folder shows only beside a full parent title.
   const nativeMobileBack = isIOSShell() || isAndroidShell();
+  const showStaticFolder = Boolean(projectName) && !(isChildSession && nativeMobileBack);
   return (
     <nav
       aria-label="Conversation"
       className={cn("conversation-breadcrumb flex min-w-0 items-center gap-1.5 text-ui", className)}
     >
       {projectTag ??
-        (projectName && (
-          <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
+        (showStaticFolder && (
+          <div
+            className={cn(
+              "min-w-0 items-center gap-1.5 text-ui shrink-0",
+              isChildSession ? "hidden md:flex" : "flex",
+            )}
+          >
             <Tooltip>
               <TooltipTrigger asChild>
                 <span

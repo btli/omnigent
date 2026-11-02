@@ -20,12 +20,21 @@ injects ``window.omnigentDesktop``).
 These cover the chain the ``nativeBridge`` unit tests can't reach end to end:
 the injected bridge -> ``isAndroidShell()`` -> the ``AppShell``
 ``data-android-native`` attribute -> the ``index.css`` ``max()`` fold that lets
-the injected OS inset reach the layout's shared vars.
+the injected OS inset reach the layout's shared vars. They also cover the glass
+header's breadcrumb on the native shell, through to the server-side move its
+project icon makes.
 """
 
 from __future__ import annotations
 
+import contextlib
+import uuid
+
+import httpx
 from playwright.sync_api import Page, ViewportSize, expect
+
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.conftest import seed_committed_turn
 
 # A phone-sized viewport: the Android shell is a mobile surface, and the narrow
 # width is where the sidebar behaves as an overlay drawer (the
@@ -132,6 +141,70 @@ def test_no_android_tag_or_fold_in_plain_browser(
     # The web app never injects --omnigent-android-safe-area-*, so with
     # env(safe-area-inset-top) also 0 here the shared inset stays 0.
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
+
+
+def test_android_shell_header_files_the_session_from_its_project_icon(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The glass header names the session, and its project icon moves it.
+
+    On a phone-width Android shell the breadcrumb shows ``[project icon] /
+    title``; tapping the icon opens the Move-session picker, and picking another
+    project commits the move server-side.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+    uniq = uuid.uuid4().hex[:6]
+    filed_name = f"E2E Android Filed {uniq}"
+    target_name = f"E2E Android Target {uniq}"
+    title = f"e2e-android-header-{uniq}"
+    icon = "🚀"
+
+    filed_id = httpx.post(
+        f"{base_url}/v1/projects",
+        json={"name": filed_name, "config": {"icon": icon}},
+        timeout=10.0,
+    ).json()["id"]
+    target_id = httpx.post(
+        f"{base_url}/v1/projects", json={"name": target_name}, timeout=10.0
+    ).json()["id"]
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"title": title, "project_id": filed_id},
+        timeout=10.0,
+    ).raise_for_status()
+    # A committed turn settles the header title so the breadcrumb mounts.
+    seed_committed_turn(session_id, prompt="ping", reply="pong")
+
+    def filed_under() -> str | None:
+        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        snapshot.raise_for_status()
+        return snapshot.json().get("project_id")
+
+    try:
+        page.set_viewport_size(_MOBILE_VIEWPORT)
+        page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.locator(".app-shell")).to_have_attribute("data-android-native", "true")
+
+        breadcrumb = page.get_by_role("navigation", name="Conversation")
+        expect(breadcrumb.get_by_text(title, exact=True)).to_be_visible(timeout=30_000)
+        tag = breadcrumb.get_by_test_id("header-project-tag")
+        expect(tag).to_have_attribute("aria-label", f"Project: {filed_name}")
+        expect(tag.get_by_test_id("project-icon")).to_have_text(icon)
+
+        tag.click()
+        page.get_by_role("menuitem", name=target_name).click()
+
+        poll_until(lambda: filed_under() == target_id, timeout_s=10.0)
+        expect(tag).to_have_attribute("aria-label", f"Project: {target_name}")
+    finally:
+        for project_id in (filed_id, target_id):
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0)
 
 
 # Bridge stub that also CAPTURES the notification-activation callback the SPA

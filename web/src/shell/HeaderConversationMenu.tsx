@@ -296,8 +296,8 @@ export function HeaderConversationMenu({
         </DropdownMenuItem>
       )}
       {/* Rename is also reachable on desktop by clicking the breadcrumb title
-          (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
-          menu is the sole entry point. */}
+          (HeaderTitle); on mobile the title is plain text, so this menu is the
+          sole entry point. */}
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}

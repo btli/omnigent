@@ -52,8 +52,8 @@ _ICON_GEOMETRY_JS = """
 
 
 def _measure_icon(page: Page, label: str) -> dict[str, float]:
-    """Measure the visible icon inside the button named ``label``."""
-    button = page.get_by_role("button", name=label)
+    """Measure the visible icon inside the button named exactly ``label``."""
+    button = page.get_by_role("button", name=label, exact=True)
     expect(button).to_be_visible()
     svg = button.locator("svg").first
     expect(svg).to_be_visible()

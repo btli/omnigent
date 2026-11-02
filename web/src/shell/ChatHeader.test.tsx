@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -79,6 +79,7 @@ function renderHeader(props: {
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
+  projectIcon?: string | null;
   titleLinkTo?: string;
   boundAgent?: Agent;
   wrapperLabel?: string | null;
@@ -118,6 +119,7 @@ function renderHeader(props: {
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
+            projectIcon={props.projectIcon ?? null}
             titleLinkTo={props.titleLinkTo}
             boundAgent={props.boundAgent}
             wrapperLabel={props.wrapperLabel ?? null}
@@ -446,6 +448,25 @@ describe("ChatHeader — conversation breadcrumb", () => {
     });
     expect(screen.getByLabelText("Project: Payments")).toBeInTheDocument();
     expect(screen.getByText("Fix the login bug")).toBeInTheDocument();
+  });
+
+  it("keeps the project segment off a sub-agent's native Back breadcrumb", () => {
+    isMobileMock.mockReturnValue(true);
+    isAndroidShellMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: false,
+      conversationId: "child-9",
+      isChildSession: true,
+      subAgentName: "comic_one",
+      conversationTitle: "Joke night",
+      titleLinkTo: "/c/parent-123",
+      projectName: "Payments",
+      projectIcon: "🚀",
+    });
+    expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveTextContent("Back");
+    expect(screen.getByText("comic_one")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Project: Payments")).toBeNull();
+    expect(screen.queryByText("Payments")).toBeNull();
   });
 
   it("appends the sub-agent identity and links the title back to the parent", () => {
@@ -852,13 +873,39 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       actionConversation: conversation,
     });
 
-    // The native shells hide the breadcrumb, so the kebab has to live in the
-    // header's own control cluster to stay reachable.
+    // A truncating mobile title leaves no room for a trailing trigger, so the
+    // kebab lives in the header's own control cluster.
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.closest("nav.conversation-breadcrumb")).toBeNull();
     // Rightmost control in the header's action cluster.
     expect(trigger.parentElement?.lastElementChild).toBe(trigger);
     expect(screen.getByText(conversation.title as string)).toBeInTheDocument();
+  });
+
+  it("files the session from the project icon before a plain mobile title", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: false,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      projectName: "Payments",
+      projectIcon: "🚀",
+    });
+    const breadcrumb = screen.getByRole("navigation", { name: "Conversation" });
+    // The desktop Move-session shortcut, ahead of the title.
+    const tag = within(breadcrumb).getByTestId("header-project-tag");
+    expect(tag).toHaveAttribute("aria-label", "Project: Payments");
+    expect(within(tag).getByTestId("project-icon")).toHaveTextContent("🚀");
+    const title = within(breadcrumb).getByText(conversation.title as string);
+    expect(tag.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // A tap on the title can't start a rename; that lives in the kebab.
+    expect(within(breadcrumb).queryByTestId("header-title")).toBeNull();
+
+    fireEvent.pointerDown(tag, { button: 0 });
+    expect(screen.getByRole("textbox", { name: "Search or create project" })).toBeInTheDocument();
+    // Non-modal, so an outside tap can still dismiss the picker.
+    expect(document.body.style.pointerEvents).not.toBe("none");
   });
 
   it("keeps the mobile Share / Agent info analytics on the owner-managed path", () => {

@@ -491,9 +491,8 @@ export function ChatHeader({
   const showShare = !pending && canShare;
   // Session actions (pin/share/rename/project/archive/delete). Desktop hangs
   // them off the breadcrumb title; mobile puts the kebab in the right-hand
-  // control cluster instead — the native iOS/Android shells hide the
-  // breadcrumb entirely (their own chrome names the session), so a
-  // title-adjacent trigger would be unreachable there.
+  // control cluster instead, where a truncating title can't push it off the
+  // narrow bar.
   const conversationMenu =
     !pending && actionConversation ? (
       <HeaderConversationMenu
@@ -512,21 +511,20 @@ export function ChatHeader({
         workspaceItems={isMobile ? workspaceItems : null}
       />
     ) : null;
-  // Slack-style "Move to…" shortcut on the breadcrumb's folder tag: click it to
-  // file/move/unfile the session without opening the kebab. Desktop-only (the
-  // tag is hidden on mobile; the mobile menu keeps its own move item) and only
-  // for the owner-managed top-level row — a sub-agent's folder stays static so
-  // the title keeps its back-to-parent role. `null` falls back to the static
-  // folder icon in the breadcrumb.
+  // Slack-style "Move to…" shortcut on the breadcrumb's folder tag: click or
+  // tap it to file/move/unfile the session without opening the kebab. Only for
+  // the owner-managed top-level row — a sub-agent's folder stays static so the
+  // title keeps its back-to-parent role. `null` falls back to the static folder
+  // icon in the breadcrumb.
   const projectTag =
-    pending && !isMobile && !projectName ? (
-      <div className="hidden min-w-0 shrink-0 items-center gap-1.5 text-ui md:flex">
+    pending && !projectName ? (
+      <div className="flex min-w-0 shrink-0 items-center gap-1.5 text-ui">
         <button
           type="button"
           aria-label="Add to project"
           title={PENDING_ACTION_TITLE}
           disabled
-          className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-30"
+          className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-30 max-md:size-11 max-md:justify-center"
         >
           <FolderPlusIcon className="size-4" />
         </button>
@@ -534,17 +532,16 @@ export function ChatHeader({
           /
         </span>
       </div>
-    ) : !pending && !isMobile && actionConversation && !isChildSession ? (
+    ) : !pending && actionConversation && !isChildSession ? (
       <HeaderProjectTag
         conversationId={actionConversation.id}
         projectName={projectName}
         projectIcon={projectIcon}
       />
     ) : null;
-  // Click-to-rename on the breadcrumb title, same gating as the folder tag:
-  // desktop, owner-managed top-level row. A sub-agent's title stays a
-  // back-to-parent link (titleLinkTo wins over titleSlot in the breadcrumb),
-  // and mobile keeps the Rename item in the kebab.
+  // Click-to-rename on the breadcrumb title: desktop, owner-managed top-level
+  // row. A sub-agent's title stays a back-to-parent link (titleLinkTo wins over
+  // titleSlot), and mobile keeps it plain so a tap can't start a rename.
   const titleSlot =
     !pending && !isMobile && actionConversation && !isChildSession ? (
       <HeaderTitle

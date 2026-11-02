@@ -42,7 +42,7 @@ export function ProjectRowIcon({ icon, className }: { icon?: string | null; clas
  * A typed name with no exact match offers a "+ Create <name>" row — the move
  * itself creates the project on demand (see `moveConversationToProject`).
  *
- * Shared by the desktop title folder-tag shortcut (HeaderProjectTag) and the
+ * Shared by the header's folder-tag shortcut (HeaderProjectTag) and the
  * mobile session menu's in-place project view (HeaderConversationMenu).
  */
 export function ProjectPicker({
