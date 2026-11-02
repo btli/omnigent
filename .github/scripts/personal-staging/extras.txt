@@ -21,4 +21,5 @@
 10032             # bot replacement for closed #10024 (desktop downloads keep request headers)
 11105             # deploy entrypoints wire server config like `omnigent server` (RCA #11104)
 12428             # project color-or-emoji marks with least-used auto color (#4417); seeds vs #6319/#9902/#11179
+12508             # bot replacement for closed #12298 (harness CLI whose --version probe times out; #12299/#12496)
 branch:genie-harness-v2  # #6109 (bbqiu genie CLI harness, head 070ba1ca) merged with upstream 824d804c + Codex signer-key fix; btli genie PRs stack on it
