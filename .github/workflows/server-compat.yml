@@ -58,6 +58,7 @@ permissions:
 
 env:
   SOURCE_REPO: omnigent-ai/omnigent
+  OMNIGENT_CI_PIPELINE: server-compat
 
 jobs:
   # ── Fast smoke: both compat configs against the latest stable release ──────
