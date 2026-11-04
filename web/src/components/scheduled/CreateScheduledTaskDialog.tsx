@@ -36,6 +36,7 @@ import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
   emptyTriggerFields,
+  isTriggerPrompt,
   renderTriggerPrompt,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
@@ -102,7 +103,7 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
-  const { data: hosts } = useHosts({ enabled: open });
+  const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -130,6 +131,12 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  // A task saved from a trigger template keeps its one session on edit too; only
+  // the reset below stays, for a session that's broken or stale.
+  const editingTemplateTrigger =
+    editingTask !== null &&
+    editingTask.sessionMode === "continue" &&
+    isTriggerPrompt(editingTask.prompt);
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -352,13 +359,29 @@ export function CreateScheduledTaskDialog({
     savedWorkspace,
   ]);
 
-  // A new task pins a host, starting on the first online one as New Chat does.
-  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  // A new task starts on a server sandbox when one is offered, so it doesn't
+  // depend on the creator's machine being online at fire time; otherwise it pins
+  // the first online host as New Chat does. The target is chosen once, after
+  // both /v1/info and the host list settle, so it never flips between the two.
+  // With no sandbox and no online host it stays open until a host comes online.
+  const targetChosenRef = useRef(false);
   useEffect(() => {
-    if (open && !isEdit && !sandboxMode && hostId === "" && defaultHostId !== undefined) {
+    if (open) targetChosenRef.current = false;
+  }, [open]);
+  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  const targetInputsLoaded = info !== "loading" && !hostsPending;
+  useEffect(() => {
+    if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
+    if (managedSandboxesEnabled) {
+      targetChosenRef.current = true;
+      setSandboxMode(true);
+      setHostId("");
+      setWorkspace("");
+    } else if (defaultHostId !== undefined) {
+      targetChosenRef.current = true;
       setHostId(defaultHostId);
     }
-  }, [open, isEdit, sandboxMode, hostId, defaultHostId]);
+  }, [open, isEdit, targetInputsLoaded, managedSandboxesEnabled, defaultHostId]);
 
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
@@ -403,6 +426,7 @@ export function CreateScheduledTaskDialog({
   function handleTargetChange(value: string) {
     const nextSandbox = value === SANDBOX_HOST;
     const nextHostId = nextSandbox ? "" : value;
+    targetChosenRef.current = true;
     if (nextSandbox === sandboxMode && nextHostId === hostId) return;
     const originalTarget =
       editingTask?.executionTarget === "managed_sandbox"
@@ -667,53 +691,59 @@ export function CreateScheduledTaskDialog({
             />
           </div>
 
-          {sessionModesSupported && (
-            <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
-              <Label htmlFor="task-session-mode">Session</Label>
-              <Select
-                value={sessionMode}
-                componentId="tasks.scheduled.session_mode"
-                disabled={trigger !== null}
-                onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
-                onOpenChange={handleSelectOpenChange}
-              >
-                <SelectTrigger
-                  id="task-session-mode"
-                  data-testid="task-session-mode-trigger"
-                  className="w-full"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  <SelectItem value="new">New session each run</SelectItem>
-                  <SelectItem value="continue" data-testid="task-session-mode-continue">
-                    Continue in the same session
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                {trigger !== null
-                  ? "Trigger automations keep one session, which remembers its last check and the sessions it already started."
-                  : sessionMode === "continue"
-                    ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
-                    : "Each run starts a new session."}
-              </p>
-              {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    id="task-start-new-session"
-                    checked={startNewSession}
-                    onCheckedChange={(checked) => setStartNewSession(checked === true)}
-                    data-testid="task-start-new-session"
-                    componentId="tasks.scheduled.start_new_session"
-                  />
-                  <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
-                    Start a new session on the next run
-                  </label>
-                </div>
-              )}
-            </div>
-          )}
+          {/* A trigger needs its one kept session, so its form leaves the choice out. */}
+          {sessionModesSupported &&
+            trigger === null &&
+            (!editingTemplateTrigger || editingTask?.sessionId) && (
+              <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
+                <Label htmlFor={editingTemplateTrigger ? undefined : "task-session-mode"}>
+                  Session
+                </Label>
+                {!editingTemplateTrigger && (
+                  <>
+                    <Select
+                      value={sessionMode}
+                      componentId="tasks.scheduled.session_mode"
+                      onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
+                      onOpenChange={handleSelectOpenChange}
+                    >
+                      <SelectTrigger
+                        id="task-session-mode"
+                        data-testid="task-session-mode-trigger"
+                        className="w-full"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent position="popper" align="start">
+                        <SelectItem value="new">New session each run</SelectItem>
+                        <SelectItem value="continue" data-testid="task-session-mode-continue">
+                          Continue in the same session
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-sm text-muted-foreground">
+                      {sessionMode === "continue"
+                        ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                        : "Each run starts a new session."}
+                    </p>
+                  </>
+                )}
+                {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="task-start-new-session"
+                      checked={startNewSession}
+                      onCheckedChange={(checked) => setStartNewSession(checked === true)}
+                      data-testid="task-start-new-session"
+                      componentId="tasks.scheduled.start_new_session"
+                    />
+                    <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
+                      Start a new session on the next run
+                    </label>
+                  </div>
+                )}
+              </div>
+            )}
 
           {trigger !== null ? (
             <TriggerTemplateFields
@@ -721,6 +751,10 @@ export function CreateScheduledTaskDialog({
               fields={triggerFields}
               onChange={setTriggerFields}
               onSelectOpenChange={handleSelectOpenChange}
+              // Arclet sandboxes start agents with Isaac's MCP servers, Jira and Slack included.
+              toolsProvided={
+                sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
+              }
               renderedPrompt={renderedTriggerPrompt}
               onEditAsPrompt={() => {
                 setPrompt(renderedTriggerPrompt);
