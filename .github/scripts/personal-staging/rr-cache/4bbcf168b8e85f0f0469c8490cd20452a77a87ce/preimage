@@ -324,7 +324,6 @@ import {
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
-import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import {
   type ProjectAppearance,
@@ -385,9 +384,16 @@ const SCROLLBAR_HIDE_DELAY_MS = 700;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
+<<<<<<<
+// Maps a first-class project id → its chosen emoji icon (only projects that
+// have one), sharing the names map lookup for the pinned flyout and session tooltip.
+const ProjectIconsContext = createContext<Map<string, string>>(new Map());
+=======
 // Maps a first-class project id → its mark (only projects with an emoji or
-// color), sharing the names map lookup for the pinned flyout and session tooltip.
+// color), sharing the same list-level lookup as the names map so a row can
+// surface the real project glyph in the pinned flyout without its own query.
 const ProjectMarksContext = createContext<Map<string, ProjectAppearance>>(new Map());
+>>>>>>>
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
@@ -2239,7 +2245,10 @@ function ConversationList({
         id,
         name,
         icon,
+<<<<<<<
         color,
+        conversations: sortConversations(inProject, activeOverride, frozenKeys, sortBy),
+=======
         conversations: sortConversations(
           inProject,
           activeOverride,
@@ -2247,6 +2256,7 @@ function ConversationList({
           sortBy,
           customOrder,
         ),
+>>>>>>>
       };
     });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
@@ -4844,11 +4854,11 @@ function SessionTooltipDetail({
 function SessionTooltipDetails({
   conversation,
   projectName,
-  projectMark,
+  projectIcon,
 }: {
   conversation: Conversation;
   projectName: string | null;
-  projectMark: ProjectAppearance | null;
+  projectIcon: string | null;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
@@ -4906,7 +4916,7 @@ function SessionTooltipDetails({
       {projectName !== null && (
         <SessionTooltipDetail
           label="Project"
-          iconContent={<ProjectRowIcon icon={projectMark?.icon} color={projectMark?.color} />}
+          iconContent={<ProjectRowIcon icon={projectIcon} />}
           testId="session-tooltip-project"
         >
           {projectName}
@@ -4998,13 +5008,13 @@ function SessionTooltipContent({
   hostsById,
   hasError,
   projectName,
-  projectMark,
+  projectIcon,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   projectName: string | null;
-  projectMark: ProjectAppearance | null;
+  projectIcon: string | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5071,7 +5081,7 @@ function SessionTooltipContent({
       <SessionTooltipDetails
         conversation={conversation}
         projectName={projectName}
-        projectMark={projectMark}
+        projectIcon={projectIcon}
       />
       {hasError && <SessionErrorHint />}
       {host && showRunnerStats && (
@@ -5235,11 +5245,19 @@ function ConversationRowImpl({
   // and leave it overlaying the chat after navigation. Forcing null there
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
+<<<<<<<
   const projectFlyoutName = !isMobile && !groupingUi && isPinned ? currentProject : null;
+  // First-class projects can carry a chosen emoji; label-only projects have
+  // none, so the project icon falls back to the folder glyph.
+  const projectIconsById = useContext(ProjectIconsContext);
+  const projectIcon =
+=======
+  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
   // First-class projects can carry an emoji or color; label-only projects have
-  // neither, so the project mark falls back to the muted folder glyph.
+  // neither, so the flyout falls back to the muted folder glyph for those.
   const projectMarksById = useContext(ProjectMarksContext);
-  const projectMark =
+  const projectFlyoutMark =
+>>>>>>>
     conversation.project_id != null
       ? (projectMarksById.get(conversation.project_id) ?? null)
       : null;
@@ -5888,7 +5906,7 @@ function ConversationRowImpl({
               <PinnedProjectFlyoutContent
                 title={conversation.title ?? conversation.id}
                 projectName={projectFlyoutName}
-                projectMark={projectMark}
+                projectIcon={projectIcon}
                 gitBranch={gitBranch}
                 hasError={sessionState?.kind === "error"}
               />
@@ -5903,7 +5921,7 @@ function ConversationRowImpl({
                 hostsById={hostsById}
                 hasError={sessionState?.kind === "error"}
                 projectName={projectTooltipName}
-                projectMark={projectMark}
+                projectIcon={projectIcon}
               />
             </Tooltip>
           )
@@ -5913,7 +5931,11 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
-              projectMark={projectMark}
+<<<<<<<
+              projectIcon={projectIcon}
+=======
+              projectMark={projectFlyoutMark}
+>>>>>>>
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
             />
@@ -5932,7 +5954,7 @@ function ConversationRowImpl({
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
               projectName={projectTooltipName}
-              projectMark={projectMark}
+              projectIcon={projectIcon}
             />
           </Tooltip>
         )}
@@ -6008,6 +6030,43 @@ function ConversationRowImpl({
         {!selectionMode && (
           <ContextMenu>
             <ContextMenuTrigger asChild>
+<<<<<<<
+              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44">
+              <ConversationMenuItems
+                components={contextBundle}
+                setMenuOpen={() => {}}
+                {...menuItemProps}
+              />
+            </ContextMenuContent>
+          </ContextMenu>
+          <PinnedProjectFlyoutContent
+            title={conversation.title ?? conversation.id}
+            projectName={projectFlyoutName}
+            projectMark={projectFlyoutMark}
+            gitBranch={gitBranch}
+            hasError={sessionState?.kind === "error"}
+          />
+        </HoverCard>
+      ) : isMobile ? (
+        <ContextMenu>
+          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+          <ContextMenuContent className="min-w-44">
+            <ConversationMenuItems
+              components={contextBundle}
+              setMenuOpen={() => {}}
+              {...menuItemProps}
+            />
+          </ContextMenuContent>
+        </ContextMenu>
+      ) : (
+        <Tooltip>
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <div className="w-full">
+                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+=======
               <div
                 data-testid="conversation-row-controls"
                 className={cn(
@@ -6026,10 +6085,7 @@ function ConversationRowImpl({
                     (archive outranks pin), so there's no pin action even on hover. */}
                 {!isArchived && (
                   <Tooltip disableHoverableContent>
-                    <TooltipContent>
-                      <TooltipArrow />
-                      {pinTooltip}
-                    </TooltipContent>
+                    <TooltipContent>{pinTooltip}</TooltipContent>
                     <TooltipTrigger asChild>
                       <Button
                         type="button"
@@ -6064,10 +6120,7 @@ function ConversationRowImpl({
                     with an explanation. */}
                 {isOwner && (
                   <Tooltip disableHoverableContent>
-                    <TooltipContent>
-                      <TooltipArrow />
-                      {isArchived ? "Unarchive" : "Archive"}
-                    </TooltipContent>
+                    <TooltipContent>{isArchived ? "Unarchive" : "Archive"}</TooltipContent>
                     <TooltipTrigger asChild>
                       <Button
                         type="button"
@@ -6119,6 +6172,7 @@ function ConversationRowImpl({
                     />
                   </DropdownMenuContent>
                 </DropdownMenu>
+>>>>>>>
               </div>
             </ContextMenuTrigger>
             <ContextMenuContent className="min-w-44">
