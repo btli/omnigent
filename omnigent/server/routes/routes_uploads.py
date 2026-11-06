@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import heapq
 import io
 import itertools
@@ -14,12 +15,13 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import Future
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -105,6 +107,7 @@ _MESSAGES = {
     ErrorCode.INVALID_NAME: "Invalid upload basename",
     ErrorCode.INVALID_PATH: "Destination must be inside the workspace",
     ErrorCode.INVALID_REQUEST: "Invalid upload declaration",
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: "Upload declaration changed for this key",
     ErrorCode.INVALID_OFFSET: "Upload-Offset must be a nonnegative integer",
     ErrorCode.FILE_EXISTS: "A file already exists at the destination",
     ErrorCode.IS_DIRECTORY: "The destination is a directory",
@@ -197,6 +200,7 @@ class UploadRecord:
     runner_id: str | None
     finished: bool = False
     aborted: bool = False
+    idempotency_key: str | None = None
 
     def expired(self, now: float) -> bool:
         return (
@@ -217,6 +221,12 @@ class SessionAdmission:
 class UploadIndex:
     # The index belongs to one application's router, never another workspace.
     records: dict[UploadKey, UploadRecord] = field(default_factory=dict)
+    idempotency_keys: dict[tuple[str, str, str, str], tuple[str, str]] = field(
+        default_factory=dict
+    )
+    pending_creates: dict[
+        tuple[str, str, str, str], tuple[str, Future[CreatedUpload | UploadError]]
+    ] = field(default_factory=dict)
     sessions: dict[str, SessionAdmission] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     expiry_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -241,6 +251,10 @@ class UploadIndex:
 
     def remove(self, key: UploadKey) -> None:
         record = self.records.pop(key, None)
+        if record is not None and record.idempotency_key is not None:
+            scope = (*key[:2], record.owner, record.idempotency_key)
+            if self.idempotency_keys.get(scope, (None,))[0] == key[2]:
+                self.idempotency_keys.pop(scope, None)
         if record is not None and not record.finished:
             self.release(key, record)
 
@@ -253,10 +267,23 @@ class UploadIndex:
         if not admission.keys:
             del self.sessions[key[0]]
 
+    def has_capacity(
+        self, session_id: str, size: int, limits: PublicLimits, replacing: UploadKey | None = None
+    ) -> bool:
+        admission = self.sessions.get(session_id, SessionAdmission())
+        count = len(admission.keys)
+        used = admission.size
+        if replacing is not None and replacing in admission.keys:
+            count -= 1
+            used -= self.records[replacing].size
+        return count < limits.max_open_uploads and used + size <= limits.max_open_bytes
+
     def finish(self, key: UploadKey, record: UploadRecord, *, aborted: bool = False) -> bool:
         if record.finished:
             return False
         self.release(key, record)
+        if record.idempotency_key is not None and aborted:
+            self.idempotency_keys.pop((*key[:2], record.owner, record.idempotency_key), None)
         record.finished = True
         record.aborted = aborted
         return True
@@ -431,6 +458,7 @@ async def _relay(
     declaration: dict[str, Any] | None = None,
     body: bytes | None = None,
     offset: int = 0,
+    idempotency_key: str | None = None,
 ) -> httpx.Response:
     try:
         async with asyncio.timeout(timeout):
@@ -445,6 +473,8 @@ async def _relay(
                     "Upload-Offset": str(offset),
                 }
                 if body is not None
+                else {"Idempotency-Key": idempotency_key}
+                if idempotency_key is not None
                 else None,
                 extensions={"runner_tunnel_binary_request_body": True}
                 if body is not None
@@ -626,7 +656,12 @@ def register_upload_routes(
             }
         },
     )
-    async def create(request: Request, session_id: str, environment_id: str) -> CreatedUpload:
+    async def create(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> CreatedUpload:
         conv, owner = await authorize(request, session_id)
         trusted_origin(request)
         if _request_media_type(request) != "application/json":
@@ -637,6 +672,8 @@ def register_upload_routes(
             )
         except ValidationError as exc:
             raise UploadError(ErrorCode.INVALID_REQUEST) from exc
+        if idempotency_key is not None and not re.fullmatch(r"[0-9a-f]{32}", idempotency_key):
+            raise UploadError(ErrorCode.INVALID_REQUEST)
         await validate_session(
             session_id, request, browse_level(declaration.dir, within_workspace=LEVEL_EDIT)
         )
@@ -674,6 +711,12 @@ def register_upload_routes(
             raise UploadError(ErrorCode.RUNNER_CAPABILITY_MISMATCH)
         if declaration.size > cap.limits.max_file_bytes:
             raise UploadError(ErrorCode.TOO_LARGE)
+        digest = hashlib.sha256(declaration.model_dump_json().encode()).hexdigest()
+        scope = (
+            (session_id, environment_id, owner, idempotency_key)
+            if idempotency_key is not None
+            else None
+        )
         now = time.monotonic()
         record = UploadRecord(
             owner,
@@ -684,17 +727,53 @@ def register_upload_routes(
             config.workspace_upload_staging_idle_ttl_s(),
             config.workspace_upload_staging_max_age_s(),
             conv.runner_id,
+            idempotency_key=idempotency_key,
         )
         pending = (session_id, environment_id, uuid.uuid4().hex)
         index.prune(session_id)
+        pending_result: Future[CreatedUpload | UploadError] | None = None
+        wait_for: Future[CreatedUpload | UploadError] | None = None
+        cached_id: str | None = None
+        reserved = False
         with index.lock:
-            admission = index.sessions.get(session_id, SessionAdmission())
-            if (
-                len(admission.keys) >= cap.limits.max_open_uploads
-                or admission.size + declaration.size > cap.limits.max_open_bytes
-            ):
-                raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
-            index.add(pending, record)
+            in_flight = index.pending_creates.get(scope) if scope is not None else None
+            if in_flight is not None:
+                if in_flight[0] != digest:
+                    raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
+                wait_for = in_flight[1]
+            else:
+                replay = index.idempotency_keys.get(scope) if scope is not None else None
+                live = (
+                    index.records.get((session_id, environment_id, replay[0]))
+                    if replay is not None
+                    else None
+                )
+                if live is not None and not live.aborted:
+                    if replay is not None and replay[1] != digest:
+                        raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
+                    cached_id = replay[0] if replay is not None else None
+                else:
+                    if scope is not None:
+                        index.idempotency_keys.pop(scope, None)
+                    if not index.has_capacity(session_id, declaration.size, cap.limits):
+                        raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
+                    reserved = True
+                if scope is not None:
+                    pending_result = Future()
+                    index.pending_creates[scope] = (digest, pending_result)
+                if reserved:
+                    try:
+                        index.add(pending, record)
+                    except BaseException:
+                        if scope is not None:
+                            index.pending_creates.pop(scope, None)
+                        raise
+        if wait_for is not None:
+            outcome = await asyncio.shield(asyncio.wrap_future(wait_for))
+            if isinstance(outcome, UploadError):
+                raise outcome
+            return outcome
+        outcome: CreatedUpload | UploadError = UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
         try:
             response = await _relay(
                 client,
@@ -702,22 +781,76 @@ def register_upload_routes(
                 _runner_path(session_id, environment_id),
                 timeout=config.workspace_upload_chunk_timeout_s(),
                 declaration={**declaration.model_dump(), "created_by": owner},
+                idempotency_key=idempotency_key,
             )
             result: CreatedUpload = _json_model(response, CreatedUpload)
-            if not re.fullmatch(r"[0-9a-f]{32}", result.upload_id) or result.offset != 0:
+            if not re.fullmatch(r"[0-9a-f]{32}", result.upload_id) or not (
+                0 <= result.offset <= declaration.size
+            ):
                 raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
+            rejected = False
+            abort_new = False
+            settled = record
             with index.lock:
-                index.remove(pending)
-                index.add((session_id, environment_id, result.upload_id), record)
+                if reserved:
+                    index.remove(pending)
+                replaced_key = (
+                    (session_id, environment_id, cached_id)
+                    if cached_id is not None and cached_id != result.upload_id
+                    else None
+                )
+                result_key = (session_id, environment_id, result.upload_id)
+                existing = index.records.get(result_key)
+                if (
+                    idempotency_key is not None
+                    and existing is not None
+                    and existing.owner == owner
+                    and existing.idempotency_key == idempotency_key
+                ):
+                    if replaced_key is not None:
+                        index.remove(replaced_key)
+                    settled = existing
+                elif not reserved and not index.has_capacity(
+                    session_id, declaration.size, cap.limits, replacing=replaced_key
+                ):
+                    rejected = True
+                    abort_new = existing is None
+                else:
+                    if replaced_key is not None:
+                        index.remove(replaced_key)
+                    index.add(result_key, record)
+                if not rejected and scope is not None and not settled.finished:
+                    index.idempotency_keys[scope] = (result.upload_id, digest)
+            if rejected:
+                if abort_new:
+                    with suppress(UploadError):
+                        await _relay(
+                            client,
+                            "DELETE",
+                            _runner_path(session_id, environment_id, "/" + result.upload_id),
+                            timeout=config.workspace_upload_chunk_timeout_s(),
+                            owner=owner,
+                        )
+                raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
+            result.chunk_bytes = cap.limits.chunk.initial
+            result.expires_at = min(
+                result.expires_at, time.time() + min(settled.idle_ttl_s, settled.max_age_s)
+            )
+            outcome = result
+            return result
+        except UploadError as exc:
+            outcome = exc
+            raise
         finally:
             # The runner accounts for creates whose acknowledgement was lost.
             with index.lock:
-                index.remove(pending)
-        result.chunk_bytes = cap.limits.chunk.initial
-        result.expires_at = min(
-            result.expires_at, time.time() + min(record.idle_ttl_s, record.max_age_s)
-        )
-        return result
+                if reserved:
+                    index.remove(pending)
+                if scope is not None and pending_result is not None:
+                    in_flight = index.pending_creates.get(scope)
+                    if in_flight is not None and in_flight[1] is pending_result:
+                        index.pending_creates.pop(scope)
+                        pending_result.set_result(outcome)
 
     async def owned(
         request: Request, session_id: str, environment_id: str, upload_id: str
