@@ -79,6 +79,7 @@ import {
   SquareCheckIcon,
   Trash2Icon,
   UserRoundIcon,
+  UsersIcon,
   WalletIcon,
   XIcon,
   type LucideIcon,
@@ -222,7 +223,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
-import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
@@ -349,6 +349,26 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
+
+// Per trailing slot: the title's right reserve, and with the w-6 shared icon,
+// a wider reserve plus the icon offset that sits it just left of the slot.
+const TRAILING_SLOT_LAYOUT = {
+  awaiting: { reserve: "pr-29", sharedReserve: "pr-36", sharedIcon: "right-29" },
+  marker: { reserve: "pr-8", sharedReserve: "pr-14", sharedIcon: "right-8" },
+  updated: { reserve: "pr-11", sharedReserve: "pr-18", sharedIcon: "right-11" },
+  none: { reserve: "pr-2", sharedReserve: "pr-8", sharedIcon: "right-1" },
+} as const;
+
+function trailingSlotKind(
+  state: SessionState | null,
+  hasSessionIndicator: boolean,
+  showUpdated: boolean,
+): keyof typeof TRAILING_SLOT_LAYOUT {
+  if (state?.kind === "awaiting") return "awaiting";
+  if (hasSessionIndicator) return "marker";
+  if (showUpdated) return "updated";
+  return "none";
+}
 
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
@@ -955,7 +975,7 @@ function SidebarImpl({
   // exposed as a CSS variable consumed by the ``md:w-[var(--sidebar-width)]``
   // class so it only applies on desktop — on mobile the sidebar is a
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
-  const { width: sidebarWidth, handleProps: resizeHandleProps } = useResizableSidebar();
+  const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
 
   // On the open mobile drawer, a leftward swipe slides it shut under the
   // finger, reusing the open swipe's progress rendering below.
@@ -1025,6 +1045,20 @@ function SidebarImpl({
   const prefersReducedMotion =
     typeof window !== "undefined" &&
     window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  // A dismissed peek card drops back into the flow at width 0; animating that
+  // width would push the chat aside, so the motion returns a frame later.
+  const [lastPeek, setLastPeek] = useState(Boolean(peek));
+  const [peekDismissed, setPeekDismissed] = useState(false);
+  if (Boolean(peek) !== lastPeek) {
+    setLastPeek(Boolean(peek));
+    setPeekDismissed(!peek);
+  }
+  useEffect(() => {
+    if (!peekDismissed) return;
+    const frame = requestAnimationFrame(() => setPeekDismissed(false));
+    return () => cancelAnimationFrame(frame);
+  }, [peekDismissed]);
+  const sidebarMotion = !peek && !peekDismissed && !resizing;
 
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
@@ -1096,8 +1130,8 @@ function SidebarImpl({
           peekCloseTimer.current = setTimeout(tryClose, 200);
         }}
         className={cn(
-          // Base: flex column. No transition — expand/collapse snaps
-          // instantly (animating the width also lagged drag-to-resize).
+          // Base: flex column. Desktop open/close animates the width
+          // (below); a drag on the resize edge stays instant so it can't lag.
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
@@ -1129,11 +1163,17 @@ function SidebarImpl({
           // variable) animates →0 to push main; when closed the border
           // collapses too so nothing lingers.
           "md:translate-x-0 md:overflow-hidden",
+          // Opening or collapsing slides the width and fades the content in
+          // 200 ms, matching the workspace rail (index.css keeps it under
+          // reduced motion, where an instant jump of the layout reads worse).
+          sidebarMotion && "md:transition-[width,opacity] md:duration-200 md:ease-in-out",
           // Normal desktop flow: relative panel that pushes main. Suppressed while
           // peeking so its `md:inset-auto`/`md:relative` don't override the
           // floating-card positioning below (same `md:` layer, source order wins).
           !peek && "md:relative md:inset-auto",
-          open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+          open || peek
+            ? "md:m-0 md:w-[var(--sidebar-width)] "
+            : "md:m-0 md:w-0 md:border-0 md:opacity-0",
           // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
           // ringed and shadowed, sliding+fading in from the left so it reads as an
           // overlay rather than a push.
@@ -1159,6 +1199,7 @@ function SidebarImpl({
         // don't see the empty-state contents while focus is elsewhere.
         aria-hidden={!effectiveOpen}
         data-collapsed={!effectiveOpen || undefined}
+        data-sidebar-motion={sidebarMotion || undefined}
         data-floating={peek ? "true" : "false"}
       >
         {mobileLayout && effectiveOpen && (
@@ -2730,7 +2771,7 @@ function ConversationList({
   }, [resolvedActiveId, activeProjectName, pinnedSet, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the numbered
-  // and ⌘[ / ⌘] session hotkeys. Titles must match the <ConversationSection> props below.
+  // session hotkeys. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list;
@@ -2771,7 +2812,6 @@ function ConversationList({
         : visibleIds("Chats", sections.sessions)),
     ];
   };
-  useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 opens the first ten sessions the sidebar lists, top to
   // bottom (see the hook for the chord). A row listed twice keeps its first slot.
@@ -3651,6 +3691,7 @@ const ORDERING_LABELS: Record<SidebarOrdering, string> = {
   custom: "Custom",
 };
 const SHOW_LABELS: Record<SidebarShowField, string> = {
+  harness: "Harness",
   updated: "Updated",
   environment: "Environment",
   repo: "Repo",
@@ -4723,6 +4764,20 @@ function SessionErrorHint() {
   );
 }
 
+// Explains the row's people icon, which can't hold a tooltip of its own: it
+// sits over the row link and fades out on hover.
+function SessionSharedHint() {
+  return (
+    <p
+      data-testid="session-shared-hint"
+      className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+    >
+      <UsersIcon aria-hidden className="size-3.5 shrink-0" />
+      <span>Shared with others</span>
+    </p>
+  );
+}
+
 /** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */
 function sessionLocationLabel(
   conversation: Conversation,
@@ -4916,16 +4971,55 @@ const TOOLTIP_COLOR_ICONS: Partial<
   Record<NativeCodingAgentIconKind, ComponentType<{ size?: number; className?: string }>>
 > = { antigravity: AntigravityColor, devin: DevinColor, kiro: KiroColor };
 
+// The session's harness glyph. `withFallback` draws the agent's generic icon for
+// sessions without a known harness, the way project rows fall back to a folder.
+function SessionHarnessIcon({
+  conversation,
+  testId,
+  withFallback = false,
+}: {
+  conversation: Conversation;
+  testId: string;
+  withFallback?: boolean;
+}) {
+  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
+  const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
+  const harnessAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
+    : conversation.agent_name === "nessie"
+      ? { name: "nessie", harness: null }
+      : withFallback
+        ? { name: conversation.agent_name ?? "", harness: conversation.harness ?? null }
+        : null;
+  if (!harnessAgent) return null;
+  return (
+    <span
+      role="img"
+      aria-label={`${getConversationAgentType(conversation)} harness`}
+      data-testid={testId}
+      className="flex shrink-0"
+    >
+      {ColorIcon ? (
+        <ColorIcon size={16} className="shrink-0" />
+      ) : (
+        <ComposerAgentIcon agent={harnessAgent} className="size-4" />
+      )}
+    </span>
+  );
+}
+
 // The tooltip before the sidebar_grouping_ui release flag; remove with the flag
 // (review by 0.19.0).
 function LegacySessionTooltipContent({
   conversation,
   hostsById,
   hasError,
+  shared,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
+  shared: boolean;
 }) {
   return (
     <TooltipContent
@@ -4960,6 +5054,7 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -4969,10 +5064,12 @@ function SessionTooltipContent({
   conversation,
   hostsById,
   hasError,
+  shared,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
+  shared: boolean;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -4981,17 +5078,10 @@ function SessionTooltipContent({
         conversation={conversation}
         hostsById={hostsById}
         hasError={hasError}
+        shared={shared}
       />
     );
   }
-  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
-  const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
-  const harnessAgent = nativeAgent
-    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
-    : conversation.agent_name === "nessie"
-      ? { name: "nessie", harness: null }
-      : null;
-
   return (
     <TooltipContent
       side="right"
@@ -5008,26 +5098,14 @@ function SessionTooltipContent({
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
         <span aria-hidden>·</span>
-        {harnessAgent && (
-          <span
-            role="img"
-            aria-label={`${getConversationAgentType(conversation)} harness`}
-            data-testid="session-tooltip-harness"
-            className="flex shrink-0"
-          >
-            {ColorIcon ? (
-              <ColorIcon size={16} className="shrink-0" />
-            ) : (
-              <ComposerAgentIcon agent={harnessAgent} className="size-4" />
-            )}
-          </span>
-        )}
+        <SessionHarnessIcon conversation={conversation} testId="session-tooltip-harness" />
         <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
           <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
       <SessionTooltipDetails conversation={conversation} />
+      {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5273,11 +5351,15 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
+  // The server reports `shared_with_others` only to the owner; absent means not shared.
+  const showSharedIndicator = isOwner && conversation.shared_with_others === true;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showUpdated;
+  const trailingLayout =
+    TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
+  const showHarness = show.includes("harness");
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -5518,6 +5600,28 @@ function ConversationRowImpl({
     reorder: canReorder && !isProvisionalRow ? { previousId, nextId } : undefined,
   };
 
+  const rowText = (
+    <>
+      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
+          markers render in the shared trailing indicator slot below. */}
+      <div className="flex w-full items-center">
+        <span
+          className={cn(
+            "relative min-w-0 truncate",
+            // The optimistic first-prompt label is a placeholder until the
+            // server's title lands — dim it so it doesn't read as final.
+            isProvisionalLabel && "italic text-muted-foreground",
+          )}
+        >
+          {label}
+          {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
+        </span>
+      </div>
+      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
+      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+    </>
+  );
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -5533,7 +5637,10 @@ function ConversationRowImpl({
       onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
       className={cn(
         SIDEBAR_ROW,
-        "relative flex flex-col justify-center text-left text-foreground transition-colors",
+        "relative flex text-left text-foreground transition-colors",
+        // With the harness icon the row takes a project row's shape: a leading
+        // icon centered against the title and meta column.
+        showHarness ? "items-center" : "flex-col justify-center",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -5544,13 +5651,7 @@ function ConversationRowImpl({
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "pr-29"
-            : showUpdated
-              ? "pr-11"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+          (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -5596,23 +5697,20 @@ function ConversationRowImpl({
       }}
       title={isMobile ? (conversation.title ?? conversation.id) : undefined}
     >
-      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
-          markers render in the shared trailing indicator slot below. */}
-      <div className="flex w-full items-center">
-        <span
-          className={cn(
-            "relative min-w-0 truncate",
-            // The optimistic first-prompt label is a placeholder until the
-            // server's title lands — dim it so it doesn't read as final.
-            isProvisionalLabel && "italic text-muted-foreground",
-          )}
-        >
-          {label}
-          {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
-        </span>
-      </div>
-      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+      {showHarness ? (
+        <>
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <SessionHarnessIcon
+              conversation={conversation}
+              testId="session-row-harness"
+              withFallback
+            />
+          </span>
+          <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
+        </>
+      ) : (
+        rowText
+      )}
     </Link>
   );
 
@@ -5676,6 +5774,7 @@ function ConversationRowImpl({
               projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
+              shared={showSharedIndicator}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -5687,6 +5786,7 @@ function ConversationRowImpl({
               conversation={conversation}
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
+              shared={showSharedIndicator}
             />
           </Tooltip>
         )
@@ -5710,6 +5810,7 @@ function ConversationRowImpl({
             projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
+            shared={showSharedIndicator}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -5743,6 +5844,7 @@ function ConversationRowImpl({
             conversation={conversation}
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
+            shared={showSharedIndicator}
           />
         </Tooltip>
       )}
@@ -5796,6 +5898,24 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
+      {!selectionMode && showSharedIndicator && (
+        <span
+          role="img"
+          // The row's hover surface carries the visible explanation.
+          aria-label="Shared with others"
+          // Shares the state slot's classes so it fades on every trigger the
+          // badge does (hover, focus, open menu, shortcut hint).
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            SESSION_STATE_DOT_SLOT_CLASS,
+            "shrink-0 text-muted-foreground",
+            overlayTop,
+            trailingLayout.sharedIcon,
+          )}
+        >
+          <UsersIcon className="size-3.5" aria-hidden="true" />
+        </span>
+      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
@@ -6164,6 +6284,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "background_work_running",
   "blocked_on",
   "provisional",
+  "shared_with_others",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -6253,12 +6374,14 @@ function PinnedProjectFlyoutContent({
   projectIcon,
   gitBranch,
   hasError,
+  shared,
 }: {
   title: string;
   projectName: string;
   projectIcon: string | null;
   gitBranch: string | null;
   hasError: boolean;
+  shared: boolean;
 }) {
   return (
     <HoverCardContent
@@ -6285,6 +6408,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
+      {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>
   );
