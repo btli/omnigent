@@ -1,3 +1,9 @@
+import {
+  orderSessionFamilies,
+  isIndentedSibling,
+  isIndividuallyPinnedSibling,
+  sessionFamilyGroups,
+} from "@/lib/sessionFamilies";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -66,6 +72,7 @@ import {
   MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
+  MonitorCloudIcon,
   MoreHorizontalIcon,
   PencilIcon,
   PinIcon,
@@ -74,7 +81,6 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
-  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   Trash2Icon,
@@ -111,7 +117,7 @@ import {
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
-import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import {
   Link,
   useLocation,
@@ -120,7 +126,11 @@ import {
   useRebasePath,
   useSearchParams,
 } from "@/lib/routing";
-import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
+import {
+  SidebarHeaderActions,
+  SidebarSearchButton,
+  SidebarSettingsButton,
+} from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
@@ -157,7 +167,6 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
@@ -196,7 +205,8 @@ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
-import { EmojiPicker } from "@/components/ProjectIconPicker";
+import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
+import { LucideProjectIcon } from "@/components/LucideProjectIcon";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -223,6 +233,7 @@ import { isMobileViewport } from "@/lib/breakpoints";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import { useShowProjectHeaderActionsOnTouch } from "@/lib/projectHeaderActionPreferences";
 import {
   finishActiveRowGesture,
   ROW_GESTURE_HOLD_MS,
@@ -238,7 +249,12 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
-import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import {
+  isAndroidShell,
+  isElectronShell,
+  isIOSShell,
+  isMacElectronShell,
+} from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -276,6 +292,7 @@ import {
   moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
+  isPinOrderUnit,
   readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
@@ -312,13 +329,7 @@ import {
 } from "@/lib/pullRequestStatus";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
-import {
-  deriveRepoName,
-  localMachineLabel,
-  resolveThisMachineHostId,
-  SANDBOX_REPO_LABEL_KEY,
-} from "./NewChatDialog";
-import { useDesktopHostId } from "./RevealInFileManager";
+import { deriveRepoName, SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
@@ -335,6 +346,14 @@ import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { getEmbedRoot } from "../lib/host";
 import {
+  type ProjectAppearance,
+  projectAppearance,
+  projectColorValue,
+  sameProjectAppearance,
+  withProjectAppearance,
+} from "@/lib/projectColors";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import {
   ARCHIVE_SESSION_KEYS,
   CompactShortcutKeys,
   FORK_SESSION_KEYS,
@@ -348,11 +367,11 @@ import {
 export { isMobileViewport };
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
-// right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
-// archive + kebab take its place; elsewhere the controls are gone and the badge
-// holds the edge, fading only under a held shortcut hint.
+// Anchored at the row's right-1 edge. On fine-hover desktop it fades on hover or
+// focus so the pin, archive and kebab take its place; a held shortcut hint fades
+// it too. Without fine hover it holds that edge and never fades.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -364,7 +383,6 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
-
 // Per trailing slot: the title's right reserve, and with the w-6 shared icon,
 // a wider reserve plus the icon offset that sits it just left of the slot.
 const TRAILING_SLOT_LAYOUT = {
@@ -391,7 +409,7 @@ function trailingSlotKind(
 // act on rows through swipes and the long-press menu instead.
 // `inline-flex` (not `block`) keeps the Button base's flex centering.
 const ROW_CONTROL_CLASS =
-  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset fine-hover:md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100";
+  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset fine-hover:md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
@@ -401,9 +419,9 @@ const SCROLLBAR_HIDE_DELAY_MS = 700;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
-// Maps a first-class project id → its chosen emoji icon (only projects that
-// have one), sharing the names map lookup for the pinned flyout and session tooltip.
-const ProjectIconsContext = createContext<Map<string, string>>(new Map());
+// Maps a first-class project id → its mark (only projects with an emoji or
+// color), sharing the names map lookup for the pinned flyout and session tooltip.
+const ProjectMarksContext = createContext<Map<string, ProjectAppearance>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
@@ -444,7 +462,7 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
 
 function SidebarRowDataProvider({
   projectNamesById,
-  projectIconsById,
+  projectMarksById,
   hostsById,
   show,
   isMobile,
@@ -455,7 +473,7 @@ function SidebarRowDataProvider({
   children,
 }: {
   projectNamesById: Map<string, string>;
-  projectIconsById: Map<string, string>;
+  projectMarksById: Map<string, ProjectAppearance>;
   hostsById: ReadonlyMap<string, Host>;
   show: readonly SidebarShowField[];
   isMobile: boolean;
@@ -467,7 +485,7 @@ function SidebarRowDataProvider({
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <ProjectIconsContext.Provider value={projectIconsById}>
+      <ProjectMarksContext.Provider value={projectMarksById}>
         <HostsByIdContext.Provider value={hostsById}>
           <SidebarShowContext.Provider value={show}>
             <IsMobileContext.Provider value={isMobile}>
@@ -483,7 +501,7 @@ function SidebarRowDataProvider({
             </IsMobileContext.Provider>
           </SidebarShowContext.Provider>
         </HostsByIdContext.Provider>
-      </ProjectIconsContext.Provider>
+      </ProjectMarksContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -916,9 +934,11 @@ function SidebarImpl({
   const { data: pinnedData, isSuccess: pinnedLoaded } = sidebarData.pinned;
   // Stable empty fallback so downstream memos don't re-fire on every render
   // while the query is still loading (`pinnedData` undefined).
+  const pinnedFamilyRows = pinnedData?.conversations ?? EMPTY_CONVERSATIONS;
   const pinnedConversations = useMemo(
-    () => pinnedData?.conversations ?? EMPTY_CONVERSATIONS,
-    [pinnedData],
+    () =>
+      pinnedFamilyRows.filter((row) => isPinOrderUnit(row) || row.labels[PINNED_LABEL_KEY] != null),
+    [pinnedFamilyRows],
   );
   const pinnedFilterHonored = pinnedData?.filterHonored ?? false;
   // Membership is the union of the server's pinned rows and any pins still in
@@ -1150,7 +1170,7 @@ function SidebarImpl({
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
-          "conversations-sidebar flex flex-col md:bg-card md:flex-row md:select-none",
+          "conversations-sidebar flex flex-col md:flex-row md:bg-card md:select-none",
           nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
           !isElectronShell() && !nativeSidebarSurface && (open || peek) && "md:pl-1",
           // Mobile (default): a fixed drawer that slides in via translate-x
@@ -1248,11 +1268,11 @@ function SidebarImpl({
           <SettingsSidebarBody onNavClick={onNavClick} />
         ) : (
           <>
-          {/* sidebar-header-row is the hook for the macOS Electron shell, where
-          this row shares the window's top strip with the traffic lights: the
-          brand mark is dropped and the actions slide left to sit beside the
-          window controls (see the [data-electron-mac] rules in index.css).
-          Inert in a browser and on other platforms, which keep the row below. */}
+            {/* sidebar-header-row is the hook for the macOS Electron shell. It
+          reserves the window's top strip for the traffic lights and title-bar
+          actions, then keeps this brand row directly below it (see the
+          [data-electron-mac] rules in index.css). Browsers and other platforms
+          keep the standard single row. */}
             {/* Mobile Search shares the floating chat controls' 16px edge inset. */}
             <div className="sidebar-header-row flex shrink-0 items-center justify-between p-4 md:h-12 md:py-0 md:pr-3">
               {/* Brand mark doubles as the "home" affordance: clicking it
@@ -1281,10 +1301,17 @@ function SidebarImpl({
                   />
                 )}
               </Link>
-              {/* On the macOS shell this copy is hidden and an identical cluster
-            renders in the title-bar strip instead (see AppShell), so the icons
-            keep their place when the sidebar collapses or peeks. Everywhere
-            else this is the only copy. */}
+              {isMacElectronShell() && (
+                <SidebarSearchButton
+                  onOpenSearch={onOpenSearch}
+                  className="hidden md:inline-flex"
+                  testId="electron-sidebar-search-button"
+                />
+              )}
+              {/* On the macOS shell this copy is hidden: Search renders beside
+            the wordmark above, while Settings and the sidebar toggle stay in
+            AppShell's persistent title-bar strip. Everywhere else this is the
+            only action cluster. */}
               <SidebarHeaderActions
                 expanded={!peek}
                 // onOpen is optional (the sidebar renders standalone in tests), so
@@ -1493,7 +1520,7 @@ function SidebarImpl({
                     onActiveTabChange={switchTab}
                     multiUser={multiUser}
                     pinnedConversationIds={pinnedConversationIds}
-                    pinnedConversations={pinnedConversations}
+                    pinnedConversations={pinnedFamilyRows}
                     pinReorderEnabled={pinnedFilterHonored}
                     onTogglePinned={togglePinnedConversation}
                     onEnterSelectionMode={enterSelectionMode}
@@ -1556,12 +1583,16 @@ function ProjectFolder({
   name,
   projectId,
   icon,
+  lucideIcon,
+  color,
   windowConversations,
   archived,
   activeConversationId,
   expanded,
   active,
   onToggleCollapsed,
+  collapsedFamilies,
+  onToggleFamily,
   pinnedConversationIds,
   sessionShortcutSlots,
   activeOverride,
@@ -1597,6 +1628,10 @@ function ProjectFolder({
   /** Chosen emoji icon (unicode grapheme), or null/absent for the default
       folder glyph. */
   icon?: string | null;
+  /** Chosen lucide-react icon name, or null/absent for the folder glyph. */
+  lucideIcon?: string | null;
+  /** Chosen color (a theme palette id), or null/absent for the muted folder. */
+  color?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
@@ -1609,6 +1644,8 @@ function ProjectFolder({
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
   onToggleCollapsed: () => void;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   pinnedConversationIds: string[];
   /** Jump slot per numbered row (the first ten the sidebar lists). */
   sessionShortcutSlots: ReadonlyMap<string, number>;
@@ -1634,6 +1671,7 @@ function ProjectFolder({
   ) => void;
 }) {
   const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
+  const showProjectHeaderActionsOnTouch = useShowProjectHeaderActionsOnTouch();
   const viewerId = useViewerId();
   const query = useProjectSessions(name, expanded, sortBy, archived);
   const watchedRows = useMemo(
@@ -1656,17 +1694,19 @@ function ProjectFolder({
       byId.set(row.id, row);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pins take precedence over live folders.
-    return sortConversations(
-      [...byId.values()].filter(
-        (c) =>
-          (c.archived === true) === archived &&
-          sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-          (archived || !pinnedSet.has(c.id)),
+    return orderSessionFamilies(
+      sortConversations(
+        [...byId.values()].filter(
+          (c) =>
+            (c.archived === true) === archived &&
+            sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
+            (archived || (!c.family?.pinned && !pinnedSet.has(c.id))),
+        ),
+        activeOverride,
+        frozenSortKeys,
+        sortBy,
+        customOrder,
       ),
-      activeOverride,
-      frozenSortKeys,
-      sortBy,
-      customOrder,
     );
   }, [
     query.data,
@@ -1748,7 +1788,10 @@ function ProjectFolder({
     name,
     projectId,
     icon,
+    color,
+    lucideIcon,
   );
+  const folderColor = projectColorValue(color, useResolvedThemeMode());
 
   const headerDrag = useSortable({
     id: projectDragId(name),
@@ -1815,15 +1858,12 @@ function ProjectFolder({
         icon={
           icon ? (
             <span className="text-[14px] leading-none">{icon}</span>
-          ) : expanded ? (
-            <FolderOpenIcon
-              className={cn(
-                "ui-icon",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
           ) : (
-            <FolderIcon
+            <LucideProjectIcon
+              iconName={lucideIcon}
+              fallback={expanded ? FolderOpenIcon : FolderIcon}
+              data-project-color={color ?? undefined}
+              style={{ color: folderColor }}
               className={cn(
                 "ui-icon",
                 active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
@@ -1841,6 +1881,8 @@ function ProjectFolder({
         // Projects default collapsed: shown only when explicitly expanded.
         collapsed={!expanded}
         onToggleCollapsed={onToggleCollapsed}
+        collapsedFamilies={collapsedFamilies}
+        onToggleFamily={onToggleFamily}
         onRowClick={onRowClick}
         onTogglePinned={onTogglePinned}
         selectionMode={selectionMode}
@@ -1875,8 +1917,10 @@ function ProjectFolder({
             projectName={name}
             onNavigate={onRowClick}
             actions={orderedMenuActions}
+            showOnTouch={showProjectHeaderActionsOnTouch}
           />
         }
+        showProjectHeaderActionsOnTouch={showProjectHeaderActionsOnTouch}
         headerContextMenu={
           <ContextMenuContent className="min-w-40" onCloseAutoFocus={menuActions.onCloseAutoFocus}>
             <ProjectFolderMenuItems
@@ -2052,6 +2096,15 @@ function ConversationList({
   getVisibleIdsRef,
 }: ConversationListProps) {
   const grids = useGridSessions();
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
+  const toggleFamily = useCallback((familyId: string) => {
+    setCollapsedFamilies((previous) => {
+      const next = new Set(previous);
+      if (next.has(familyId)) next.delete(familyId);
+      else next.add(familyId);
+      return next;
+    });
+  }, []);
   // Row-invariant values resolved once here and shared with rows via context
   // (see IsMobileContext etc.), so each row doesn't run its own copy.
   const viewerId = useViewerId();
@@ -2059,11 +2112,13 @@ function ConversationList({
   const serverInfo = useServerInfo();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
   // owner so ordinary rows do not each create their own polling observer.
-  const { data: hosts = [] } = useHosts({ includeSandbox: true });
+  const { data: hosts = [], isLoading: hostsLoading } = useHosts({ includeSandbox: true });
   const hostsById = useMemo(
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
+  const defaultProjectHostId =
+    hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
   // Grouping / ordering / show options from the filter menu, seeded from the
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
@@ -2122,7 +2177,7 @@ function ConversationList({
     () => (openSessionRow ? [...pagedConversations, openSessionRow] : pagedConversations),
     [pagedConversations, openSessionRow],
   );
-  const groupOrder = useMemo(
+  const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"
         ? [...new Set(allConversations.map(harnessLabel))].sort((a, b) => a.localeCompare(b))
@@ -2172,12 +2227,17 @@ function ConversationList({
     return map;
   }, [projects]);
 
-  // id → emoji icon for rows that want to show the real project glyph (e.g. the
+  // id → mark for rows that want to show the real project glyph (e.g. the
   // pinned flyout); built alongside the names map and shared the same way.
-  const projectIconsById = useMemo(() => {
-    const map = new Map<string, string>();
+  const projectMarksById = useMemo(() => {
+    const map = new Map<string, ProjectAppearance>();
     for (const p of projects) {
-      if (p.id !== null && p.icon) map.set(p.id, p.icon);
+      const mark = projectAppearance({
+        icon: p.icon ?? undefined,
+        lucide_icon: p.lucide_icon ?? undefined,
+        color: p.color ?? undefined,
+      });
+      if (p.id !== null && (mark.icon || mark.lucideIcon || mark.color)) map.set(p.id, mark);
     }
     return map;
   }, [projects]);
@@ -2279,7 +2339,9 @@ function ConversationList({
     // the Shared tab, a shared pin stays visible on My sessions, and the pins
     // don't vanish on the Archived tab either. (An archived session is never
     // pinned into the live sections — hence notArchived, not allWithPinned.)
-    const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
+    const pinned = orderSessionFamilies(
+      orderByPinnedTimestamp(notArchived.filter((c) => c.family?.pinned || pinnedSet.has(c.id))),
+    );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Folders use live members on All / My and archives on Archived. Filing is
@@ -2290,8 +2352,9 @@ function ConversationList({
       id: string | null;
       name: string;
       icon?: string | null;
+      color?: string | null;
       conversations: Conversation[];
-    }[] = (grouped || activeTab === "shared" ? [] : projects).map(({ id, name, icon }) => {
+    }[] = (grouped || activeTab === "shared" ? [] : projects).map(({ id, name, icon, color }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -2303,12 +2366,9 @@ function ConversationList({
         id,
         name,
         icon,
-        conversations: sortConversations(
-          inProject,
-          activeOverride,
-          frozenKeys,
-          sortBy,
-          customOrder,
+        color,
+        conversations: orderSessionFamilies(
+          sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
         ),
       };
     });
@@ -2346,7 +2406,14 @@ function ConversationList({
     const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
       : allOrdered;
-    if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
+    if (!grouped)
+      return {
+        pinned,
+        shared,
+        sessions: orderSessionFamilies(ordered),
+        projectGroups,
+        groupTitles: null,
+      };
     // Buckets use render-time "now", so a day rollover shows on the next list update.
     const now = new Date();
     const groupTitles = new Map<string, string>(
@@ -2365,8 +2432,31 @@ function ConversationList({
               )}`,
       ]),
     );
+    const familyGroups = new Map<string, string>();
+    const familyRows = sessionFamilyGroups(ordered);
+    for (const row of ordered) {
+      if (!row.family) continue;
+      const representative = familyRows.get(row.family.id)?.[0];
+      const group = groupTitles.get(
+        (view.grouping === "created" || view.grouping === "harness") && representative
+          ? representative.id
+          : row.id,
+      );
+      const previous = familyGroups.get(row.family.id);
+      if (
+        group &&
+        (!previous ||
+          (view.grouping === "status" && groupOrder.indexOf(group) < groupOrder.indexOf(previous)))
+      ) {
+        familyGroups.set(row.family.id, group);
+      }
+    }
+    for (const row of ordered) {
+      const group = row.family ? familyGroups.get(row.family.id) : undefined;
+      if (group) groupTitles.set(row.id, group);
+    }
     const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
-      (g) => g.conversations,
+      (g) => orderSessionFamilies(g.conversations),
     );
     return { pinned, shared, sessions, projectGroups, groupTitles };
     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
@@ -2633,6 +2723,11 @@ function ConversationList({
         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
         target,
       );
+      if (
+        (action.kind === "move" || action.kind === "ungroup") &&
+        event.active.data.current?.canMoveProject === false
+      )
+        return;
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
         // Unpin a pinned session so it actually drops into the folder instead of
@@ -2813,12 +2908,16 @@ function ConversationList({
   // session hotkeys. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list;
+      effectiveCollapsedSections.includes(title)
+        ? []
+        : orderSessionFamilies(list, collapsedFamilies);
     // A project's chats are navigable only while the "Projects" group and that
     // folder are both expanded (folders start collapsed), down to its "Show more".
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
-      !projectsCollapsed && expandedProjects.includes(group.name) ? folderVisibleRows(group) : [];
+      !projectsCollapsed && expandedProjects.includes(group.name)
+        ? orderSessionFamilies(folderVisibleRows(group), collapsedFamilies)
+        : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
     // Projects / Sessions walk covers every tab (Projects is empty on Shared).
     return [
@@ -2829,7 +2928,14 @@ function ConversationList({
         ? sessionGroups.flatMap((g) => visible(g.title, g.conversations))
         : visible("Chats", sections.sessions)),
     ].map((c) => c.id);
-  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects, folderVisibleRows]);
+  }, [
+    sections,
+    sessionGroups,
+    effectiveCollapsedSections,
+    expandedProjects,
+    folderVisibleRows,
+    collapsedFamilies,
+  ]);
   // Shift-select range ids in render order, built at click time from the
   // selectable scope. Folders contribute the rows they list above "Show more"
   // (their own reports), so a target outside the global window still resolves.
@@ -2837,12 +2943,16 @@ function ConversationList({
     const projectIds = () => {
       if (effectiveCollapsedSections.includes("Projects")) return [];
       return sections.projectGroups.flatMap((g) =>
-        expandedProjects.includes(g.name) ? folderVisibleRows(g).map((c) => c.id) : [],
+        expandedProjects.includes(g.name)
+          ? orderSessionFamilies(folderVisibleRows(g), collapsedFamilies).map((c) => c.id)
+          : [],
       );
     };
     if (selectionScope === "projects") return projectIds();
     const visibleIds = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
+      effectiveCollapsedSections.includes(title)
+        ? []
+        : orderSessionFamilies(list, collapsedFamilies).map((c) => c.id);
     return [
       ...(unifiedSelection ? projectIds() : []),
       ...visibleIds("Shared", sections.shared),
@@ -2873,7 +2983,7 @@ function ConversationList({
     () =>
       pinReorderEnabled && !pinWriting
         ? {
-            ids: sections.pinned.map((c) => c.id),
+            ids: sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
             draggingId: activeDrag?.id ?? null,
             overId: overPin,
           }
@@ -2919,6 +3029,8 @@ function ConversationList({
   // List header controls and row props, shared by the Shared, single "Sessions"
   // and grouped sections; the controls sit on the first of the viewer's lists.
   const sessionRowProps = {
+    collapsedFamilies,
+    onToggleFamily: toggleFamily,
     activeConversationId: displayedActiveId,
     pinnedConversationIds,
     sessionShortcutSlots,
@@ -3024,7 +3136,7 @@ function ConversationList({
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
-      projectIconsById={projectIconsById}
+      projectMarksById={projectMarksById}
       hostsById={hostsById}
       show={view.show}
       isMobile={isMobile}
@@ -3144,6 +3256,8 @@ function ConversationList({
                       <PinOrderContext.Provider value={pinOrder}>
                         <ConversationSection
                           title="Pinned"
+                          collapsedFamilies={collapsedFamilies}
+                          onToggleFamily={toggleFamily}
                           conversations={sections.pinned}
                           activeConversationId={displayedActiveId}
                           pinnedConversationIds={pinnedConversationIds}
@@ -3188,6 +3302,8 @@ function ConversationList({
                         !selectionMode ? (
                           <>
                             <ProjectHeaderActions
+                              hostId={defaultProjectHostId}
+                              hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
                                   projectOrder.data?.ordered_project_ids?.map((id, index) => [
@@ -3254,12 +3370,18 @@ function ConversationList({
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}
+                            lucideIcon={
+                              group.id !== null ? projectMarksById.get(group.id)?.lucideIcon : null
+                            }
+                            color={group.color}
                             windowConversations={group.conversations}
                             archived={activeTab === "archived"}
                             activeConversationId={displayedActiveId}
                             expanded={expandedProjects.includes(group.name)}
                             active={newSessionProjectName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                            collapsedFamilies={collapsedFamilies}
+                            onToggleFamily={toggleFamily}
                             pinnedConversationIds={pinnedConversationIds}
                             sessionShortcutSlots={sessionShortcutSlots}
                             activeOverride={activeOverride}
@@ -3537,6 +3659,7 @@ function SectionHeader({
   active = false,
   hasAction,
   hasPersistentAction,
+  showProjectHeaderActionsOnTouch,
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
@@ -3556,6 +3679,8 @@ function SectionHeader({
       paint theirs only with fine hover. At rest on hover-capable desktops the
       badges return to the rows' badge column. */
   hasAction?: boolean;
+  /** Project-header controls stay visible on touch when this is enabled. */
+  showProjectHeaderActionsOnTouch?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
       hover-capable desktops. */
@@ -3581,6 +3706,12 @@ function SectionHeader({
         ? "fine-hover:md:-mr-1"
         : "fine-hover:md:mr-1"
       : "fine-hover:md:mr-2";
+  const touchActionMargin =
+    showProjectHeaderActionsOnTouch === undefined
+      ? undefined
+      : showProjectHeaderActionsOnTouch
+        ? "no-fine-hover:mr-24"
+        : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:mr-24 no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:mr-24";
   const markerFade =
     "fine-hover:md:group-hover/section:opacity-0 fine-hover:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
@@ -3622,12 +3753,21 @@ function SectionHeader({
           ? cn(
               SIDEBAR_ROW,
               "group flex w-full items-center border-0 text-left text-foreground transition-colors",
+              // The row grows to fit 44px touch actions so neighbors never overlap.
+              showProjectHeaderActionsOnTouch && "no-fine-hover:min-h-11",
               SIDEBAR_HOVER_HIGHLIGHT,
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                cn(
+                  "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                  showProjectHeaderActionsOnTouch === undefined
+                    ? undefined
+                    : showProjectHeaderActionsOnTouch
+                      ? "no-fine-hover:pr-24"
+                      : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24 no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:pr-24",
+                ),
             )
           : cn(
               "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
@@ -3675,12 +3815,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity mobile-app:mr-0 mobile-app:opacity-100",
-            // Project actions exist only with fine hover (touch uses the
-            // long-press menu); section headers keep their select/filter slots.
+            // Project actions reserve their column only when visible or focused.
             hasAction
               ? cn(
                   icon ? cn(clusterRestMargin, "fine-hover:mr-14") : "mr-14",
                   clusterHoverDesktopMargin,
+                  touchActionMargin,
                 )
               : hasPersistentAction
                 ? "mr-7"
@@ -3909,6 +4049,8 @@ function SessionFilterMenu({
 }
 
 function ProjectHeaderActions({
+  hostId,
+  hostsLoading,
   onOrderChange,
   manualOrder,
   orderDisabled,
@@ -3921,6 +4063,8 @@ function ProjectHeaderActions({
   onProjectCreated,
   onEnterSelectionMode,
 }: {
+  hostId: string | null;
+  hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
   orderDisabled: boolean;
@@ -3944,7 +4088,7 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} />
+      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -4094,6 +4238,8 @@ function ConversationSection({
   pinnedConversationIds,
   collapsed,
   onToggleCollapsed,
+  collapsedFamilies,
+  onToggleFamily,
   onRowClick,
   onTogglePinned,
   selectionMode,
@@ -4102,6 +4248,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  showProjectHeaderActionsOnTouch,
   headerStatus,
   headerContextMenu,
   persistentHeaderAction,
@@ -4132,6 +4279,8 @@ function ConversationSection({
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -4143,6 +4292,7 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
+  showProjectHeaderActionsOnTouch?: boolean;
   /** Progress displayed beside the title, including while collapsed. */
   headerStatus?: ReactNode;
   /** Optional context-menu content opened from the header button. */
@@ -4165,6 +4315,16 @@ function ConversationSection({
   /** The folder containing these rows, if this section is a project folder. */
   projectFolderName?: string;
 }) {
+  const families = sessionFamilyGroups(conversations);
+  const familyRepresentative = (row: Conversation) =>
+    row.family && !isIndividuallyPinnedSibling(row) ? families.get(row.family.id)?.[0] : undefined;
+  const isNestedFamilyRow = (row: Conversation) => {
+    const representative = familyRepresentative(row);
+    return representative !== undefined && representative.id !== row.id;
+  };
+  const visibleFamilyRows = orderSessionFamilies(conversations, collapsedFamilies);
+  const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
+
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
   const gridMembers = new Set(grids?.activeGrid ? gridSessionIds(grids.activeGrid.layout) : []);
@@ -4193,6 +4353,7 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
+            showProjectHeaderActionsOnTouch={showProjectHeaderActionsOnTouch}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -4231,6 +4392,10 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
+                    // Hidden touch actions stay in the accessibility tree and tab
+                    // order without a hit area; keyboard focus or their open menu reveals them.
+                    showProjectHeaderActionsOnTouch === false &&
+                      "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:not-sr-only",
                     "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
@@ -4276,10 +4441,19 @@ function ConversationSection({
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {conversations.map((conv, index) => (
+              {visibleFamilyRows.map((conv) => (
                 <ConversationRow
                   key={conv.id}
                   conversation={conv}
+                  familyIndented={isNestedFamilyRow(conv)}
+                  familyExpanded={
+                    conv.family &&
+                    familyRepresentative(conv)?.id === conv.id &&
+                    families.get(conv.family.id)!.length > 1
+                      ? !collapsedFamilies.has(conv.family.id)
+                      : undefined
+                  }
+                  onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={conv.id === activeConversationId}
                   inActiveGrid={gridMembers.has(conv.id)}
                   gridSelected={conv.id === grids?.selectedSessionId}
@@ -4292,10 +4466,10 @@ function ConversationSection({
                   isSelected={selectedIds.has(conv.id)}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
-                  reorderGroup={reorderGroup}
-                  previousId={reorderNeighbour(conversations[index - 1])}
-                  nextId={reorderNeighbour(conversations[index + 1])}
-                  reorderIndex={reorderGroup ? index : undefined}
+                  reorderGroup={isNestedFamilyRow(conv) ? undefined : reorderGroup}
+                  previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
+                  nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
+                  reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
                   projectFolderName={projectFolderName}
                 />
               ))}
@@ -4373,6 +4547,7 @@ function ConversationMenuItems({
   components: C,
   conversation,
   sessionShortcuts,
+  onNavigate,
   isPinned,
   isArchived,
   isOwner,
@@ -4400,6 +4575,7 @@ function ConversationMenuItems({
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
   sessionShortcuts: ReadonlySet<DesktopCommand>;
+  onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
   isPinned: boolean;
   isArchived: boolean;
   isOwner: boolean;
@@ -4432,6 +4608,7 @@ function ConversationMenuItems({
   /** The neighbours Move up/down swap with in the Custom order. */
   reorder?: { previousId?: string; nextId?: string };
 }) {
+  const info = useContext(ServerInfoContext);
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
   const moveSession = useContext(SessionReorderContext);
@@ -4509,6 +4686,17 @@ function ConversationMenuItems({
 
   return (
     <>
+      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
+        <>
+          <C.Item asChild data-testid="add-sibling-session">
+            <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
+              <PlusIcon className="size-3.5" />
+              Add nested agent
+            </Link>
+          </C.Item>
+          <C.Separator />
+        </>
+      )}
       {!isArchived && gridOptions.length > 0 && (
         <C.Sub>
           <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
@@ -4660,6 +4848,7 @@ function ConversationMenuItems({
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
+        !isIndentedSibling(conversation) &&
         (isMobile ? (
           // Mobile: no room for a side flyout, so this item swaps the menu
           // body to the project picker in place (see the `view === "projects"`
@@ -4832,22 +5021,13 @@ function sessionLocationLabel(
     : (host?.name ?? conversation.host_id);
 }
 
-/** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */
-function sessionEnvironmentLabel(
+/** The host picker's icon for where a session runs: a cloud monitor for a sandbox, else a laptop. */
+function sessionLocationIcon(
   conversation: Conversation,
   hostsById: ReadonlyMap<string, Host>,
-  desktopHostId: string | null,
-): string {
-  const hostId = conversation.host_id;
-  if (!hostId || hostsById.get(hostId)?.sandbox_provider) {
-    return sessionLocationLabel(conversation, hostsById);
-  }
-  const onlineHostIds = [...hostsById.values()]
-    .filter((h) => h.status === "online" && !h.sandbox_provider)
-    .map((h) => h.host_id);
-  return hostId === resolveThisMachineHostId(desktopHostId, isCurrentServerLocal(), onlineHostIds)
-    ? localMachineLabel(navigator.userAgent)
-    : "Remote";
+): LucideIcon {
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
+  return host?.sandbox_provider ? MonitorCloudIcon : LaptopIcon;
 }
 
 /** A managed-sandbox session's repo name from its first `omnigent.sandbox.repo` label; null otherwise. */
@@ -4856,17 +5036,6 @@ function sessionRepoName(conversation: Conversation): string | null {
   const workspace = labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ?? labels[SANDBOX_REPO_LABEL_KEY];
   // Label value is `<url>[#<branch>]`; the name is derived from the url part.
   return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
-}
-
-// Its own component so only rows showing Environment subscribe to the desktop host id.
-function SessionEnvironmentLabel({
-  conversation,
-  hostsById,
-}: {
-  conversation: Conversation;
-  hostsById: ReadonlyMap<string, Host>;
-}) {
-  return sessionEnvironmentLabel(conversation, hostsById, useDesktopHostId());
 }
 
 // Its own component so only rows showing the timestamp subscribe to the shared clock.
@@ -4881,12 +5050,14 @@ function SessionMetaLine({
   repo,
   branch,
 }: {
-  environment: ReactNode;
+  environment: { icon: LucideIcon; label: string } | null;
   repo: string | null;
   branch: string | null;
 }) {
-  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
-  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
+  const parts: { key: string; icon: LucideIcon; value: string }[] = [];
+  if (environment !== null) {
+    parts.push({ key: "environment", icon: environment.icon, value: environment.label });
+  }
   if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
   if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
   if (parts.length === 0) return null;
@@ -4900,7 +5071,7 @@ function SessionMetaLine({
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             <Icon aria-hidden className="size-3.5 shrink-0" />
-            <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
+            <span className="truncate">{value}</span>
           </span>
         </Fragment>
       ))}
@@ -4940,11 +5111,11 @@ function SessionTooltipDetail({
 function SessionTooltipDetails({
   conversation,
   projectName,
-  projectIcon,
+  projectMark,
 }: {
   conversation: Conversation;
   projectName: string | null;
-  projectIcon: string | null;
+  projectMark: ProjectAppearance | null;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
@@ -5002,7 +5173,7 @@ function SessionTooltipDetails({
       {projectName !== null && (
         <SessionTooltipDetail
           label="Project"
-          iconContent={<ProjectRowIcon icon={projectIcon} />}
+          iconContent={<ProjectRowIcon icon={projectMark?.icon} color={projectMark?.color} />}
           testId="session-tooltip-project"
         >
           {projectName}
@@ -5135,14 +5306,14 @@ function SessionTooltipContent({
   hasError,
   shared,
   projectName,
-  projectIcon,
+  projectMark,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: boolean;
   projectName: string | null;
-  projectIcon: string | null;
+  projectMark: ProjectAppearance | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5158,6 +5329,7 @@ function SessionTooltipContent({
   // Runner stats section replaces the location line when available.
   const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
+  const LocationIcon = sessionLocationIcon(conversation, hostsById);
 
   return (
     <TooltipContent
@@ -5181,7 +5353,7 @@ function SessionTooltipContent({
             data-testid="session-tooltip-location"
             className="flex min-w-0 items-center gap-1.5"
           >
-            <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+            <LocationIcon aria-hidden className="size-3.5 shrink-0" />
             <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
           </span>
         )}
@@ -5189,7 +5361,7 @@ function SessionTooltipContent({
       <SessionTooltipDetails
         conversation={conversation}
         projectName={projectName}
-        projectIcon={projectIcon}
+        projectMark={projectMark}
       />
       {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
@@ -5217,6 +5389,9 @@ function isRowFullyVisible(row: HTMLElement): boolean {
 
 function ConversationRowImpl({
   conversation,
+  familyIndented = false,
+  familyExpanded,
+  onToggleFamily,
   isActive,
   inActiveGrid,
   gridSelected,
@@ -5236,6 +5411,9 @@ function ConversationRowImpl({
   projectFolderName,
 }: {
   conversation: Conversation;
+  familyIndented?: boolean;
+  familyExpanded?: boolean;
+  onToggleFamily?: () => void;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
   // read, so only the two rows whose value flips re-render on a switch.
@@ -5374,12 +5552,12 @@ function ConversationRowImpl({
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && !groupingUi && isPinned ? currentProject : null;
-  // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the project icon falls back to the folder glyph.
-  const projectIconsById = useContext(ProjectIconsContext);
-  const projectIcon =
+  // First-class projects can carry an emoji or color; label-only projects have
+  // neither, so the project mark falls back to the muted folder glyph.
+  const projectMarksById = useContext(ProjectMarksContext);
+  const projectMark =
     conversation.project_id != null
-      ? (projectIconsById.get(conversation.project_id) ?? null)
+      ? (projectMarksById.get(conversation.project_id) ?? null)
       : null;
 
   // The title the user just committed. The rename's cache write reaches this
@@ -5453,9 +5631,12 @@ function ConversationRowImpl({
   const trailingLayout =
     TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
-  const metaEnvironment = show.includes("environment") ? (
-    <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
-  ) : null;
+  const metaEnvironment = show.includes("environment")
+    ? {
+        icon: sessionLocationIcon(conversation, hostsById),
+        label: sessionLocationLabel(conversation, hostsById),
+      }
+    : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const loadBranch = show.includes("branch") && gitBranch === null;
   const { data: worktrees } = useSessionWorktrees(
@@ -5571,12 +5752,13 @@ function ConversationRowImpl({
       label,
       project: currentProject,
       isPinned,
-      canManage: isOwner,
+      canManage: isOwner && !familyIndented,
+      canMoveProject: !isIndentedSibling(conversation),
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
       rowGesture: gesture.dndData,
     },
-    disabled: !dragEnabled,
+    disabled: !dragEnabled || (familyIndented && !gridsEnabled),
   });
   const {
     setNodeRef: setSessionOrderNodeRef,
@@ -5605,7 +5787,7 @@ function ConversationRowImpl({
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
     id: `pin-order:${conversation.id}`,
     data: { type: "pin-order", id: conversation.id },
-    disabled: !pinOrder || !isPinned,
+    disabled: !pinOrder || !isPinned || !pinOrder.ids.includes(conversation.id),
   });
   // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
   let pinInsertion: "before" | "after" | undefined;
@@ -5748,6 +5930,7 @@ function ConversationRowImpl({
   const menuItemProps = {
     conversation,
     sessionShortcuts,
+    onNavigate: onClick,
     isPinned,
     isArchived,
     isOwner,
@@ -5796,106 +5979,123 @@ function ConversationRowImpl({
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
-    <Link
-      ref={rowLinkRef}
-      to={selectionMode ? "#" : `/c/${conversation.id}`}
-      componentId="sidebar.conversation_switcher"
-      aria-keyshortcuts={
-        shortcutSlot !== undefined
-          ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
-          : undefined
-      }
-      draggable={false}
-      onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
-      onContextMenu={(e) => {
-        if (isDragging) e.preventDefault();
-      }}
-      onKeyDown={gesture.clearClickSuppression}
-      className={cn(
-        SIDEBAR_ROW,
-        "relative flex text-left text-foreground transition-colors",
-        // With the harness icon the row takes a project row's shape: a leading
-        // icon centered against the title and meta column.
-        showHarness ? "items-center" : "flex-col justify-center",
-        SIDEBAR_HOVER_HIGHLIGHT,
-        // Full width (not 100%+1rem) so the highlight stays inset from the
-        // right edge, aligning with the project/folder rows above.
-        "w-full focus-visible:outline-offset-[-2px]",
-        // Touch reaches the row menu by long press.
-        "mobile-touch-target",
-        // Rest reserve: without fine hover the controls are gone, so the row
-        // reserves only what the badge needs — the same width a fine-hover
-        // desktop uses before hover reveals the controls.
-        !selectionMode &&
-          (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
-        // The narrowed reserve must track exactly when the trailing controls
-        // appear and the state marker fades — both keyed on `:focus-visible`.
-        // `focus-within` also fires for a plain click, which shrank the reserve
-        // on the selected row while the marker stayed put, sliding the title
-        // under it.
-        // Gated on fine hover like the reveals themselves: without it the
-        // persistent touch-tablet reserve above stays put.
-        !selectionMode &&
-          `fine-hover:md:group-hover:pr-20 fine-hover:md:group-has-[:focus-visible]:pr-20`,
-        !selectionMode && menuOpen && "fine-hover:md:pr-20",
-        // Same room as the hover controls, so a held hint never covers the title.
-        shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
-        selectionMode && "pr-2 pl-8",
-        !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
-        !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
-        !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
-        selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+    <div className="relative">
+      {familyExpanded !== undefined && (
+        <button
+          type="button"
+          aria-label={familyExpanded ? "Collapse session family" : "Expand session family"}
+          aria-expanded={familyExpanded}
+          onClick={onToggleFamily}
+          className="absolute top-1/2 left-2 z-10 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+        >
+          <ChevronRightIcon className={cn("size-3", familyExpanded && "rotate-90")} />
+        </button>
       )}
-      onClick={(e) => {
-        recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a resolved touch gesture.
-        if (gesture.consumeClick()) {
-          e.preventDefault();
-          return;
+      <Link
+        ref={rowLinkRef}
+        to={selectionMode ? "#" : `/c/${conversation.id}`}
+        componentId="sidebar.conversation_switcher"
+        aria-keyshortcuts={
+          shortcutSlot !== undefined
+            ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
+            : undefined
         }
-        if (selectionMode) {
+        draggable={false}
+        onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
+        onContextMenu={(e) => {
+          if (isDragging) e.preventDefault();
+        }}
+        onKeyDown={gesture.clearClickSuppression}
+        className={cn(
+          SIDEBAR_ROW,
+          "relative flex text-left text-foreground transition-colors",
+          // With the harness icon the row takes a project row's shape: a leading
+          // icon centered against the title and meta column.
+          showHarness ? "items-center" : "flex-col justify-center",
+          SIDEBAR_HOVER_HIGHLIGHT,
+          // Full width (not 100%+1rem) so the highlight stays inset from the
+          // right edge, aligning with the project/folder rows above.
+          "w-full focus-visible:outline-offset-[-2px]",
+          // Touch reaches the row menu by long press.
+          "mobile-touch-target",
+          familyExpanded !== undefined && "pl-7",
+          // Rest reserve: without fine hover the controls are gone, so the row
+          // reserves only what the badge needs — the same width a fine-hover
+          // desktop uses before hover reveals the controls.
+          !selectionMode &&
+            (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
+          // The narrowed reserve must track exactly when the trailing controls
+          // appear and the state marker fades — both keyed on `:focus-visible`.
+          // `focus-within` also fires for a plain click, which shrank the reserve
+          // on the selected row while the marker stayed put, sliding the title
+          // under it.
+          // Gated on fine hover like the reveals themselves: without it the
+          // persistent touch-tablet reserve above stays put.
+          !selectionMode &&
+            `fine-hover:md:group-hover:pr-20 fine-hover:md:group-has-[:focus-visible]:pr-20`,
+          !selectionMode && menuOpen && "fine-hover:md:pr-20",
+          // Same room as the hover controls, so a held hint never covers the title.
+          shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
+          selectionMode && "pr-2 pl-8",
+          !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+          !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+          !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
+          selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+        )}
+        onClick={(e) => {
+          recentClickTimesRef.current = [
+            ...recentClickTimesRef.current.slice(-1),
+            performance.now(),
+          ];
+          // Swallow the click that trails a resolved touch gesture.
+          if (gesture.consumeClick()) {
+            e.preventDefault();
+            return;
+          }
+          if (selectionMode) {
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelected(conversation.id, e.shiftKey);
+            return;
+          }
+          activateRow(conversation.id, e);
+          onClick(e);
+        }}
+        onDoubleClick={(e) => {
+          if (selectionMode) return;
+          if (!isOwner) return;
+          if (isProvisionalRow) return; // no rename before the real session exists
           e.preventDefault();
-          e.stopPropagation();
-          onToggleSelected(conversation.id, e.shiftKey);
-          return;
-        }
-        activateRow(conversation.id, e);
-        onClick(e);
-      }}
-      onDoubleClick={(e) => {
-        if (selectionMode) return;
-        if (!isOwner) return;
-        if (isProvisionalRow) return; // no rename before the real session exists
-        e.preventDefault();
-        // The dblclick's own second click was already recorded above, so
-        // exactly ONE recent click means the first click landed on a different
-        // row — the list reordered mid-double-click and renaming here would
-        // hit the wrong session. Zero recent clicks (synthetic dblclick with
-        // no click events, e.g. in tests) stays allowed.
-        const now = performance.now();
-        const recent = recentClickTimesRef.current.filter(
-          (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
-        );
-        if (recent.length === 1) return;
-        setIsEditing(true);
-      }}
-      title={isMobile ? (conversation.title ?? conversation.id) : undefined}
-    >
-      {showHarness ? (
-        <>
-          <span className="flex size-4 shrink-0 items-center justify-center">
-            <SessionHarnessIcon
-              conversation={conversation}
-              testId="session-row-harness"
-              withFallback
-            />
-          </span>
-          <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
-        </>
-      ) : (
-        rowText
-      )}
-    </Link>
+          // The dblclick's own second click was already recorded above, so
+          // exactly ONE recent click means the first click landed on a different
+          // row — the list reordered mid-double-click and renaming here would
+          // hit the wrong session. Zero recent clicks (synthetic dblclick with
+          // no click events, e.g. in tests) stays allowed.
+          const now = performance.now();
+          const recent = recentClickTimesRef.current.filter(
+            (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
+          );
+          if (recent.length === 1) return;
+          setIsEditing(true);
+        }}
+        title={isMobile ? (conversation.title ?? conversation.id) : undefined}
+      >
+        {showHarness ? (
+          <>
+            <span className="flex size-4 shrink-0 items-center justify-center">
+              <SessionHarnessIcon
+                conversation={conversation}
+                testId="session-row-harness"
+                withFallback
+              />
+            </span>
+            <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
+          </>
+        ) : (
+          rowText
+        )}
+      </Link>
+    </div>
   );
 
   // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
@@ -5974,11 +6174,12 @@ function ConversationRowImpl({
       }}
       className={cn(
         "group relative overflow-hidden",
+        familyIndented && "ml-9",
         isDragging && "opacity-40",
         gesture.phase === "armed" && "z-10 motion-safe:scale-[1.01] shadow-sm",
         ownsPointer && "touch-none",
       )}
-<<<<<<<
+      data-sibling-session={familyIndented || undefined}
       // Keep vertical scrolling native while claiming the horizontal axis for
       // the swipe: without this the browser can take the horizontal pan (or
       // back-navigation gesture) and cancel the gesture mid-drag. Only where
@@ -5986,6 +6187,12 @@ function ConversationRowImpl({
       // Inline style, not utility classes — see the swipeTouchAction comment.
       style={!ownsPointer && swipeTouchAction ? { touchAction: swipeTouchAction } : undefined}
     >
+      {familyIndented && (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute -left-3 top-0 h-5 w-2 rounded-bl-md border-b border-l border-muted-foreground/40"
+        />
+      )}
       {/* Clip the hint to the vacated strip so it cannot overlap the moving
           surface. The threshold also scales the glyph, avoiding a color-only cue.
           Action colors switch immediately so reversals cannot inherit the old color. */}
@@ -6041,15 +6248,9 @@ function ConversationRowImpl({
             style={insertion === "before" ? { top: 0 } : { bottom: 0 }}
           />
         )}
-        {/* Right-click anywhere on the row opens the same actions as the kebab.
-          Suppressed in selection mode (bulk-select owns the row), where the
-          bare link is rendered instead. ContextMenuTrigger preventDefaults the
-          native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+        {/* Right-click opens row actions; selection mode uses a bare link.
+          With sidebar_grouping_ui off, pinned project rows use HoverCardTrigger
+          for the project flyout. */}
         {selectionMode ? (
           projectFlyoutName ? (
             <HoverCard openDelay={150} closeDelay={0}>
@@ -6057,7 +6258,7 @@ function ConversationRowImpl({
               <PinnedProjectFlyoutContent
                 title={conversation.title ?? conversation.id}
                 projectName={projectFlyoutName}
-                projectIcon={projectFlyoutIcon}
+                projectMark={projectMark}
                 gitBranch={gitBranch}
                 hasError={sessionState?.kind === "error"}
                 shared={showSharedIndicator}
@@ -6073,23 +6274,18 @@ function ConversationRowImpl({
                 hostsById={hostsById}
                 hasError={sessionState?.kind === "error"}
                 shared={showSharedIndicator}
+                projectName={projectTooltipName}
+                projectMark={projectMark}
               />
             </Tooltip>
           )
         ) : projectFlyoutName ? (
-=======
-      {/* Right-click opens row actions; selection mode uses a bare link.
-          With sidebar_grouping_ui off, pinned project rows use HoverCardTrigger
-          for the project flyout. */}
-      {selectionMode ? (
-        projectFlyoutName ? (
->>>>>>>
           <HoverCard openDelay={150} closeDelay={0}>
             {renderContextMenu(<HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>)}
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
-              projectIcon={projectIcon}
+              projectMark={projectMark}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
               shared={showSharedIndicator}
@@ -6110,7 +6306,7 @@ function ConversationRowImpl({
               hasError={sessionState?.kind === "error"}
               shared={showSharedIndicator}
               projectName={projectTooltipName}
-              projectIcon={projectIcon}
+              projectMark={projectMark}
             />
           </Tooltip>
         )}
@@ -6191,44 +6387,6 @@ function ConversationRowImpl({
         {!selectionMode && (
           <ContextMenu>
             <ContextMenuTrigger asChild>
-<<<<<<<
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-            projectIcon={projectIcon}
-            gitBranch={gitBranch}
-            hasError={sessionState?.kind === "error"}
-            shared={showSharedIndicator}
-          />
-        </HoverCard>
-      ) : isMobile ? (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      ) : (
-        <Tooltip>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <div className="w-full">
-                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-=======
               <div
                 data-testid="conversation-row-controls"
                 className={cn(
@@ -6240,7 +6398,7 @@ function ConversationRowImpl({
                   // inert until the same hover/focus/open state that reveals them —
                   // the section headers' controls use the identical gate.
                   "fine-hover:md:pointer-events-none",
-                  "fine-hover:md:group-hover:pointer-events-auto fine-hover:md:group-has-[:focus-visible]:pointer-events-auto fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+                  "fine-hover:md:group-hover:pointer-events-auto fine-hover:md:group-has-[:focus-visible]:pointer-events-auto fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
                   "group-has-[[data-session-shortcut-hint]]:hidden",
                 )}
               >
@@ -6347,7 +6505,6 @@ function ConversationRowImpl({
                     />
                   </DropdownMenuContent>
                 </DropdownMenu>
->>>>>>>
               </div>
             </ContextMenuTrigger>
             <ContextMenuContent className="min-w-44">
@@ -6358,259 +6515,11 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-<<<<<<<
-          <SessionTooltipContent
-            conversation={conversation}
-            hostsById={hostsById}
-            hasError={sessionState?.kind === "error"}
-            shared={showSharedIndicator}
-            projectName={projectTooltipName}
-            projectIcon={projectIcon}
-          />
-        </Tooltip>
-      )}
-      {selectionMode ? (
-        <span
-          className={cn(
-            "-translate-y-1/2 pointer-events-none absolute left-2 flex items-center",
-            overlayTop,
-          )}
-        >
-          {isSelected ? (
-            <SquareCheckIcon className="size-4 text-primary" />
-          ) : (
-            <SquareIcon className="size-4 text-muted-foreground" />
-          )}
-        </span>
-      ) : hasSessionIndicator ? (
-        <span
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            overlayTop,
-            "right-1",
-            // The wide "awaiting" pill keeps its natural width; every other
-            // marker (running/starting/unseen dot, or the draft pencil) sits in
-            // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
-          )}
-        >
-          {sessionState !== null ? (
-            <SessionStateBadge state={sessionState} />
-          ) : (
-            <span
-              role="img"
-              aria-label="Draft"
-              data-testid="conversation-draft-indicator"
-              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
-            >
-              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
-            </span>
-          )}
-        </span>
-      ) : showUpdated ? (
-        <span
-          data-testid="session-row-updated"
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            overlayTop,
-            "right-2 text-sm text-muted-foreground",
-          )}
-        >
-          <SessionUpdatedLabel updatedAt={conversation.updated_at} />
-        </span>
-      ) : null}
-      {!selectionMode && showSharedIndicator && (
-        <span
-          role="img"
-          // The row's hover surface carries the visible explanation.
-          aria-label="Shared with others"
-          // Shares the state slot's classes so it fades on every trigger the
-          // badge does (hover, focus, open menu, shortcut hint).
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            SESSION_STATE_DOT_SLOT_CLASS,
-            "shrink-0 text-muted-foreground",
-            overlayTop,
-            trailingLayout.sharedIcon,
-          )}
-        >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-        </span>
-      )}
-      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
-          row, so their spacing is defined once (gap-0.5) and stays aligned
-          with the project-folder header actions, which use the same pattern.
-          The kebab is the rightmost child (pinned to right-1); the pin sits a
-          gap to its left. Hidden entirely while selecting (bulk mode owns the
-          row controls). */}
-      {!selectionMode && (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>
-            <div
-              className={cn(
-                "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
-                overlayTop,
-                "group-has-[[data-session-shortcut-hint]]:hidden",
-              )}
-            >
-              {/* Archived rows omit the pin entirely: pinning is meaningless there
-              (archive outranks pin), so there's no pin action even on hover. */}
-              {!isArchived && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent
-                    shortcut={
-                      sessionShortcuts.has("toggle-pin-session") ? PIN_SESSION_KEYS : undefined
-                    }
-                  >
-                    {pinTooltip}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                      data-testid="quick-pin-conversation"
-                      aria-disabled={pinSaving || (!isPinned && atPinCap)}
-                      className={cn(
-                        // Desktop-only quick affordance: hidden on mobile (the kebab's
-                        // Pin item below covers that), hover/focus-revealed from `md`
-                        // up. Pinned rows no longer keep a persistent pin marker, since
-                        // the "Pinned" section header (and pinned-first ordering inside
-                        // a project) already conveys the pinned state. Revealed glyph:
-                        // unpin if pinned, pin otherwise.
-                        //
-                        // `md:inline-flex` (not `md:block`): the Button base is
-                        // `inline-flex` and relies on it for `items-center
-                        // justify-center` to center the icon. `md:block` would override
-                        // that display and collapse the centering, leaving the glyph
-                        // pinned to the top-left of the button — so keep the flex
-                        // display when revealing it.
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (pinSaving) return;
-                        onTogglePinned(conversation.id);
-                      }}
-                    >
-                      {isPinned ? (
-                        <PinOffIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <PinIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-              {/* Archive is owner-only, same as the kebab's Archive item; non-owners
-              don't get the quick affordance and instead see that item disabled
-              with an explanation. */}
-              {isOwner && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent
-                    shortcut={
-                      sessionShortcuts.has("archive-session") ? ARCHIVE_SESSION_KEYS : undefined
-                    }
-                  >
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                      data-testid="quick-archive-conversation"
-                      className={cn(
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (!isArchived) {
-                          runArchive();
-                        } else {
-                          runUnarchive();
-                        }
-                      }}
-                    >
-                      {isArchived ? (
-                        <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-
-              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Conversation actions"
-                    data-testid="conversation-actions"
-                    // Desktop-only: the chat page's own header menu covers these
-                    // per-session actions on mobile, so the row kebab is dropped
-                    // there. From `md` up it stays hidden until hover / keyboard
-                    // focus, with `aria-expanded` keeping it surfaced while the menu
-                    // is open so the trigger doesn't vanish under the cursor.
-                    className={cn(
-                      "text-muted-foreground transition-opacity",
-                      "hidden md:inline-flex",
-                      "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                      "md:aria-expanded:opacity-100",
-                    )}
-                    onClick={(e) => {
-                      // Keep the trigger click from bubbling into the Link.
-                      e.preventDefault();
-                      e.stopPropagation();
-                    }}
-                  >
-                    <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-44">
-                  <ConversationMenuItems
-                    components={dropdownBundle}
-                    setMenuOpen={setMenuOpen}
-                    {...menuItemProps}
-                  />
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      )}
-      {shortcutSlot !== undefined && (
-        <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
-      )}
-=======
         )}
         {shortcutSlot !== undefined && (
           <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
         )}
       </div>
->>>>>>>
       {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
       {shareOpen && (
@@ -6813,6 +6722,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "blocked_on",
   "provisional",
   "shared_with_others",
+  "family",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -6829,6 +6739,8 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
 // are stabilized at the list owner so they don't defeat it.
 const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
+    prev.familyIndented === next.familyIndented &&
+    prev.familyExpanded === next.familyExpanded &&
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
     prev.gridSelected === next.gridSelected &&
@@ -6893,14 +6805,14 @@ function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: s
 function PinnedProjectFlyoutContent({
   title,
   projectName,
-  projectIcon,
+  projectMark,
   gitBranch,
   hasError,
   shared,
 }: {
   title: string;
   projectName: string;
-  projectIcon: string | null;
+  projectMark: ProjectAppearance | null;
   gitBranch: string | null;
   hasError: boolean;
   shared: boolean;
@@ -6918,7 +6830,11 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <ProjectRowIcon icon={projectIcon} />
+        <ProjectRowIcon
+          icon={projectMark?.icon}
+          lucideIcon={projectMark?.lucideIcon}
+          color={projectMark?.color}
+        />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
@@ -6940,14 +6856,15 @@ function ProjectFolderActions({
   projectName,
   onNavigate,
   actions,
+  showOnTouch,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  showOnTouch: boolean;
 }) {
-  // Touch devices of any width reach these through the header's long-press menu.
   return (
-    <div className="hidden items-center gap-0.5 fine-hover:flex">
+    <div className="flex items-center gap-0.5">
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -6956,7 +6873,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="text-muted-foreground"
+            className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -6971,7 +6888,12 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        actions={actions}
+        showOnTouch={showOnTouch}
+      />
     </div>
   );
 }
@@ -7081,47 +7003,53 @@ function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
   icon?: string | null,
+  color?: string | null,
+  lucideIcon?: string | null,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const menuOpenedDialogRef = useRef(false);
-  // The icon staged in the rename modal, committed only on Confirm:
-  //   undefined = untouched (show the saved icon), string = a picked emoji,
-  //   null = staged removal. Reset to `undefined` each time the modal opens.
-  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
+  // The mark staged in the rename modal, committed only on Confirm; undefined
+  // while untouched (shows the saved mark). Reset each time the modal opens.
+  const [pendingAppearance, setPendingAppearance] = useState<ProjectAppearance | undefined>(
+    undefined,
+  );
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
   const updateConfig = useUpdateProjectConfig();
   // Fetch the full config only while the menu or rename modal is open, so we can
-  // merge the icon onto the other stored defaults (host / workspace / agent)
+  // merge the mark onto the other stored defaults (host / workspace / agent)
   // without a per-folder request on every sidebar render — and without wiping
   // those defaults on save.
   const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
     menuOpen || renameOpen ? projectId : null,
   );
-  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
+  // The config PATCH replaces the whole blob, so a MARK save must merge onto a
   // fully-loaded config or it silently wipes the other defaults. "Ready" means
   // the config actually resolved (`!== undefined` — `isLoading` alone is false
   // on a query *error* too, leaving no data to merge onto) — except a
   // label-only folder (`projectId === null`), whose base is legitimately `{}`.
-  // This gates only the icon path; renaming the name never needs the config.
+  // This gates only the mark path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
-  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
-  // What the modal's tile shows: the staged pick when touched, else the saved
-  // icon. `null` (staged removal) renders as the empty folder.
-  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
+  const savedAppearance = projectAppearance(
+    iconConfig ?? {
+      icon: icon ?? undefined,
+      lucide_icon: lucideIcon ?? undefined,
+      color: color ?? undefined,
+    },
+  );
+  const displayAppearance = pendingAppearance ?? savedAppearance;
 
   const actions = useMemo<ProjectFolderMenuActions>(
     () => ({
       openRename: () => {
         menuOpenedDialogRef.current = true;
         setRenameValue(projectName);
-        setPendingIcon(undefined);
+        setPendingAppearance(undefined);
         setRenameOpen(true);
       },
       openSettings: () => {
@@ -7155,20 +7083,6 @@ function useProjectFolderMenu(
             renameInputRef.current?.focus();
             renameInputRef.current?.select();
           }}
-          // emoji-mart preventDefaults the pointer event, so Radix's own
-          // outside-dismissal never fires for clicks elsewhere in the modal.
-          // Catch them in the capture phase and close the picker ourselves,
-          // unless the pointer is inside the picker or on its trigger tile.
-          onPointerDownCapture={(e) => {
-            if (!emojiOpen) return;
-            const target = e.target as Element;
-            if (
-              target.closest('[data-slot="popover-content"]') ||
-              target.closest('[data-testid="rename-project-icon"]')
-            )
-              return;
-            setEmojiOpen(false);
-          }}
         >
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
@@ -7181,118 +7095,60 @@ function useProjectFolderMenu(
               e.preventDefault();
               const newName = renameValue.trim();
               const nameChanged = newName !== "" && newName !== projectName;
-              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
-              // Only the icon write needs a loaded config to merge onto; a
+              const appearanceChanged =
+                pendingAppearance !== undefined &&
+                !sameProjectAppearance(pendingAppearance, savedAppearance);
+              // Only the mark write needs a loaded config to merge onto; a
               // name-only rename must proceed even if the config fetch failed.
-              if (iconChanged && !configReady) return;
+              if (appearanceChanged && !configReady) return;
               try {
                 // Name first: it promotes a label-only folder (creating the
                 // first-class row) and reconciles members. Capture the resolved
-                // id so the icon write below targets that row — passing the
+                // id so the mark write below targets that row — passing the
                 // stale render-time `null` would make the config write try to
                 // create the project a second time and 409 on the duplicate.
+                // Promoting a label-only folder carries the mark in its create:
+                // a follow-up PATCH would replace the create's config (its color).
+                const markInCreate = nameChanged && projectId === null && appearanceChanged;
                 let targetId = projectId;
                 if (nameChanged) {
                   targetId = await renameProject.mutateAsync({
                     id: projectId,
                     oldName: projectName,
                     newName,
+                    config:
+                      markInCreate && pendingAppearance
+                        ? withProjectAppearance({}, pendingAppearance)
+                        : undefined,
                   });
                 }
-                if (iconChanged) {
-                  const next = { ...(iconConfig ?? {}) };
-                  if (pendingIcon === null) delete next.icon;
-                  else next.icon = pendingIcon;
+                if (appearanceChanged && !markInCreate && pendingAppearance) {
                   await updateConfig.mutateAsync({
                     id: targetId,
                     name: nameChanged ? newName : projectName,
-                    config: next,
+                    config: withProjectAppearance(iconConfig ?? {}, pendingAppearance),
                   });
                 }
               } catch {
                 // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
+                // lands before a failed mark write is already persisted; only
+                // the mark needs retrying.
                 return;
               }
               setRenameOpen(false);
               setMenuOpen(false);
             }}
           >
-            {/* One combined control: emoji tile (left) + name (right) share a
-                single border, so it reads as a single input. The tile opens a
-                picker popover; the pick is staged and committed on Confirm. */}
+            {/* One combined control: the mark tile (left) + name (right) share
+                a single border, so it reads as a single input. The tile opens
+                the color / emoji picker; the pick is committed on Confirm. */}
             <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="Change project icon"
-                    data-testid="rename-project-icon"
-                    disabled={!configReady}
-                    className={cn(
-                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
-                      displayIcon ? "bg-muted" : "bg-tag-pink",
-                    )}
-                  >
-                    {displayIcon ? (
-                      <span className="text-xl leading-none">{displayIcon}</span>
-                    ) : (
-                      <SmilePlusIcon className="size-4 text-brand-accent" />
-                    )}
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent
-                  align="start"
-                  // Publish the collision-aware available viewport height (Radix
-                  // exposes it as a CSS var), less the optional "Remove icon"
-                  // header and capped at the picker's natural size, so the
-                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
-                  // fit — it then scrolls its grid internally (nav + search
-                  // pinned) instead of clipping on short screens.
-                  collisionPadding={8}
-                  style={
-                    {
-                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
-                    } as CSSProperties
-                  }
-                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-                  // The rename Dialog's scroll lock (react-remove-scroll)
-                  // preventDefaults wheel events over the picker — it can't see
-                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
-                  // from reaching the document-level lock so the grid scrolls.
-                  onWheel={(e) => e.stopPropagation()}
-                  // Nested in the rename Dialog, emoji-mart's own focus handling
-                  // swallows Radix's default outside-pointer dismissal, so a
-                  // click elsewhere in the modal wouldn't close the picker.
-                  // Close it explicitly on any outside interaction.
-                >
-                  {displayIcon ? (
-                    <div className="shrink-0 border-b p-1">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="w-full justify-start"
-                        data-testid="rename-project-remove-icon"
-                        onClick={() => {
-                          setPendingIcon(null);
-                          setEmojiOpen(false);
-                        }}
-                      >
-                        <Trash2Icon className="size-3.5" />
-                        Remove icon
-                      </Button>
-                    </div>
-                  ) : null}
-                  <EmojiPicker
-                    onSelect={(native) => {
-                      setPendingIcon(native);
-                      setEmojiOpen(false);
-                    }}
-                  />
-                </PopoverContent>
-              </Popover>
+              <ProjectAppearanceButton
+                value={displayAppearance}
+                onChange={setPendingAppearance}
+                disabled={!configReady}
+                testId="rename-project-icon"
+              />
               <input
                 ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
@@ -7302,8 +7158,8 @@ function useProjectFolderMenu(
             </div>
             {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
-                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
-                changing the icon is unavailable until this loads.
+                Couldn&apos;t load this project&apos;s color and icon. You can still rename it;
+                changing them is unavailable until this loads.
               </p>
             )}
             {(renameProject.isError || updateConfig.isError) && (
@@ -7404,13 +7260,17 @@ function ProjectFolderMenu({
   projectName,
   onNavigate,
   actions,
+  showOnTouch,
 }: {
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  showOnTouch: boolean;
 }) {
+  const [open, setOpen] = useState(false);
+  const pressPointerRef = useRef<"mouse" | "touch" | null>(null);
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <Button
           type="button"
@@ -7418,8 +7278,26 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="text-muted-foreground"
-          onClick={(e) => e.stopPropagation()}
+          className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
+          onPointerDown={(e) => {
+            // Only treat as touch if explicitly a touch or pen event; default to mouse.
+            const isTouchLike = e.pointerType === "touch" || e.pointerType === "pen";
+            pressPointerRef.current = isTouchLike ? "touch" : "mouse";
+            // Touch and pen skip Radix's press toggle so a scroll start never opens the menu.
+            if (isTouchLike) e.preventDefault();
+          }}
+          onPointerCancel={() => {
+            pressPointerRef.current = null;
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            // Mouse presses already toggled and touch taps toggle here; keyboard and
+            // assistive-tech clicks (detail 0) only open, so a Space click is a no-op.
+            const press = e.detail > 0 ? pressPointerRef.current : null;
+            pressPointerRef.current = null;
+            if (press === "touch") setOpen((wasOpen) => !wasOpen);
+            else if (press === null) setOpen(true);
+          }}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
         </Button>
@@ -7470,7 +7348,7 @@ function ProjectPickerMenu({
   // Offer create only when the typed name isn't already an exact project.
   const canCreate =
     trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
-  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
+  const current = projects.find((p) => p.name === currentProject);
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -7498,7 +7376,7 @@ function ProjectPickerMenu({
             textValue={p.name}
             onSelect={() => onSelect(p.name)}
           >
-            <ProjectRowIcon icon={p.icon} />
+            <ProjectRowIcon icon={p.icon} lucideIcon={p.lucide_icon} color={p.color} />
             <span className="flex-1 truncate text-left">{p.name}</span>
             {currentProject === p.name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -7527,7 +7405,11 @@ function ProjectPickerMenu({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={currentProjectIcon} />
+            <ProjectRowIcon
+              icon={current?.icon}
+              lucideIcon={current?.lucide_icon}
+              color={current?.color}
+            />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
@@ -7649,8 +7531,17 @@ function BulkActionBar({
     );
   }
 
+  const canMoveSelection =
+    ownedSelected.length > 0 &&
+    ownedSelected.every(
+      (row) =>
+        !isIndentedSibling(row) ||
+        ownedSelected.some((other) => other.id === row.family?.representative_id),
+    );
+
   function handleMoveToProject(project: string) {
-    const ids = ownedSelected.map((c) => c.id);
+    if (!canMoveSelection) return;
+    const ids = ownedSelected.filter((row) => !isIndentedSibling(row)).map((c) => c.id);
     if (ids.length === 0) return;
     bulkMove.mutate(
       { ids, project },
@@ -7849,7 +7740,7 @@ function BulkActionBar({
                         type="button"
                         variant="ghost"
                         size="icon-xs"
-                        disabled={isBusy || ownedSelected.length === 0}
+                        disabled={isBusy || !canMoveSelection}
                         aria-label="Move to project"
                         data-testid="bulk-move-to-project"
                       >
