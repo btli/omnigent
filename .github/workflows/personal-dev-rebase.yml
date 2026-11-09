@@ -31,7 +31,7 @@ concurrency:
 jobs:
   rebase:
     if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Same PAT protection as the composes; the push touches no workflow
     # files, so the github.token fallback works too when no PAT is set.
     environment: staging-push
@@ -174,7 +174,7 @@ jobs:
   alert-failure:
     needs: rebase
     if: failure() && github.repository == 'btli/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Notify Home Assistant

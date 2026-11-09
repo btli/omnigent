@@ -55,7 +55,7 @@ jobs:
       && (github.event_name != 'status'
         || (github.event.context == 'soak/homelab' && github.event.state != 'pending'
           && vars.SOAK_STATUS_LOGIN != ''))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -92,7 +92,7 @@ jobs:
     concurrency:
       group: personal-promote
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: staging-push
     timeout-minutes: 30
     permissions:
@@ -448,7 +448,7 @@ jobs:
   alert-failure:
     needs: [test-promote, promote]
     if: (failure() || cancelled()) && github.repository == 'btli/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Notify Home Assistant
