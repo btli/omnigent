@@ -51,6 +51,21 @@ rebases it, never recomposes it). Nothing here flips any existing behavior.
 
 ## Hourly staging refresh (`personal-staging-hourly.yml`)
 
+### Incomplete image recovery
+
+`personal-image-recovery.yml` checks every 20 minutes for the newest published
+nightly missing `build-complete.json`. After a 30-minute grace period it
+dispatches a missing image run or retries the failed jobs of an existing run.
+It waits while any image publication is active, counts manual runs and reruns
+together, and stops red after three attempts. A successful image run without
+the completion marker also needs operator investigation. Completed nightlies
+are never rebuilt; migration and soak gates remain in force.
+
+Kiro, Antigravity, and GitHub CLI downloads in the image use bounded curl
+retries for transient network errors, with checksums still required. A
+migration test failure needs a code fix and is never treated as permission
+to skip the tests.
+
 `Personal Staging Hourly` (cron `17 0-9,11-23 * * *`, plus `workflow_dispatch`)
 keeps branch `staging` fresh between nightlies. The odd minute is
 deliberate: GitHub delays or drops runs scheduled on the congested `:00` minute. It runs the same composer

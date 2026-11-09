@@ -22,7 +22,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     outputs:
       server_digest: ${{ steps.build-server.outputs.digest }}
@@ -222,7 +222,7 @@ jobs:
 
   promote-channel:
     needs: [build-and-push, native-host-check]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       packages: write

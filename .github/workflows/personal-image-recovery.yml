@@ -1,0 +1,29 @@
+name: Recover personal nightly images
+
+on:
+  schedule:
+    - cron: "13,33,53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: personal-image-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Recover incomplete image publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/personal-staging/recover_images.py

@@ -42,7 +42,7 @@ jobs:
   # collect .github/scripts/**, hence the explicit run here).
   test-composer:
     if: github.repository == 'btli/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -80,7 +80,7 @@ jobs:
     # can't stop a malicious ref — the keystore's real protection is the
     # server-enforced staging-signing Environment on android-sign.
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: staging-push
     timeout-minutes: 20
     permissions:
@@ -207,7 +207,7 @@ jobs:
     # An incomplete composition never builds; the skip cascades to android-build,
     # android-sign, desktop-build and publish.
     if: needs.integrate.outputs.complete == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout the staging commit
@@ -263,7 +263,7 @@ jobs:
   composition-gate:
     needs: integrate
     if: needs.integrate.result == 'success' && needs.integrate.outputs.complete != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:
@@ -301,7 +301,7 @@ jobs:
     needs: integrate
     if: always() && needs.integrate.result == 'success'
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: read
@@ -430,7 +430,7 @@ jobs:
   android-build:
     needs: [integrate, verify]
     # Build only after the ring composition and the web bundle succeed.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
       run:
@@ -516,7 +516,7 @@ jobs:
   android-sign:
     needs: android-build
     if: always() && needs.android-build.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Server-enforced gate for the keystore secrets: the staging-signing
     # Environment carries the OMNIGENT_DEBUG_* secrets and a main-only
@@ -636,7 +636,7 @@ jobs:
   # right-click-Open or an xattr quarantine strip; fine for self-testing.
   desktop-build:
     needs: [integrate, verify]
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Checkout the staging commit
@@ -716,7 +716,7 @@ jobs:
       && needs.desktop-build.result == 'success'
       && needs.integrate.outputs.complete == 'true'
       && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: staging-push
     timeout-minutes: 15
     permissions:
@@ -852,7 +852,7 @@ jobs:
   alert-failure:
     needs: [test-composer, integrate, verify, android-build, android-sign, desktop-build, publish]
     if: (failure() || cancelled()) && github.repository == 'btli/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:

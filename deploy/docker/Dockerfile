@@ -305,7 +305,7 @@ RUN set -eu; \
       aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
       *) echo "ERROR: unsupported arch '$(uname -m)' for kiro-cli" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
+    curl -fsSL --retry 5 --retry-connrefused --connect-timeout 20 --max-time 300 -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
     echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
     unzip -q /tmp/kiro.zip -d /tmp/kiro; \
     KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
@@ -356,7 +356,7 @@ RUN set -eu; \
       *) echo "ERROR: unsupported arch '$arch' for agy" >&2; exit 1 ;; \
     esac; \
     url="https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${asset}"; \
-    curl -fsSL -o /tmp/agy.tar.gz "$url"; \
+    curl -fsSL --retry 5 --retry-connrefused --connect-timeout 20 --max-time 300 -o /tmp/agy.tar.gz "$url"; \
     echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/agy.tar.gz -C /tmp antigravity; \
     install -m 0755 /tmp/antigravity /usr/local/bin/agy; \
@@ -387,7 +387,7 @@ RUN set -eu; \
       *) echo "ERROR: unsupported arch '$arch' for gh" >&2; exit 1 ;; \
     esac; \
     asset="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
-    curl -fsSL -o /tmp/gh.tar.gz \
+    curl -fsSL --retry 5 --retry-connrefused --connect-timeout 20 --max-time 300 -o /tmp/gh.tar.gz \
       "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${asset}"; \
     echo "${sha}  /tmp/gh.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
