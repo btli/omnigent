@@ -395,6 +395,7 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { useHarnessLabels } from "@/lib/agentLabels";
 import { nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
+import { isHeadlessCliHarness } from "@/lib/agentGrouping";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import {
   getPullRequestStatus,
@@ -6335,7 +6336,11 @@ function SessionTooltipContent({
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
         <span aria-hidden>·</span>
-        <SessionHarnessIcon conversation={conversation} testId="session-tooltip-harness" />
+        <SessionHarnessIcon
+          conversation={conversation}
+          testId="session-tooltip-harness"
+          withFallback={isHeadlessCliHarness({ harness: conversation.harness ?? null })}
+        />
         {!showRunnerStats && (
           <span
             data-testid="session-tooltip-location"
