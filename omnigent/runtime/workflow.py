@@ -170,7 +170,15 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk",
+    "codex",
+    "genie",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+    "goose",
 ]
 
 
@@ -224,6 +232,20 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_CODEX_GATEWAY_HOST",
         auth_key="HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+        catalog_family="openai",
+    ),
+    # Genie is Databricks' codex fork; same gateway transport as codex, its
+    # own ``HARNESS_GENIE_*`` env vars. ``agent_name="genie"`` means a host
+    # with no ucode ``genie`` agent simply skips ucode enrichment.
+    "genie": UcodeHarnessConfig(
+        agent_name="genie",
+        model_key="HARNESS_GENIE_MODEL",
+        base_url_key="HARNESS_GENIE_GATEWAY_BASE_URL",
+        base_url_family="codex",
+        base_urls_key=None,
+        host_key="HARNESS_GENIE_GATEWAY_HOST",
+        auth_key="HARNESS_GENIE_GATEWAY_AUTH_COMMAND",
+        refresh_key="HARNESS_GENIE_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="openai",
     ),
     "pi": UcodeHarnessConfig(
@@ -365,24 +387,64 @@ def configure_agent_harness_with_ucode(
         )
 
 
+def _signer_configuration_error(
+    harness_type: Literal["codex", "genie"],
+    reason: Literal["auth_command", "worker_egress", "profile", "state"],
+) -> OmnigentError:
+    """Fixed public guidance for a signer-backed setup failure, named for its harness.
+
+    Genie signs the same ``codex`` gateway route as Codex but reads its own
+    ``HARNESS_GENIE_*`` overrides, so its guidance names Genie.
+    """
+    if harness_type == "codex":
+        return CodexSignerConfigurationError(reason)
+    if reason == "auth_command":
+        return HarnessConfigurationError(
+            "signer-backed Genie conflicts with HARNESS_GENIE_GATEWAY_AUTH_COMMAND; "
+            "remove that environment override and retry."
+        )
+    if reason == "worker_egress":
+        return HarnessConfigurationError(
+            "signer-backed Genie does not support os_env.sandbox.egress_rules or tcp_egress; "
+            "brokered sessions are model-only. Remove those worker egress declarations "
+            "and use model_egress for model routes."
+        )
+    if reason == "profile":
+        return HarnessConfigurationError(
+            "signer-backed Genie requires an explicit Databricks profile. "
+            "Set the Databricks provider's 'profile' and retry."
+        )
+    return HarnessConfigurationError(
+        "signer-backed Genie requires configured provider state. "
+        "Run the provider's Codex setup and retry."
+    )
+
+
 def _configure_brokered_codex_with_ucode(
     env: dict[str, str],
     spec: AgentSpec,
     provider: ProviderEntry,
+    *,
+    harness_type: Literal["codex", "genie"] = "codex",
 ) -> None:
     """Bind the supported Databricks Codex route to signer-only authority.
 
     A spec without an active sandbox runs on the platform sandbox, and one
     without a ``model_egress`` grant gets the provider's single model route.
+
+    :param harness_type: ``"genie"`` writes the same keys under
+        ``HARNESS_GENIE_*``. Genie speaks the Codex Responses API, so it signs
+        the ucode ``codex`` agent's route.
     """
     import dataclasses
 
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.sandbox import _default_sandbox_for_platform
 
+    prefix = f"HARNESS_{harness_type.upper()}"
     profile = provider.profile
-    if os.environ.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"):
-        raise CodexSignerConfigurationError("auth_command")
+    if os.environ.get(f"{prefix}_GATEWAY_AUTH_COMMAND"):
+        raise _signer_configuration_error(harness_type, "auth_command")
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     if sandbox is None or sandbox.type == "none":
         platform_sandbox = _default_sandbox_for_platform()
@@ -393,22 +455,20 @@ def _configure_brokered_codex_with_ucode(
         )
         if spec.os_env is None:
             # Worker only: a spec without os_env has no OS tools to contain.
-            env["HARNESS_CODEX_OS_ENV"] = json.dumps(
-                dataclasses.asdict(OSEnvSpec(sandbox=sandbox))
-            )
+            env[f"{prefix}_OS_ENV"] = json.dumps(dataclasses.asdict(OSEnvSpec(sandbox=sandbox)))
         else:
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
     if sandbox.egress_rules or sandbox.tcp_egress:
-        raise CodexSignerConfigurationError("worker_egress")
+        raise _signer_configuration_error(harness_type, "worker_egress")
     if not profile:
-        raise CodexSignerConfigurationError("profile")
+        raise _signer_configuration_error(harness_type, "profile")
     workspace_url = get_workspace_url_for_profile(profile)
     state = read_ucode_state(workspace_url) if workspace_url is not None else None
     agent_state = state.agent("codex") if state is not None else None
     endpoint = agent_state.base_url if agent_state is not None else None
     if state is None or endpoint is None:
-        raise CodexSignerConfigurationError("state")
+        raise _signer_configuration_error(harness_type, "state")
     assert agent_state is not None
     try:
         binding = registered_model_provider_binding(
@@ -422,17 +482,17 @@ def _configure_brokered_codex_with_ucode(
     model_egress = spec.model_egress or [
         f"{route.method} {route.host}{route.path}" for route in binding.maximum_routes
     ]
-    if "HARNESS_CODEX_MODEL" not in env:
-        env["HARNESS_CODEX_MODEL"] = agent_state.model or _resolve_catalog_default_model(
+    if f"{prefix}_MODEL" not in env:
+        env[f"{prefix}_MODEL"] = agent_state.model or _resolve_catalog_default_model(
             "databricks",
             "openai",
-            context="ucode 'codex' signer",
+            context=f"ucode {harness_type!r} signer",
         )
-    env["HARNESS_CODEX_SIGNER_PROVIDER"] = UCODE_SIGNER_BINDING_ID
-    env["HARNESS_CODEX_SIGNER_ENDPOINT"] = endpoint
-    env["HARNESS_CODEX_GATEWAY_HOST"] = state.workspace_host
-    env["HARNESS_CODEX_DATABRICKS_PROFILE"] = profile
-    env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(model_egress)
+    env[f"{prefix}_SIGNER_PROVIDER"] = UCODE_SIGNER_BINDING_ID
+    env[f"{prefix}_SIGNER_ENDPOINT"] = endpoint
+    env[f"{prefix}_GATEWAY_HOST"] = state.workspace_host
+    env[f"{prefix}_DATABRICKS_PROFILE"] = profile
+    env[f"{prefix}_MODEL_EGRESS"] = json.dumps(model_egress)
 
 
 def _inject_ucode_agent_state(
@@ -488,6 +548,7 @@ def _inject_ucode_agent_state(
 _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
+    "genie": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
@@ -506,6 +567,7 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
 _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
+    "genie": "HARNESS_GENIE_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
     "qwen": "HARNESS_QWEN_GATEWAY",
 }
@@ -526,6 +588,7 @@ _PI_FAMILY_KEY: dict[str, str] = {
 _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE",
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
+    "genie": "HARNESS_GENIE_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
@@ -1781,6 +1844,63 @@ def _build_codex_spawn_env(
     if retry_payload is not None:
         env["HARNESS_CODEX_RETRY_POLICY"] = retry_payload
     _apply_harness_path_override(env, "codex")
+    return env
+
+
+def _build_genie_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the genie harness wrap reads.
+
+    Same shape as :func:`_build_codex_spawn_env` (genie is Databricks' codex
+    fork), keyed by the ``HARNESS_GENIE_*`` vars in
+    ``omnigent/inner/genie_harness.py``. A Databricks provider is brokered
+    exactly as for codex. Genie has no login of its own, so a launch with no
+    usable provider fails here instead of letting the executor pick the
+    default ``~/.databrickscfg`` profile. Codex's dismissed-``config.toml``
+    provider handling has no genie equivalent.
+
+    :param spec: The agent spec.
+    :param cwd: Session workspace, threaded as ``HARNESS_GENIE_CWD``.
+    :param workdir: The bundle's on-disk path, threaded as
+        ``HARNESS_GENIE_BUNDLE_DIR`` so bundled skills are discovered.
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    :raises OmnigentError: If no provider genie can use resolves.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_GENIE_MODEL"] = model
+    provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
+    if provider is None or provider.kind == SUBSCRIPTION_KIND:
+        raise OmnigentError(
+            "The 'genie' harness needs a Databricks workspace or an OpenAI-compatible "
+            f"provider. Run `{cli_invocation()} setup` and add one for Genie.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if provider.kind == DATABRICKS_KIND:
+        _configure_brokered_codex_with_ucode(env, spec, provider, harness_type="genie")
+    else:
+        configure_agent_harness_with_provider(env, provider, harness_type="genie")
+    env["HARNESS_GENIE_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_GENIE_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_GENIE_CWD"] = str(cwd)
+    if workdir is not None:
+        env["HARNESS_GENIE_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_GENIE_OS_ENV"] = os_env_payload
+    retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
+    if retry_payload is not None:
+        env["HARNESS_GENIE_RETRY_POLICY"] = retry_payload
+    _apply_harness_path_override(env, "genie")
     return env
 
 
