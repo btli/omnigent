@@ -1,3 +1,4 @@
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
 import {
   codeMirrorComposerLoad,
@@ -6465,6 +6466,27 @@ describe("NewChatLandingScreen", () => {
       true,
     );
     expect(screen.getByText("No agents")).toBeTruthy();
+  });
+
+  it("keeps Genie's list row mono while its composer chip draws the gradient", () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("g1", "genie", { display_name: "Genie", harness: "genie" }),
+    ]);
+    localStorage.setItem(LAST_AGENT_KEY, "g1");
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-agent-icon").querySelector("img")).toHaveAttribute(
+      "src",
+      genieCodeLogo,
+    );
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    if (screen.queryByTestId("new-chat-landing-agent-g1") == null) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    }
+    const row = screen.getByTestId("new-chat-landing-agent-g1");
+    expect(row.querySelector(`img[src="${genieCodeLogo}"]`)).toBeNull();
+    expect(row.querySelector('svg[fill="currentColor"]')).toBeTruthy();
   });
 
   it("orders native built-ins together in the agent picker", () => {
