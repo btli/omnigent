@@ -111,6 +111,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { iconForAgent } from "@/components/agentIcon";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
@@ -302,6 +303,7 @@ import {
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
 import {
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   partitionPickerEntries,
   selectableSessionAgents,
@@ -1127,6 +1129,7 @@ const COMPOSER_HARNESS_ICONS: Record<
   string,
   { src: string; invertInDark: boolean; className?: string }
 > = {
+  genie: { src: genieCodeLogo, invertInDark: false },
   claude: {
     src: claudeCodeLogo,
     invertInDark: false,
@@ -1168,7 +1171,8 @@ export function ComposerAgentIcon({
     );
   }
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-  const product = nativeAgent ? COMPOSER_HARNESS_ICONS[nativeAgent.iconKind] : undefined;
+  const iconKind = agent.harness === "genie" ? "genie" : nativeAgent?.iconKind;
+  const product = iconKind ? COMPOSER_HARNESS_ICONS[iconKind] : undefined;
   const FallbackIcon = iconForAgent(agent);
   return product ? (
     <img
@@ -1541,6 +1545,9 @@ export function AgentHarnessPicker({
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
+    // Genie's gradient marks the chosen harness; its list row stays mono like
+    // its "Other..." siblings.
+    const ListGlyph = isHeadlessCliHarness(agent) ? iconForAgent(agent) : null;
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const details = active
       ? triggerDetails
@@ -1581,7 +1588,13 @@ export function AgentHarnessPicker({
           setFocusConfigAgentId((current) => (current === agent.id ? null : current));
         }}
         testId={`new-chat-landing-agent-${agent.id}`}
-        icon={<ComposerAgentIcon agent={agent} />}
+        icon={
+          ListGlyph ? (
+            <ListGlyph className="size-4 shrink-0" aria-hidden="true" />
+          ) : (
+            <ComposerAgentIcon agent={agent} />
+          )
+        }
         label={agent.display_name}
         summary={summary}
         description={blurb}
