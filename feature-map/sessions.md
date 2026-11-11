@@ -98,6 +98,10 @@ the header menu), and each place is a separate entry point.
   [session orchestration](session-orchestration.md)).
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+  Agents rename projects and set their emoji with `sys_project_update`, and
+  rename, pin or archive
+  sessions with `sys_session_update` (see
+  [session orchestration](session-orchestration.md)).
 - `project-show-more`: an expanded project folder lists its five newest
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
@@ -1275,8 +1279,8 @@ its discoverability.
   cannot create siblings. Shared viewers see flat rows.
 - Families are bounded to 100 retained members, including archived members.
   Use the row chevron to **Collapse session family** or **Expand session family**.
-- Nested creation and same-sandbox fork selection require the default-off
-  `OMNIGENT_FEATURES=sibling_sessions` flag. Reload the UI after enabling it.
+- Nested creation and same-sandbox fork selection are enabled by default.
+  Set `OMNIGENT_FEATURES=-sibling_sessions` to disable them and reload the UI.
   Opening a saved **Add nested agent** link while disabled or on an older server
   shows an unavailable message instead of a composer that cannot submit.
 - If the source disappears after a rejected create, **Continue in a new session**
