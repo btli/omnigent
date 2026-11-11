@@ -75,7 +75,8 @@ export type FeatureKey =
   | "project_kanban"
   | "project_repository_creation"
   | "workspace_direct_access"
-  | "workspace_api_server_access";
+  | "workspace_api_server_access"
+  | "host_stats";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
