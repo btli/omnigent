@@ -832,6 +832,7 @@ function AppShellImpl() {
   const headerProjectName =
     headerProjectSummary?.name ?? breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ?? null;
   const headerProjectIcon = headerProjectSummary?.icon ?? null;
+  const headerProjectLucideIcon = headerProjectSummary?.lucide_icon ?? null;
   const headerProjectColor = headerProjectSummary?.color ?? null;
   const headerTitleLinkTo =
     isChildSession && activeSession?.parentSessionId
@@ -2887,6 +2888,7 @@ function AppShellImpl() {
                     conversationTitle={headerConversationTitle}
                     projectName={headerProjectName}
                     projectIcon={headerProjectIcon}
+                    projectLucideIcon={headerProjectLucideIcon}
                     projectColor={headerProjectColor}
                     titleLinkTo={headerTitleLinkTo}
                     boundAgent={boundAgent}
