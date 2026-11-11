@@ -74,6 +74,17 @@ def create_projects_router(
     """
     router = APIRouter()
 
+    async def _require_private_source(request: Request, user_id: str | None) -> None:
+        """Refuse an agent-tool write whose calling session is shared with edit access."""
+        if conversation_store is not None:
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+
     @router.post("/projects")
     async def create_project(
         request: Request,
@@ -90,14 +101,7 @@ def create_projects_router(
             if the caller already has a project with this name.
         """
         user_id = require_user(request, auth_provider)
-        if conversation_store is not None:
-            await asyncio.to_thread(
-                require_named_source_private,
-                request,
-                user_id,
-                conversation_store,
-                permission_store,
-            )
+        await _require_private_source(request, user_id)
         config = await asyncio.to_thread(with_project_color, project_store, user_id, body.config)
         project = await asyncio.to_thread(
             project_store.create, uuid.uuid4().hex, body.name, user_id, config
@@ -212,6 +216,7 @@ def create_projects_router(
             projects.
         """
         user_id = require_user(request, auth_provider)
+        await _require_private_source(request, user_id)
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
@@ -241,6 +246,7 @@ def create_projects_router(
             owned by the caller.
         """
         user_id = require_user(request, auth_provider)
+        await _require_private_source(request, user_id)
         deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
