@@ -36,7 +36,7 @@ import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { UPDATE_MODE_ENTRY } from "@/pages/settings/search/catalog/updates";
 import { settingsDescriptionId } from "@/pages/settings/search/settingsControl";
-import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
+import { UI_FONT_FAMILY_FALLBACK, UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
   useCodeBlockWordWrap,
@@ -47,7 +47,6 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
-import { UI_FONT_FAMILY_FALLBACK } from "@/lib/uiFontPreferences";
 import { resetFontLoaderForTests, setWebFontsEnabled } from "@/lib/webFontLoader";
 
 const mocks = vi.hoisted(() => ({
