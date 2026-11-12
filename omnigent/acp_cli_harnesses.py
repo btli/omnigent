@@ -26,9 +26,10 @@ rejected up front rather than silently dropped.
 
 The generic ACP spawn env is deny-by-default. Rows may declare exact-name
 ``env_passthrough`` entries for variables their child needs; Grok forwards
-``XAI_API_KEY``. These values must already be present in the runner environment;
-the host-to-runner hop is a separate gate. Vendors can also read stored
-credentials from disk, such as Grok's OAuth login.
+``XAI_API_KEY``. The host owner can also forward specific names with
+``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. These values must already be present in the
+runner environment; the host-to-runner hop is a separate gate. Vendors can also
+read stored credentials from disk, such as Grok's OAuth login.
 
 This module stays import-light (stdlib + :mod:`omnigent.harness_install_spec`)
 so the registry, onboarding, and runner layers can all read it without cycles.
@@ -99,7 +100,10 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             None,
             login_args=("login", "--device-auth"),
             install_hint="curl -fsSL https://x.ai/cli/install.sh | bash",
-            auth_hint="run `grok login --device-auth` (xAI OAuth) or set XAI_API_KEY",
+            auth_hint=(
+                "run `grok login --device-auth` (xAI OAuth) or forward XAI_API_KEY "
+                "with `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`"
+            ),
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),
