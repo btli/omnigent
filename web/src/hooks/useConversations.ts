@@ -2439,6 +2439,12 @@ export interface ProjectSummary {
   /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
       folder glyph. Sourced from the project's `config.icon`. */
   icon?: string | null;
+  /** Chosen lucide-react icon name, or null/absent for the folder glyph.
+      Sourced from the project's `config.lucide_icon`. */
+  lucide_icon?: string | null;
+  /** Chosen color (a theme palette id), or null/absent for the muted folder.
+      Sourced from the project's `config.color`. */
+  color?: string | null;
 }
 
 /**
@@ -3201,10 +3207,13 @@ export function useRenameProject() {
       id,
       oldName,
       newName,
+      config,
     }: {
       id: string | null;
       oldName: string;
       newName: string;
+      /** Initial config for a promoted label-only folder; ignored when `id` is set. */
+      config?: ProjectConfig;
     }) => {
       // The target project id: rename the existing row (first-class), or
       // create one on demand (label-only folder being promoted).
@@ -3213,7 +3222,7 @@ export function useRenameProject() {
         await apiRenameProject(id, newName);
         projectId = id;
       } else {
-        projectId = (await apiCreateProject(newName)).id;
+        projectId = (await apiCreateProject(newName, config)).id;
       }
       // Reconcile the folder's members either way. During the dual-read
       // transition a member can still sit in the oldName folder via the legacy
@@ -3288,8 +3297,10 @@ export function useUpdateProjectConfig() {
       name: string;
       config: ProjectConfig;
     }) => {
-      const projectId = id ?? (await apiCreateProject(name)).id;
-      return apiUpdateProjectConfig(projectId, config);
+      // Promote with the config in the create itself: a follow-up PATCH would
+      // replace the config the create stored (including its auto-assigned color).
+      if (id === null) return apiCreateProject(name, config);
+      return apiUpdateProjectConfig(id, config);
     },
     onSuccess: (project) => {
       // Seed the fresh config into the cache (not just invalidate) so the
@@ -3304,7 +3315,13 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
+        const summary = {
+          id: project.id,
+          name: project.name,
+          icon: project.config?.icon,
+          lucide_icon: project.config?.lucide_icon,
+          color: project.config?.color,
+        };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];
