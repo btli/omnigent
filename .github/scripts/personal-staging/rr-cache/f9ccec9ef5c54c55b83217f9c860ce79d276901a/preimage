@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
-
 
 @dataclass(frozen=True)
 class StaticModelFallback:
@@ -63,6 +61,8 @@ PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
 )
 
 
+<<<<<<<
+=======
 #: Curated preference ORDER for codex's current arms — a ranking hint only
 #: (preferred first), consumed by the Databricks live-discovery ranker to
 #: sort servable ids. It never invents picker rows: ids absent from the live
@@ -84,8 +84,6 @@ def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback |
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
-<<<<<<<
-=======
 #: Codex's launch default when nothing else names a model. The bundled
 #: OpenAI catalog's newest row is a bare family alias (``gpt-5.6``) that
 #: codex rejects, so a codex launch defaults to a concrete variant from
