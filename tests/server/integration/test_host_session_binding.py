@@ -42,6 +42,8 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     parse_sandbox_config,
 )
+from omnigent.server.routes import runner_tunnel
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.server.sharing_settings import SiblingSessionDestinations
@@ -3569,6 +3571,175 @@ async def test_wake_on_the_owning_replica_launches_the_runner_before_ready(
     assert launch.settled.is_set()
     assert launch.error is None
     assert tracker.get(conv.id) is None
+
+
+class _WakeProbe:
+    """A resumable managed session whose host row is live, plus a recorded wake."""
+
+    def __init__(self, db_uri: str, monkeypatch: pytest.MonkeyPatch, host_id: str) -> None:
+        from omnigent.server.routes import sessions as sessions_module
+
+        self.host_store = HostStore(db_uri)
+        self.conv_store = SqlAlchemyConversationStore(db_uri)
+        self.host_store.register_managed_host(
+            host_id=host_id,
+            name=f"managed-{host_id[:6]}",
+            user_id=RESERVED_USER_LOCAL,
+            token=f"tok-{host_id[:6]}",
+            provider="modal",
+            sandbox_id=f"sb-{host_id[:6]}",
+            token_expires_at=9_999_999_999,
+        )
+        self.host_store.upsert_on_connect(
+            host_id=host_id, name=f"managed-{host_id[:6]}", user_id=RESERVED_USER_LOCAL
+        )
+        conv = self.conv_store.create_conversation(
+            agent_id=None, host_id=host_id, workspace="/root/workspace"
+        )
+        self.conv_store.set_runner_id(conv.id, "runner_live")
+        refreshed = self.conv_store.get_conversation(conv.id)
+        assert refreshed is not None
+        self.conv = refreshed
+        fake = FakeSandboxLauncher(can_resume=True)
+        self.config = ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: fake,
+                token_ttl_s=3600,
+                provider="modal",
+            )
+        )
+        self.tracker = ManagedLaunchTracker()
+        self.wakes: list[str] = []
+
+        def _finish_wake(**kwargs: object) -> None:
+            self.wakes.append(str(kwargs["provider"]))
+            self.tracker.begin(self.conv.id)
+            self.tracker.finish(self.conv.id)
+
+        monkeypatch.setattr(sessions_module, "_kick_managed_wake", _finish_wake)
+        self.connected = object()
+        monkeypatch.setattr(orchestration, "_get_runner_client", _async_value(None))
+        monkeypatch.setattr(
+            orchestration, "_wait_for_host_bound_runner_client", _async_value(self.connected)
+        )
+
+    def app_state(self, host_conns: list[object | None], runner_idle_s: float | None) -> Any:
+        """Host registry yielding ``host_conns`` in turn (last one sticks)."""
+        conns = list(host_conns)
+
+        def _get(_host_id: str) -> object | None:
+            return conns.pop(0) if len(conns) > 1 else conns[0]
+
+        def _deregister(_host_id: str) -> None:
+            conns[:] = [None]
+
+        runner_session = object() if runner_idle_s is not None else None
+        return SimpleNamespace(
+            host_store=self.host_store,
+            sandbox_config=self.config,
+            managed_launches=self.tracker,
+            host_registry=SimpleNamespace(get=_get, deregister=_deregister),
+            tunnel_registry=SimpleNamespace(
+                get=lambda _runner_id: runner_session,
+                seconds_since_last_frame=lambda _session: runner_idle_s,
+                deregister=lambda _runner_id, *, retire: None,
+            ),
+        )
+
+    async def ensure(self, app_state: Any) -> Any:
+        return await orchestration.ensure_runner_connected(
+            session_id=self.conv.id,
+            conv=self.conv,
+            app_state=app_state,
+            conversation_store=self.conv_store,
+            runner_router=None,
+        )
+
+
+def _async_value(value: Any) -> Callable[..., Any]:
+    async def _fn(*_a: Any, **_k: Any) -> Any:
+        return value
+
+    return _fn
+
+
+async def test_resumable_managed_host_with_one_missed_ping_is_not_woken(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live tunnel that missed one ping is reused, not woken (recreated)."""
+    probe = _WakeProbe(db_uri, monkeypatch, "7c1e2f0a9b3d4c5e8f6a7b8c9d0e1f2a")
+    idle_s = 2 * runner_tunnel.PING_INTERVAL_S + 5
+    host_conn = SimpleNamespace(last_frame_at=time.time() - idle_s)
+
+    client, _ = await probe.ensure(probe.app_state([host_conn], runner_idle_s=idle_s))
+
+    assert client is probe.connected
+    assert probe.wakes == []
+
+
+async def test_resumable_managed_host_silent_for_liveness_window_is_woken(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel silent for the whole ping liveness window still triggers the wake."""
+    probe = _WakeProbe(db_uri, monkeypatch, "8d2f3a1b0c4e5d6f9a7b8c9d0e1f2a3b")
+    idle_s = runner_tunnel.PING_INTERVAL_S * runner_tunnel.PING_MISS_THRESHOLD
+    host_conn = SimpleNamespace(last_frame_at=time.time() - idle_s)
+
+    with pytest.raises(OmnigentError) as exc:
+        await probe.ensure(probe.app_state([host_conn], runner_idle_s=idle_s))
+
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
+    assert probe.wakes == ["modal"]
+
+
+async def test_live_host_reconnecting_after_server_start_is_not_woken(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Right after a server start, a live host gets to redial before any wake."""
+    probe = _WakeProbe(db_uri, monkeypatch, "9e3a4b2c1d5f6e7a0b8c9d0e1f2a3b4c")
+    monkeypatch.setattr(orchestration, "_PROCESS_STARTED_MONOTONIC", time.monotonic())
+    reconnected = SimpleNamespace(last_frame_at=time.time())
+
+    client, _ = await probe.ensure(probe.app_state([None, reconnected], runner_idle_s=None))
+
+    assert client is probe.connected
+    assert probe.wakes == []
+
+
+@pytest.mark.parametrize("grace_elapsed", [False, True], ids=["within-grace", "grace-elapsed"])
+async def test_absent_host_is_woken_once_reconnect_grace_runs_out(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    grace_elapsed: bool,
+) -> None:
+    """A host that never redials is woken after at most the remaining grace."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    probe = _WakeProbe(db_uri, monkeypatch, "0f4b5c3d2e6a7f8b1c9d0e1f2a3b4c5d")
+    grace_s = sessions_module._HOST_RECONNECT_GRACE_S
+    started = time.monotonic() - (grace_s + 1 if grace_elapsed else 0)
+    monkeypatch.setattr(orchestration, "_PROCESS_STARTED_MONOTONIC", started)
+    waits: list[float] = []
+
+    async def _never_reconnects(*_a: Any, timeout_s: float, **_k: Any) -> None:
+        waits.append(timeout_s)
+
+    monkeypatch.setattr(orchestration, "_wait_for_host_reconnect", _never_reconnects)
+
+    with pytest.raises(OmnigentError) as exc:
+        await probe.ensure(probe.app_state([None], runner_idle_s=None))
+
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
+    assert probe.wakes == ["modal"]
+    if grace_elapsed:
+        assert waits == []
+    else:
+        assert len(waits) == 1
+        assert 0 < waits[0] <= grace_s
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(

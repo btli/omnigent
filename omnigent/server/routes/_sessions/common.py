@@ -48,6 +48,7 @@ from omnigent.harness_plugins import (
 from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes import host_tunnel, runner_tunnel
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     McpServerStartup,
@@ -445,7 +446,12 @@ _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 _HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
 
 
-_MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
+# Must exceed two ping intervals plus pong latency: an idle tunnel's only frames
+# are pongs, so a threshold at one interval reads a live, CPU-throttled peer as
+# stale and the resulting wake recreates its sandbox.
+_MANAGED_RESUMABLE_TUNNEL_STALE_S = 2.5 * max(
+    host_tunnel.PING_INTERVAL_S, runner_tunnel.PING_INTERVAL_S
+)
 
 
 _RUNNER_CONVICTION_POLL_S = 0.25
