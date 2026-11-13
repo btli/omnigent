@@ -352,6 +352,31 @@ def test_headless_subagent_purpose_guard_requires_explicit_purpose(
     assert _result(decision) == expected
 
 
+@pytest.mark.parametrize(
+    "send_args,expected",
+    [
+        ({"session_id": "conv_child", "args": {"input": "Continue."}}, "ALLOW"),
+        ({"session_id": "conv_child", "args": "Continue."}, "ALLOW"),
+        ({"session_id": "conv_child", "args": {"input": "Go.", "purpose": "review"}}, "ALLOW"),
+        ({"session_id": "conv_child", "args": {"input": "Go.", "purpose": "bogus"}}, "DENY"),
+        ({"session_id": "", "args": {"input": "Continue."}}, "DENY"),
+        ({"agent": "codex", "title": "t", "args": {"input": "Continue."}}, "DENY"),
+    ],
+)
+def test_headless_subagent_purpose_guard_session_id_continuation(
+    send_args: dict[str, Any],
+    expected: str,
+) -> None:
+    """
+    A ``session_id`` continuation may omit ``args.purpose`` (dict or plain-string
+    args); a purpose it does supply is still validated, and a named
+    ``(agent, title)`` send without a purpose still DENYs.
+    """
+    evaluate = headless_subagent_purpose_guard()
+
+    assert _result(evaluate(_tool_call("sys_session_send", **send_args))) == expected
+
+
 def test_headless_subagent_purpose_guard_honors_custom_allowed_purposes() -> None:
     """
     The ``allowed_purposes`` factory param controls the accepted set.
