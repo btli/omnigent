@@ -7,7 +7,6 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
-from operator import ge, gt, le, lt
 from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
@@ -36,6 +35,7 @@ from omnigent.db.enum_codecs import (
     encode_scheduled_task_session_mode,
     encode_scheduled_task_state,
 )
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -425,8 +425,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         unchanged.
         """
         updated_at = now_epoch()
+        checks_owner = state is not None and state != "deleted"
 
         def write(session: Session) -> ScheduledTask | None:
+            # Writers lock accounts before resource rows, so the owner read without a
+            # lock is checked first; the recheck below catches a change before the lock.
+            checked_owner = None
+            if checks_owner:
+                checked_owner = session.execute(
+                    select(SqlScheduledTask.user_id, SqlScheduledTask.account_generation).where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == scheduled_task_id,
+                        SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
+                    )
+                ).one_or_none()
+                if checked_owner is not None:
+                    require_active_account(
+                        session, checked_owner.user_id, generation=checked_owner.account_generation
+                    )
             row = session.get(
                 SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
             )
@@ -451,7 +467,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                         "Reload and try again.",
                         code=ErrorCode.CONFLICT,
                     )
-            if state is not None and state != "deleted":
+            if checks_owner and (
+                checked_owner is None
+                or tuple(checked_owner) != (row.user_id, row.account_generation)
+            ):
                 require_active_account(session, row.user_id, generation=row.account_generation)
             schedule_before = (row.rrule, row.timezone, row.state)
             trigger_before = is_trigger_automation(_to_entity(row))
@@ -1111,20 +1130,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         descending: bool = False,
     ) -> ColumnElement[bool]:
         """MySQL needs scalar ranges to seek past a composite cursor."""
-        compare = lt if descending else gt
-        compare_inclusive = le if descending else ge
-        if self._engine.dialect.name != "mysql":
-            return (compare_inclusive if inclusive else compare)(tuple_(*columns), cursor)
-        return or_(
-            *(
-                and_(
-                    *(columns[previous] == cursor[previous] for previous in range(index)),
-                    (compare_inclusive if inclusive and index == len(columns) - 1 else compare)(
-                        column, cursor[index]
-                    ),
-                )
-                for index, column in enumerate(columns)
-            )
+        return keyset_after(
+            self._engine.dialect.name,
+            columns,
+            cursor,
+            inclusive=inclusive,
+            descending=descending,
         )
 
     def _refresh_schedule(self, row: SqlScheduledTask, after: int) -> None:
