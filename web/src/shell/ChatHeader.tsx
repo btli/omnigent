@@ -181,6 +181,8 @@ interface ChatHeaderProps {
    * for the default folder glyph. Shown as the breadcrumb's leading segment.
    */
   projectIcon?: string | null;
+  /** The filed project's lucide icon name, or ``null`` for the folder glyph. */
+  projectLucideIcon?: string | null;
   /** The filed project's palette color, or ``null`` for a muted folder. */
   projectColor?: string | null;
   /**
@@ -361,6 +363,7 @@ export function ChatHeader({
   conversationTitle,
   projectName,
   projectIcon,
+  projectLucideIcon,
   projectColor,
   titleLinkTo,
   boundAgent,
@@ -575,6 +578,7 @@ export function ChatHeader({
         conversationId={actionConversation.id}
         projectName={projectName}
         projectIcon={projectIcon}
+        projectLucideIcon={projectLucideIcon}
         projectColor={projectColor}
       />
     ) : null;
@@ -648,6 +652,7 @@ export function ChatHeader({
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
             projectIcon={projectIcon}
+            projectLucideIcon={projectLucideIcon}
             projectColor={projectColor}
             projectTag={projectTag ?? undefined}
             titleSlot={titleSlot ?? undefined}
