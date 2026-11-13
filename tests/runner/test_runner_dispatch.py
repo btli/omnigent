@@ -6249,13 +6249,13 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
 
 
 @pytest.mark.asyncio
-async def test_sys_cancel_task_hard_stops_codex_native_subagent() -> None:
+async def test_sys_cancel_task_routes_codex_native_cancel_to_hard_stop() -> None:
     """
     Journey: a parent cancels its codex-native sub-agent with ``sys_cancel_task``.
 
     An Omnigent-dispatched Codex child owns its app-server and terminal, so the
-    cancel must route to ``stop_session`` (the child runner's hard-stop) and
-    report the confirmed cancellation rather than a best-effort interrupt.
+    cancel routes to ``stop_session`` (the child runner's hard-stop) and no
+    longer claims that no runner-side hard-stop is wired.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -6272,16 +6272,13 @@ async def test_sys_cancel_task_hard_stops_codex_native_subagent() -> None:
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         """
-        Accept the stop and mark the child cancelled, as the child runner does.
+        Accept the interrupt without marking the child terminal (codex no-op).
 
         :param request: Request sent to the child session events route.
         :returns: Accepted response.
         """
         if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
             stops.append(json.loads(request.content))
-            subagent_work.mark_subagent_work_terminal(
-                child_id, status="cancelled", output=None, confirmed_cancellation=True
-            )
             return httpx.Response(204)
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -6304,7 +6301,16 @@ async def test_sys_cancel_task_hard_stops_codex_native_subagent() -> None:
 
     # ``data`` rides along for SessionEventInput compatibility with older servers.
     assert stops == [{"type": "stop_session", "data": {}}]
-    assert cancel_output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+    assert cancel_output == {
+        "cancel_requested": True,
+        "cancel_confirmed": False,
+        "task_id": child_id,
+        "status": "launching",
+        "message": (
+            "Cancel requested; cancellation has not been confirmed yet. "
+            "Use sys_read_inbox to observe terminal status."
+        ),
+    }
 
 
 @pytest.mark.asyncio
