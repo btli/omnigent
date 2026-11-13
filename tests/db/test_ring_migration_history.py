@@ -47,19 +47,27 @@ def test_bootstrap_metadata_preserves_migrated_tables(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("upgrade", [_initialize_or_verify_schema, _run_migrations])
-def test_resume_published_branches(tmp_path: Path, upgrade) -> None:
+@pytest.mark.parametrize(
+    "revisions",
+    [
+        ("f5b9e1a3d2c4", "mp1b2c3d4e5f"),
+        ("04ad1cb0328e",),
+        ("27d16059fab9",),
+        ("04ad1cb0328e", "27d16059fab9"),
+    ],
+)
+def test_resume_published_branches(tmp_path: Path, upgrade, revisions: tuple[str, ...]) -> None:
     uri = f"sqlite:///{tmp_path / 'branches.db'}"
     engine = sa.create_engine(uri)
     config = _build_alembic_config(uri)
     try:
         with engine.begin() as connection:
             config.attributes["connection"] = connection
-            command.upgrade(config, "f5b9e1a3d2c4")
-            command.upgrade(config, "mp1b2c3d4e5f")
-            assert (
-                len(connection.execute(sa.text("SELECT version_num FROM alembic_version")).all())
-                == 2
-            )
+            for revision in revisions:
+                command.upgrade(config, revision)
+            assert len(
+                connection.execute(sa.text("SELECT version_num FROM alembic_version")).all()
+            ) == len(revisions)
         upgrade(engine, uri)
         with engine.connect() as connection:
             assert connection.execute(
@@ -92,7 +100,16 @@ def test_unknown_branch_prevents_any_migration(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "revision", [None, "e583339768f0", "5e92355b0960", "6c5a89455605", "e8dded566507"]
+    "revision",
+    [
+        None,
+        "e583339768f0",
+        "5e92355b0960",
+        "6c5a89455605",
+        "e8dded566507",
+        "04ad1cb0328e",
+        "27d16059fab9",
+    ],
 )
 def test_published_ring_upgrade_preserves_projects_and_preferences(
     tmp_path: Path, revision: str | None
