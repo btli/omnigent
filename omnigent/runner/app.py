@@ -7921,6 +7921,23 @@ def create_runner_app(
                         _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
+            if (
+                (_harness == "acp" or _harness in ACP_CLI_HARNESSES)
+                and process_manager is not None
+                and (
+                    conversation_id in _session_sub_agent_names
+                    or get_subagent_work(conversation_id) is not None
+                )
+            ):
+                # A sub-agent's ACP process stays resident between turns; stopping
+                # it must reclaim the process even when no turn was in flight.
+                await process_manager.release(conversation_id)
+                _mark_subagent_terminal_and_wake(
+                    conversation_id,
+                    status="cancelled",
+                    output=None,
+                    confirmed_cancellation=True,
+                )
             return Response(status_code=204)
 
         if body_type == "effort_change":
