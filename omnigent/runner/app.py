@@ -1222,6 +1222,21 @@ _session_histories_ref: dict[str, list[_JsonObject]] = {}
 _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 
 
+# The latest runner app's ``_session_harness_name``; set inside
+# create_runner_app, read by tool_dispatch's sys_cancel_task routing.
+_session_harness_name_ref: list[Callable[[str], str | None]] = []
+
+
+def get_session_harness_name(session_id: str) -> str | None:
+    """
+    Return the canonical harness a session runs, including its override.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: The harness, e.g. ``"grok"``, or ``None`` when unknown.
+    """
+    return _session_harness_name_ref[-1](session_id) if _session_harness_name_ref else None
+
+
 def get_session_agent_id(session_id: str) -> str | None:
     """
     Return the durable agent_id for a session.
@@ -3958,6 +3973,8 @@ def create_runner_app(
             return None
         h = spec.executor.config.get("harness") or spec.executor.type
         return canonicalize_harness(h) or h
+
+    _session_harness_name_ref[:] = [_session_harness_name]
 
     def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
         """Whether this session's forwarder distinguishes finished from aborted turns."""

@@ -9734,7 +9734,15 @@ async def _cancel_subagent_task(
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    event_type = "stop_session" if capability == "stop" else "interrupt"
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.runner import app as _runner_app
+
+    child_harness = _runner_app.get_session_harness_name(str(task_id))
+    # An ACP child's process stays resident between turns; only a stop reclaims it.
+    acp_child = capability == "inprocess" and (
+        child_harness == "acp" or child_harness in ACP_CLI_HARNESSES
+    )
+    event_type = "stop_session" if capability == "stop" or acp_child else "interrupt"
 
     try:
         resp = await server_client.post(

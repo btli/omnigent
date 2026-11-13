@@ -11,12 +11,13 @@ fall-through contract, and the 503 mapping.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -31,8 +32,8 @@ from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
-from tests.runner.helpers import NullServerClient
 from tests.runner.native_helpers import _harness_spec
 
 
@@ -837,6 +838,14 @@ async def test_codex_ui_stop_and_top_level_stop_only_interrupt_the_turn(
     assert runner.take_pending_interrupt(conv_id)[0] is True
 
 
+def _empty_ok_server_client() -> httpx.AsyncClient:
+    """Server client answering every request with an empty 200, like ``NullServerClient``."""
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+        base_url="http://server",
+    )
+
+
 async def _grok_runner_events(
     *,
     sub_agent: bool,
@@ -854,10 +863,12 @@ async def _grok_runner_events(
 
     harness_client = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(harness_client)
+    server_client = _empty_ok_server_client()
     app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
+        # The fake implements the process-manager calls the runner makes.
+        process_manager=cast(HarnessProcessManager, pm),
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client,
     )
     if sub_agent:
         subagent_work.register_subagent_work(
@@ -882,6 +893,7 @@ async def _grok_runner_events(
         entry = subagent_work.get_subagent_work(conv_id)
     finally:
         subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
     return pm, harness_client, resp.status_code, entry
 
 
@@ -931,3 +943,74 @@ async def test_grok_ui_stop_and_top_level_stop_keep_the_acp_process(
     assert pm.released == []
     if sub_agent:
         assert entry is not None and entry.cancellation_confirmed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "expected_event"),
+    [
+        pytest.param("grok", "stop_session", id="grok-acp-hard-stop"),
+        pytest.param("claude-sdk", "interrupt", id="non-acp-in-process-interrupt"),
+    ],
+)
+async def test_sys_cancel_task_routes_in_process_child_by_runner_harness(
+    harness: str, expected_event: str
+) -> None:
+    """Journey: a parent cancels an in-process sub-agent with ``sys_cancel_task``.
+
+    The child runner's own harness decides the route: a grok ACP child gets the
+    ``stop_session`` hard-stop, any other in-process child keeps ``interrupt``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_cancel_parent"
+    child_id = f"conv_cancel_child_{harness}"
+    spec = _harness_spec(harness)
+    # The in-process SDK harness needs a model to accept the session.
+    spec = dataclasses.replace(
+        spec, executor=dataclasses.replace(spec.executor, model="claude-sonnet-4-5")
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            posted.append(json.loads(request.content))
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="worker", title="work"
+    )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_worker"}
+            )
+            assert created.status_code == 201, created.text
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            await execute_tool(
+                tool_name="sys_cancel_task",
+                arguments=json.dumps({"task_id": child_id}),
+                server_client=parent_server,
+                conversation_id=parent_id,
+                session_async_tasks={},
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert posted == [{"type": expected_event, "data": {}}]
