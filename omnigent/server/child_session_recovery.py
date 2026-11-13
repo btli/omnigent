@@ -15,6 +15,7 @@ from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
+from omnigent.runner.subagent_work import subagent_dispatch_cancelled
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
@@ -99,6 +100,8 @@ def _interrupted(conv: Conversation) -> bool:
     from omnigent.server.routes._sessions.common import _session_status_cache
     from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
+    if subagent_dispatch_cancelled(conv.labels):
+        return False
     status = _session_status_cache.get(conv.id, conv.live_status)
     error = _last_task_error_from_labels(conv.labels)
     return status in {"running", "waiting"} or (

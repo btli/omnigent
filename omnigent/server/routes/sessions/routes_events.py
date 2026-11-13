@@ -72,6 +72,10 @@ from omnigent.runner.launch_failure import (
     turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.subagent_work import (
+    SUBAGENT_CANCELLED_ID_LABEL_KEY,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
+)
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -647,6 +651,24 @@ def _hostless_runner_gone_message(
         f"{message} Resume it from the machine that ran it with "
         f"`{cli_invocation()} {agent.key} --resume {conv.id}`, then send the message again."
     )
+
+
+async def _mark_subagent_dispatch_cancelled(
+    conv: Conversation, conversation_store: ConversationStore
+) -> None:
+    """
+    Durably mark a sub-agent's current dispatch cancelled for restart recovery.
+
+    :param conv: Session receiving the interrupt or stop.
+    :param conversation_store: Store that persists the label.
+    """
+    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if dispatch_id:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {SUBAGENT_CANCELLED_ID_LABEL_KEY: dispatch_id},
+        )
 
 
 async def _unrecoverable_side_chat_source(
@@ -2041,6 +2063,7 @@ def register_events_routes(
                     codex_side_turn_id=response_id.removeprefix("codex_"),
                 )
             else:
+                await _mark_subagent_dispatch_cancelled(conv, conversation_store)
                 _publish_interrupted(session_id)
                 # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
@@ -2085,6 +2108,7 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            await _mark_subagent_dispatch_cancelled(conv, conversation_store)
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external

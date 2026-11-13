@@ -88,6 +88,9 @@ _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH = "superseded_dispatch"
 # ``sys_read_inbox`` drain writes once it has consumed that turn's result.
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
+# Server-written when a dispatch is cancelled: restart recovery never resumes
+# that dispatch nor delivers it as completed. A new dispatch id makes it stale.
+SUBAGENT_CANCELLED_ID_LABEL_KEY = "omnigent.subagent.cancelled_id"
 
 
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
@@ -516,6 +519,18 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     return dispatch_id
 
 
+def subagent_dispatch_cancelled(labels: Mapping[str, object]) -> bool:
+    """
+    Return whether a child's current dispatch carries the cancelled marker.
+
+    :param labels: Child session labels, e.g.
+        ``{"omnigent.subagent.cancelled_id": "subagent_a1b2c3d4e5f6"}``.
+    :returns: ``True`` only when the cancelled id names the current dispatch.
+    """
+    dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    return bool(dispatch_id) and labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) == dispatch_id
+
+
 class _SubagentRecoveryReadError(Exception):
     """A sessions API read needed by restart recovery returned a non-200."""
 
@@ -603,7 +618,8 @@ async def _recover_subagent_results_from_server(
     parent's ``sys_read_inbox`` drain writes that id back as the delivered
     id. A terminal child whose two ids differ was never drained, so its
     result is rebuilt from the child transcript and queued again under the
-    same dispatch id, letting the eventual drain close the loop.
+    same dispatch id, letting the eventual drain close the loop. A dispatch
+    marked cancelled is queued as ``cancelled``, never resumed or completed.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session whose inbox was recreated, e.g.
@@ -617,6 +633,12 @@ async def _recover_subagent_results_from_server(
         status = child.get("current_task_status")
         if not isinstance(child_id, str) or not isinstance(status, str):
             continue
+        raw_labels = child.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+        cancelled = subagent_dispatch_cancelled(labels)
+        if cancelled:
+            # Whatever the child did after the cancel, the parent sees it cancelled.
+            status = "cancelled"
         error = child.get("last_task_error")
         interrupted = status == "in_progress" or (
             status == "failed"
@@ -631,8 +653,6 @@ async def _recover_subagent_results_from_server(
             child_id in _drained_delivered_subagent_children
         ):
             continue
-        raw_labels = child.get("labels")
-        labels = raw_labels if isinstance(raw_labels, dict) else {}
         dispatch_id = undelivered_subagent_dispatch_id(labels)
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
@@ -641,7 +661,7 @@ async def _recover_subagent_results_from_server(
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
-        elif not interrupted:
+        elif not interrupted and not cancelled:
             output = await _fetch_latest_assistant_text(server_client, child_id)
         # A forwarded completion or newer dispatch may arrive during the history read.
         if (
@@ -662,7 +682,9 @@ async def _recover_subagent_results_from_server(
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"
             continue
-        ack = mark_subagent_work_terminal(child_id, status=status, output=output)
+        ack = mark_subagent_work_terminal(
+            child_id, status=status, output=output, confirmed_cancellation=cancelled
+        )
         if ack.delivered_now:
             schedule_wake(entry)
 
