@@ -4205,6 +4205,28 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
     session_id = "6f2e1d0c9b8a47f6a5e4d3c2b1a09f8e"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    # A turn is in flight when the forwarder ends.
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path="ws://127.0.0.1:9876",
+            thread_id="thread_test",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_live",
+        ),
+    )
+    posted: list[tuple[str, dict[str, Any]]] = []
+    real_async_client = httpx.AsyncClient
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200)
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(_record), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
     monkeypatch.setattr(orchestration, "_required_runner_env", server_url)
     monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
     monkeypatch.setattr(codex_forwarder, "supervise_forwarder", forward)
@@ -4247,10 +4269,27 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
         assert slot_after is None
         assert recorded == codex_native_bridge.CODEX_APP_SERVER_STOPPED
         assert reusable is False
+    state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert state is not None
+    if outcome in ("success", "forward_error"):
+        # The lost turn ends as failed, naming the lost app-server connection.
+        assert [path for path, _ in posted] == [f"/v1/sessions/{session_id}/events"]
+        event = posted[0][1]
+        assert event["type"] == "external_session_status"
+        assert event["data"]["status"] == "failed"
+        assert event["data"]["response_id"] == "codex_turn_live"
+        assert "connection to Codex's app-server" in event["data"]["output"]
+        assert state.active_turn_id is None
+    else:
+        # Teardown, a superseded launch, or no server to reach: no terminal edge.
+        assert posted == []
+        assert state.active_turn_id == "turn_live"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["returns", "raises", "cancelled", "superseded"])
+@pytest.mark.parametrize(
+    "outcome", ["returns", "raises", "cancelled", "superseded", "turn_finished"]
+)
 async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
 ) -> None:
@@ -4266,16 +4305,24 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
     )
 
     real_async_client = httpx.AsyncClient
+    status_posts: list[dict[str, Any]] = []
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            status_posts.append(json.loads(request.content))
+        return httpx.Response(200)
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(
-            transport=httpx.MockTransport(lambda _r: httpx.Response(200)), **kwargs
-        )
+        return real_async_client(transport=httpx.MockTransport(_record), **kwargs)
 
     async def _fake_wait(*_args: object, **_kwargs: object) -> str:
         return "019e96aa-abcd-7343-8d3b-6f914d60936b"
 
     async def _fake_supervise(**_kwargs: object) -> None:
+        # The forwarder saw turn/started; a finished turn is cleared by its terminal edge.
+        codex_native_bridge.update_active_turn_id(tmp_path, "turn_live")
+        if outcome == "turn_finished":
+            codex_native_bridge.clear_active_turn_id_if_matches(tmp_path, "turn_live")
         if outcome == "raises":
             raise RuntimeError("forward failed")
         if outcome == "cancelled":
@@ -4321,10 +4368,16 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
     recorded = codex_native_bridge.read_bridge_startup_failure(tmp_path)
-    if outcome in ("returns", "raises"):
+    if outcome in ("returns", "raises", "turn_finished"):
         assert recorded == codex_native_bridge.CODEX_APP_SERVER_STOPPED
     else:
         assert recorded is None
+    if outcome in ("returns", "raises"):
+        assert [post["data"]["status"] for post in status_posts] == ["failed"]
+        assert status_posts[0]["data"]["response_id"] == "codex_turn_live"
+        assert "connection to Codex's app-server" in status_posts[0]["data"]["output"]
+    else:
+        assert status_posts == []
 
 
 @pytest.mark.asyncio
