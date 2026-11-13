@@ -437,6 +437,8 @@ function useHeaderConversation(
   const headerProjectName =
     headerProjectSummary?.name ?? breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ?? null;
   const headerProjectIcon = headerProjectSummary?.icon ?? null;
+  const headerProjectLucideIcon = headerProjectSummary?.lucide_icon ?? null;
+  const headerProjectColor = headerProjectSummary?.color ?? null;
   const headerTitleLinkTo =
     isChildSession && activeSession?.parentSessionId
       ? `/c/${activeSession.parentSessionId}`
@@ -514,6 +516,8 @@ function useHeaderConversation(
     conversationTitle: headerConversationTitle,
     projectName: headerProjectName,
     projectIcon: headerProjectIcon,
+    projectLucideIcon: headerProjectLucideIcon,
+    projectColor: headerProjectColor,
     titleLinkTo: headerTitleLinkTo,
     actionConversation,
     canShare,
@@ -3626,6 +3630,8 @@ function AppShellImpl() {
                     conversationTitle={header.conversationTitle}
                     projectName={header.projectName}
                     projectIcon={header.projectIcon}
+                    projectLucideIcon={header.projectLucideIcon}
+                    projectColor={header.projectColor}
                     titleLinkTo={header.titleLinkTo}
                     pageTitle={
                       projectHomeName !== null ? (
