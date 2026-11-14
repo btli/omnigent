@@ -54,6 +54,8 @@ def test_bootstrap_metadata_preserves_migrated_tables(tmp_path: Path) -> None:
         ("04ad1cb0328e",),
         ("27d16059fab9",),
         ("04ad1cb0328e", "27d16059fab9"),
+        ("91c2e7a4d6b8",),
+        ("91c2e7a4d6b8", "7fc806e94a38"),
     ],
 )
 def test_resume_published_branches(tmp_path: Path, upgrade, revisions: tuple[str, ...]) -> None:
@@ -109,6 +111,7 @@ def test_unknown_branch_prevents_any_migration(tmp_path: Path) -> None:
         "e8dded566507",
         "04ad1cb0328e",
         "27d16059fab9",
+        "91c2e7a4d6b8",
     ],
 )
 def test_published_ring_upgrade_preserves_projects_and_preferences(

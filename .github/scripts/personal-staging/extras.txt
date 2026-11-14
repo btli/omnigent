@@ -19,6 +19,5 @@
 #
 9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
 10032             # bot replacement for closed #10024 (desktop downloads keep request headers)
-11105             # deploy entrypoints wire server config like `omnigent server` (RCA #11104)
 12428             # project color-or-emoji marks with least-used auto color (#4417); seeds vs #6319/#9902/#11179
 6109              # bbqiu genie CLI harness, rebased onto upstream c0d9f527 (head 425b2ba0); btli genie PRs stack on it
