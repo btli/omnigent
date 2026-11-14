@@ -1009,21 +1009,22 @@ async def test_sys_cancel_task_routes_and_reports_outcome_by_child_harness(
     async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
         return spec
 
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     runner_server = _empty_ok_server_client()
     app = create_runner_app(
-        process_manager=cast(
-            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
-        ),
+        process_manager=cast(HarnessProcessManager, pm),
         spec_resolver=_resolver,
         server_client=runner_server,
     )
     posted: list[dict[str, Any]] = []
 
-    def _parent_server(request: httpx.Request) -> httpx.Response:
+    async def _parent_server(request: httpx.Request) -> httpx.Response:
         """Accept the event and settle the entry the way the child runner does."""
         if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
             body = json.loads(request.content)
             posted.append(body)
+            if body["type"] == "stop_session":
+                await pm.release(child_id)
             subagent_work.mark_subagent_work_terminal(
                 child_id,
                 status="cancelled",
@@ -1487,3 +1488,67 @@ async def test_codex_subagent_stop_leaves_work_sent_while_waiting_for_launch(
     assert entry.work_id == "work_replacement"
     assert entry.status != "cancelled"
     assert entry.cancellation_confirmed is False
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_does_not_claim_hard_stop_for_unreached_grok_child() -> None:
+    """Journey: a parent cancels a grok sub-agent the user already Stopped in the UI.
+
+    The entry is already ``cancelled`` but its ACP process is still resident. If
+    the server answers the stop with 2xx without reaching a runner, nothing was
+    killed, so the parent must get ``unconfirmed``, not ``hard_stopped``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_unreached_parent"
+    child_id = "conv_unreached_grok"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        # The server's no-runner-bound stop: a 2xx that reaches nothing.
+        posted.append(json.loads(request.content))
+        return httpx.Response(200, json={"queued": False})
+
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="grok", title="work"
+    )
+    entry.status = "cancelled"
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+        await pm.get_client(child_id, "grok")
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=parent_server,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert pm.released == []
+    assert result["outcome"] == "unconfirmed"
+    assert result["cancel_confirmed"] is False

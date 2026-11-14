@@ -91,7 +91,7 @@ def _make_cancel_server(
             events.append(body)
             if stop_marks_terminal and body.get("type") == "stop_session":
                 subagent_work.mark_subagent_work_terminal(
-                    child_id, status="cancelled", output=None
+                    child_id, status="cancelled", output=None, confirmed_cancellation=True
                 )
             return httpx.Response(204)
         return httpx.Response(404, json={"error": str(request.url)})

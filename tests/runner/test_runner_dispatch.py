@@ -6195,6 +6195,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
                     "conv_child_cancel",
                     status="cancelled",
                     output=None,
+                    confirmed_cancellation=True,
                 )
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
@@ -6404,12 +6405,13 @@ async def test_sys_cancel_task_stops_terminal_claude_native_entry(
 
     parent_id = "conv_parent_terminal"
     child_id = "conv_child_terminal"
-    _install_cancel_pane(
+    pane = _install_cancel_pane(
         monkeypatch,
         wrapper_label="claude-code-native-ui",
         task_id=child_id,
         alive=True,
     )
+    assert pane is not None
     entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
@@ -6423,6 +6425,7 @@ async def test_sys_cancel_task_stops_terminal_claude_native_entry(
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         posts.append(json.loads(request.content))
         entry.status = "cancelled"
+        pane.alive = False
         return httpx.Response(204)
 
     try:
@@ -6641,6 +6644,7 @@ async def _drive_cancel_matrix_row(
     http_status: int,
     evicted: bool,
     requesting_parent: str,
+    pane: _CancelPane | None = None,
 ) -> tuple[list[dict[str, Any]], Any]:
     """Run ``_cancel_subagent_task`` for one matrix row and return posts + output."""
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
@@ -6674,6 +6678,8 @@ async def _drive_cancel_matrix_row(
             updated = subagent_work.get_subagent_work(child_id)
             if updated is not None:
                 updated.status = "cancelled"
+            if pane is not None:
+                pane.alive = False
         return httpx.Response(http_status)
 
     try:
@@ -6876,13 +6882,16 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     """
     parent_id = f"conv_parent_{row_id}"
     child_id = f"conv_child_{row_id}"
-    if pane_alive is not None:
+    pane = (
         _install_cancel_pane(
             monkeypatch,
             wrapper_label=wrapper_label,
             task_id=child_id,
             alive=pane_alive,
         )
+        if pane_alive is not None
+        else None
+    )
     posts, output = await _drive_cancel_matrix_row(
         parent_id=parent_id,
         child_id=child_id,
@@ -6891,6 +6900,7 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
         http_status=http_status,
         evicted=False,
         requesting_parent=parent_id,
+        pane=pane,
     )
     if expect_event is None:
         assert posts == [], f"{row_id}: dead/absent pane must not POST a stop"

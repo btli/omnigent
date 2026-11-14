@@ -9795,6 +9795,9 @@ async def _cancel_subagent_task(
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
     event_type = "stop_session" if capability == "stop" or acp_child else "interrupt"
+    # Settlement already on the entry before this call proves nothing about this stop.
+    targeted_work_id = entry.work_id
+    confirmed_before = entry.status == "cancelled" and entry.cancellation_confirmed
 
     try:
         resp = await server_client.post(
@@ -9816,16 +9819,24 @@ async def _cancel_subagent_task(
         )
 
     updated = _subagent_work.get_subagent_work(str(task_id)) or entry
-    # The runner settles a stop only after its kill; an unsettled 2xx (no runner
-    # bound) leaves the entry untouched and stays unconfirmed below.
-    if event_type == "stop_session" and (
-        updated.status == "cancelled"
-        or (can_stop_idle_acp and not _acp_child_process_resident(str(task_id)))
-    ):
-        return _settled_subagent_cancel_result(
-            str(task_id), status=updated.status, hard_stopped=True
-        )
-    if updated.status == "cancelled":
+    if event_type == "stop_session":
+        # A 2xx alone is not proof: the server answers it even when no runner was bound.
+        if can_stop_idle_acp:
+            stopped = not _acp_child_process_resident(str(task_id))
+        elif can_stop_failed:
+            stopped = not await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+        else:
+            stopped = (
+                updated.work_id == targeted_work_id
+                and updated.status == "cancelled"
+                and updated.cancellation_confirmed
+                and not confirmed_before
+            )
+        if stopped:
+            return _settled_subagent_cancel_result(
+                str(task_id), status=updated.status, hard_stopped=True
+            )
+    elif updated.status == "cancelled":
         return _settled_subagent_cancel_result(
             str(task_id), status="cancelled", hard_stopped=False
         )
