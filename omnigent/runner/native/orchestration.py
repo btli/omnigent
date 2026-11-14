@@ -6910,23 +6910,35 @@ async def _codex_discover_thread_and_forward(
             ),
         )
         leftover_app_server = app_server
-        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-            if not cancelled:
-                # The pane outlives its app-server; mark it so the next ensure replaces it.
-                record_app_server_stopped(bridge_dir)
-                if server_url is not None:
-                    # Before any teardown await: a relaunch cancels this task and wipes the turn.
-                    await _fail_codex_turn_in_flight(
-                        bridge_dir, server_url=server_url, headers=headers, auth=forward_auth
-                    )
-        with contextlib.suppress(Exception):
-            await event_client.close()
-        if leftover_app_server is not None:
+        lost_turn_post: asyncio.Task[None] | None = None
+        try:
+            if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+                leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+                if not cancelled:
+                    # The pane outlives its app-server; mark it so the next ensure replaces it.
+                    record_app_server_stopped(bridge_dir)
+                    if server_url is not None:
+                        # Before any teardown await: a relaunch cancels this task and wipes
+                        # the turn. Shielded so that cancel cannot abandon the claimed turn.
+                        lost_turn_post = asyncio.create_task(
+                            _fail_codex_turn_in_flight(
+                                bridge_dir,
+                                server_url=server_url,
+                                headers=headers,
+                                auth=forward_auth,
+                            )
+                        )
+                        await asyncio.shield(lost_turn_post)
+        finally:
             with contextlib.suppress(Exception):
-                await leftover_app_server.close()
-        await _shutdown_session_router_async(session_id, subagent_router)
-        await _shutdown_session_turn_router_async(session_id, turn_router)
+                await event_client.close()
+            if leftover_app_server is not None:
+                with contextlib.suppress(Exception):
+                    await leftover_app_server.close()
+            await _shutdown_session_router_async(session_id, subagent_router)
+            await _shutdown_session_turn_router_async(session_id, turn_router)
+            if lost_turn_post is not None and not lost_turn_post.done():
+                await asyncio.shield(lost_turn_post)
 
 
 async def _codex_forward_known_thread(
@@ -7006,21 +7018,33 @@ async def _codex_forward_known_thread(
             ),
         )
         leftover_app_server = app_server
-        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-            if not cancelled:
-                # The pane outlives its app-server; mark it so the next ensure replaces it.
-                record_app_server_stopped(bridge_dir)
-                if server_url is not None:
-                    # Before any teardown await: a relaunch cancels this task and wipes the turn.
-                    await _fail_codex_turn_in_flight(
-                        bridge_dir, server_url=server_url, headers=headers, auth=forward_auth
-                    )
-        if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
-        await _shutdown_session_router_async(session_id, subagent_router)
-        await _shutdown_session_turn_router_async(session_id, turn_router)
+        lost_turn_post: asyncio.Task[None] | None = None
+        try:
+            if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+                leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+                if not cancelled:
+                    # The pane outlives its app-server; mark it so the next ensure replaces it.
+                    record_app_server_stopped(bridge_dir)
+                    if server_url is not None:
+                        # Before any teardown await: a relaunch cancels this task and wipes
+                        # the turn. Shielded so that cancel cannot abandon the claimed turn.
+                        lost_turn_post = asyncio.create_task(
+                            _fail_codex_turn_in_flight(
+                                bridge_dir,
+                                server_url=server_url,
+                                headers=headers,
+                                auth=forward_auth,
+                            )
+                        )
+                        await asyncio.shield(lost_turn_post)
+        finally:
+            if leftover_app_server is not None:
+                with contextlib.suppress(Exception):
+                    await leftover_app_server.close()
+            await _shutdown_session_router_async(session_id, subagent_router)
+            await _shutdown_session_turn_router_async(session_id, turn_router)
+            if lost_turn_post is not None and not lost_turn_post.done():
+                await asyncio.shield(lost_turn_post)
 
 
 async def _run_antigravity_reader(

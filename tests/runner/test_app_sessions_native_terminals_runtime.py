@@ -4415,6 +4415,112 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", ["known_thread", "discovered"])
+async def test_codex_forwarder_cancelled_during_lost_turn_post_still_fails_turn_and_tears_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrapper: str
+) -> None:
+    """
+    A relaunch cancel that lands while the lost turn's failure is being posted
+    neither abandons that failure nor skips closing the app-server and routers.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+
+    session_id = "3c9a7d2e5f1b4a6c8d0e2f4a6b8c0d1e"
+    codex_native_bridge.write_bridge_state(
+        tmp_path,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path="ws://127.0.0.1:9876",
+            thread_id="thread_test",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    post_started, release_post = asyncio.Event(), asyncio.Event()
+    posted: list[dict[str, Any]] = []
+    torn_down: list[str] = []
+    real_async_client = httpx.AsyncClient
+
+    async def _handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            post_started.set()
+            await release_post.wait()
+            posted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(_handle), **kwargs)
+
+    async def _forward(**_kwargs: Any) -> None:
+        # The turn was running when the app-server event stream ended.
+        codex_native_bridge.update_active_turn_id(tmp_path, "turn_live")
+
+    async def _thread_started(*_args: object, **_kwargs: object) -> str:
+        return "thread_test"
+
+    async def _shutdown(name: str, *_args: object) -> None:
+        torn_down.append(name)
+
+    class _Closable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def close(self) -> None:
+            torn_down.append(self.name)
+
+    app_server = _Closable("app_server")
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", _forward)
+    monkeypatch.setattr(codex_forwarder, "wait_for_thread_started", _thread_started)
+    monkeypatch.setattr(
+        orchestration,
+        "_shutdown_session_router_async",
+        lambda *args: _shutdown("subagent_router", *args),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_shutdown_session_turn_router_async",
+        lambda *args: _shutdown("turn_router", *args),
+    )
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = app_server  # type: ignore[assignment]
+    kwargs: dict[str, Any] = {
+        "session_id": session_id,
+        "bridge_dir": tmp_path,
+        "codex_ws_url": "ws://127.0.0.1:9876",
+        "app_server": app_server,
+    }
+    operation = (
+        orchestration._codex_forward_known_thread(**kwargs, thread_id="thread_test")
+        if wrapper == "known_thread"
+        else orchestration._codex_discover_thread_and_forward(
+            **kwargs,
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path),
+            event_client=_Closable("event_client"),  # type: ignore[arg-type]
+            routing_summary="test",
+        )
+    )
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(post_started.wait(), timeout=budget(4))
+        task.cancel()
+        await asyncio.sleep(0)
+        release_post.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=budget(4))
+    finally:
+        release_post.set()
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert [event["data"]["status"] for event in posted] == ["failed"]
+    assert posted[0]["data"]["response_id"] == "codex_turn_live"
+    assert {"app_server", "subagent_router", "turn_router"} <= set(torn_down)
+
+
+@pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
