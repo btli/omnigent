@@ -7958,7 +7958,11 @@ def create_runner_app(
                 async with _codex_terminal_ensure_locks.setdefault(
                     conversation_id, asyncio.Lock()
                 ):
-                    _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
+                    _stop_resp = await _native_interrupt_runner.stop(
+                        _harness,
+                        conversation_id,
+                        stopped_work_id=_stopped_work.work_id if _stopped_work else None,
+                    )
             else:
                 _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:

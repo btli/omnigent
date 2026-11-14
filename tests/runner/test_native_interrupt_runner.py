@@ -1157,14 +1157,16 @@ async def _codex_stop_while_new_work_arrives(
         monkeypatch, tmp_path, conv_id, sub_agent=True
     )
     captured["current_work_id"] = "work_stopped"
-    stop = asyncio.create_task(runner.stop("codex-native", conv_id))
+    stop = asyncio.create_task(
+        runner.stop("codex-native", conv_id, stopped_work_id="work_stopped")
+    )
     await asyncio.wait_for(app_server.close_started.wait(), timeout=5)
     captured["current_work_id"] = "work_replacement"
     app_server.close_gate.set()
     resp = await stop
     assert isinstance(resp, Response) and resp.status_code == 204
     assert app_server.closed is True
-    assert captured["superseded"] == [(conv_id, "cancelled", "work_stopped")]
+    assert captured["wake_calls"] == []
     return captured["wakes"]
 
 
@@ -1408,3 +1410,80 @@ async def test_sys_cancel_task_reports_slow_grok_hard_stop_as_unconfirmed(
     assert result["outcome"] == "unconfirmed"
     assert result["cancel_confirmed"] is False
     assert "may still be running" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_leaves_work_sent_while_waiting_for_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent stops a launching codex sub-agent, then sends it new work.
+
+    The stop waits for the in-flight launch; work the parent registers on the
+    same child during that wait belongs to a new dispatch and must not be
+    marked cancelled by the earlier stop.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner import app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "conv_codex_reused_launch"
+    spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+
+    def _register(work_id: str) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id="conv_reuse_launch_parent",
+            child_session_id=conv_id,
+            agent="codex_impl",
+            title="work",
+            wrapper_label="codex-native-ui",
+            work_id=work_id,
+        )
+
+    _register("work_stopped")
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_codex"}
+            )
+            assert created.status_code == 201, created.text
+            launch_lock = app.state.native_terminal_ensure_locks["codex"].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with launch_lock:
+                stop = asyncio.create_task(
+                    client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "stop_session", "data": {}},
+                    )
+                )
+                await asyncio.sleep(0.2)
+                assert not stop.done()
+                _register("work_replacement")
+            resp = await stop
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert resp.status_code == 204
+    assert entry is not None
+    assert entry.work_id == "work_replacement"
+    assert entry.status != "cancelled"
+    assert entry.cancellation_confirmed is False

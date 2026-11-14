@@ -397,13 +397,18 @@ class NativeInterruptRunner:
             return None
         return await self._uniform_interrupt(spec, conv_id, terminal_role=agent.harness)
 
-    async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
+    async def stop(
+        self, harness_name: str | None, conv_id: str, *, stopped_work_id: str | None = None
+    ) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
 
         A codex sub-agent child is hard-stopped; any other codex session, pi
         and opencode have no distinct stop — they route to their interrupt
         handler, so a top-level Stop session keeps its turn-interrupt behavior.
 
+        :param stopped_work_id: The sub-agent dispatch registered when the stop
+            request arrived, e.g. ``"subagent_a1b2c3d4e5f6"``; only that
+            dispatch is settled by a codex hard-stop.
         :returns: A response when this harness has a stop handler, else ``None``
             so the caller falls through to the in-process turn cancel.
         """
@@ -414,7 +419,7 @@ class NativeInterruptRunner:
         if key == "claude":
             return await self._claude_stop(conv_id)
         if key == "codex" and self._is_subagent_session(conv_id):
-            return await self._codex_stop(conv_id)
+            return await self._codex_stop(conv_id, stopped_work_id=stopped_work_id)
         if key in ("codex", "pi", "opencode"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
@@ -716,18 +721,23 @@ class NativeInterruptRunner:
         await self._teardown_session_terminals(conv_id)
         return self._settle_confirmed_stop(conv_id, display_name="Claude")
 
-    async def _codex_stop(self, conv_id: str) -> Response:
-        work_id = (
-            self._subagent_work_id_for_session(conv_id)
-            if self._subagent_work_id_for_session is not None
-            else None
-        )
+    async def _codex_stop(self, conv_id: str, *, stopped_work_id: str | None) -> Response:
         # A failed interrupt (unreachable app-server) must not block the kill.
         await self._codex_interrupt(conv_id)
         await teardown_codex_native_app_server(conv_id)
         await self._teardown_session_terminals(conv_id)
         await _cancel_auto_forwarder_task(conv_id)
-        return self._settle_confirmed_stop(conv_id, display_name="Codex", only_if_work_id=work_id)
+        current_work_id = (
+            self._subagent_work_id_for_session(conv_id)
+            if self._subagent_work_id_for_session is not None
+            else None
+        )
+        if current_work_id != stopped_work_id:
+            # New work reused the child while the stop waited; its own launch owns it.
+            return Response(status_code=204)
+        return self._settle_confirmed_stop(
+            conv_id, display_name="Codex", only_if_work_id=stopped_work_id
+        )
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
         from omnigent.harnesses.codex_native.app_server import (
