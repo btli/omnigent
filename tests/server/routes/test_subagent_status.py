@@ -874,3 +874,7 @@ async def test_codex_failure_superseded_while_suspended_is_ignored(
     assert common._session_status_cache[route.child_id] == "running"
     assert common._session_active_response_cache[route.child_id] == "codex_turn_b"
     assert route.store.list_items(route.parent_id).data == []
+    if suspend_in == "_enrich_terminal_status_with_subagent_output":
+        conv = route.store.get_conversation(route.child_id)
+        assert conv is not None
+        assert not conv.labels.get(common._LAST_TASK_ERROR_CODE_LABEL_KEY)
