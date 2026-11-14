@@ -1139,3 +1139,80 @@ async def test_subagent_hard_stop_leaves_work_sent_during_teardown_running(
     else:
         wakes = await _codex_stop_while_new_work_arrives(monkeypatch, tmp_path)
         assert wakes == []
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_during_backend_launch_tears_down_the_launched_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent cancels its codex sub-agent while the child's backend is starting.
+
+    The stop must wait for the in-flight launch, tear down the app-server it
+    registers, and only then report the cancellation as confirmed.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner import app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        raise RuntimeError("launch config disabled in test")
+
+    # Keep the session-create auto-launch from touching the host's codex install.
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "conv_codex_launching"
+    spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id="conv_launch_parent",
+        child_session_id=conv_id,
+        agent="codex_impl",
+        title="work",
+        wrapper_label="codex-native-ui",
+    )
+    app_server = _RecordingAppServer()
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_codex"}
+            )
+            assert created.status_code == 201, created.text
+            launch_lock = app.state.native_terminal_ensure_locks["codex"].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with launch_lock:
+                stop = asyncio.create_task(
+                    client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "stop_session", "data": {}},
+                    )
+                )
+                await asyncio.sleep(0.2)
+                assert not stop.done(), "stop confirmed before the launch was dealt with"
+                entry = subagent_work.get_subagent_work(conv_id)
+                assert entry is not None and entry.status != "cancelled"
+                # The launch completes by registering its backend.
+                monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, conv_id, app_server)
+            resp = await stop
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert resp.status_code == 204
+    assert app_server.closed is True
+    assert conv_id not in orchestration._AUTO_CODEX_APP_SERVERS
+    assert entry is not None
+    assert entry.status == "cancelled"
+    assert entry.cancellation_confirmed is True

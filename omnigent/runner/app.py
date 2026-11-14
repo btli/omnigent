@@ -7931,7 +7931,17 @@ def create_runner_app(
             )
             if _cancels_turn:
                 _interrupted_sessions.add(conversation_id)
-            _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
+            if _harness == "codex-native" and (
+                conversation_id in _session_sub_agent_names or _stopped_work is not None
+            ):
+                # Launch holds this lock until its app-server and terminal are
+                # registered; stopping inside it tears down a mid-launch backend too.
+                async with _codex_terminal_ensure_locks.setdefault(
+                    conversation_id, asyncio.Lock()
+                ):
+                    _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
+            else:
+                _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
                 if _cancels_turn:
                     if _stop_resp.status_code == 204:
