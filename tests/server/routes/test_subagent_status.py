@@ -782,11 +782,13 @@ async def test_bare_external_failure_preserves_intake_presence_before_enrichment
 
 
 async def _post_codex_status(
-    route: _StatusRoute, status: str, response_id: str | None = None
+    route: _StatusRoute, status: str, response_id: str | None = None, output: str | None = None
 ) -> None:
     data: dict[str, Any] = {"status": status}
     if response_id is not None:
         data["response_id"] = response_id
+    if output is not None:
+        data["output"] = output
     response = await route.client.post(
         f"/v1/sessions/{route.child_id}/events",
         json={"type": "external_session_status", "data": data},
@@ -794,15 +796,19 @@ async def _post_codex_status(
     assert response.status_code == 202, response.text
 
 
+@pytest.mark.parametrize("output", [None, "Codex turn failed"], ids=["bare", "with-output"])
 async def test_superseded_codex_terminal_edge_is_ignored(
-    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    output: str | None,
 ) -> None:
     """A delayed failure for turn A must not end the turn B a relaunch started."""
     route = status_route
     monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
     await _post_codex_status(route, "running", "codex_turn_b")
 
-    await _post_codex_status(route, "failed", "codex_turn_a")
+    await _post_codex_status(route, "failed", "codex_turn_a", output)
 
     assert common._session_status_cache[route.child_id] == "running"
     assert common._session_active_response_cache[route.child_id] == "codex_turn_b"
@@ -833,3 +839,38 @@ async def test_codex_terminal_edge_for_active_or_unnamed_turn_applies(
     [notice] = route.store.list_items(route.parent_id).data
     assert notice.data.event_type == "session.subagent.returned"
     assert notice.data.resource["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "suspend_in",
+    ["_enrich_terminal_status_with_subagent_output", "_persist_session_status_error_labels"],
+)
+async def test_codex_failure_superseded_while_suspended_is_ignored(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch, suspend_in: str
+) -> None:
+    """Turn B's running edge can land while turn A's failure awaits mid-handler."""
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    await _post_codex_status(route, "running", "codex_turn_a")
+    original = getattr(routes_events, suspend_in)
+    reached = asyncio.Event()
+    release = asyncio.Event()
+
+    async def suspended(*args: Any, **kwargs: Any) -> Any:
+        if not reached.is_set():
+            reached.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events, suspend_in, suspended)
+    stale = asyncio.create_task(
+        _post_codex_status(route, "failed", "codex_turn_a", "Codex turn failed")
+    )
+    await asyncio.wait_for(reached.wait(), 10)
+    await _post_codex_status(route, "running", "codex_turn_b")
+    release.set()
+    await asyncio.wait_for(stale, 10)
+
+    assert common._session_status_cache[route.child_id] == "running"
+    assert common._session_active_response_cache[route.child_id] == "codex_turn_b"
+    assert route.store.list_items(route.parent_id).data == []

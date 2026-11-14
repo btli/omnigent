@@ -2668,14 +2668,20 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
-            if _is_superseded_terminal_status_edge(session_id, status, response_id):
+
+            def edge_superseded(edge_status: str) -> bool:
+                if not _is_superseded_terminal_status_edge(session_id, edge_status, response_id):
+                    return False
                 _logger.warning(
                     "Ignoring superseded %s edge for session %s: response %s, active response %s",
-                    status,
+                    edge_status,
                     session_id,
                     response_id,
                     _session_active_response_cache.get(session_id),
                 )
+                return True
+
+            if edge_superseded(status):
                 return {"queued": False}
             # Terminal edges carry the harness's own persisted text: the
             # child's result on ``idle``, and on ``failed`` — when the
@@ -2753,10 +2759,16 @@ def register_events_routes(
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
+            failed_agent_name = None
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(
                     _response_agent_name_from_store, conversation_store, session_id, response_id
                 )
+            # Each await above and below can let a newer turn's running edge land
+            # first; re-check so this edge never writes labels or status over it.
+            if edge_superseded(status):
+                return {"queued": False}
+            if status_error is not None:
                 await _persist_session_status_error_labels(
                     session_id,
                     status_error,
@@ -2766,6 +2778,8 @@ def register_events_routes(
                 )
             elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            if edge_superseded(status):
+                return {"queued": False}
             _publish_status(
                 session_id,
                 status,
