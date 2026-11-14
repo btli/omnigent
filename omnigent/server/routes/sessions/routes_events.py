@@ -75,7 +75,8 @@ from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.subagent_work import (
     SUBAGENT_CANCELLED_ID_LABEL_KEY,
     SUBAGENT_DISPATCH_ID_LABEL_KEY,
-    subagent_dispatch_cancelled,
+    SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY,
+    subagent_dispatch_resume_blocked,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
@@ -666,6 +667,13 @@ async def _mark_subagent_dispatch_cancelled(
     """
     dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
     if dispatch_id:
+        # A new cancel outranks an earlier human resume of the same dispatch.
+        if conv.labels.get(SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY) == dispatch_id:
+            await asyncio.to_thread(
+                conversation_store.delete_label,
+                conv.id,
+                SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY,
+            )
         await asyncio.to_thread(
             conversation_store.set_labels,
             conv.id,
@@ -675,21 +683,52 @@ async def _mark_subagent_dispatch_cancelled(
 
 
 async def _unmark_subagent_dispatch_cancelled(
-    session_id: str, dispatch_id: str | None, conversation_store: ConversationStore
+    conv: Conversation, dispatch_id: str | None, conversation_store: ConversationStore
 ) -> None:
     """
-    Remove a cancelled marker that still names *dispatch_id*.
+    Restore the cancel labels a cancel that did not land overwrote.
 
-    :param session_id: Sub-agent session, e.g. ``"conv_child456"``.
+    :param conv: Session as it was read before the cancel marked it.
     :param dispatch_id: Dispatch the marker was written for, or ``None``.
-    :param conversation_store: Store that persists the label.
+    :param conversation_store: Store that persists the labels.
     """
     if dispatch_id is None:
         return
-    current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if current is not None and current.labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) == dispatch_id:
+    current = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+    if current is None or current.labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) != dispatch_id:
+        return
+    if conv.labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) != dispatch_id:
         await asyncio.to_thread(
-            conversation_store.delete_label, session_id, SUBAGENT_CANCELLED_ID_LABEL_KEY
+            conversation_store.delete_label, conv.id, SUBAGENT_CANCELLED_ID_LABEL_KEY
+        )
+    if conv.labels.get(SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY) == dispatch_id:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY: dispatch_id},
+        )
+
+
+async def _mark_subagent_resumed_after_cancel(
+    conv: Conversation, conversation_store: ConversationStore
+) -> None:
+    """
+    Let restart recovery resume a human turn accepted after a cancel.
+
+    The cancelled marker stays, so the parent still receives that dispatch as cancelled.
+
+    :param conv: Session whose user message was just dispatched.
+    :param conversation_store: Store that persists the label.
+    """
+    if subagent_dispatch_resume_blocked(conv.labels):
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {
+                SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY: conv.labels[
+                    SUBAGENT_DISPATCH_ID_LABEL_KEY
+                ]
+            },
         )
 
 
@@ -1830,11 +1869,6 @@ def register_events_routes(
                 # response body. queued=False signals the event was
                 # handled synchronously (denied, not queued for a turn).
                 return {"queued": False, "denied": True, "reason": reason}
-            if subagent_dispatch_cancelled(conv.labels):
-                # A human message after a cancel starts new work that recovery may resume.
-                await _unmark_subagent_dispatch_cancelled(
-                    session_id, conv.labels[SUBAGENT_DISPATCH_ID_LABEL_KEY], conversation_store
-                )
             start_fire_stage("input_validation", session_id=session_id)
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             start_fire_stage("input_policy", session_id=session_id)
@@ -2131,7 +2165,7 @@ def register_events_routes(
                 if runner_client is not None:
                     # With no runner at all, keep the marker so recovery cannot resume it.
                     await _unmark_subagent_dispatch_cancelled(
-                        session_id, cancelled_dispatch_id, conversation_store
+                        conv, cancelled_dispatch_id, conversation_store
                     )
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
@@ -2163,7 +2197,7 @@ def register_events_routes(
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
                 await _unmark_subagent_dispatch_cancelled(
-                    session_id, cancelled_dispatch_id, conversation_store
+                    conv, cancelled_dispatch_id, conversation_store
                 )
                 raise
             if not stop_delivered:
@@ -3940,6 +3974,9 @@ def register_events_routes(
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
         )
+        if body.type == "message" and body.data.get("role") == "user":
+            # Only a dispatched message may lift the cancel's resume block.
+            await _mark_subagent_resumed_after_cancel(conv, conversation_store)
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}

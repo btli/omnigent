@@ -10798,10 +10798,135 @@ async def test_user_message_after_stop_lets_restart_recovery_resume_the_child(
                 },
             )
             assert message.status_code == 202, message.text
-        assert _interrupted(restarted_and_running())
+            assert _interrupted(restarted_and_running())
+
+            restop = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert restop.status_code == 202, restop.text
+        # A later stop blocks recovery again.
+        assert not _interrupted(restarted_and_running())
     finally:
         _interrupt_fenced_sessions.discard(session_id)
         _session_status_cache.pop(session_id, None)
+
+
+async def test_refused_user_message_after_stop_keeps_recovery_blocked(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A message refused because no runner is bound leaves a stopped child blocked."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    set_runner_client(None)
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], labels={SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-stopped"}
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    try:
+        stop = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        assert stop.status_code == 202, stop.text
+        message = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Please continue"}],
+                },
+            },
+        )
+        assert message.status_code == 503, message.text
+        _session_status_cache.pop(session_id, None)
+        store.set_session_live_status(session_id, "running")
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        assert not _interrupted(conversation)
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+        _session_status_cache.pop(session_id, None)
+
+
+async def test_user_turn_after_cancel_still_delivers_the_dispatch_cancelled(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent runner restart reports an undrained cancelled dispatch as cancelled."""
+    from omnigent.runner import subagent_work
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    for name in (
+        "_subagent_work_by_child",
+        "_subagent_work_by_parent",
+        "_drained_delivered_subagent_children",
+        "_provisional_cancelled_subagent_work",
+        "_session_inboxes_ref",
+    ):
+        monkeypatch.setattr(subagent_work, name, type(getattr(subagent_work, name))())
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "reviewer:auth",
+            "labels": {SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-cancelled"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    child_id = created.json()["id"]
+    try:
+        async with _runtime_runner(
+            lambda _request: httpx.Response(202, json={"queued": True})
+        ) as runner:
+
+            async def runner_for(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+                return runner
+
+            monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", runner_for)
+            stop = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert stop.status_code == 202, stop.text
+            message = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Fix it yourself"}],
+                    },
+                },
+            )
+            assert message.status_code == 202, message.text
+        # The human turn finished; the parent runner then restarts with an empty inbox.
+        _session_status_cache[child_id] = "idle"
+        inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        subagent_work._session_inboxes_ref[parent["id"]] = inbox
+        wakes: list[str] = []
+        await subagent_work._recover_subagent_results_from_server(
+            server_client=client,
+            parent_id=parent["id"],
+            schedule_wake=lambda entry: wakes.append(entry.work_id),
+        )
+        delivered = [inbox.get_nowait() for _ in range(inbox.qsize())]
+        assert [(item["work_id"], item["status"]) for item in delivered] == [
+            ("dispatch-cancelled", "cancelled")
+        ]
+        assert wakes == ["dispatch-cancelled"]
+    finally:
+        _interrupt_fenced_sessions.discard(child_id)
+        _session_status_cache.pop(child_id, None)
 
 
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(

@@ -91,6 +91,9 @@ SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 # Server-written when a dispatch is cancelled: restart recovery never resumes
 # that dispatch nor delivers it as completed. A new dispatch id makes it stale.
 SUBAGENT_CANCELLED_ID_LABEL_KEY = "omnigent.subagent.cancelled_id"
+# Server-written when a human message is accepted after that cancel: the child's
+# new turn may be resumed, while the parent still sees the dispatch cancelled.
+SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY = "omnigent.subagent.resumed_after_cancel_id"
 
 
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
@@ -529,6 +532,20 @@ def subagent_dispatch_cancelled(labels: Mapping[str, object]) -> bool:
     """
     dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
     return bool(dispatch_id) and labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) == dispatch_id
+
+
+def subagent_dispatch_resume_blocked(labels: Mapping[str, object]) -> bool:
+    """
+    Return whether restart recovery must not resume the child's current turn.
+
+    :param labels: Child session labels, e.g.
+        ``{"omnigent.subagent.cancelled_id": "subagent_a1b2c3d4e5f6"}``.
+    :returns: ``True`` when the current dispatch is cancelled and no human
+        message was accepted after that cancel.
+    """
+    return subagent_dispatch_cancelled(labels) and labels.get(
+        SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY
+    ) != labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
 
 
 class _SubagentRecoveryReadError(Exception):
