@@ -3971,8 +3971,8 @@ def register_events_routes(
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
         )
-        if body.type == "message" and body.data.get("role") == "user":
-            # Only a dispatched message may lift the cancel's resume block.
+        if dispatch.accepted and body.type == "message" and body.data.get("role") == "user":
+            # Only a message the runner accepted may lift the cancel's resume block.
             await _mark_subagent_resumed_after_cancel(conv, conversation_store)
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

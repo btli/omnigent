@@ -32,6 +32,7 @@ from starlette.datastructures import Headers
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     Conversation,
+    ErrorData,
     FunctionCallData,
     MessageData,
     NewConversationItem,
@@ -43,6 +44,7 @@ from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runner.subagent_work import (
     SUBAGENT_CANCELLED_ID_LABEL_KEY,
     SUBAGENT_DISPATCH_ID_LABEL_KEY,
+    SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY,
 )
 from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
@@ -10849,6 +10851,82 @@ async def test_refused_user_message_after_stop_keeps_recovery_blocked(
         store.set_session_live_status(session_id, "running")
         conversation = store.get_conversation(session_id)
         assert conversation is not None
+        assert not _interrupted(conversation)
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+        _session_status_cache.pop(session_id, None)
+
+
+async def test_unforwarded_user_message_after_stop_keeps_recovery_blocked(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message saved as a failed native turn, never forwarded, leaves a stopped child blocked."""
+    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    agent = await create_test_agent(client, name="claude-native-ui")
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+            SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-stopped",
+        },
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    terminal_failed = _NativeTerminalEnsureOutcome(
+        error=ErrorData(
+            source="execution",
+            code="runner_failed_to_start",
+            message="The terminal did not start",
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        AsyncMock(return_value=terminal_failed),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._ensure_runner_session_initialized",
+        AsyncMock(return_value=False),
+    )
+    try:
+        async with _runtime_runner(
+            lambda _request: httpx.Response(202, json={"queued": True})
+        ) as runner:
+            monkeypatch.setattr(
+                "omnigent.server.routes.sessions._get_runner_client",
+                AsyncMock(return_value=runner),
+            )
+            monkeypatch.setattr(
+                "omnigent.server.routes._sessions.orchestration._get_runner_client",
+                AsyncMock(return_value=runner),
+            )
+            stop = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert stop.status_code == 202, stop.text
+            message = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Please continue"}],
+                    },
+                },
+            )
+            # The input is kept as a failed turn, but no runner ever received it.
+            assert message.status_code == 202, message.text
+        _session_status_cache.pop(session_id, None)
+        store.set_session_live_status(session_id, "running")
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        assert SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY not in conversation.labels
         assert not _interrupted(conversation)
     finally:
         _interrupt_fenced_sessions.discard(session_id)
