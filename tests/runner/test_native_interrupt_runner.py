@@ -1717,3 +1717,91 @@ async def test_codex_subagent_stop_with_live_turn_never_cancels_work_sent_meanwh
     assert entry.work_id == "work_replacement"
     assert entry.status != "cancelled"
     assert entry.cancellation_confirmed is False
+
+
+class _CodexPane:
+    """Stand-in codex ``main`` pane whose liveness the test controls."""
+
+    def __init__(self, alive: bool) -> None:
+        self.alive = alive
+
+    async def is_alive(self) -> bool:
+        return self.alive
+
+
+class _OnePaneRegistry:
+    """Terminal registry holding one child's codex ``main`` pane."""
+
+    def __init__(self, task_id: str, pane: _CodexPane) -> None:
+        self._task_id = task_id
+        self._pane = pane
+
+    def get(self, conv_id: str, terminal_name: str, session_key: str) -> _CodexPane | None:
+        if (conv_id, terminal_name, session_key) == (self._task_id, "codex", "main"):
+            return self._pane
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pane_alive", "stop_kills_pane", "stop_response", "expected_outcome"),
+    [
+        pytest.param(True, False, (200, {"queued": False}), "unconfirmed", id="no-runner-2xx"),
+        pytest.param(True, True, (204, None), "hard_stopped", id="pane-dies-on-stop"),
+        pytest.param(False, False, (204, None), "nothing_to_stop", id="already-exited"),
+    ],
+)
+async def test_sys_cancel_task_reports_drained_codex_stop_from_pane_evidence(
+    pane_alive: bool,
+    stop_kills_pane: bool,
+    stop_response: tuple[int, dict[str, Any] | None],
+    expected_outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Journey: a parent cancels a codex sub-agent whose result it already read.
+
+    With the work entry drained, only the child's pane shows what the stop did:
+    alive before and gone after is a hard-stop, already gone is nothing to stop,
+    and still alive (as after the server's no-runner 2xx) is unconfirmed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_drained_codex_parent"
+    child_id = f"conv_drained_codex_{expected_outcome}"
+    pane = _CodexPane(pane_alive)
+    registry = _OnePaneRegistry(child_id, pane)
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: registry)
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": "codex-native-ui"},
+                },
+            )
+        posted.append(json.loads(request.content))
+        if stop_kills_pane:
+            pane.alive = False
+        status_code, body = stop_response
+        return httpx.Response(status_code, json=body) if body else httpx.Response(status_code)
+
+    assert subagent_work.get_subagent_work(child_id) is None
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_parent_server), base_url="http://server"
+    ) as parent_server:
+        raw = await execute_tool(
+            tool_name="sys_cancel_task",
+            arguments=json.dumps({"task_id": child_id}),
+            server_client=parent_server,
+            conversation_id=parent_id,
+            session_async_tasks={},
+        )
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    result = json.loads(raw)
+    assert result["outcome"] == expected_outcome
+    assert result["cancelled"] is (expected_outcome == "hard_stopped")

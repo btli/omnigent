@@ -6499,12 +6499,21 @@ async def test_sys_cancel_task_returns_cached_finished_claude_native_status(
 
 
 @pytest.mark.asyncio
-async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
+async def test_sys_cancel_task_stops_evicted_claude_native_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Server metadata restores the cleanup path after local eviction."""
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
 
     parent_id = "conv_parent_evicted"
     child_id = "conv_child_evicted"
+    pane = _install_cancel_pane(
+        monkeypatch,
+        wrapper_label="claude-code-native-ui",
+        task_id=child_id,
+        alive=True,
+    )
+    assert pane is not None
     posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -6518,6 +6527,7 @@ async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
                 },
             )
         posts.append(json.loads(request.content))
+        pane.alive = False
         return httpx.Response(204)
 
     async with httpx.AsyncClient(
@@ -6674,10 +6684,11 @@ async def _drive_cancel_matrix_row(
         posts.append(body)
         if http_status == 503:
             return httpx.Response(503, json={"error": "native_stop_failed"})
-        if not evicted and body.get("type") == "stop_session":
-            updated = subagent_work.get_subagent_work(child_id)
-            if updated is not None:
-                updated.status = "cancelled"
+        if body.get("type") == "stop_session":
+            if not evicted:
+                updated = subagent_work.get_subagent_work(child_id)
+                if updated is not None:
+                    updated.status = "cancelled"
             if pane is not None:
                 pane.alive = False
         return httpx.Response(http_status)
@@ -6960,10 +6971,14 @@ async def test_cancel_evicted_native_subagent_ownership_matrix(
     row_id: str,
     requesting_parent: str,
     expect_stop: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Evicted-work recovery keeps the parent ownership check for every stop-capable native."""
     owner = "conv_owner_evicted_goose"
     child_id = f"conv_child_{row_id}"
+    pane = _install_cancel_pane(
+        monkeypatch, wrapper_label="goose-native-ui", task_id=child_id, alive=True
+    )
     posts, output = await _drive_cancel_matrix_row(
         parent_id=owner,
         child_id=child_id,
@@ -6972,6 +6987,7 @@ async def test_cancel_evicted_native_subagent_ownership_matrix(
         http_status=204,
         evicted=True,
         requesting_parent=requesting_parent,
+        pane=pane,
     )
     if expect_stop:
         assert posts == [{"type": "stop_session", "data": {}}], (

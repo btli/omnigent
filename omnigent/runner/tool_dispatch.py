@@ -9512,16 +9512,25 @@ async def _execute_task_lifecycle_tool(
 
 def _cached_subagent_cancel_result(task_id: str, status: str) -> str:
     """Return the cached terminal status for a sub-agent cancel."""
+    return _nothing_to_stop_result(
+        task_id,
+        status=status,
+        message=(
+            f"Nothing to stop: the task already ended as {status} and no "
+            "turn or process was stopped."
+        ),
+    )
+
+
+def _nothing_to_stop_result(task_id: str, *, status: str, message: str) -> str:
+    """Return a sub-agent cancel that found no turn or process to stop."""
     return json.dumps(
         {
             "cancelled": status == "cancelled",
             "task_id": task_id,
             "status": status,
             "outcome": "nothing_to_stop",
-            "message": (
-                f"Nothing to stop: the task already ended as {status} and no "
-                "turn or process was stopped."
-            ),
+            "message": message,
         }
     )
 
@@ -9709,6 +9718,9 @@ async def _cancel_evicted_native_subagent(
         or not (stop_capable or resident_acp)
     ):
         return f"Error: no in-flight task with task_id {task_id}"
+    # A 2xx alone proves no kill (the server answers it when no runner is bound),
+    # so a native child's pane is probed on both sides of the stop.
+    pane_alive_before = stop_capable and await _native_child_pane_alive(task_id, wrapper)
     # A 503 is a failed kill, not proof the pane is gone. Report an explicit
     # unconfirmed result rather than ``absent`` / a cached terminal status.
     try:
@@ -9719,7 +9731,16 @@ async def _cancel_evicted_native_subagent(
         if status_code == 503:
             return _unconfirmed_hard_stop_result(task_id, status="unknown")
         return stop_error
-    if resident_acp and _acp_child_process_resident(task_id):
+    if resident_acp:
+        if _acp_child_process_resident(task_id):
+            return _unconfirmed_hard_stop_result(task_id, status="unknown")
+    elif not pane_alive_before:
+        return _nothing_to_stop_result(
+            task_id,
+            status="unknown",
+            message="Nothing to stop: the sub-agent's process had already exited.",
+        )
+    elif await _native_child_pane_alive(task_id, wrapper):
         return _unconfirmed_hard_stop_result(task_id, status="unknown")
     return _settled_subagent_cancel_result(task_id, status="cancelled", hard_stopped=True)
 
