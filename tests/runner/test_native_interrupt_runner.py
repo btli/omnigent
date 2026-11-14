@@ -1614,3 +1614,106 @@ async def test_sys_cancel_task_reports_timed_out_drained_grok_stop_as_unconfirme
     result = json.loads(raw)
     assert result["outcome"] == "unconfirmed"
     assert result["cancel_confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_with_live_turn_never_cancels_work_sent_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent stops a codex sub-agent mid-turn, then sends it new work.
+
+    Extends the stop-during-launch scenario with a live Codex bridge and turn.
+    The replacement work lands while the stop interrupts that turn; even after
+    the interrupt grace interval has passed, the replacement must never be
+    marked cancelled by the earlier stop.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner import app as runner_app_module
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.05)
+    conv_id = "conv_codex_live_turn_reused"
+    spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    def _register(work_id: str) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id="conv_live_turn_parent",
+            child_session_id=conv_id,
+            agent="codex_impl",
+            title="work",
+            wrapper_label="codex-native-ui",
+            work_id=work_id,
+        )
+
+    class _ReplacingCodexClient(_RecordingCodexClient):
+        """Records the interrupt; the parent sends new work while it is in flight."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            result = await super().request(method, params)
+            _register("work_replacement")
+            return result
+
+    codex_client = _ReplacingCodexClient()
+    monkeypatch.setattr(codex_app_server, "client_for_transport", lambda *_a, **_k: codex_client)
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    _register("work_stopped")
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_codex"}
+            )
+            assert created.status_code == 201, created.text
+            codex_bridge.write_bridge_state(
+                codex_bridge.bridge_dir_for_bridge_id(conv_id),
+                CodexNativeBridgeState(
+                    session_id=conv_id,
+                    socket_path="ws://127.0.0.1:43298",
+                    thread_id="thread_live",
+                    codex_home=str(tmp_path / "codex-home"),
+                    active_turn_id="turn_live",
+                ),
+            )
+            launch_lock = app.state.native_terminal_ensure_locks["codex"].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with launch_lock:
+                stop = asyncio.create_task(
+                    client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "stop_session", "data": {}},
+                    )
+                )
+                await asyncio.sleep(0.2)
+                assert not stop.done()
+            resp = await stop
+            # Run past the interrupt grace interval: no delayed cancel may land.
+            await asyncio.sleep(0.5)
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert resp.status_code == 204
+    assert codex_client.requests == [
+        ("turn/interrupt", {"threadId": "thread_live", "turnId": "turn_live"})
+    ]
+    assert entry is not None
+    assert entry.work_id == "work_replacement"
+    assert entry.status != "cancelled"
+    assert entry.cancellation_confirmed is False

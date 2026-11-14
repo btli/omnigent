@@ -722,24 +722,41 @@ class NativeInterruptRunner:
         return self._settle_confirmed_stop(conv_id, display_name="Claude")
 
     async def _codex_stop(self, conv_id: str, *, stopped_work_id: str | None) -> Response:
-        # A failed interrupt (unreachable app-server) must not block the kill.
-        await self._codex_interrupt(conv_id)
+        if not self._owns_dispatch(conv_id, stopped_work_id):
+            return self._abandon_stop(conv_id, stopped_work_id)
+        # A failed interrupt (unreachable app-server) must not block the kill. The
+        # stop settles its own dispatch, so it arms no grace timer that could later
+        # cancel work registered on the child meanwhile.
+        await self._codex_interrupt(conv_id, defer_parent_wake=False)
         await teardown_codex_native_app_server(conv_id)
         await self._teardown_session_terminals(conv_id)
         await _cancel_auto_forwarder_task(conv_id)
+        if not self._owns_dispatch(conv_id, stopped_work_id):
+            return self._abandon_stop(conv_id, stopped_work_id)
+        return self._settle_confirmed_stop(
+            conv_id, display_name="Codex", only_if_work_id=stopped_work_id
+        )
+
+    def _owns_dispatch(self, conv_id: str, stopped_work_id: str | None) -> bool:
+        """Whether the dispatch the stop was raised for still holds *conv_id*."""
         current_work_id = (
             self._subagent_work_id_for_session(conv_id)
             if self._subagent_work_id_for_session is not None
             else None
         )
-        if current_work_id != stopped_work_id:
-            # New work reused the child while the stop waited; its own launch owns it.
-            return Response(status_code=204)
-        return self._settle_confirmed_stop(
-            conv_id, display_name="Codex", only_if_work_id=stopped_work_id
-        )
+        return current_work_id == stopped_work_id
 
-    async def _codex_interrupt(self, conv_id: str) -> Response:
+    def _abandon_stop(self, conv_id: str, stopped_work_id: str | None) -> Response:
+        """Leave a child that new work reused; its own launch and outcome own it now."""
+        # An interrupt still pending for the stopped dispatch can no longer settle it.
+        if (
+            conv_id in self._pending_interrupts
+            and self._pending_interrupts[conv_id] == stopped_work_id
+        ):
+            self.clear_pending_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _codex_interrupt(self, conv_id: str, *, defer_parent_wake: bool = True) -> Response:
         from omnigent.harnesses.codex_native.app_server import (
             CodexAppServerResponseError,
             client_for_transport,
@@ -886,7 +903,8 @@ class NativeInterruptRunner:
                 await asyncio.wait_for(
                     codex_client.close(), timeout=_CODEX_INTERRUPT_CLOSE_TIMEOUT_S
                 )
-        self._defer_parent_wake_after_native_interrupt(conv_id)
+        if defer_parent_wake:
+            self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
     async def _opencode_interrupt(self, conv_id: str) -> Response | None:
