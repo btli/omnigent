@@ -45,6 +45,7 @@ from omnigent.harnesses.codex_native.bridge import (
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
+    _write_bridge_record,
     clear_active_turn_id_if_matches,
     clear_certificate_failure,
     codex_config_revision,
@@ -229,6 +230,10 @@ _GOAL_STOPPED_FAILURE_OUTPUT = {
     "usageLimited": "Codex stopped the goal: usage limit reached.",
     "budgetLimited": "Codex stopped the goal: token budget reached.",
 }
+# Names a still-open turn whose failure was already posted, so the runner's
+# lost-connection cleanup does not post a second failure over its reason.
+_TURN_FAILURE_POSTED_FILE = "turn_failure_posted.json"
+_AP_CLIENT_TIMEOUT = httpx.Timeout(30.0)
 _CODEX_BACKGROUND_TERMINALS_LIST_METHOD = "thread/backgroundTerminals/list"
 # A running background terminal is listed again at this interval until none is left.
 _BACKGROUND_TERMINAL_POLL_SECONDS = 3.0
@@ -2819,7 +2824,7 @@ async def supervise_forwarder(
         base_url,
         headers=headers,
         auth=auth,
-        timeout=httpx.Timeout(30.0),
+        timeout=_AP_CLIENT_TIMEOUT,
         transport=ap_transport,
     ) as ap_client:
         # Synthesize the thread's MCP startup round (see the comment on
@@ -4927,12 +4932,28 @@ async def _handle_thread_goal_notification(
         if turn_id is not None:
             # The turn's own terminal boundary must not replace this failure with idle.
             forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+            _write_bridge_record(bridge_dir, _TURN_FAILURE_POSTED_FILE, {"turn_id": turn_id})
         else:
             # The turn's start was missed, so its boundary is recognized when it arrives.
             forwarder_state.goal_failure_awaits_turn = True
         forwarder_state.turn_failure_surfaced = True
         await _post_status(client, session_id, "failed", output=failure_output)
         await forwarder_state.forget_posted_terminals()
+
+
+def turn_failure_already_posted(bridge_dir: Path, turn_id: str) -> bool:
+    """
+    Return whether the forwarder already posted a failure for a still-open turn.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param turn_id: Codex turn id, e.g. ``"turn_abc123"``.
+    :returns: ``True`` when that turn's failure was posted.
+    """
+    try:
+        record = json.loads((bridge_dir / _TURN_FAILURE_POSTED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record.get("turn_id") == turn_id
 
 
 async def _clear_superseded_background_work(
