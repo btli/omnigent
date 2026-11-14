@@ -1341,3 +1341,70 @@ async def test_sys_cancel_task_hard_stops_idle_grok_child_with_resident_process(
     assert not result.startswith("Error"), result
     assert posted == [{"type": "stop_session", "data": {}}]
     assert pm.released == [child_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forward_failure", ["503", "timeout"])
+async def test_sys_cancel_task_reports_slow_grok_hard_stop_as_unconfirmed(
+    forward_failure: str,
+) -> None:
+    """Journey: a parent cancels a grok sub-agent whose process is slow to die.
+
+    The server's stop forward gives up (503) or the request times out while the
+    runner's kill keeps going; the parent must get an unconfirmed hard-stop it
+    can follow up on, not an error claiming the stop failed outright.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_slow_stop_parent"
+    child_id = f"conv_slow_stop_child_{forward_failure}"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        if forward_failure == "timeout":
+            raise httpx.ReadTimeout("stop forward timed out", request=request)
+        return httpx.Response(503, json={"error": "runner_unavailable"})
+
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="grok", title="work"
+    )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            raw = await execute_tool(
+                tool_name="sys_cancel_task",
+                arguments=json.dumps({"task_id": child_id}),
+                server_client=parent_server,
+                conversation_id=parent_id,
+                session_async_tasks={},
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert not raw.startswith("Error"), raw
+    result = json.loads(raw)
+    assert result["outcome"] == "unconfirmed"
+    assert result["cancel_confirmed"] is False
+    assert "may still be running" in result["message"]

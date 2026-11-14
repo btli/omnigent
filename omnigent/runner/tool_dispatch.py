@@ -9804,9 +9804,12 @@ async def _cancel_subagent_task(
             timeout=30.0,
         )
     except (httpx.HTTPError, ValueError) as exc:
+        # A kill outlasting the forward's deadline keeps running and settles later.
+        if event_type == "stop_session" and isinstance(exc, httpx.TimeoutException):
+            return _unconfirmed_hard_stop_result(str(task_id), status=entry.status)
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
-        if capability == "stop" and resp.status_code == 503:
+        if event_type == "stop_session" and resp.status_code == 503:
             return _unconfirmed_hard_stop_result(str(task_id), status=entry.status)
         return (
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
