@@ -6481,16 +6481,9 @@ async def _fail_codex_turn_in_flight(
             state.session_id,
             turn_id,
         )
-        # Trap: a relaunch waits for this forwarder only up to its cancel barrier,
-        # then starts the replacement. A post landing after that would fail the
-        # recovered session, so end it within half the barrier, which always
-        # starts after this post does, leaving the rest for teardown.
-        async with (
-            asyncio.timeout(_AUTO_FORWARDER_CANCEL_TIMEOUT_S / 2),
-            open_server_client(
-                server_url, headers=headers, auth=auth, timeout=_AP_CLIENT_TIMEOUT
-            ) as client,
-        ):
+        async with open_server_client(
+            server_url, headers=headers, auth=auth, timeout=_AP_CLIENT_TIMEOUT
+        ) as client:
             await _post_status(
                 client,
                 state.session_id,
@@ -6502,12 +6495,6 @@ async def _fail_codex_turn_in_flight(
                     f"{CODEX_APP_SERVER_STOPPED.remediation}"
                 ),
             )
-    except TimeoutError:
-        _logger.warning(
-            "Dropped the failed status for a lost Codex turn in %s: the post outlasted "
-            "the relaunch cancel barrier, and a relaunch supersedes the turn",
-            bridge_dir,
-        )
     except Exception:  # teardown must finish even if the failure cannot be posted.
         _logger.warning(
             "Could not post the failed status for a lost Codex turn in %s",
