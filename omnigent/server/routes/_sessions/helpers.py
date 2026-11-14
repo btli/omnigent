@@ -5491,7 +5491,7 @@ async def _persist_session_status_error_labels(
     owner_runner_id: str | None = None,
     agent_name: str | None = None,
     item_id: str | None = None,
-) -> None:
+) -> dict[str, str] | None:
     """
     Persist or clear the reload-visible failure detail for a session status.
 
@@ -5511,6 +5511,7 @@ async def _persist_session_status_error_labels(
     :param agent_name: Agent responsible for this failure, captured before a rebind.
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
+    :returns: The labels written, or ``None`` when the write failed.
     """
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
@@ -5547,6 +5548,32 @@ async def _persist_session_status_error_labels(
             session_id,
             extra={"session_id": session_id},
         )
+        return None
+    return updates
+
+
+async def _clear_session_status_error_labels_if_unchanged(
+    session_id: str,
+    written: Mapping[str, str],
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Clear failure labels a rejected status edge wrote, unless a later edge replaced them.
+
+    :param session_id: Session/conversation identifier.
+    :param written: Labels the rejected edge wrote, as returned by
+        :func:`_persist_session_status_error_labels`.
+    :param conversation_store: Store holding the labels.
+    :returns: None.
+    """
+
+    def clear() -> None:
+        conv = conversation_store.get_conversation(session_id)
+        if conv is None or any(conv.labels.get(key) != value for key, value in written.items()):
+            return
+        conversation_store.set_labels(session_id, dict.fromkeys(written, ""))
+
+    await asyncio.to_thread(clear)
 
 
 def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:

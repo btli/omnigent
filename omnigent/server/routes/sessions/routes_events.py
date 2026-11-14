@@ -199,6 +199,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _clear_session_status_error_labels_if_unchanged,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -2765,11 +2766,13 @@ def register_events_routes(
                     _response_agent_name_from_store, conversation_store, session_id, response_id
                 )
             # Each await above and below can let a newer turn's running edge land
-            # first; re-check so this edge never writes labels or status over it.
+            # first. Re-check before writing labels, and again before publishing;
+            # a newer edge can still land during the label write, so undo it then.
             if edge_superseded(status):
                 return {"queued": False}
+            written_error_labels: dict[str, str] | None = None
             if status_error is not None:
-                await _persist_session_status_error_labels(
+                written_error_labels = await _persist_session_status_error_labels(
                     session_id,
                     status_error,
                     conversation_store,
@@ -2779,6 +2782,10 @@ def register_events_routes(
             elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
             if edge_superseded(status):
+                if written_error_labels is not None:
+                    await _clear_session_status_error_labels_if_unchanged(
+                        session_id, written_error_labels, conversation_store
+                    )
                 return {"queued": False}
             _publish_status(
                 session_id,
