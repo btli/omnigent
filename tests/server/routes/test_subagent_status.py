@@ -21,7 +21,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
-from omnigent.server.routes._sessions import common
+from omnigent.server.routes._sessions import common, helpers
 from omnigent.server.routes.sessions import routes_events
 from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -778,4 +778,190 @@ async def test_bare_external_failure_preserves_intake_presence_before_enrichment
     assert attributes["response_id"] == "synthetic:signals"
     assert attributes["active_response_id_at_failure"] == "resp_active"
     assert route.store.get_conversation(route.child_id) is not None
+    assert common._session_status_cache[route.child_id] == "failed"
+
+
+async def _post_codex_status(
+    route: _StatusRoute, status: str, response_id: str | None = None, output: str | None = None
+) -> None:
+    data: dict[str, Any] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
+    if output is not None:
+        data["output"] = output
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert response.status_code == 202, response.text
+
+
+@pytest.mark.parametrize("output", [None, "Codex turn failed"], ids=["bare", "with-output"])
+async def test_superseded_codex_terminal_edge_is_ignored(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    output: str | None,
+) -> None:
+    """A delayed failure for turn A must not end the turn B a relaunch started."""
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    await _post_codex_status(route, "running", "codex_turn_b")
+
+    await _post_codex_status(route, "failed", "codex_turn_a", output)
+
+    assert common._session_status_cache[route.child_id] == "running"
+    assert common._session_active_response_cache[route.child_id] == "codex_turn_b"
+    assert route.store.list_items(route.parent_id).data == []
+    assert "Ignoring superseded failed edge" in caplog.text
+    await _flush_live_state()
+    conv = route.store.get_conversation(route.child_id)
+    assert conv is not None
+    assert conv.live_status == "running"
+
+
+@pytest.mark.parametrize(
+    "terminal_response_id", ["codex_turn_b", None], ids=["current-turn", "no-turn"]
+)
+async def test_codex_terminal_edge_for_active_or_unnamed_turn_applies(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_response_id: str | None,
+) -> None:
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    await _post_codex_status(route, "running", "codex_turn_b")
+
+    await _post_codex_status(route, "failed", terminal_response_id)
+
+    assert common._session_status_cache[route.child_id] == "failed"
+    assert route.child_id not in common._session_active_response_cache
+    [notice] = route.store.list_items(route.parent_id).data
+    assert notice.data.event_type == "session.subagent.returned"
+    assert notice.data.resource["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "suspend_in",
+    ["_enrich_terminal_status_with_subagent_output", "_persist_session_status_error_labels"],
+)
+async def test_codex_failure_superseded_while_suspended_is_ignored(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch, suspend_in: str
+) -> None:
+    """Turn B's running edge can land while turn A's failure awaits mid-handler."""
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    await _post_codex_status(route, "running", "codex_turn_a")
+    original = getattr(routes_events, suspend_in)
+    reached = asyncio.Event()
+    release = asyncio.Event()
+
+    async def suspended(*args: Any, **kwargs: Any) -> Any:
+        if not reached.is_set():
+            reached.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events, suspend_in, suspended)
+    stale = asyncio.create_task(
+        _post_codex_status(route, "failed", "codex_turn_a", "Codex turn failed")
+    )
+    await asyncio.wait_for(reached.wait(), 10)
+    await _post_codex_status(route, "running", "codex_turn_b")
+    release.set()
+    await asyncio.wait_for(stale, 10)
+
+    assert common._session_status_cache[route.child_id] == "running"
+    assert common._session_active_response_cache[route.child_id] == "codex_turn_b"
+    assert route.store.list_items(route.parent_id).data == []
+    conv = route.store.get_conversation(route.child_id)
+    assert conv is not None
+    assert not conv.labels.get(common._LAST_TASK_ERROR_CODE_LABEL_KEY)
+    children = await route.client.get(f"/v1/sessions/{route.parent_id}/child_sessions")
+    assert children.status_code == 200, children.text
+    [child] = [row for row in children.json()["data"] if row["id"] == route.child_id]
+    assert child["current_task_status"] != "failed"
+    assert [call.args[0].status for call in route.telemetry.call_args_list] == []
+    assert [body["data"]["status"] for _path, body in route.forwarded] == ["running", "running"]
+
+
+class _ContentionSignalLock(asyncio.Lock):
+    """Lock that reports when a second caller has to wait for it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.contended = asyncio.Event()
+
+    async def acquire(self) -> bool:
+        if self.locked():
+            self.contended.set()
+        return await super().acquire()
+
+
+async def test_superseded_label_undo_never_erases_newer_failure(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turn B's own failure, written while A's undo is mid-compare, survives the undo."""
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    lock = _ContentionSignalLock()
+    helpers._status_error_label_locks[route.child_id] = lock
+    await _post_codex_status(route, "running", "codex_turn_a")
+
+    original_persist = routes_events._persist_session_status_error_labels
+    stale_write_reached = asyncio.Event()
+    release_stale_write = asyncio.Event()
+
+    async def suspended_persist(*args: Any, **kwargs: Any) -> Any:
+        if not stale_write_reached.is_set():
+            stale_write_reached.set()
+            await release_stale_write.wait()
+        return await original_persist(*args, **kwargs)
+
+    original_undo = routes_events._clear_superseded_status_error_labels
+    undo_armed = threading.Event()
+    undo_read_done = threading.Event()
+    release_undo = threading.Event()
+
+    async def armed_undo(*args: Any, **kwargs: Any) -> None:
+        undo_armed.set()
+        await original_undo(*args, **kwargs)
+
+    original_get = route.store.get_conversation
+
+    def paused_get(conversation_id: str) -> Any:
+        conv = original_get(conversation_id)
+        if undo_armed.is_set() and not undo_read_done.is_set():
+            undo_read_done.set()
+            assert release_undo.wait(10)
+        return conv
+
+    monkeypatch.setattr(routes_events, "_persist_session_status_error_labels", suspended_persist)
+    monkeypatch.setattr(routes_events, "_clear_superseded_status_error_labels", armed_undo)
+    monkeypatch.setattr(route.store, "get_conversation", paused_get)
+    try:
+        stale = asyncio.create_task(
+            _post_codex_status(route, "failed", "codex_turn_a", "Codex turn A failed")
+        )
+        await asyncio.wait_for(stale_write_reached.wait(), 10)
+        await _post_codex_status(route, "running", "codex_turn_b")
+        release_stale_write.set()
+        assert await asyncio.to_thread(undo_read_done.wait, 10)
+
+        current = asyncio.create_task(
+            _post_codex_status(route, "failed", "codex_turn_b", "Codex turn B failed")
+        )
+        contended = asyncio.create_task(lock.contended.wait())
+        await asyncio.wait({current, contended}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        contended.cancel()
+    finally:
+        release_undo.set()
+        release_stale_write.set()
+    await asyncio.wait_for(stale, 10)
+    await asyncio.wait_for(current, 10)
+
+    conv = original_get(route.child_id)
+    assert conv is not None
+    assert conv.labels.get(common._LAST_TASK_ERROR_CODE_LABEL_KEY) == "codex_turn_error"
+    assert conv.labels.get(common._LAST_TASK_ERROR_MESSAGE_LABEL_KEY) == "Codex turn B failed"
     assert common._session_status_cache[route.child_id] == "failed"

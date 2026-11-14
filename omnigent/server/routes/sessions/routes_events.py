@@ -199,6 +199,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _clear_superseded_status_error_labels,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -210,6 +211,7 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos,
     _is_codex_native_subagent,
     _is_devin_native_subagent,
+    _is_superseded_terminal_status_edge,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
     _owns_host_runner,
@@ -253,6 +255,7 @@ from omnigent.server.routes._sessions.helpers import (
     _set_background_tasks,
     _set_background_work_running,
     _signal_harness_elicitation_resolved_by_id,
+    _status_error_label_lock,
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
@@ -2667,6 +2670,21 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
+
+            def edge_superseded(edge_status: str) -> bool:
+                if not _is_superseded_terminal_status_edge(session_id, edge_status, response_id):
+                    return False
+                _logger.warning(
+                    "Ignoring superseded %s edge for session %s: response %s, active response %s",
+                    edge_status,
+                    session_id,
+                    response_id,
+                    _session_active_response_cache.get(session_id),
+                )
+                return True
+
+            if edge_superseded(status):
+                return {"queued": False}
             # Terminal edges carry the harness's own persisted text: the
             # child's result on ``idle``, and on ``failed`` — when the
             # forwarder attached no detail — its error report (claude-native's
@@ -2743,19 +2761,34 @@ def register_events_routes(
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
+            failed_agent_name = None
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(
                     _response_agent_name_from_store, conversation_store, session_id, response_id
                 )
-                await _persist_session_status_error_labels(
-                    session_id,
-                    status_error,
-                    conversation_store,
-                    owner_runner_id=conv.runner_id,
-                    agent_name=failed_agent_name,
-                )
+            # Each await above and below can let a newer turn's running edge land
+            # first. Re-check before writing labels, and again before publishing;
+            # a newer edge can still land during the label write, so undo it then.
+            if edge_superseded(status):
+                return {"queued": False}
+            written_error_labels: dict[str, str] | None = None
+            if status_error is not None:
+                async with _status_error_label_lock(session_id):
+                    written_error_labels = await _persist_session_status_error_labels(
+                        session_id,
+                        status_error,
+                        conversation_store,
+                        owner_runner_id=conv.runner_id,
+                        agent_name=failed_agent_name,
+                    )
             elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            if edge_superseded(status):
+                if written_error_labels is not None:
+                    await _clear_superseded_status_error_labels(
+                        session_id, status, response_id, written_error_labels, conversation_store
+                    )
+                return {"queued": False}
             _publish_status(
                 session_id,
                 status,
