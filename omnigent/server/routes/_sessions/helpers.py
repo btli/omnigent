@@ -5552,15 +5552,39 @@ async def _persist_session_status_error_labels(
     return updates
 
 
-async def _clear_session_status_error_labels_if_unchanged(
+# Serializes one session's external-status failure-label writes with a superseded
+# edge's undo, so the undo's read-compare-clear cannot interleave a newer write.
+_status_error_label_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    weakref.WeakValueDictionary
+)
+
+
+def _status_error_label_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock guarding one session's external-status failure labels.
+
+    :param session_id: Session/conversation identifier.
+    :returns: A process-wide :class:`asyncio.Lock` for ``session_id``.
+    """
+    return _status_error_label_locks.setdefault(session_id, asyncio.Lock())
+
+
+async def _clear_superseded_status_error_labels(
     session_id: str,
+    status: str,
+    response_id: str | None,
     written: Mapping[str, str],
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Clear failure labels a rejected status edge wrote, unless a later edge replaced them.
+    Clear failure labels a superseded status edge wrote, unless a later edge replaced them.
+
+    Runs under :func:`_status_error_label_lock`, so a newer edge's label write
+    lands either before the comparison or after the clear.
 
     :param session_id: Session/conversation identifier.
+    :param status: Status the rejected edge carried, e.g. ``"failed"``.
+    :param response_id: Turn the rejected edge named, e.g. ``"codex_turn_a"``.
     :param written: Labels the rejected edge wrote, as returned by
         :func:`_persist_session_status_error_labels`.
     :param conversation_store: Store holding the labels.
@@ -5573,7 +5597,17 @@ async def _clear_session_status_error_labels_if_unchanged(
             return
         conversation_store.set_labels(session_id, dict.fromkeys(written, ""))
 
-    await asyncio.to_thread(clear)
+    async with _status_error_label_lock(session_id):
+        if not _is_superseded_terminal_status_edge(session_id, status, response_id):
+            return
+        try:
+            await asyncio.to_thread(clear)
+        except SQLAlchemyError:
+            _logger.exception(
+                "Failed to clear superseded status error labels for %s",
+                session_id,
+                extra={"session_id": session_id},
+            )
 
 
 def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:

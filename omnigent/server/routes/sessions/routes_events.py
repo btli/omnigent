@@ -199,7 +199,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
-    _clear_session_status_error_labels_if_unchanged,
+    _clear_superseded_status_error_labels,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -255,6 +255,7 @@ from omnigent.server.routes._sessions.helpers import (
     _set_background_tasks,
     _set_background_work_running,
     _signal_harness_elicitation_resolved_by_id,
+    _status_error_label_lock,
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
@@ -2772,19 +2773,20 @@ def register_events_routes(
                 return {"queued": False}
             written_error_labels: dict[str, str] | None = None
             if status_error is not None:
-                written_error_labels = await _persist_session_status_error_labels(
-                    session_id,
-                    status_error,
-                    conversation_store,
-                    owner_runner_id=conv.runner_id,
-                    agent_name=failed_agent_name,
-                )
+                async with _status_error_label_lock(session_id):
+                    written_error_labels = await _persist_session_status_error_labels(
+                        session_id,
+                        status_error,
+                        conversation_store,
+                        owner_runner_id=conv.runner_id,
+                        agent_name=failed_agent_name,
+                    )
             elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
             if edge_superseded(status):
                 if written_error_labels is not None:
-                    await _clear_session_status_error_labels_if_unchanged(
-                        session_id, written_error_labels, conversation_store
+                    await _clear_superseded_status_error_labels(
+                        session_id, status, response_id, written_error_labels, conversation_store
                     )
                 return {"queued": False}
             _publish_status(
