@@ -720,15 +720,12 @@ async def _mark_subagent_resumed_after_cancel(
     :param conv: Session whose user message was just dispatched.
     :param conversation_store: Store that persists the label.
     """
-    if subagent_dispatch_resume_blocked(conv.labels):
+    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if dispatch_id and subagent_dispatch_resume_blocked(conv.labels):
         await asyncio.to_thread(
             conversation_store.set_labels,
             conv.id,
-            {
-                SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY: conv.labels[
-                    SUBAGENT_DISPATCH_ID_LABEL_KEY
-                ]
-            },
+            {SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY: dispatch_id},
         )
 
 
