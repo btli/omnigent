@@ -1552,3 +1552,65 @@ async def test_sys_cancel_task_does_not_claim_hard_stop_for_unreached_grok_child
     assert pm.released == []
     assert result["outcome"] == "unconfirmed"
     assert result["cancel_confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_reports_timed_out_drained_grok_stop_as_unconfirmed() -> None:
+    """Journey: a parent cancels a grok sub-agent whose result it already read.
+
+    The drained child's ACP process is still resident, and the stop forward
+    times out while the kill keeps going; the parent must get an unconfirmed
+    hard-stop, not an error claiming the stop failed outright.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_drained_timeout_parent"
+    child_id = "conv_drained_timeout_grok"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200, json={"id": child_id, "parent_session_id": parent_id, "labels": {}}
+            )
+        posted.append(json.loads(request.content))
+        raise httpx.ReadTimeout("stop forward timed out", request=request)
+
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+        await pm.get_client(child_id, "grok")
+        assert subagent_work.get_subagent_work(child_id) is None
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            raw = await execute_tool(
+                tool_name="sys_cancel_task",
+                arguments=json.dumps({"task_id": child_id}),
+                server_client=parent_server,
+                conversation_id=parent_id,
+                session_async_tasks={},
+            )
+    finally:
+        await runner_server.aclose()
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert not raw.startswith("Error"), raw
+    result = json.loads(raw)
+    assert result["outcome"] == "unconfirmed"
+    assert result["cancel_confirmed"] is False

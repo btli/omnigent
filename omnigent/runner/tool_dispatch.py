@@ -9651,6 +9651,8 @@ async def _post_session_stop(
 
     :returns: ``(status_code, error)``. ``error`` is ``None`` on 2xx.
         Transport failures use ``status_code is None``.
+    :raises httpx.TimeoutException: The forward timed out; the kill may still
+        be running, so the caller reports it unconfirmed rather than failed.
     """
     try:
         resp = await server_client.post(
@@ -9658,6 +9660,8 @@ async def _post_session_stop(
             json={"type": "stop_session", "data": {}},
             timeout=30.0,
         )
+    except httpx.TimeoutException:
+        raise
     except (httpx.HTTPError, ValueError) as exc:
         return None, f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
@@ -9707,7 +9711,10 @@ async def _cancel_evicted_native_subagent(
         return f"Error: no in-flight task with task_id {task_id}"
     # A 503 is a failed kill, not proof the pane is gone. Report an explicit
     # unconfirmed result rather than ``absent`` / a cached terminal status.
-    status_code, stop_error = await _post_session_stop(server_client, task_id)
+    try:
+        status_code, stop_error = await _post_session_stop(server_client, task_id)
+    except httpx.TimeoutException:
+        return _unconfirmed_hard_stop_result(task_id, status="unknown")
     if stop_error is not None:
         if status_code == 503:
             return _unconfirmed_hard_stop_result(task_id, status="unknown")
