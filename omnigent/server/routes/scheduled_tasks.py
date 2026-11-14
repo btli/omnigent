@@ -72,6 +72,7 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
+from omnigent.server.scheduled.name_template import NameTemplateError, validate_name_template
 from omnigent.server.scheduled.rrule import (
     RRuleSearchError,
     RRuleValidationError,
@@ -365,6 +366,14 @@ def _run_to_response(
         "session_cost_usd": session_cost_usd,
         "conversation_pending_approvals": conversation_pending_approvals,
     }
+
+
+def _validate_name_template_or_400(name: str) -> None:
+    """Raise a 400 for invalid date placeholders in a task name."""
+    try:
+        validate_name_template(name)
+    except NameTemplateError as exc:
+        raise OmnigentError(f"invalid name template: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 def one_time_schedules_supported(request: Request) -> bool:
@@ -1000,6 +1009,9 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        if body.kind != "reminder":
+            # A reminder continues its session, so its name is never rendered.
+            _validate_name_template_or_400(body.name)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1489,6 +1501,8 @@ def create_scheduled_tasks_router(
         stored = _require_owned(scheduled_task_id, owner_id)
         existing = without_legacy_sandbox_workspace(stored)
         legacy_workspace = existing.workspace != stored.workspace
+        if body.name is not None and body.name != existing.name:
+            _validate_name_template_or_400(body.name)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
