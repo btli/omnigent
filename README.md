@@ -386,13 +386,11 @@ inference config: Omnigent then writes a session-private Jcode config and
 forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
 servers, so Omnigent's MCP tools are not offered to it.
 
-Builtin ACP rows may declare exact-name `env_passthrough` allowances; Grok
-forwards `XAI_API_KEY` for API-key authentication. The key must already be
-present in the runner environment: set it in the runner container's environment,
-or export it on the host and set `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`.
-The host-to-runner hop (`connect.py`) remains a separate, unchanged gate:
-`XAI_API_KEY` is not in its credential allowlist, so exporting the key alone on
-the host is insufficient. Other variables still require an explicit declaration.
+Use the vendor login or explicitly forward an API key. The builtin Grok row
+declares `XAI_API_KEY` for runner-to-Grok forwarding. Host-to-runner forwarding
+still requires `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`; exporting the key
+in your host shell alone does not reach a host-managed runner. Custom `acp:`
+agents can declare their own passthrough variables.
 
 </details>
 

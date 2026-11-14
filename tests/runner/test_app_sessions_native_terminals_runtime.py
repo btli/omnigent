@@ -4115,7 +4115,8 @@ async def test_codex_forwarder_auth_keeps_tunnel_pings_responsive(
         httpx,
         "AsyncClient",
         lambda **kwargs: real_async_client(
-            transport=httpx.MockTransport(lambda _request: httpx.Response(200)), **kwargs
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+            **{key: value for key, value in kwargs.items() if key != "transport"},
         ),
     )
     kwargs: dict[str, Any] = {
@@ -4251,6 +4252,7 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
         return httpx.Response(200)
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(transport=httpx.MockTransport(_record), **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
@@ -4347,6 +4349,7 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
         return httpx.Response(200)
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(transport=httpx.MockTransport(_record), **kwargs)
 
     async def _fake_wait(*_args: object, **_kwargs: object) -> str:
@@ -4450,6 +4453,7 @@ async def test_codex_forwarder_cancelled_during_lost_turn_post_still_fails_turn_
         return httpx.Response(200)
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(transport=httpx.MockTransport(_handle), **kwargs)
 
     async def _forward(**_kwargs: Any) -> None:
@@ -4698,6 +4702,7 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     real_async_client = httpx.AsyncClient
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(
             transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
             **kwargs,
@@ -4829,6 +4834,7 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
     real_async_client = httpx.AsyncClient
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(
             transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
             **kwargs,
@@ -5039,6 +5045,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         return httpx.Response(200, json={})
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(transport=httpx.MockTransport(_handle_patch), **kwargs)
 
     async def _fake_wait(*_args: object, **kwargs: object) -> str:
@@ -5224,6 +5231,66 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
     assert result is not None
     state = bridge_mod.read_bridge_state(bridge_dir)
     assert state is not None and state.conversation_id == result
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_discards_phantom_when_reader_adopted_meanwhile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold-start must not clobber a real id the reader adopted mid-flight:
+    it re-checks bridge state before writing and returns the adopted id instead
+    of persisting its headless phantom over the live binding."""
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration as orchestration_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "cc44894f77886259ee71e892a9e2af22"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id="agy_conv_placeholder",
+        ),
+    )
+    convs = bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    convs.mkdir(parents=True, exist_ok=True)
+    adopted_id = "2a6a4a8b-69da-4b90-ab6f-1c9e4a7d3f22"
+
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda _s, _t: 34601)
+    monkeypatch.setattr(
+        rpc_mod,
+        "get_available_models",
+        lambda _port: {"models": {"gemini": {"model": "MODEL_GEMINI"}}},
+    )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(orchestration_mod, "_agy_cold_start_poll_sleep", _no_sleep)
+
+    def _start_cascade(_port: int, cascade_id: str, **_kwargs: Any) -> None:
+        # Our agy owns the phantom, but the reader adopts the TUI cascade first.
+        (convs / f"{cascade_id}.db").write_bytes(b"")
+        bridge_mod.write_bridge_state(
+            bridge_dir,
+            bridge_mod.AntigravityNativeBridgeState(
+                session_id=session_id,
+                conversation_id=adopted_id,
+            ),
+        )
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _start_cascade)
+
+    result = await runner_app_mod._cold_start_agy_conversation(bridge_dir, session_id)
+
+    assert result == adopted_id, "the adopted id stands; the phantom is discarded"
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == adopted_id
 
 
 @pytest.mark.asyncio
