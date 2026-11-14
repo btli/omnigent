@@ -5663,6 +5663,11 @@ def _raise_if_managed_wake_misses_host_tunnel(
     )
 
 
+# Anchors the post-start reconnect grace: the host registry is in-memory, so it
+# is empty after a server start until each live host redials its tunnel.
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
+
+
 async def _maybe_wake_stale_resumable_managed_sandbox(
     *,
     session_id: str,
@@ -5697,9 +5702,35 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     _raise_if_managed_wake_misses_host_tunnel(
         conv=conv, host=host, request=request, app_state=app_state
     )
+    from omnigent.server.routes import sessions as _facade
+
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+    host_row_online = host_is_live(host)
+    sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    reconnect_grace_left_s = _facade._HOST_RECONNECT_GRACE_S - (
+        time.monotonic() - _PROCESS_STARTED_MONOTONIC
+    )
+    if (
+        host_conn is None
+        and host_registry is not None
+        and sandbox_running is not False
+        and reconnect_grace_left_s > 0
+    ):
+        # A wake recreates the sandbox; give a host that has not redialed since
+        # this server started the chance to reconnect first. Its row may read
+        # offline: a graceful shutdown marks every tunneled host offline.
+        host_conn = await _wait_for_host_reconnect(
+            conv.host_id,
+            host_registry,
+            tunnel_registry,
+            runner_id=None,
+            timeout_s=reconnect_grace_left_s,
+        )
+        if host_conn is not None:
+            refreshed_host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+            host_row_online = refreshed_host is not None and host_is_live(refreshed_host)
     host_tunnel_stale = (
         host_conn is not None
         and time.time() - host_conn.last_frame_at >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
@@ -5716,8 +5747,6 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
             runner_idle_s is not None and runner_idle_s >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
         )
 
-    host_row_online = host_is_live(host)
-    sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
     if (
         sandbox_running is not False
         and host_row_online
