@@ -957,7 +957,9 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        _validate_name_template_or_400(body.name)
+        if body.kind != "reminder":
+            # A reminder continues its session, so its name is never rendered.
+            _validate_name_template_or_400(body.name)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
