@@ -5622,12 +5622,12 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     if (
         host_conn is None
         and host_registry is not None
-        and host_row_online
         and sandbox_running is not False
         and reconnect_grace_left_s > 0
     ):
-        # A wake recreates the sandbox; give a live host that has not redialed
-        # since this server started the chance to reconnect first.
+        # A wake recreates the sandbox; give a host that has not redialed since
+        # this server started the chance to reconnect first. Its row may read
+        # offline: a graceful shutdown marks every tunneled host offline.
         host_conn = await _wait_for_host_reconnect(
             conv.host_id,
             host_registry,
@@ -5635,6 +5635,9 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
             runner_id=None,
             timeout_s=reconnect_grace_left_s,
         )
+        if host_conn is not None:
+            refreshed_host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+            host_row_online = refreshed_host is not None and host_is_live(refreshed_host)
     host_tunnel_stale = (
         host_conn is not None
         and time.time() - host_conn.last_frame_at >= _MANAGED_RESUMABLE_TUNNEL_STALE_S

@@ -3710,6 +3710,40 @@ async def test_live_host_reconnecting_after_server_start_is_not_woken(
     assert probe.wakes == []
 
 
+async def test_host_marked_offline_by_graceful_shutdown_redials_without_wake(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A graceful shutdown leaves the row offline; its redial within the grace is not woken."""
+    host_id = "1a5c6d4e3f7b8a9c2d0e1f2a3b4c5d6e"
+    probe = _WakeProbe(db_uri, monkeypatch, host_id)
+    probe.host_store.set_offline(host_id)
+    monkeypatch.setattr(orchestration, "_PROCESS_STARTED_MONOTONIC", time.monotonic())
+    app_state = probe.app_state([None], runner_idle_s=None)
+    reconnected = SimpleNamespace(last_frame_at=time.time())
+    registry: dict[str, object | None] = {"conn": None}
+    lookups: list[str] = []
+
+    def _get(_host_id: str) -> object | None:
+        lookups.append(_host_id)
+        if len(lookups) == 2:
+            probe.host_store.upsert_on_connect(
+                host_id=host_id, name=f"managed-{host_id[:6]}", user_id=RESERVED_USER_LOCAL
+            )
+            registry["conn"] = reconnected
+        return registry["conn"]
+
+    def _deregister(_host_id: str) -> None:
+        registry["conn"] = None
+
+    app_state.host_registry = SimpleNamespace(get=_get, deregister=_deregister)
+
+    client, _ = await probe.ensure(app_state)
+
+    assert client is probe.connected
+    assert probe.wakes == []
+
+
 @pytest.mark.parametrize("grace_elapsed", [False, True], ids=["within-grace", "grace-elapsed"])
 async def test_absent_host_is_woken_once_reconnect_grace_runs_out(
     db_uri: str,
