@@ -779,3 +779,57 @@ async def test_bare_external_failure_preserves_intake_presence_before_enrichment
     assert attributes["active_response_id_at_failure"] == "resp_active"
     assert route.store.get_conversation(route.child_id) is not None
     assert common._session_status_cache[route.child_id] == "failed"
+
+
+async def _post_codex_status(
+    route: _StatusRoute, status: str, response_id: str | None = None
+) -> None:
+    data: dict[str, Any] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert response.status_code == 202, response.text
+
+
+async def test_superseded_codex_terminal_edge_is_ignored(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A delayed failure for turn A must not end the turn B a relaunch started."""
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    await _post_codex_status(route, "running", "codex_turn_b")
+
+    await _post_codex_status(route, "failed", "codex_turn_a")
+
+    assert common._session_status_cache[route.child_id] == "running"
+    assert common._session_active_response_cache[route.child_id] == "codex_turn_b"
+    assert route.store.list_items(route.parent_id).data == []
+    assert "Ignoring superseded failed edge" in caplog.text
+    await _flush_live_state()
+    conv = route.store.get_conversation(route.child_id)
+    assert conv is not None
+    assert conv.live_status == "running"
+
+
+@pytest.mark.parametrize(
+    "terminal_response_id", ["codex_turn_b", None], ids=["current-turn", "no-turn"]
+)
+async def test_codex_terminal_edge_for_active_or_unnamed_turn_applies(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_response_id: str | None,
+) -> None:
+    route = status_route
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: "codex-native")
+    await _post_codex_status(route, "running", "codex_turn_b")
+
+    await _post_codex_status(route, "failed", terminal_response_id)
+
+    assert common._session_status_cache[route.child_id] == "failed"
+    assert route.child_id not in common._session_active_response_cache
+    [notice] = route.store.list_items(route.parent_id).data
+    assert notice.data.event_type == "session.subagent.returned"
+    assert notice.data.resource["status"] == "failed"

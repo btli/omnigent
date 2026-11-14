@@ -5130,6 +5130,38 @@ def _failure_log_detail(error: ErrorDetail | None) -> str:
     return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
 
 
+def _is_codex_turn_response_id(response_id: str | None) -> bool:
+    """Return whether ``response_id`` names a Codex turn, e.g. ``"codex_turn_abc"``."""
+    return (
+        response_id is not None
+        and response_id.startswith("codex_")
+        and response_id not in ("codex_", "codex_native")
+    )
+
+
+def _is_superseded_terminal_status_edge(
+    session_id: str, status: str, response_id: str | None
+) -> bool:
+    """
+    Return whether a terminal edge closes a Codex turn a newer turn replaced.
+
+    A delayed ``failed`` / ``idle`` post for turn A that lands after turn B's
+    ``running`` edge would otherwise end the live turn B. Only Codex turn ids
+    are compared: the relay also tracks its own delivery ids in
+    ``_session_active_response_cache``, and other harnesses do not name every
+    edge with the id their ``running`` edge used.
+
+    :param session_id: Session/conversation identifier.
+    :param status: Status the edge applies, e.g. ``"failed"``.
+    :param response_id: Turn the edge names, e.g. ``"codex_turn_a"``.
+    :returns: ``True`` when the edge must be ignored.
+    """
+    if status not in ("idle", "failed") or not _is_codex_turn_response_id(response_id):
+        return False
+    active_response_id = _session_active_response_cache.get(session_id)
+    return _is_codex_turn_response_id(active_response_id) and active_response_id != response_id
+
+
 def _publish_status(
     session_id: str,
     status: str,

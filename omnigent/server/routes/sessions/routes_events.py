@@ -210,6 +210,7 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos,
     _is_codex_native_subagent,
     _is_devin_native_subagent,
+    _is_superseded_terminal_status_edge,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
     _owns_host_runner,
@@ -2667,6 +2668,15 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
+            if _is_superseded_terminal_status_edge(session_id, status, response_id):
+                _logger.warning(
+                    "Ignoring superseded %s edge for session %s: response %s, active response %s",
+                    status,
+                    session_id,
+                    response_id,
+                    _session_active_response_cache.get(session_id),
+                )
+                return {"queued": False}
             # Terminal edges carry the harness's own persisted text: the
             # child's result on ``idle``, and on ``failed`` — when the
             # forwarder attached no detail — its error report (claude-native's
