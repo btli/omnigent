@@ -75,6 +75,7 @@ from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.subagent_work import (
     SUBAGENT_CANCELLED_ID_LABEL_KEY,
     SUBAGENT_DISPATCH_ID_LABEL_KEY,
+    subagent_dispatch_cancelled,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
@@ -655,12 +656,13 @@ def _hostless_runner_gone_message(
 
 async def _mark_subagent_dispatch_cancelled(
     conv: Conversation, conversation_store: ConversationStore
-) -> None:
+) -> str | None:
     """
     Durably mark a sub-agent's current dispatch cancelled for restart recovery.
 
     :param conv: Session receiving the interrupt or stop.
     :param conversation_store: Store that persists the label.
+    :returns: The dispatch id marked cancelled, or ``None`` when there is none.
     """
     dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
     if dispatch_id:
@@ -668,6 +670,26 @@ async def _mark_subagent_dispatch_cancelled(
             conversation_store.set_labels,
             conv.id,
             {SUBAGENT_CANCELLED_ID_LABEL_KEY: dispatch_id},
+        )
+    return dispatch_id or None
+
+
+async def _unmark_subagent_dispatch_cancelled(
+    session_id: str, dispatch_id: str | None, conversation_store: ConversationStore
+) -> None:
+    """
+    Remove a cancelled marker that still names *dispatch_id*.
+
+    :param session_id: Sub-agent session, e.g. ``"conv_child456"``.
+    :param dispatch_id: Dispatch the marker was written for, or ``None``.
+    :param conversation_store: Store that persists the label.
+    """
+    if dispatch_id is None:
+        return
+    current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if current is not None and current.labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) == dispatch_id:
+        await asyncio.to_thread(
+            conversation_store.delete_label, session_id, SUBAGENT_CANCELLED_ID_LABEL_KEY
         )
 
 
@@ -1808,6 +1830,11 @@ def register_events_routes(
                 # response body. queued=False signals the event was
                 # handled synchronously (denied, not queued for a turn).
                 return {"queued": False, "denied": True, "reason": reason}
+            if subagent_dispatch_cancelled(conv.labels):
+                # A human message after a cancel starts new work that recovery may resume.
+                await _unmark_subagent_dispatch_cancelled(
+                    session_id, conv.labels[SUBAGENT_DISPATCH_ID_LABEL_KEY], conversation_store
+                )
             start_fire_stage("input_validation", session_id=session_id)
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             start_fire_stage("input_policy", session_id=session_id)
@@ -2024,6 +2051,7 @@ def register_events_routes(
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
             queued_pending_ids: list[str] = []
+            cancelled_dispatch_id: str | None = None
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -2063,7 +2091,9 @@ def register_events_routes(
                     codex_side_turn_id=response_id.removeprefix("codex_"),
                 )
             else:
-                await _mark_subagent_dispatch_cancelled(conv, conversation_store)
+                cancelled_dispatch_id = await _mark_subagent_dispatch_cancelled(
+                    conv, conversation_store
+                )
                 _publish_interrupted(session_id)
                 # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
@@ -2098,6 +2128,9 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                await _unmark_subagent_dispatch_cancelled(
+                    session_id, cancelled_dispatch_id, conversation_store
+                )
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if stop_codex_side_chat:
@@ -2108,7 +2141,9 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
-            await _mark_subagent_dispatch_cancelled(conv, conversation_store)
+            cancelled_dispatch_id = await _mark_subagent_dispatch_cancelled(
+                conv, conversation_store
+            )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2125,6 +2160,9 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                await _unmark_subagent_dispatch_cancelled(
+                    session_id, cancelled_dispatch_id, conversation_store
+                )
                 raise
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
