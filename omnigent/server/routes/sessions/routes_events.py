@@ -2128,9 +2128,11 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
-                await _unmark_subagent_dispatch_cancelled(
-                    session_id, cancelled_dispatch_id, conversation_store
-                )
+                if runner_client is not None:
+                    # With no runner at all, keep the marker so recovery cannot resume it.
+                    await _unmark_subagent_dispatch_cancelled(
+                        session_id, cancelled_dispatch_id, conversation_store
+                    )
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if stop_codex_side_chat:

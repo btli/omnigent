@@ -11152,7 +11152,10 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
             "leaving it set drops the rest of the still-running turn"
         )
         snapshot = await client.get(f"/v1/sessions/{session_id}")
-        assert SUBAGENT_CANCELLED_ID_LABEL_KEY not in snapshot.json()["labels"]
+        # A runner that failed keeps working; with no runner at all, recovery must stay blocked.
+        assert snapshot.json()["labels"].get(SUBAGENT_CANCELLED_ID_LABEL_KEY) == (
+            "dispatch-still-running" if failure_mode == "no_runner_client" else None
+        )
     finally:
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
