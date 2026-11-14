@@ -6539,6 +6539,12 @@ def test_list_tasks_is_not_runner_local_builtin() -> None:
     assert "list_tasks" not in _NATIVE_RELAY_BUILTIN_TOOLS
 
 
+_HARD_STOPPED_FIELDS = {
+    "outcome": "hard_stopped",
+    "message": "Hard-stopped: the sub-agent's process was terminated.",
+}
+
+
 @pytest.mark.asyncio
 async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
     monkeypatch: pytest.MonkeyPatch,
@@ -6589,6 +6595,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
                     "conv_child_cancel",
                     status="cancelled",
                     output=None,
+                    confirmed_cancellation=True,
                 )
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
@@ -6642,6 +6649,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
         "cancelled": True,
         "task_id": "conv_child_cancel",
         "status": "cancelled",
+        **_HARD_STOPPED_FIELDS,
     }
     assert inbox_output == (
         "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c]"
@@ -6649,14 +6657,13 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
 
 
 @pytest.mark.asyncio
-async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> None:
+async def test_sys_cancel_task_routes_codex_native_cancel_to_hard_stop() -> None:
     """
-    Unconfirmed codex-native cancel must not promise terminal inbox status.
+    Journey: a parent cancels its codex-native sub-agent with ``sys_cancel_task``.
 
-    Codex-native has no runner-side hard-stop path (stop aliases to
-    interrupt), so the cancel routes to ``interrupt`` and the tool result
-    must say cancellation is best-effort instead of telling the parent to
-    wait forever for a terminal inbox item.
+    An Omnigent-dispatched Codex child owns its app-server and terminal, so the
+    cancel routes to ``stop_session`` (the child runner's hard-stop) and no
+    longer claims that no runner-side hard-stop is wired.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -6700,19 +6707,17 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
     finally:
         subagent_work.unregister_subagent_work(child_id)
 
-    # Codex-native routes to interrupt; ``data`` rides along for
-    # SessionEventInput compatibility with older servers.
-    assert stops == [{"type": "interrupt", "data": {}}]
+    # ``data`` rides along for SessionEventInput compatibility with older servers.
+    assert stops == [{"type": "stop_session", "data": {}}]
     assert cancel_output == {
         "cancel_requested": True,
         "cancel_confirmed": False,
-        "best_effort": True,
         "task_id": child_id,
         "status": "launching",
+        "outcome": "unconfirmed",
         "message": (
-            "Interrupt forwarded, but no runner-side hard-stop is wired for "
-            "this harness; the child may keep running and no terminal inbox "
-            "status is guaranteed."
+            "Cancel requested; cancellation has not been confirmed yet. "
+            "Use sys_read_inbox to observe terminal status."
         ),
     }
 
@@ -6783,6 +6788,7 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
         "cancel_confirmed": False,
         "task_id": child_id,
         "status": "launching",
+        "outcome": "unconfirmed",
         "message": (
             "Cancel requested; cancellation has not been confirmed yet. "
             "Use sys_read_inbox to observe terminal status."
@@ -6799,12 +6805,13 @@ async def test_sys_cancel_task_stops_terminal_claude_native_entry(
 
     parent_id = "conv_parent_terminal"
     child_id = "conv_child_terminal"
-    _install_cancel_pane(
+    pane = _install_cancel_pane(
         monkeypatch,
         wrapper_label="claude-code-native-ui",
         task_id=child_id,
         alive=True,
     )
+    assert pane is not None
     entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
@@ -6818,6 +6825,7 @@ async def test_sys_cancel_task_stops_terminal_claude_native_entry(
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         posts.append(json.loads(request.content))
         entry.status = "cancelled"
+        pane.alive = False
         return httpx.Response(204)
 
     try:
@@ -6836,7 +6844,12 @@ async def test_sys_cancel_task_stops_terminal_claude_native_entry(
         subagent_work.unregister_subagent_work(child_id)
 
     assert posts == [{"type": "stop_session", "data": {}}]
-    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+    assert output == {
+        "cancelled": True,
+        "task_id": child_id,
+        "status": "cancelled",
+        **_HARD_STOPPED_FIELDS,
+    }
 
 
 @pytest.mark.asyncio
@@ -6873,7 +6886,16 @@ async def test_sys_cancel_task_returns_cached_finished_claude_native_status(
     finally:
         subagent_work.unregister_subagent_work(child_id)
 
-    assert output == {"cancelled": cancelled, "task_id": child_id, "status": status}
+    assert output == {
+        "cancelled": cancelled,
+        "task_id": child_id,
+        "status": status,
+        "outcome": "nothing_to_stop",
+        "message": (
+            f"Nothing to stop: the task already ended as {status} and no turn "
+            "or process was stopped."
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -6911,7 +6933,12 @@ async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
         )
 
     assert posts == [{"type": "stop_session", "data": {}}]
-    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+    assert output == {
+        "cancelled": True,
+        "task_id": child_id,
+        "status": "cancelled",
+        **_HARD_STOPPED_FIELDS,
+    }
 
 
 @pytest.mark.asyncio
@@ -7017,6 +7044,7 @@ async def _drive_cancel_matrix_row(
     http_status: int,
     evicted: bool,
     requesting_parent: str,
+    pane: _CancelPane | None = None,
 ) -> tuple[list[dict[str, Any]], Any]:
     """Run ``_cancel_subagent_task`` for one matrix row and return posts + output."""
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
@@ -7050,6 +7078,8 @@ async def _drive_cancel_matrix_row(
             updated = subagent_work.get_subagent_work(child_id)
             if updated is not None:
                 updated.status = "cancelled"
+            if pane is not None:
+                pane.alive = False
         return httpx.Response(http_status)
 
     try:
@@ -7252,13 +7282,16 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     """
     parent_id = f"conv_parent_{row_id}"
     child_id = f"conv_child_{row_id}"
-    if pane_alive is not None:
+    pane = (
         _install_cancel_pane(
             monkeypatch,
             wrapper_label=wrapper_label,
             task_id=child_id,
             alive=pane_alive,
         )
+        if pane_alive is not None
+        else None
+    )
     posts, output = await _drive_cancel_matrix_row(
         parent_id=parent_id,
         child_id=child_id,
@@ -7267,6 +7300,7 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
         http_status=http_status,
         evicted=False,
         requesting_parent=parent_id,
+        pane=pane,
     )
     if expect_event is None:
         assert posts == [], f"{row_id}: dead/absent pane must not POST a stop"
@@ -7275,6 +7309,11 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
             "cancelled": expect_cancelled,
             "task_id": child_id,
             "status": expect_status,
+            "outcome": "nothing_to_stop",
+            "message": (
+                f"Nothing to stop: the task already ended as {expect_status} and no "
+                "turn or process was stopped."
+            ),
         }
         assert not str(output).startswith("Error:")
         return
@@ -7296,11 +7335,13 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
         assert "may keep running" in message
         return
     if expect_cancelled is not None:
-        assert output == {
+        assert {key: output.get(key) for key in ("cancelled", "task_id", "status")} == {
             "cancelled": expect_cancelled,
             "task_id": child_id,
             "status": expect_status,
         }
+        # A posted stop that settled is a hard-stop; an unposted cancel is cached.
+        assert output.get("outcome") == ("hard_stopped" if posts else "nothing_to_stop")
         return
     assert output.get("task_id") == child_id
     assert output.get("status") in {expect_status, "cancelled"}
@@ -7336,7 +7377,12 @@ async def test_cancel_evicted_native_subagent_ownership_matrix(
         assert posts == [{"type": "stop_session", "data": {}}], (
             f"{row_id}: owned Goose evicted work must hard-stop"
         )
-        assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+        assert output == {
+            "cancelled": True,
+            "task_id": child_id,
+            "status": "cancelled",
+            **_HARD_STOPPED_FIELDS,
+        }
         return
     assert posts == [], f"{row_id}: foreign parent must not stop the child"
     assert isinstance(output, str)

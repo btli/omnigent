@@ -9777,6 +9777,34 @@ def _cached_subagent_cancel_result(task_id: str, status: str) -> str:
             "cancelled": status == "cancelled",
             "task_id": task_id,
             "status": status,
+            "outcome": "nothing_to_stop",
+            "message": (
+                f"Nothing to stop: the task already ended as {status} and no "
+                "turn or process was stopped."
+            ),
+        }
+    )
+
+
+def _settled_subagent_cancel_result(task_id: str, *, status: str, hard_stopped: bool) -> str:
+    """Return a cancel whose effect the child runner confirmed before answering.
+
+    :param hard_stopped: ``True`` when the child's process was terminated,
+        ``False`` when only its turn was interrupted.
+    """
+    if hard_stopped:
+        message = "Hard-stopped: the sub-agent's process was terminated."
+        if status != "cancelled":
+            message += f" Its last task had already ended as {status}."
+    else:
+        message = "Turn interrupted: the sub-agent's process keeps running for later sends."
+    return json.dumps(
+        {
+            "cancelled": status == "cancelled",
+            "task_id": task_id,
+            "status": status,
+            "outcome": "hard_stopped" if hard_stopped else "turn_interrupted",
+            "message": message,
         }
     )
 
@@ -9790,6 +9818,7 @@ def _best_effort_cancel_result(task_id: str, status: str) -> str:
             "best_effort": True,
             "task_id": task_id,
             "status": status,
+            "outcome": "unconfirmed",
             "message": (
                 "Interrupt forwarded, but no runner-side hard-stop is wired for "
                 "this harness; the child may keep running and no terminal inbox "
@@ -9816,6 +9845,7 @@ def _unconfirmed_hard_stop_result(task_id: str, *, status: str) -> str:
             "best_effort": True,
             "task_id": task_id,
             "status": status,
+            "outcome": "unconfirmed",
             "message": (
                 "Hard-stop failed; the native worker may still be running. "
                 "Cleanup is not confirmed."
@@ -9858,6 +9888,22 @@ async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> b
         return False
 
 
+def _runs_acp_harness(task_id: str) -> bool:
+    """Whether this runner hosts *task_id* on ``acp`` or a builtin ACP CLI harness."""
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.runner import app as _runner_app
+
+    harness = _runner_app.get_session_harness_name(task_id)
+    return harness == "acp" or harness in ACP_CLI_HARNESSES
+
+
+def _acp_child_process_resident(task_id: str) -> bool:
+    """Whether an ACP child's harness process is still registered on this runner."""
+    from omnigent.runner import app as _runner_app
+
+    return _runner_app.session_has_harness_process(task_id)
+
+
 async def _post_session_stop(
     server_client: httpx.AsyncClient, task_id: str
 ) -> tuple[int | None, str | None]:
@@ -9865,6 +9911,8 @@ async def _post_session_stop(
 
     :returns: ``(status_code, error)``. ``error`` is ``None`` on 2xx.
         Transport failures use ``status_code is None``.
+    :raises httpx.TimeoutException: The forward timed out; the kill may still
+        be running, so the caller reports it unconfirmed rather than failed.
     """
     try:
         resp = await server_client.post(
@@ -9872,6 +9920,8 @@ async def _post_session_stop(
             json={"type": "stop_session", "data": {}},
             timeout=30.0,
         )
+    except httpx.TimeoutException:
+        raise
     except (httpx.HTTPError, ValueError) as exc:
         return None, f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
@@ -9907,21 +9957,31 @@ async def _cancel_evicted_native_subagent(
     snapshot = resp.json()
     labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
     wrapper = labels.get(_SESSION_WRAPPER_LABEL_KEY) if isinstance(labels, dict) else None
+    stop_capable = isinstance(wrapper, str) and native_cancel_capability(wrapper) == "stop"
+    resident_acp = (
+        native_cancel_capability(wrapper if isinstance(wrapper, str) else None) == "inprocess"
+        and _runs_acp_harness(task_id)
+        and _acp_child_process_resident(task_id)
+    )
     if (
         not isinstance(snapshot, dict)
         or snapshot.get("parent_session_id") != conversation_id
-        or not isinstance(wrapper, str)
-        or native_cancel_capability(wrapper) != "stop"
+        or not (stop_capable or resident_acp)
     ):
         return f"Error: no in-flight task with task_id {task_id}"
     # A 503 is a failed kill, not proof the pane is gone. Report an explicit
     # unconfirmed result rather than ``absent`` / a cached terminal status.
-    status_code, stop_error = await _post_session_stop(server_client, task_id)
+    try:
+        status_code, stop_error = await _post_session_stop(server_client, task_id)
+    except httpx.TimeoutException:
+        return _unconfirmed_hard_stop_result(task_id, status="unknown")
     if stop_error is not None:
         if status_code == 503:
             return _unconfirmed_hard_stop_result(task_id, status="unknown")
         return stop_error
-    return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+    if resident_acp and _acp_child_process_resident(task_id):
+        return _unconfirmed_hard_stop_result(task_id, status="unknown")
+    return _settled_subagent_cancel_result(task_id, status="cancelled", hard_stopped=True)
 
 
 async def _cancel_subagent_task(
@@ -9935,7 +9995,7 @@ async def _cancel_subagent_task(
 
     The cancel event is chosen from ``native_cancel_capability``, which
     mirrors the child runner's ``NativeInterruptRunner.stop`` dispatch
-    (Claude plus the ``_UNIFORM_STOP`` natives):
+    (Claude, the ``_UNIFORM_STOP`` natives, and Omnigent-dispatched Codex):
 
     * stop-capable natives — POST ``stop_session``: the child runner
       hard-stops the worker, marks the work entry cancelled, delivers a
@@ -9948,10 +10008,11 @@ async def _cancel_subagent_task(
       ``stop_session`` returns 503 is reported as an unconfirmed /
       best-effort cancel: the kill failed and the worker may still be
       running.
-    * best-effort natives (Codex, Pi, Antigravity, OpenCode) and
-      in-process harnesses — POST ``interrupt``. No runner-side
-      hard-stop is wired for them, so the result is reported
-      best-effort rather than implying process termination.
+    * best-effort natives (Pi, Antigravity, OpenCode, Codex-spawned
+      threads) and in-process harnesses — POST ``interrupt``. No
+      runner-side hard-stop is wired for the best-effort natives, so
+      their result is reported best-effort rather than implying process
+      termination.
 
     :param args: Tool arguments containing ``task_id`` or
         ``handle_id``, e.g. ``{"task_id": "conv_child456"}``.
@@ -9988,12 +10049,22 @@ async def _cancel_subagent_task(
         and entry.status == "failed"
         and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
     )
-    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
+    # An ACP child's process stays resident between turns; only a stop reclaims it.
+    acp_child = capability == "inprocess" and _runs_acp_harness(str(task_id))
+    can_stop_idle_acp = acp_child and _acp_child_process_resident(str(task_id))
+    if (
+        entry.status not in ("launching", "running", "waiting")
+        and not can_stop_failed
+        and not can_stop_idle_acp
+    ):
         return _cached_subagent_cancel_result(str(task_id), entry.status)
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    event_type = "stop_session" if capability == "stop" else "interrupt"
+    event_type = "stop_session" if capability == "stop" or acp_child else "interrupt"
+    # Settlement already on the entry before this call proves nothing about this stop.
+    targeted_work_id = entry.work_id
+    confirmed_before = entry.status == "cancelled" and entry.cancellation_confirmed
 
     try:
         resp = await server_client.post(
@@ -10003,17 +10074,39 @@ async def _cancel_subagent_task(
             timeout=30.0,
         )
     except (httpx.HTTPError, ValueError) as exc:
+        # A kill outlasting the forward's deadline keeps running and settles later.
+        if event_type == "stop_session" and isinstance(exc, httpx.TimeoutException):
+            return _unconfirmed_hard_stop_result(str(task_id), status=entry.status)
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
-        if capability == "stop" and resp.status_code == 503:
+        if event_type == "stop_session" and resp.status_code == 503:
             return _unconfirmed_hard_stop_result(str(task_id), status=entry.status)
         return (
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
 
     updated = _subagent_work.get_subagent_work(str(task_id)) or entry
-    if updated.status == "cancelled":
-        return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+    if event_type == "stop_session":
+        # A 2xx alone is not proof: the server answers it even when no runner was bound.
+        if can_stop_idle_acp:
+            stopped = not _acp_child_process_resident(str(task_id))
+        elif can_stop_failed:
+            stopped = not await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+        else:
+            stopped = (
+                updated.work_id == targeted_work_id
+                and updated.status == "cancelled"
+                and updated.cancellation_confirmed
+                and not confirmed_before
+            )
+        if stopped:
+            return _settled_subagent_cancel_result(
+                str(task_id), status=updated.status, hard_stopped=True
+            )
+    elif updated.status == "cancelled":
+        return _settled_subagent_cancel_result(
+            str(task_id), status="cancelled", hard_stopped=False
+        )
     if capability == "best_effort":
         return _best_effort_cancel_result(str(task_id), updated.status)
     return json.dumps(
@@ -10022,6 +10115,7 @@ async def _cancel_subagent_task(
             "cancel_confirmed": False,
             "task_id": task_id,
             "status": updated.status,
+            "outcome": "unconfirmed",
             "message": (
                 "Cancel requested; cancellation has not been confirmed yet. "
                 "Use sys_read_inbox to observe terminal status."

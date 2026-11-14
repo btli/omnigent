@@ -11,21 +11,31 @@ fall-through contract, and the 503 mapping.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from fastapi.responses import Response
 
+from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.codex_native import app_server as codex_app_server
+from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 from omnigent.harnesses.opencode_native import app_server as opencode_app_server
 from omnigent.harnesses.opencode_native import bridge as opencode_bridge
 from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner.native import orchestration
 from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+from tests.runner.native_helpers import _harness_spec
 
 
 @dataclass
@@ -119,7 +129,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
 
 
 def test_native_cancel_capability_follows_stop_registry() -> None:
-    """Parent cancel capability must track ``_UNIFORM_STOP`` plus Claude."""
+    """Parent cancel capability must track ``_UNIFORM_STOP``, Claude, and dispatched Codex."""
     from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
     from omnigent.runner.native.interrupt import (
         _UNIFORM_STOP,
@@ -128,12 +138,14 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 
     for agent in NATIVE_CODING_AGENTS:
         capability = native_cancel_capability(agent.wrapper_label)
-        if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+        if agent.key in ("claude", "codex") or agent.key in _UNIFORM_STOP:
             assert capability == "stop", agent.key
         else:
             assert capability == "best_effort", agent.key
         if agent.subagent_wrapper_label:
-            assert native_cancel_capability(agent.subagent_wrapper_label) == capability
+            # A Codex-spawned thread shares its parent's app-server: nothing to kill.
+            expected = "best_effort" if agent.key == "codex" else capability
+            assert native_cancel_capability(agent.subagent_wrapper_label) == expected
 
     assert native_cancel_capability(None) == "inprocess"
     assert native_cancel_capability("not-a-native-wrapper") == "inprocess"
@@ -671,3 +683,1037 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     # No optimistic 'cancelled': the outcome is unknown until an edge lands.
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_cl")[0] is True
+
+
+class _RecordingCodexClient:
+    """Codex app-server client double that records JSON-RPC requests."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((method, params))
+        return {}
+
+    async def close(self) -> None:
+        return None
+
+
+class _RecordingAppServer:
+    """Registered Codex app-server double; ``close`` is the process teardown."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _OneTerminalList(_FakeTerminalRegistry):
+    """Terminal registry listing the codex tmux terminal for one session."""
+
+    def __init__(self, conv_id: str) -> None:
+        super().__init__()
+        self._conv_id = conv_id
+
+    def list_for_conversation(self, conv_id: str) -> list[Any]:
+        if conv_id != self._conv_id:
+            return []
+        return [SimpleNamespace(terminal_name="codex", session_key="main")]
+
+
+class _OneTerminalRegistry(_FakeResourceRegistry):
+    """Resource registry exposing the codex tmux terminal for one session."""
+
+    def __init__(self, conv_id: str) -> None:
+        super().__init__()
+        self.closed_terminals: list[str] = []
+        self.terminal_registry = _OneTerminalList(conv_id)
+
+    async def close_terminal(self, conv_id: str, terminal_id: str) -> bool:
+        self.closed_terminals.append(terminal_id)
+        return True
+
+
+def _codex_runner_with_live_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    conv_id: str,
+    *,
+    sub_agent: bool,
+) -> tuple[NativeInterruptRunner, dict[str, Any], _RecordingCodexClient, _OneTerminalRegistry]:
+    """Build a runner whose codex session has an active turn and a registered app-server."""
+    state = CodexNativeBridgeState(
+        session_id=conv_id,
+        socket_path="ws://127.0.0.1:43299",
+        thread_id="thread_child",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="turn_child",
+    )
+
+    async def _bridge_state(
+        conv: str, *, action: str, **_kw: Any
+    ) -> tuple[CodexNativeBridgeState | None, Path]:
+        return (state if conv == conv_id else None), tmp_path
+
+    client = _RecordingCodexClient()
+    monkeypatch.setattr(codex_app_server, "client_for_transport", lambda *_a, **_k: client)
+    registry = _OneTerminalRegistry(conv_id)
+    runner, captured = _make_runner(
+        codex_bridge_state_for_session=_bridge_state,
+        resource_registry=registry,
+        session_sub_agent_names={conv_id: "codex_impl"} if sub_agent else {},
+    )
+    return runner, captured, client, registry
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_interrupts_turn_then_kills_app_server_and_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent's sys_cancel_task hard-stops its codex-native sub-agent.
+
+    The stop must interrupt the live turn, terminate the Codex app-server and its
+    tmux terminal, and hand the parent a confirmed ``cancelled`` outcome.
+    """
+    conv_id = "conv_codex_child"
+    app_server = _RecordingAppServer()
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, conv_id, app_server)
+    runner, captured, client, registry = _codex_runner_with_live_turn(
+        monkeypatch, tmp_path, conv_id, sub_agent=True
+    )
+
+    resp = await runner.stop("codex-native", conv_id)
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert client.requests == [
+        ("turn/interrupt", {"threadId": "thread_child", "turnId": "turn_child"})
+    ]
+    assert app_server.closed is True
+    assert conv_id not in orchestration._AUTO_CODEX_APP_SERVERS
+    assert registry.closed_terminals == [terminal_resource_id("codex", "main")]
+    assert {"type": "session.status", "status": "idle"} in [e for _, e in captured["published"]]
+    assert captured["wakes"] == [(conv_id, "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
+    # The kill settled the outcome, so no grace-timer cancel stays armed.
+    assert runner.take_pending_interrupt(conv_id)[0] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "sub_agent"),
+    [
+        pytest.param("interrupt", True, id="ui-stop-on-subagent"),
+        pytest.param("interrupt", False, id="ui-stop-top-level"),
+        pytest.param("stop", False, id="stop-session-top-level"),
+    ],
+)
+async def test_codex_ui_stop_and_top_level_stop_only_interrupt_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event: str,
+    sub_agent: bool,
+) -> None:
+    """Journey: a user presses Stop on a codex-native chat; only the turn is interrupted."""
+    conv_id = "conv_codex_ui"
+    app_server = _RecordingAppServer()
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, conv_id, app_server)
+    runner, captured, client, registry = _codex_runner_with_live_turn(
+        monkeypatch, tmp_path, conv_id, sub_agent=sub_agent
+    )
+
+    dispatch = runner.interrupt if event == "interrupt" else runner.stop
+    resp = await dispatch("codex-native", conv_id)
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert client.requests == [
+        ("turn/interrupt", {"threadId": "thread_child", "turnId": "turn_child"})
+    ]
+    assert app_server.closed is False
+    assert registry.closed_terminals == []
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt(conv_id)[0] is True
+
+
+def _empty_ok_server_client() -> httpx.AsyncClient:
+    """Server client answering every request with an empty 200, like ``NullServerClient``."""
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+        base_url="http://server",
+    )
+
+
+async def _grok_runner_events(
+    *,
+    sub_agent: bool,
+    event_type: str,
+    turn_in_flight: bool,
+) -> tuple[
+    _FakeProcessManager, _ScriptedHarnessClient, int, subagent_work._SubagentWorkEntry | None
+]:
+    """POST one control event to a runner hosting a grok ACP session."""
+    conv_id = "conv_grok_child" if sub_agent else "conv_grok_top"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        # The fake implements the process-manager calls the runner makes.
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    if sub_agent:
+        subagent_work.register_subagent_work(
+            parent_session_id="conv_grok_parent",
+            child_session_id=conv_id,
+            agent="grok_impl",
+            title="work",
+        )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+            await pm.get_client(conv_id, "grok")
+            if turn_in_flight:
+                # A stream-mode turn: the harness owns the live ACP prompt.
+                app.state.active_turns[conv_id] = None
+            resp = await client.post(
+                f"/v1/sessions/{conv_id}/events", json={"type": event_type, "data": {}}
+            )
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+    return pm, harness_client, resp.status_code, entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_in_flight", [True, False], ids=["turn-in-flight", "idle"])
+async def test_grok_subagent_stop_cancels_turn_and_terminates_acp_process(
+    turn_in_flight: bool,
+) -> None:
+    """Journey: a parent hard-stops its grok ACP sub-agent, mid-turn or idle.
+
+    A live turn gets ``session/cancel`` (the harness interrupt); the resident
+    ACP process is terminated either way and the parent gets a confirmed cancel.
+    """
+    pm, harness_client, status_code, entry = await _grok_runner_events(
+        sub_agent=True, event_type="stop_session", turn_in_flight=turn_in_flight
+    )
+
+    assert status_code == 204
+    interrupts = [body for body in harness_client.patched_events if body == {"type": "interrupt"}]
+    assert interrupts == ([{"type": "interrupt"}] if turn_in_flight else [])
+    assert pm.released == ["conv_grok_child"]
+    assert entry is not None
+    assert entry.status == "cancelled"
+    assert entry.cancellation_confirmed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "sub_agent"),
+    [
+        pytest.param("interrupt", True, id="ui-stop-on-subagent"),
+        pytest.param("interrupt", False, id="ui-stop-top-level"),
+        pytest.param("stop_session", False, id="stop-session-top-level"),
+    ],
+)
+async def test_grok_ui_stop_and_top_level_stop_keep_the_acp_process(
+    event_type: str,
+    sub_agent: bool,
+) -> None:
+    """Journey: a user presses Stop on a grok chat; the turn ends, the process stays."""
+    pm, harness_client, status_code, entry = await _grok_runner_events(
+        sub_agent=sub_agent, event_type=event_type, turn_in_flight=True
+    )
+
+    assert status_code == 204
+    assert {"type": "interrupt"} in harness_client.patched_events
+    assert pm.released == []
+    if sub_agent:
+        assert entry is not None and entry.cancellation_confirmed is False
+
+
+_HARD_STOPPED = {
+    "cancelled": True,
+    "status": "cancelled",
+    "outcome": "hard_stopped",
+    "message": "Hard-stopped: the sub-agent's process was terminated.",
+}
+_TURN_INTERRUPTED = {
+    "cancelled": True,
+    "status": "cancelled",
+    "outcome": "turn_interrupted",
+    "message": "Turn interrupted: the sub-agent's process keeps running for later sends.",
+}
+_NOTHING_TO_STOP = {
+    "cancelled": False,
+    "status": "completed",
+    "outcome": "nothing_to_stop",
+    "message": (
+        "Nothing to stop: the task already ended as completed and no turn or process was stopped."
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "wrapper_label", "recorded_status", "expected_event", "expected_result"),
+    [
+        pytest.param(
+            "codex-native", "codex-native-ui", "running", "stop_session", _HARD_STOPPED, id="codex"
+        ),
+        pytest.param("grok", None, "running", "stop_session", _HARD_STOPPED, id="grok"),
+        pytest.param(
+            "claude-sdk", None, "running", "interrupt", _TURN_INTERRUPTED, id="claude-sdk"
+        ),
+        pytest.param("claude-sdk", None, "completed", None, _NOTHING_TO_STOP, id="already-ended"),
+    ],
+)
+async def test_sys_cancel_task_routes_and_reports_outcome_by_child_harness(
+    harness: str,
+    wrapper_label: str | None,
+    recorded_status: str,
+    expected_event: str | None,
+    expected_result: dict[str, Any],
+) -> None:
+    """Journey: a parent cancels a sub-agent and reads what the cancel actually did.
+
+    The child's harness decides the route (codex and grok ACP get the
+    ``stop_session`` hard-stop, other in-process children ``interrupt``), and the
+    tool result says whether the process was stopped, only the turn was
+    interrupted, or there was nothing to stop.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_cancel_parent"
+    child_id = f"conv_cancel_child_{harness}_{recorded_status}"
+    spec = _harness_spec(harness)
+    # The in-process SDK harness needs a model to accept the session.
+    spec = dataclasses.replace(
+        spec, executor=dataclasses.replace(spec.executor, model="claude-sonnet-4-5")
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    async def _parent_server(request: httpx.Request) -> httpx.Response:
+        """Accept the event and settle the entry the way the child runner does."""
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            body = json.loads(request.content)
+            posted.append(body)
+            if body["type"] == "stop_session":
+                await pm.release(child_id)
+            subagent_work.mark_subagent_work_terminal(
+                child_id,
+                status="cancelled",
+                output=None,
+                confirmed_cancellation=body["type"] == "stop_session",
+            )
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="work",
+        wrapper_label=wrapper_label,
+    )
+    entry.status = recorded_status
+    try:
+        if wrapper_label is None:
+            async with _runner_client(app) as client:
+                created = await client.post(
+                    "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_worker"}
+                )
+                assert created.status_code == 201, created.text
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=parent_server,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert posted == ([] if expected_event is None else [{"type": expected_event, "data": {}}])
+    assert result == {"task_id": child_id, **expected_result}
+
+
+class _HeldReleaseProcessManager(_FakeProcessManager):
+    """Process manager whose ``release`` waits on a gate, like a slow ACP shutdown."""
+
+    def __init__(self, client: _ScriptedHarnessClient) -> None:
+        super().__init__(client)
+        self.release_started = asyncio.Event()
+        self.release_gate = asyncio.Event()
+
+    async def release(self, conversation_id: str, **kwargs: Any) -> None:
+        self.release_started.set()
+        await self.release_gate.wait()
+        await super().release(conversation_id, **kwargs)
+
+
+class _HeldCloseAppServer(_RecordingAppServer):
+    """Codex app-server double whose ``close`` waits on a gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_gate = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.close_gate.wait()
+        await super().close()
+
+
+async def _grok_stop_while_new_work_arrives() -> tuple[
+    str, subagent_work._SubagentWorkEntry | None
+]:
+    conv_id = "conv_grok_reused"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _HeldReleaseProcessManager(_ScriptedHarnessClient([]))
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id="conv_reuse_parent",
+        child_session_id=conv_id,
+        agent="grok_impl",
+        title="work",
+        work_id="work_stopped",
+    )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+            await pm.get_client(conv_id, "grok")
+            stop = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "stop_session", "data": {}}
+                )
+            )
+            await asyncio.wait_for(pm.release_started.wait(), timeout=5)
+            subagent_work.register_subagent_work(
+                parent_session_id="conv_reuse_parent",
+                child_session_id=conv_id,
+                agent="grok_impl",
+                title="work",
+                work_id="work_replacement",
+            )
+            pm.release_gate.set()
+            assert (await stop).status_code == 204
+        return conv_id, subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+
+async def _codex_stop_while_new_work_arrives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> list[tuple[str, str, str]]:
+    conv_id = "conv_codex_reused"
+    app_server = _HeldCloseAppServer()
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, conv_id, app_server)
+    runner, captured, _client, _registry = _codex_runner_with_live_turn(
+        monkeypatch, tmp_path, conv_id, sub_agent=True
+    )
+    captured["current_work_id"] = "work_stopped"
+    stop = asyncio.create_task(
+        runner.stop("codex-native", conv_id, stopped_work_id="work_stopped")
+    )
+    await asyncio.wait_for(app_server.close_started.wait(), timeout=5)
+    captured["current_work_id"] = "work_replacement"
+    app_server.close_gate.set()
+    resp = await stop
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert app_server.closed is True
+    assert captured["wake_calls"] == []
+    return captured["wakes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["grok", "codex"])
+async def test_subagent_hard_stop_leaves_work_sent_during_teardown_running(
+    harness: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent stops a sub-agent, then reuses it before the kill finishes.
+
+    The stop's confirmed ``cancelled`` belongs to the dispatch it was raised for;
+    new work registered on the same child while the process is torn down must
+    not be marked cancelled.
+    """
+    if harness == "grok":
+        _conv_id, entry = await _grok_stop_while_new_work_arrives()
+        assert entry is not None
+        assert entry.work_id == "work_replacement"
+        assert entry.status != "cancelled"
+        assert entry.cancellation_confirmed is False
+    else:
+        wakes = await _codex_stop_while_new_work_arrives(monkeypatch, tmp_path)
+        assert wakes == []
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_during_backend_launch_tears_down_the_launched_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent cancels its codex sub-agent while the child's backend is starting.
+
+    The stop must wait for the in-flight launch, tear down the app-server it
+    registers, and only then report the cancellation as confirmed.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner import app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        raise RuntimeError("launch config disabled in test")
+
+    # Keep the session-create auto-launch from touching the host's codex install.
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "conv_codex_launching"
+    spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id="conv_launch_parent",
+        child_session_id=conv_id,
+        agent="codex_impl",
+        title="work",
+        wrapper_label="codex-native-ui",
+    )
+    app_server = _RecordingAppServer()
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_codex"}
+            )
+            assert created.status_code == 201, created.text
+            launch_lock = app.state.native_terminal_ensure_locks["codex"].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with launch_lock:
+                stop = asyncio.create_task(
+                    client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "stop_session", "data": {}},
+                    )
+                )
+                await asyncio.sleep(0.2)
+                assert not stop.done(), "stop confirmed before the launch was dealt with"
+                entry = subagent_work.get_subagent_work(conv_id)
+                assert entry is not None and entry.status != "cancelled"
+                # The launch completes by registering its backend.
+                monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, conv_id, app_server)
+            resp = await stop
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert resp.status_code == 204
+    assert app_server.closed is True
+    assert conv_id not in orchestration._AUTO_CODEX_APP_SERVERS
+    assert entry is not None
+    assert entry.status == "cancelled"
+    assert entry.cancellation_confirmed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_view", ["completed", "drained"])
+async def test_sys_cancel_task_hard_stops_idle_grok_child_with_resident_process(
+    parent_view: str,
+) -> None:
+    """Journey: a parent cancels a grok sub-agent whose turn already ended.
+
+    The child's ACP process stays resident after the turn, so the cancel must
+    still reach the runner's hard-stop and release it, whether the parent's
+    work entry is ``completed`` or was evicted after the parent read the result.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_idle_grok_parent"
+    child_id = "conv_idle_grok_child"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+    try:
+        async with _runner_client(app) as runner:
+
+            async def _parent_server(request: httpx.Request) -> httpx.Response:
+                if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+                    return httpx.Response(
+                        200, json={"id": child_id, "parent_session_id": parent_id, "labels": {}}
+                    )
+                if request.method == "POST" and request.url.path.endswith("/events"):
+                    body = json.loads(request.content)
+                    posted.append(body)
+                    forwarded = await runner.post(request.url.path, json=body)
+                    return httpx.Response(forwarded.status_code)
+                return httpx.Response(404)
+
+            created = await runner.post(
+                "/v1/sessions",
+                json={"session_id": child_id, "agent_id": "agent_grok", "sub_agent_name": "grok"},
+            )
+            assert created.status_code == 201, created.text
+            await pm.get_client(child_id, "grok")
+            entry = subagent_work.register_subagent_work(
+                parent_session_id=parent_id, child_session_id=child_id, agent="grok", title="work"
+            )
+            entry.status = "completed"
+            if parent_view == "drained":
+                subagent_work.unregister_subagent_work(child_id)
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(_parent_server), base_url="http://server"
+            ) as parent_server:
+                result = await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=parent_server,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert not result.startswith("Error"), result
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert pm.released == [child_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forward_failure", ["503", "timeout"])
+async def test_sys_cancel_task_reports_slow_grok_hard_stop_as_unconfirmed(
+    forward_failure: str,
+) -> None:
+    """Journey: a parent cancels a grok sub-agent whose process is slow to die.
+
+    The server's stop forward gives up (503) or the request times out while the
+    runner's kill keeps going; the parent must get an unconfirmed hard-stop it
+    can follow up on, not an error claiming the stop failed outright.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_slow_stop_parent"
+    child_id = f"conv_slow_stop_child_{forward_failure}"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        if forward_failure == "timeout":
+            raise httpx.ReadTimeout("stop forward timed out", request=request)
+        return httpx.Response(503, json={"error": "runner_unavailable"})
+
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="grok", title="work"
+    )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            raw = await execute_tool(
+                tool_name="sys_cancel_task",
+                arguments=json.dumps({"task_id": child_id}),
+                server_client=parent_server,
+                conversation_id=parent_id,
+                session_async_tasks={},
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert not raw.startswith("Error"), raw
+    result = json.loads(raw)
+    assert result["outcome"] == "unconfirmed"
+    assert result["cancel_confirmed"] is False
+    assert "may still be running" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_leaves_work_sent_while_waiting_for_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent stops a launching codex sub-agent, then sends it new work.
+
+    The stop waits for the in-flight launch; work the parent registers on the
+    same child during that wait belongs to a new dispatch and must not be
+    marked cancelled by the earlier stop.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner import app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    conv_id = "conv_codex_reused_launch"
+    spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+
+    def _register(work_id: str) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id="conv_reuse_launch_parent",
+            child_session_id=conv_id,
+            agent="codex_impl",
+            title="work",
+            wrapper_label="codex-native-ui",
+            work_id=work_id,
+        )
+
+    _register("work_stopped")
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_codex"}
+            )
+            assert created.status_code == 201, created.text
+            launch_lock = app.state.native_terminal_ensure_locks["codex"].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with launch_lock:
+                stop = asyncio.create_task(
+                    client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "stop_session", "data": {}},
+                    )
+                )
+                await asyncio.sleep(0.2)
+                assert not stop.done()
+                _register("work_replacement")
+            resp = await stop
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert resp.status_code == 204
+    assert entry is not None
+    assert entry.work_id == "work_replacement"
+    assert entry.status != "cancelled"
+    assert entry.cancellation_confirmed is False
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_does_not_claim_hard_stop_for_unreached_grok_child() -> None:
+    """Journey: a parent cancels a grok sub-agent the user already Stopped in the UI.
+
+    The entry is already ``cancelled`` but its ACP process is still resident. If
+    the server answers the stop with 2xx without reaching a runner, nothing was
+    killed, so the parent must get ``unconfirmed``, not ``hard_stopped``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_unreached_parent"
+    child_id = "conv_unreached_grok"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        # The server's no-runner-bound stop: a 2xx that reaches nothing.
+        posted.append(json.loads(request.content))
+        return httpx.Response(200, json={"queued": False})
+
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="grok", title="work"
+    )
+    entry.status = "cancelled"
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+        await pm.get_client(child_id, "grok")
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=parent_server,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
+            )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert pm.released == []
+    assert result["outcome"] == "unconfirmed"
+    assert result["cancel_confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_reports_timed_out_drained_grok_stop_as_unconfirmed() -> None:
+    """Journey: a parent cancels a grok sub-agent whose result it already read.
+
+    The drained child's ACP process is still resident, and the stop forward
+    times out while the kill keeps going; the parent must get an unconfirmed
+    hard-stop, not an error claiming the stop failed outright.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_drained_timeout_parent"
+    child_id = "conv_drained_timeout_grok"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _parent_server(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200, json={"id": child_id, "parent_session_id": parent_id, "labels": {}}
+            )
+        posted.append(json.loads(request.content))
+        raise httpx.ReadTimeout("stop forward timed out", request=request)
+
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+        await pm.get_client(child_id, "grok")
+        assert subagent_work.get_subagent_work(child_id) is None
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_parent_server), base_url="http://server"
+        ) as parent_server:
+            raw = await execute_tool(
+                tool_name="sys_cancel_task",
+                arguments=json.dumps({"task_id": child_id}),
+                server_client=parent_server,
+                conversation_id=parent_id,
+                session_async_tasks={},
+            )
+    finally:
+        await runner_server.aclose()
+
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert not raw.startswith("Error"), raw
+    result = json.loads(raw)
+    assert result["outcome"] == "unconfirmed"
+    assert result["cancel_confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_codex_subagent_stop_with_live_turn_never_cancels_work_sent_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent stops a codex sub-agent mid-turn, then sends it new work.
+
+    Extends the stop-during-launch scenario with a live Codex bridge and turn.
+    The replacement work lands while the stop interrupts that turn; even after
+    the interrupt grace interval has passed, the replacement must never be
+    marked cancelled by the earlier stop.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner import app as runner_app_module
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.05)
+    conv_id = "conv_codex_live_turn_reused"
+    spec = _harness_spec("codex-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    def _register(work_id: str) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id="conv_live_turn_parent",
+            child_session_id=conv_id,
+            agent="codex_impl",
+            title="work",
+            wrapper_label="codex-native-ui",
+            work_id=work_id,
+        )
+
+    class _ReplacingCodexClient(_RecordingCodexClient):
+        """Records the interrupt; the parent sends new work while it is in flight."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            result = await super().request(method, params)
+            _register("work_replacement")
+            return result
+
+    codex_client = _ReplacingCodexClient()
+    monkeypatch.setattr(codex_app_server, "client_for_transport", lambda *_a, **_k: codex_client)
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager, _FakeProcessManager(_ScriptedHarnessClient([]))
+        ),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    _register("work_stopped")
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_codex"}
+            )
+            assert created.status_code == 201, created.text
+            codex_bridge.write_bridge_state(
+                codex_bridge.bridge_dir_for_bridge_id(conv_id),
+                CodexNativeBridgeState(
+                    session_id=conv_id,
+                    socket_path="ws://127.0.0.1:43298",
+                    thread_id="thread_live",
+                    codex_home=str(tmp_path / "codex-home"),
+                    active_turn_id="turn_live",
+                ),
+            )
+            launch_lock = app.state.native_terminal_ensure_locks["codex"].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with launch_lock:
+                stop = asyncio.create_task(
+                    client.post(
+                        f"/v1/sessions/{conv_id}/events",
+                        json={"type": "stop_session", "data": {}},
+                    )
+                )
+                await asyncio.sleep(0.2)
+                assert not stop.done()
+            resp = await stop
+            # Run past the interrupt grace interval: no delayed cancel may land.
+            await asyncio.sleep(0.5)
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert resp.status_code == 204
+    assert codex_client.requests == [
+        ("turn/interrupt", {"threadId": "thread_live", "turnId": "turn_live"})
+    ]
+    assert entry is not None
+    assert entry.work_id == "work_replacement"
+    assert entry.status != "cancelled"
+    assert entry.cancellation_confirmed is False

@@ -1315,6 +1315,37 @@ _session_histories_ref: dict[str, list[_JsonObject]] = {}
 _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 
 
+# The latest runner app's ``_session_harness_name``; set inside
+# create_runner_app, read by tool_dispatch's sys_cancel_task routing.
+_session_harness_name_ref: list[Callable[[str], str | None]] = []
+
+
+def get_session_harness_name(session_id: str) -> str | None:
+    """
+    Return the canonical harness a session runs, including its override.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: The harness, e.g. ``"grok"``, or ``None`` when unknown.
+    """
+    return _session_harness_name_ref[-1](session_id) if _session_harness_name_ref else None
+
+
+# The latest runner app's harness-process liveness check; read by sys_cancel_task.
+_session_has_harness_process_ref: list[Callable[[str], bool]] = []
+
+
+def session_has_harness_process(session_id: str) -> bool:
+    """
+    Return whether a harness subprocess is still registered for a session.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: ``True`` while the session's harness process is resident.
+    """
+    return bool(_session_has_harness_process_ref) and _session_has_harness_process_ref[-1](
+        session_id
+    )
+
+
 def get_session_agent_id(session_id: str) -> str | None:
     """
     Return the durable agent_id for a session.
@@ -4252,6 +4283,11 @@ def create_runner_app(
             return None
         h = spec.executor.config.get("harness") or spec.executor.type
         return canonicalize_harness(h) or h
+
+    _session_harness_name_ref[:] = [_session_harness_name]
+    _session_has_harness_process_ref[:] = [
+        lambda session_id: process_manager is not None and process_manager.has_session(session_id)
+    ]
 
     def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
         """Whether this session's forwarder distinguishes finished from aborted turns."""
@@ -8207,6 +8243,8 @@ def create_runner_app(
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            # Bind the ACP settlement to the dispatch being stopped, before any await.
+            _stopped_work = get_subagent_work(conversation_id)
             # Killing Claude's pane fails a turn still waiting to deliver into it;
             # mark that turn interrupted first so it ends cancelled, not failed.
             _cancels_turn = _harness == "claude-native" and isinstance(
@@ -8214,7 +8252,21 @@ def create_runner_app(
             )
             if _cancels_turn:
                 _interrupted_sessions.add(conversation_id)
-            _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
+            if _harness == "codex-native" and (
+                conversation_id in _session_sub_agent_names or _stopped_work is not None
+            ):
+                # Launch holds this lock until its app-server and terminal are
+                # registered; stopping inside it tears down a mid-launch backend too.
+                async with _codex_terminal_ensure_locks.setdefault(
+                    conversation_id, asyncio.Lock()
+                ):
+                    _stop_resp = await _native_interrupt_runner.stop(
+                        _harness,
+                        conversation_id,
+                        stopped_work_id=_stopped_work.work_id if _stopped_work else None,
+                    )
+            else:
+                _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
                 if _cancels_turn:
                     if _stop_resp.status_code == 204:
@@ -8223,6 +8275,21 @@ def create_runner_app(
                         _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
+            if (
+                (_harness == "acp" or _harness in ACP_CLI_HARNESSES)
+                and process_manager is not None
+                and (conversation_id in _session_sub_agent_names or _stopped_work is not None)
+            ):
+                # A sub-agent's ACP process stays resident between turns; stopping
+                # it must reclaim the process even when no turn was in flight.
+                await process_manager.release(conversation_id)
+                _mark_subagent_terminal_and_wake(
+                    conversation_id,
+                    status="cancelled",
+                    output=None,
+                    only_if_work_id=_stopped_work.work_id if _stopped_work is not None else None,
+                    confirmed_cancellation=True,
+                )
             return Response(status_code=204)
 
         if body_type == "effort_change":
