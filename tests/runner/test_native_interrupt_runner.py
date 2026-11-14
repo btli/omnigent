@@ -786,8 +786,9 @@ async def test_codex_subagent_stop_interrupts_turn_then_kills_app_server_and_ter
     runner, captured, client, registry = _codex_runner_with_live_turn(
         monkeypatch, tmp_path, conv_id, sub_agent=True
     )
+    captured["current_work_id"] = "work_child"
 
-    resp = await runner.stop("codex-native", conv_id)
+    resp = await runner.stop("codex-native", conv_id, stopped_work_id="work_child")
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert client.requests == [
