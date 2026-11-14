@@ -581,17 +581,26 @@ class NativeInterruptRunner:
         )
 
     def _settle_confirmed_stop(
-        self, conv_id: str, *, display_name: str, only_if_work_id: str | None = None
+        self,
+        conv_id: str,
+        *,
+        display_name: str,
+        only_if_work_id: str | None = None,
+        settle_dispatch: bool = True,
     ) -> Response:
         """Publish idle and deliver a confirmed ``cancelled`` after a successful kill.
 
         :param only_if_work_id: The dispatch the stop was raised for; a newer
             dispatch registered on the child while the kill awaited is left alone.
+        :param settle_dispatch: ``False`` when the stop captured no dispatch to
+            settle, so no ``cancelled`` is delivered.
         """
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
         # The kill is confirmed, so this ``cancelled`` is truthful and settles
         # any interrupt still waiting on its outcome.
         self.clear_pending_interrupt(conv_id)
+        if not settle_dispatch:
+            return Response(status_code=204)
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
@@ -734,7 +743,10 @@ class NativeInterruptRunner:
         if not self._owns_dispatch(conv_id, stopped_work_id):
             return self._abandon_stop(conv_id, stopped_work_id)
         return self._settle_confirmed_stop(
-            conv_id, display_name="Codex", only_if_work_id=stopped_work_id
+            conv_id,
+            display_name="Codex",
+            only_if_work_id=stopped_work_id,
+            settle_dispatch=stopped_work_id is not None,
         )
 
     def _owns_dispatch(self, conv_id: str, stopped_work_id: str | None) -> bool:

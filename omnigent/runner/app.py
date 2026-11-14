@@ -7981,13 +7981,16 @@ def create_runner_app(
                 # A sub-agent's ACP process stays resident between turns; stopping
                 # it must reclaim the process even when no turn was in flight.
                 await process_manager.release(conversation_id)
-                _mark_subagent_terminal_and_wake(
-                    conversation_id,
-                    status="cancelled",
-                    output=None,
-                    only_if_work_id=_stopped_work.work_id if _stopped_work is not None else None,
-                    confirmed_cancellation=True,
-                )
+                # With no dispatch captured before the release (a drained child), an
+                # unbound settlement would cancel work the parent sent meanwhile.
+                if _stopped_work is not None:
+                    _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="cancelled",
+                        output=None,
+                        only_if_work_id=_stopped_work.work_id,
+                        confirmed_cancellation=True,
+                    )
             return Response(status_code=204)
 
         if body_type == "effort_change":

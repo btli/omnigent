@@ -1805,3 +1805,60 @@ async def test_sys_cancel_task_reports_drained_codex_stop_from_pane_evidence(
     result = json.loads(raw)
     assert result["outcome"] == expected_outcome
     assert result["cancelled"] is (expected_outcome == "hard_stopped")
+
+
+@pytest.mark.asyncio
+async def test_drained_grok_stop_never_cancels_work_sent_during_release() -> None:
+    """Journey: a parent stops a grok sub-agent it already drained, then reuses it.
+
+    The drained child has no work entry when the stop arrives, so there is no
+    dispatch to settle; new work the parent registers while the ACP process is
+    released must not be marked cancelled, and the process is still released.
+    """
+    conv_id = "conv_grok_drained_reused"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _HeldReleaseProcessManager(_ScriptedHarnessClient([]))
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "agent_grok", "sub_agent_name": "grok"},
+            )
+            assert created.status_code == 201, created.text
+            await pm.get_client(conv_id, "grok")
+            assert subagent_work.get_subagent_work(conv_id) is None
+            stop = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "stop_session", "data": {}}
+                )
+            )
+            await asyncio.wait_for(pm.release_started.wait(), timeout=5)
+            subagent_work.register_subagent_work(
+                parent_session_id="conv_drained_reuse_parent",
+                child_session_id=conv_id,
+                agent="grok",
+                title="work",
+                work_id="work_replacement",
+            )
+            pm.release_gate.set()
+            assert (await stop).status_code == 204
+        entry = subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+    assert pm.released == [conv_id]
+    assert entry is not None
+    assert entry.work_id == "work_replacement"
+    assert entry.status != "cancelled"
+    assert entry.cancellation_confirmed is False
