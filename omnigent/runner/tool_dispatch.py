@@ -9517,6 +9517,34 @@ def _cached_subagent_cancel_result(task_id: str, status: str) -> str:
             "cancelled": status == "cancelled",
             "task_id": task_id,
             "status": status,
+            "outcome": "nothing_to_stop",
+            "message": (
+                f"Nothing to stop: the task already ended as {status} and no "
+                "turn or process was stopped."
+            ),
+        }
+    )
+
+
+def _settled_subagent_cancel_result(task_id: str, *, status: str, hard_stopped: bool) -> str:
+    """Return a cancel whose effect the child runner confirmed before answering.
+
+    :param hard_stopped: ``True`` when the child's process was terminated,
+        ``False`` when only its turn was interrupted.
+    """
+    if hard_stopped:
+        message = "Hard-stopped: the sub-agent's process was terminated."
+        if status != "cancelled":
+            message += f" Its last task had already ended as {status}."
+    else:
+        message = "Turn interrupted: the sub-agent's process keeps running for later sends."
+    return json.dumps(
+        {
+            "cancelled": status == "cancelled",
+            "task_id": task_id,
+            "status": status,
+            "outcome": "hard_stopped" if hard_stopped else "turn_interrupted",
+            "message": message,
         }
     )
 
@@ -9530,6 +9558,7 @@ def _best_effort_cancel_result(task_id: str, status: str) -> str:
             "best_effort": True,
             "task_id": task_id,
             "status": status,
+            "outcome": "unconfirmed",
             "message": (
                 "Interrupt forwarded, but no runner-side hard-stop is wired for "
                 "this harness; the child may keep running and no terminal inbox "
@@ -9556,6 +9585,7 @@ def _unconfirmed_hard_stop_result(task_id: str, *, status: str) -> str:
             "best_effort": True,
             "task_id": task_id,
             "status": status,
+            "outcome": "unconfirmed",
             "message": (
                 "Hard-stop failed; the native worker may still be running. "
                 "Cleanup is not confirmed."
@@ -9682,7 +9712,9 @@ async def _cancel_evicted_native_subagent(
         if status_code == 503:
             return _unconfirmed_hard_stop_result(task_id, status="unknown")
         return stop_error
-    return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+    if resident_acp and _acp_child_process_resident(task_id):
+        return _unconfirmed_hard_stop_result(task_id, status="unknown")
+    return _settled_subagent_cancel_result(task_id, status="cancelled", hard_stopped=True)
 
 
 async def _cancel_subagent_task(
@@ -9781,8 +9813,19 @@ async def _cancel_subagent_task(
         )
 
     updated = _subagent_work.get_subagent_work(str(task_id)) or entry
+    # The runner settles a stop only after its kill; an unsettled 2xx (no runner
+    # bound) leaves the entry untouched and stays unconfirmed below.
+    if event_type == "stop_session" and (
+        updated.status == "cancelled"
+        or (can_stop_idle_acp and not _acp_child_process_resident(str(task_id)))
+    ):
+        return _settled_subagent_cancel_result(
+            str(task_id), status=updated.status, hard_stopped=True
+        )
     if updated.status == "cancelled":
-        return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+        return _settled_subagent_cancel_result(
+            str(task_id), status="cancelled", hard_stopped=False
+        )
     if capability == "best_effort":
         return _best_effort_cancel_result(str(task_id), updated.status)
     return json.dumps(
@@ -9791,6 +9834,7 @@ async def _cancel_subagent_task(
             "cancel_confirmed": False,
             "task_id": task_id,
             "status": updated.status,
+            "outcome": "unconfirmed",
             "message": (
                 "Cancel requested; cancellation has not been confirmed yet. "
                 "Use sys_read_inbox to observe terminal status."

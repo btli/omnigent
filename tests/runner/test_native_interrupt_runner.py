@@ -946,26 +946,60 @@ async def test_grok_ui_stop_and_top_level_stop_keep_the_acp_process(
         assert entry is not None and entry.cancellation_confirmed is False
 
 
+_HARD_STOPPED = {
+    "cancelled": True,
+    "status": "cancelled",
+    "outcome": "hard_stopped",
+    "message": "Hard-stopped: the sub-agent's process was terminated.",
+}
+_TURN_INTERRUPTED = {
+    "cancelled": True,
+    "status": "cancelled",
+    "outcome": "turn_interrupted",
+    "message": "Turn interrupted: the sub-agent's process keeps running for later sends.",
+}
+_NOTHING_TO_STOP = {
+    "cancelled": False,
+    "status": "completed",
+    "outcome": "nothing_to_stop",
+    "message": (
+        "Nothing to stop: the task already ended as completed and no turn or process was stopped."
+    ),
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "expected_event"),
+    ("harness", "wrapper_label", "recorded_status", "expected_event", "expected_result"),
     [
-        pytest.param("grok", "stop_session", id="grok-acp-hard-stop"),
-        pytest.param("claude-sdk", "interrupt", id="non-acp-in-process-interrupt"),
+        pytest.param(
+            "codex-native", "codex-native-ui", "running", "stop_session", _HARD_STOPPED, id="codex"
+        ),
+        pytest.param("grok", None, "running", "stop_session", _HARD_STOPPED, id="grok"),
+        pytest.param(
+            "claude-sdk", None, "running", "interrupt", _TURN_INTERRUPTED, id="claude-sdk"
+        ),
+        pytest.param("claude-sdk", None, "completed", None, _NOTHING_TO_STOP, id="already-ended"),
     ],
 )
-async def test_sys_cancel_task_routes_in_process_child_by_runner_harness(
-    harness: str, expected_event: str
+async def test_sys_cancel_task_routes_and_reports_outcome_by_child_harness(
+    harness: str,
+    wrapper_label: str | None,
+    recorded_status: str,
+    expected_event: str | None,
+    expected_result: dict[str, Any],
 ) -> None:
-    """Journey: a parent cancels an in-process sub-agent with ``sys_cancel_task``.
+    """Journey: a parent cancels a sub-agent and reads what the cancel actually did.
 
-    The child runner's own harness decides the route: a grok ACP child gets the
-    ``stop_session`` hard-stop, any other in-process child keeps ``interrupt``.
+    The child's harness decides the route (codex and grok ACP get the
+    ``stop_session`` hard-stop, other in-process children ``interrupt``), and the
+    tool result says whether the process was stopped, only the turn was
+    interrupted, or there was nothing to stop.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
     parent_id = "conv_cancel_parent"
-    child_id = f"conv_cancel_child_{harness}"
+    child_id = f"conv_cancel_child_{harness}_{recorded_status}"
     spec = _harness_spec(harness)
     # The in-process SDK harness needs a model to accept the session.
     spec = dataclasses.replace(
@@ -986,35 +1020,52 @@ async def test_sys_cancel_task_routes_in_process_child_by_runner_harness(
     posted: list[dict[str, Any]] = []
 
     def _parent_server(request: httpx.Request) -> httpx.Response:
+        """Accept the event and settle the entry the way the child runner does."""
         if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
-            posted.append(json.loads(request.content))
+            body = json.loads(request.content)
+            posted.append(body)
+            subagent_work.mark_subagent_work_terminal(
+                child_id,
+                status="cancelled",
+                output=None,
+                confirmed_cancellation=body["type"] == "stop_session",
+            )
             return httpx.Response(204)
         return httpx.Response(404)
 
-    subagent_work.register_subagent_work(
-        parent_session_id=parent_id, child_session_id=child_id, agent="worker", title="work"
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="work",
+        wrapper_label=wrapper_label,
     )
+    entry.status = recorded_status
     try:
-        async with _runner_client(app) as client:
-            created = await client.post(
-                "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_worker"}
-            )
-            assert created.status_code == 201, created.text
+        if wrapper_label is None:
+            async with _runner_client(app) as client:
+                created = await client.post(
+                    "/v1/sessions", json={"session_id": child_id, "agent_id": "agent_worker"}
+                )
+                assert created.status_code == 201, created.text
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(_parent_server), base_url="http://server"
         ) as parent_server:
-            await execute_tool(
-                tool_name="sys_cancel_task",
-                arguments=json.dumps({"task_id": child_id}),
-                server_client=parent_server,
-                conversation_id=parent_id,
-                session_async_tasks={},
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=parent_server,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
             )
     finally:
         subagent_work.unregister_subagent_work(child_id)
         await runner_server.aclose()
 
-    assert posted == [{"type": expected_event, "data": {}}]
+    assert posted == ([] if expected_event is None else [{"type": expected_event, "data": {}}])
+    assert result == {"task_id": child_id, **expected_result}
 
 
 class _HeldReleaseProcessManager(_FakeProcessManager):
