@@ -575,8 +575,14 @@ class NativeInterruptRunner:
             and self._subagent_work_id_for_session(conv_id) is not None
         )
 
-    def _settle_confirmed_stop(self, conv_id: str, *, display_name: str) -> Response:
-        """Publish idle and deliver a confirmed ``cancelled`` after a successful kill."""
+    def _settle_confirmed_stop(
+        self, conv_id: str, *, display_name: str, only_if_work_id: str | None = None
+    ) -> Response:
+        """Publish idle and deliver a confirmed ``cancelled`` after a successful kill.
+
+        :param only_if_work_id: The dispatch the stop was raised for; a newer
+            dispatch registered on the child while the kill awaited is left alone.
+        """
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
         # The kill is confirmed, so this ``cancelled`` is truthful and settles
         # any interrupt still waiting on its outcome.
@@ -585,6 +591,7 @@ class NativeInterruptRunner:
             conv_id,
             status="cancelled",
             output=None,
+            only_if_work_id=only_if_work_id,
             confirmed_cancellation=True,
         )
         if not delivery_ack.delivered and (
@@ -710,12 +717,17 @@ class NativeInterruptRunner:
         return self._settle_confirmed_stop(conv_id, display_name="Claude")
 
     async def _codex_stop(self, conv_id: str) -> Response:
+        work_id = (
+            self._subagent_work_id_for_session(conv_id)
+            if self._subagent_work_id_for_session is not None
+            else None
+        )
         # A failed interrupt (unreachable app-server) must not block the kill.
         await self._codex_interrupt(conv_id)
         await teardown_codex_native_app_server(conv_id)
         await self._teardown_session_terminals(conv_id)
         await _cancel_auto_forwarder_task(conv_id)
-        return self._settle_confirmed_stop(conv_id, display_name="Codex")
+        return self._settle_confirmed_stop(conv_id, display_name="Codex", only_if_work_id=work_id)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
         from omnigent.harnesses.codex_native.app_server import (

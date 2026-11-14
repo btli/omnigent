@@ -11,6 +11,7 @@ fall-through contract, and the 503 mapping.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -1014,3 +1015,127 @@ async def test_sys_cancel_task_routes_in_process_child_by_runner_harness(
         await runner_server.aclose()
 
     assert posted == [{"type": expected_event, "data": {}}]
+
+
+class _HeldReleaseProcessManager(_FakeProcessManager):
+    """Process manager whose ``release`` waits on a gate, like a slow ACP shutdown."""
+
+    def __init__(self, client: _ScriptedHarnessClient) -> None:
+        super().__init__(client)
+        self.release_started = asyncio.Event()
+        self.release_gate = asyncio.Event()
+
+    async def release(self, conversation_id: str, **kwargs: Any) -> None:
+        self.release_started.set()
+        await self.release_gate.wait()
+        await super().release(conversation_id, **kwargs)
+
+
+class _HeldCloseAppServer(_RecordingAppServer):
+    """Codex app-server double whose ``close`` waits on a gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_gate = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.close_gate.wait()
+        await super().close()
+
+
+async def _grok_stop_while_new_work_arrives() -> tuple[
+    str, subagent_work._SubagentWorkEntry | None
+]:
+    conv_id = "conv_grok_reused"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _HeldReleaseProcessManager(_ScriptedHarnessClient([]))
+    server_client = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=server_client,
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id="conv_reuse_parent",
+        child_session_id=conv_id,
+        agent="grok_impl",
+        title="work",
+        work_id="work_stopped",
+    )
+    try:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_grok"}
+            )
+            assert created.status_code == 201, created.text
+            await pm.get_client(conv_id, "grok")
+            stop = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "stop_session", "data": {}}
+                )
+            )
+            await asyncio.wait_for(pm.release_started.wait(), timeout=5)
+            subagent_work.register_subagent_work(
+                parent_session_id="conv_reuse_parent",
+                child_session_id=conv_id,
+                agent="grok_impl",
+                title="work",
+                work_id="work_replacement",
+            )
+            pm.release_gate.set()
+            assert (await stop).status_code == 204
+        return conv_id, subagent_work.get_subagent_work(conv_id)
+    finally:
+        subagent_work.unregister_subagent_work(conv_id)
+        await server_client.aclose()
+
+
+async def _codex_stop_while_new_work_arrives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> list[tuple[str, str, str]]:
+    conv_id = "conv_codex_reused"
+    app_server = _HeldCloseAppServer()
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, conv_id, app_server)
+    runner, captured, _client, _registry = _codex_runner_with_live_turn(
+        monkeypatch, tmp_path, conv_id, sub_agent=True
+    )
+    captured["current_work_id"] = "work_stopped"
+    stop = asyncio.create_task(runner.stop("codex-native", conv_id))
+    await asyncio.wait_for(app_server.close_started.wait(), timeout=5)
+    captured["current_work_id"] = "work_replacement"
+    app_server.close_gate.set()
+    resp = await stop
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert app_server.closed is True
+    assert captured["superseded"] == [(conv_id, "cancelled", "work_stopped")]
+    return captured["wakes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["grok", "codex"])
+async def test_subagent_hard_stop_leaves_work_sent_during_teardown_running(
+    harness: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Journey: a parent stops a sub-agent, then reuses it before the kill finishes.
+
+    The stop's confirmed ``cancelled`` belongs to the dispatch it was raised for;
+    new work registered on the same child while the process is torn down must
+    not be marked cancelled.
+    """
+    if harness == "grok":
+        _conv_id, entry = await _grok_stop_while_new_work_arrives()
+        assert entry is not None
+        assert entry.work_id == "work_replacement"
+        assert entry.status != "cancelled"
+        assert entry.cancellation_confirmed is False
+    else:
+        wakes = await _codex_stop_while_new_work_arrives(monkeypatch, tmp_path)
+        assert wakes == []

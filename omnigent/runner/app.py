@@ -7922,6 +7922,8 @@ def create_runner_app(
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            # Bind the ACP settlement to the dispatch being stopped, before any await.
+            _stopped_work = get_subagent_work(conversation_id)
             # Killing Claude's pane fails a turn still waiting to deliver into it;
             # mark that turn interrupted first so it ends cancelled, not failed.
             _cancels_turn = _harness == "claude-native" and isinstance(
@@ -7941,10 +7943,7 @@ def create_runner_app(
             if (
                 (_harness == "acp" or _harness in ACP_CLI_HARNESSES)
                 and process_manager is not None
-                and (
-                    conversation_id in _session_sub_agent_names
-                    or get_subagent_work(conversation_id) is not None
-                )
+                and (conversation_id in _session_sub_agent_names or _stopped_work is not None)
             ):
                 # A sub-agent's ACP process stays resident between turns; stopping
                 # it must reclaim the process even when no turn was in flight.
@@ -7953,6 +7952,7 @@ def create_runner_app(
                     conversation_id,
                     status="cancelled",
                     output=None,
+                    only_if_work_id=_stopped_work.work_id if _stopped_work is not None else None,
                     confirmed_cancellation=True,
                 )
             return Response(status_code=204)
