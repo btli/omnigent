@@ -4164,7 +4164,16 @@ class _CodexPaneRegistry:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "outcome", ["success", "setup_error", "forward_error", "cancelled", "superseded"]
+    "outcome",
+    [
+        "success",
+        "setup_error",
+        "forward_error",
+        "cancelled",
+        "superseded",
+        "cancelled_in_teardown",
+        "goal_failed",
+    ],
 )
 async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
@@ -4188,6 +4197,9 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
 
         async def close(self) -> None:
             closed.append(self.name)
+            if outcome == "cancelled_in_teardown":
+                # A relaunch cancels the retiring forwarder while it tears down.
+                raise asyncio.CancelledError
 
     launched, successor = _AppServer("launched"), _AppServer("successor")
 
@@ -4201,6 +4213,21 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
             raise RuntimeError("forward failed")
         if outcome == "cancelled":
             raise asyncio.CancelledError
+        if outcome == "goal_failed":
+            # Codex stops the goal while the turn is still open, then the stream ends.
+            async with httpx.AsyncClient(base_url="http://127.0.0.1:8000") as client:
+                await codex_forwarder._handle_thread_goal_notification(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    method="thread/goal/updated",
+                    params={
+                        "threadId": "thread_test",
+                        "turnId": "turn_live",
+                        "goal": {"status": "budgetLimited"},
+                    },
+                    forwarder_state=codex_forwarder._CodexForwarderState(),
+                )
 
     session_id = "6f2e1d0c9b8a47f6a5e4d3c2b1a09f8e"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -4240,10 +4267,11 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
             thread_id="thread_test",
             app_server=launched,  # type: ignore[arg-type]
         )
-        if outcome in ("success", "superseded"):
+        if outcome in ("success", "superseded", "goal_failed"):
             await operation
         else:
-            error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+            cancels = ("cancelled", "cancelled_in_teardown")
+            error = asyncio.CancelledError if outcome in cancels else RuntimeError
             with pytest.raises(error):
                 await operation
         slot_after = orchestration._AUTO_CODEX_APP_SERVERS.get(session_id)
@@ -4271,7 +4299,13 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
         assert reusable is False
     state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert state is not None
-    if outcome in ("success", "forward_error"):
+    if outcome == "goal_failed":
+        # Only the forwarder's own failure, keeping the goal reason.
+        statuses = [e["data"] for _, e in posted if e["type"] == "external_session_status"]
+        assert statuses == [
+            {"status": "failed", "output": "Codex stopped the goal: token budget reached."}
+        ]
+    elif outcome in ("success", "forward_error", "cancelled_in_teardown"):
         # The lost turn ends as failed, naming the lost app-server connection.
         assert [path for path, _ in posted] == [f"/v1/sessions/{session_id}/events"]
         event = posted[0][1]

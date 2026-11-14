@@ -6459,7 +6459,12 @@ async def _fail_codex_turn_in_flight(
         clear_active_turn_id_if_matches,
         read_bridge_state,
     )
-    from omnigent.harnesses.codex_native.forwarder import _post_status, _response_id
+    from omnigent.harnesses.codex_native.forwarder import (
+        _AP_CLIENT_TIMEOUT,
+        _post_status,
+        _response_id,
+        turn_failure_already_posted,
+    )
 
     try:
         state = read_bridge_state(bridge_dir)
@@ -6467,6 +6472,7 @@ async def _fail_codex_turn_in_flight(
         if (
             state is None
             or turn_id is None
+            or turn_failure_already_posted(bridge_dir, turn_id)
             or not clear_active_turn_id_if_matches(bridge_dir, turn_id)
         ):
             return
@@ -6476,7 +6482,7 @@ async def _fail_codex_turn_in_flight(
             turn_id,
         )
         async with open_server_client(
-            server_url, headers=headers, auth=auth, timeout=httpx.Timeout(10.0)
+            server_url, headers=headers, auth=auth, timeout=_AP_CLIENT_TIMEOUT
         ) as client:
             await _post_status(
                 client,
@@ -6904,13 +6910,16 @@ async def _codex_discover_thread_and_forward(
             ),
         )
         leftover_app_server = app_server
-        stopped_on_its_own = False
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
             leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
-                stopped_on_its_own = True
+                if server_url is not None:
+                    # Before any teardown await: a relaunch cancels this task and wipes the turn.
+                    await _fail_codex_turn_in_flight(
+                        bridge_dir, server_url=server_url, headers=headers, auth=forward_auth
+                    )
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
@@ -6918,10 +6927,6 @@ async def _codex_discover_thread_and_forward(
                 await leftover_app_server.close()
         await _shutdown_session_router_async(session_id, subagent_router)
         await _shutdown_session_turn_router_async(session_id, turn_router)
-        if stopped_on_its_own and server_url is not None:
-            await _fail_codex_turn_in_flight(
-                bridge_dir, server_url=server_url, headers=headers, auth=forward_auth
-            )
 
 
 async def _codex_forward_known_thread(
@@ -7001,22 +7006,21 @@ async def _codex_forward_known_thread(
             ),
         )
         leftover_app_server = app_server
-        stopped_on_its_own = False
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
             leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
-                stopped_on_its_own = True
+                if server_url is not None:
+                    # Before any teardown await: a relaunch cancels this task and wipes the turn.
+                    await _fail_codex_turn_in_flight(
+                        bridge_dir, server_url=server_url, headers=headers, auth=forward_auth
+                    )
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
         await _shutdown_session_router_async(session_id, subagent_router)
         await _shutdown_session_turn_router_async(session_id, turn_router)
-        if stopped_on_its_own and server_url is not None:
-            await _fail_codex_turn_in_flight(
-                bridge_dir, server_url=server_url, headers=headers, auth=forward_auth
-            )
 
 
 async def _run_antigravity_reader(
