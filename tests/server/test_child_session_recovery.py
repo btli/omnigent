@@ -15,6 +15,10 @@ import pytest
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
+from omnigent.runner.subagent_work import (
+    SUBAGENT_CANCELLED_ID_LABEL_KEY,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
+)
 from omnigent.server.child_session_recovery import (
     RECOVERY_STORE_CONCURRENCY,
     restore_active_children,
@@ -112,7 +116,17 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "exclusion", ["closed", "archived", "stopped", "fenced", "hosted", "side_chat", "live_runner"]
+    "exclusion",
+    [
+        "closed",
+        "archived",
+        "stopped",
+        "fenced",
+        "hosted",
+        "side_chat",
+        "live_runner",
+        "cancelled_dispatch",
+    ],
 )
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
@@ -136,6 +150,14 @@ async def test_do_not_restore_excluded_children(
         store.set_host_id(row.id, "a" * 32, workspace="/tmp")
     elif exclusion == "side_chat":
         store.set_labels(row.id, {"omnigent.codex_native.agent_nickname": "Side chat"})
+    elif exclusion == "cancelled_dispatch":
+        store.set_labels(
+            row.id,
+            {
+                SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch",
+                SUBAGENT_CANCELLED_ID_LABEL_KEY: "dispatch",
+            },
+        )
     else:
         monkeypatch.setattr(
             "omnigent.runtime.get_runner_router", lambda: Mock(runner_is_online=lambda _: True)
@@ -150,6 +172,30 @@ async def test_do_not_restore_excluded_children(
     finally:
         _intentional_stop_sessions.pop(row.id, None)
         _interrupt_fenced_sessions.discard(row.id)
+
+
+@pytest.mark.asyncio
+async def test_new_dispatch_after_a_cancelled_one_resumes(recovery_tree: Any) -> None:
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child()
+    store.set_labels(
+        row.id,
+        {SUBAGENT_DISPATCH_ID_LABEL_KEY: "second", SUBAGENT_CANCELLED_ID_LABEL_KEY: "first"},
+    )
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        await restore_active_children(parent, client, store, initializer)
+    assert [
+        (call["session_id"], call["session_init"]["resume_interrupted_turn"]) for call in calls
+    ] == [(row.id, True)]
+    relay.assert_called_once()
 
 
 @pytest.mark.asyncio

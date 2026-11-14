@@ -72,6 +72,12 @@ from omnigent.runner.launch_failure import (
     turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.subagent_work import (
+    SUBAGENT_CANCELLED_ID_LABEL_KEY,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
+    SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY,
+    subagent_dispatch_resume_blocked,
+)
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -647,6 +653,80 @@ def _hostless_runner_gone_message(
         f"{message} Resume it from the machine that ran it with "
         f"`{cli_invocation()} {agent.key} --resume {conv.id}`, then send the message again."
     )
+
+
+async def _mark_subagent_dispatch_cancelled(
+    conv: Conversation, conversation_store: ConversationStore
+) -> str | None:
+    """
+    Durably mark a sub-agent's current dispatch cancelled for restart recovery.
+
+    :param conv: Session receiving the interrupt or stop.
+    :param conversation_store: Store that persists the label.
+    :returns: The dispatch id marked cancelled, or ``None`` when there is none.
+    """
+    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if dispatch_id:
+        # A new cancel outranks an earlier human resume of the same dispatch.
+        if conv.labels.get(SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY) == dispatch_id:
+            await asyncio.to_thread(
+                conversation_store.delete_label,
+                conv.id,
+                SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY,
+            )
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {SUBAGENT_CANCELLED_ID_LABEL_KEY: dispatch_id},
+        )
+    return dispatch_id or None
+
+
+async def _unmark_subagent_dispatch_cancelled(
+    conv: Conversation, dispatch_id: str | None, conversation_store: ConversationStore
+) -> None:
+    """
+    Restore the cancel labels a cancel that did not land overwrote.
+
+    :param conv: Session as it was read before the cancel marked it.
+    :param dispatch_id: Dispatch the marker was written for, or ``None``.
+    :param conversation_store: Store that persists the labels.
+    """
+    if dispatch_id is None:
+        return
+    current = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+    if current is None or current.labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) != dispatch_id:
+        return
+    if conv.labels.get(SUBAGENT_CANCELLED_ID_LABEL_KEY) != dispatch_id:
+        await asyncio.to_thread(
+            conversation_store.delete_label, conv.id, SUBAGENT_CANCELLED_ID_LABEL_KEY
+        )
+    if conv.labels.get(SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY) == dispatch_id:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY: dispatch_id},
+        )
+
+
+async def _mark_subagent_resumed_after_cancel(
+    conv: Conversation, conversation_store: ConversationStore
+) -> None:
+    """
+    Let restart recovery resume a human turn accepted after a cancel.
+
+    The cancelled marker stays, so the parent still receives that dispatch as cancelled.
+
+    :param conv: Session whose user message was just dispatched.
+    :param conversation_store: Store that persists the label.
+    """
+    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if dispatch_id and subagent_dispatch_resume_blocked(conv.labels):
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY: dispatch_id},
+        )
 
 
 async def _unrecoverable_side_chat_source(
@@ -2005,6 +2085,7 @@ def register_events_routes(
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
             queued_pending_ids: list[str] = []
+            cancelled_dispatch_id: str | None = None
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -2044,6 +2125,9 @@ def register_events_routes(
                     codex_side_turn_id=response_id.removeprefix("codex_"),
                 )
             else:
+                cancelled_dispatch_id = await _mark_subagent_dispatch_cancelled(
+                    conv, conversation_store
+                )
                 _publish_interrupted(session_id)
                 # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
@@ -2079,6 +2163,11 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                if runner_client is not None:
+                    # With no runner at all, keep the marker so recovery cannot resume it.
+                    await _unmark_subagent_dispatch_cancelled(
+                        conv, cancelled_dispatch_id, conversation_store
+                    )
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if stop_codex_side_chat:
@@ -2098,6 +2187,9 @@ def register_events_routes(
                 await _raise_if_runner_on_another_replica(
                     conv, request.app.state, conversation_store
                 )
+            cancelled_dispatch_id = await _mark_subagent_dispatch_cancelled(
+                conv, conversation_store
+            )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2114,6 +2206,9 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                await _unmark_subagent_dispatch_cancelled(
+                    conv, cancelled_dispatch_id, conversation_store
+                )
                 raise
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
@@ -3917,6 +4012,9 @@ def register_events_routes(
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
         )
+        if dispatch.accepted and body.type == "message" and body.data.get("role") == "user":
+            # Only a message the runner accepted may lift the cancel's resume block.
+            await _mark_subagent_resumed_after_cancel(conv, conversation_store)
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}

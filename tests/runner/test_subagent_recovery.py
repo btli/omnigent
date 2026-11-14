@@ -434,6 +434,60 @@ async def test_reconcile_delivers_interrupted_dispatch_once_it_finishes(
         assert len(child_scans) == 2
 
 
+@pytest.mark.parametrize(
+    ("status", "error_code"),
+    [("in_progress", None), ("failed", "runner_disconnected"), ("completed", None)],
+)
+async def test_cancelled_dispatch_is_recovered_as_cancelled_once(
+    status: str, error_code: str | None
+) -> None:
+    child = _child(
+        status=status,
+        last_task_error={"code": error_code, "message": "Runner went away"},
+        labels={
+            subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: _DISPATCH,
+            subagent_work.SUBAGENT_CANCELLED_ID_LABEL_KEY: _DISPATCH,
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == _CHILDREN_PATH, "cancelled work has no result to read"
+        return httpx.Response(200, json=_page(child))
+
+    async with _recovery_harness(handler) as harness:
+        await harness.recovery.recover_undrained_subagent_results(_PARENT)
+        assert [
+            (message["work_id"], message["status"], message["output"])
+            for message in harness.drain()
+        ] == [(_DISPATCH, "cancelled", "")]
+
+        await harness.app.state.reconcile_pending_subagent_results()
+        assert harness.drain() == []
+        assert harness.wakes == [(_CHILD, _DISPATCH)]
+
+
+async def test_new_dispatch_after_a_cancelled_one_delivers_its_result() -> None:
+    child = _child(
+        labels={
+            subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: _DISPATCH,
+            subagent_work.SUBAGENT_CANCELLED_ID_LABEL_KEY: "dispatch-cancelled-earlier",
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == _CHILDREN_PATH:
+            return httpx.Response(200, json=_page(child))
+        assert request.url.path == _ITEMS_PATH
+        return httpx.Response(200, json=_page(_assistant_message("Follow-up result")))
+
+    async with _recovery_harness(handler) as harness:
+        await harness.recovery.recover_undrained_subagent_results(_PARENT)
+        assert [
+            (message["work_id"], message["status"], message["output"])
+            for message in harness.drain()
+        ] == [(_DISPATCH, "completed", "Follow-up result")]
+
+
 async def test_stalled_recovery_does_not_block_or_deliver_into_another_parent() -> None:
     other_parent = "another-parent"
     other_child = "another-child"

@@ -31,6 +31,8 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    Conversation,
+    ErrorData,
     FunctionCallData,
     MessageData,
     NewConversationItem,
@@ -39,6 +41,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner.subagent_work import (
+    SUBAGENT_CANCELLED_ID_LABEL_KEY,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
+    SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY,
+)
 from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
@@ -10777,6 +10784,7 @@ async def test_stop_session_surfaces_runner_failure_as_error(
             labels={
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "claude-code-native-ui",
+                SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-still-running",
             },
         )
 
@@ -10784,6 +10792,7 @@ async def test_stop_session_surfaces_runner_failure_as_error(
             f"/v1/sessions/{session['id']}/events",
             json={"type": "stop_session", "data": {}},
         )
+        snapshot = await client.get(f"/v1/sessions/{session['id']}")
 
     # RUNNER_UNAVAILABLE → 503. A 202 here would mean the failure was
     # swallowed and the UI would falsely report success.
@@ -10799,6 +10808,8 @@ async def test_stop_session_surfaces_runner_failure_as_error(
     assert session["id"] not in _interrupt_fenced_sessions, (
         "a failed stop_session must remove the interrupt fence it installed"
     )
+    # The child keeps working, so restart recovery must not treat it as cancelled.
+    assert SUBAGENT_CANCELLED_ID_LABEL_KEY not in snapshot.json()["labels"]
 
 
 async def test_stop_session_no_runner_lifts_stop_fence(
@@ -10838,6 +10849,267 @@ async def test_stop_session_no_runner_lifts_stop_fence(
     finally:
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_user_message_after_stop_lets_restart_recovery_resume_the_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A human message typed into a stopped sub-agent starts work recovery may resume."""
+    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        title="reviewer:auth",
+        labels={SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-stopped"},
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+
+    def restarted_and_running() -> Conversation:
+        # A restarted server has no status cache; the row says the turn was live.
+        _session_status_cache.pop(session_id, None)
+        store.set_session_live_status(session_id, "running")
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        return conversation
+
+    try:
+        async with _runtime_runner(
+            lambda _request: httpx.Response(202, json={"queued": True})
+        ) as runner:
+
+            async def runner_for(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+                return runner
+
+            monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", runner_for)
+            stop = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert stop.status_code == 202, stop.text
+            assert not _interrupted(restarted_and_running())
+
+            message = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Please continue"}],
+                    },
+                },
+            )
+            assert message.status_code == 202, message.text
+            assert _interrupted(restarted_and_running())
+
+            restop = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert restop.status_code == 202, restop.text
+        # A later stop blocks recovery again.
+        assert not _interrupted(restarted_and_running())
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+        _session_status_cache.pop(session_id, None)
+
+
+async def test_refused_user_message_after_stop_keeps_recovery_blocked(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A message refused because no runner is bound leaves a stopped child blocked."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    set_runner_client(None)
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], labels={SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-stopped"}
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    try:
+        stop = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        assert stop.status_code == 202, stop.text
+        message = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Please continue"}],
+                },
+            },
+        )
+        assert message.status_code == 503, message.text
+        _session_status_cache.pop(session_id, None)
+        store.set_session_live_status(session_id, "running")
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        assert not _interrupted(conversation)
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+        _session_status_cache.pop(session_id, None)
+
+
+async def test_unforwarded_user_message_after_stop_keeps_recovery_blocked(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message saved as a failed native turn, never forwarded, leaves a stopped child blocked."""
+    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    agent = await create_test_agent(client, name="claude-native-ui")
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+            SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-stopped",
+        },
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    terminal_failed = _NativeTerminalEnsureOutcome(
+        error=ErrorData(
+            source="execution",
+            code="runner_failed_to_start",
+            message="The terminal did not start",
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        AsyncMock(return_value=terminal_failed),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._ensure_runner_session_initialized",
+        AsyncMock(return_value=False),
+    )
+    try:
+        async with _runtime_runner(
+            lambda _request: httpx.Response(202, json={"queued": True})
+        ) as runner:
+            monkeypatch.setattr(
+                "omnigent.server.routes.sessions._get_runner_client",
+                AsyncMock(return_value=runner),
+            )
+            monkeypatch.setattr(
+                "omnigent.server.routes._sessions.orchestration._get_runner_client",
+                AsyncMock(return_value=runner),
+            )
+            stop = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert stop.status_code == 202, stop.text
+            message = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Please continue"}],
+                    },
+                },
+            )
+            # The input is kept as a failed turn, but no runner ever received it.
+            assert message.status_code == 202, message.text
+        _session_status_cache.pop(session_id, None)
+        store.set_session_live_status(session_id, "running")
+        conversation = store.get_conversation(session_id)
+        assert conversation is not None
+        assert SUBAGENT_RESUMED_AFTER_CANCEL_ID_LABEL_KEY not in conversation.labels
+        assert not _interrupted(conversation)
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+        _session_status_cache.pop(session_id, None)
+
+
+async def test_user_turn_after_cancel_still_delivers_the_dispatch_cancelled(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent runner restart reports an undrained cancelled dispatch as cancelled."""
+    from omnigent.runner import subagent_work
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, _session_status_cache
+
+    for name in (
+        "_subagent_work_by_child",
+        "_subagent_work_by_parent",
+        "_drained_delivered_subagent_children",
+        "_provisional_cancelled_subagent_work",
+        "_session_inboxes_ref",
+    ):
+        monkeypatch.setattr(subagent_work, name, type(getattr(subagent_work, name))())
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "reviewer:auth",
+            "labels": {SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-cancelled"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    child_id = created.json()["id"]
+    try:
+        async with _runtime_runner(
+            lambda _request: httpx.Response(202, json={"queued": True})
+        ) as runner:
+
+            async def runner_for(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+                return runner
+
+            monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", runner_for)
+            stop = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+            assert stop.status_code == 202, stop.text
+            message = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Fix it yourself"}],
+                    },
+                },
+            )
+            assert message.status_code == 202, message.text
+        # The human turn finished; the parent runner then restarts with an empty inbox.
+        _session_status_cache[child_id] = "idle"
+        inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        subagent_work._session_inboxes_ref[parent["id"]] = inbox
+        wakes: list[str] = []
+        await subagent_work._recover_subagent_results_from_server(
+            server_client=client,
+            parent_id=parent["id"],
+            schedule_wake=lambda entry: wakes.append(entry.work_id),
+        )
+        delivered = [inbox.get_nowait() for _ in range(inbox.qsize())]
+        assert [(item["work_id"], item["status"]) for item in delivered] == [
+            ("dispatch-cancelled", "cancelled")
+        ]
+        assert wakes == ["dispatch-cancelled"]
+    finally:
+        _interrupt_fenced_sessions.discard(child_id)
+        _session_status_cache.pop(child_id, None)
 
 
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(
@@ -11172,7 +11444,9 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
     session_id: str | None = None
     try:
         agent = await create_test_agent(client)
-        session = await _create_session(client, agent["id"])
+        session = await _create_session(
+            client, agent["id"], labels={SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-still-running"}
+        )
         session_id = session["id"]
 
         resp = await client.post(
@@ -11185,6 +11459,11 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         assert session_id not in _interrupt_fenced_sessions, (
             "a failed interrupt forward must remove the fence it installed — "
             "leaving it set drops the rest of the still-running turn"
+        )
+        snapshot = await client.get(f"/v1/sessions/{session_id}")
+        # A runner that failed keeps working; with no runner at all, recovery must stay blocked.
+        assert snapshot.json()["labels"].get(SUBAGENT_CANCELLED_ID_LABEL_KEY) == (
+            "dispatch-still-running" if failure_mode == "no_runner_client" else None
         )
     finally:
         if session_id is not None:
