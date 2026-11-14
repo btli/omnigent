@@ -9598,6 +9598,22 @@ async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> b
         return False
 
 
+def _runs_acp_harness(task_id: str) -> bool:
+    """Whether this runner hosts *task_id* on ``acp`` or a builtin ACP CLI harness."""
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.runner import app as _runner_app
+
+    harness = _runner_app.get_session_harness_name(task_id)
+    return harness == "acp" or harness in ACP_CLI_HARNESSES
+
+
+def _acp_child_process_resident(task_id: str) -> bool:
+    """Whether an ACP child's harness process is still registered on this runner."""
+    from omnigent.runner import app as _runner_app
+
+    return _runner_app.session_has_harness_process(task_id)
+
+
 async def _post_session_stop(
     server_client: httpx.AsyncClient, task_id: str
 ) -> tuple[int | None, str | None]:
@@ -9647,11 +9663,16 @@ async def _cancel_evicted_native_subagent(
     snapshot = resp.json()
     labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
     wrapper = labels.get(_SESSION_WRAPPER_LABEL_KEY) if isinstance(labels, dict) else None
+    stop_capable = isinstance(wrapper, str) and native_cancel_capability(wrapper) == "stop"
+    resident_acp = (
+        native_cancel_capability(wrapper if isinstance(wrapper, str) else None) == "inprocess"
+        and _runs_acp_harness(task_id)
+        and _acp_child_process_resident(task_id)
+    )
     if (
         not isinstance(snapshot, dict)
         or snapshot.get("parent_session_id") != conversation_id
-        or not isinstance(wrapper, str)
-        or native_cancel_capability(wrapper) != "stop"
+        or not (stop_capable or resident_acp)
     ):
         return f"Error: no in-flight task with task_id {task_id}"
     # A 503 is a failed kill, not proof the pane is gone. Report an explicit
@@ -9729,19 +9750,18 @@ async def _cancel_subagent_task(
         and entry.status == "failed"
         and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
     )
-    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
+    # An ACP child's process stays resident between turns; only a stop reclaims it.
+    acp_child = capability == "inprocess" and _runs_acp_harness(str(task_id))
+    can_stop_idle_acp = acp_child and _acp_child_process_resident(str(task_id))
+    if (
+        entry.status not in ("launching", "running", "waiting")
+        and not can_stop_failed
+        and not can_stop_idle_acp
+    ):
         return _cached_subagent_cancel_result(str(task_id), entry.status)
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-    from omnigent.runner import app as _runner_app
-
-    child_harness = _runner_app.get_session_harness_name(str(task_id))
-    # An ACP child's process stays resident between turns; only a stop reclaims it.
-    acp_child = capability == "inprocess" and (
-        child_harness == "acp" or child_harness in ACP_CLI_HARNESSES
-    )
     event_type = "stop_session" if capability == "stop" or acp_child else "interrupt"
 
     try:

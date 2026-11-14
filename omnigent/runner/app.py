@@ -1237,6 +1237,22 @@ def get_session_harness_name(session_id: str) -> str | None:
     return _session_harness_name_ref[-1](session_id) if _session_harness_name_ref else None
 
 
+# The latest runner app's harness-process liveness check; read by sys_cancel_task.
+_session_has_harness_process_ref: list[Callable[[str], bool]] = []
+
+
+def session_has_harness_process(session_id: str) -> bool:
+    """
+    Return whether a harness subprocess is still registered for a session.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: ``True`` while the session's harness process is resident.
+    """
+    return bool(_session_has_harness_process_ref) and _session_has_harness_process_ref[-1](
+        session_id
+    )
+
+
 def get_session_agent_id(session_id: str) -> str | None:
     """
     Return the durable agent_id for a session.
@@ -3975,6 +3991,9 @@ def create_runner_app(
         return canonicalize_harness(h) or h
 
     _session_harness_name_ref[:] = [_session_harness_name]
+    _session_has_harness_process_ref[:] = [
+        lambda session_id: process_manager is not None and process_manager.has_session(session_id)
+    ]
 
     def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
         """Whether this session's forwarder distinguishes finished from aborted turns."""

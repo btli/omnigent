@@ -1216,3 +1216,77 @@ async def test_codex_subagent_stop_during_backend_launch_tears_down_the_launched
     assert entry is not None
     assert entry.status == "cancelled"
     assert entry.cancellation_confirmed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_view", ["completed", "drained"])
+async def test_sys_cancel_task_hard_stops_idle_grok_child_with_resident_process(
+    parent_view: str,
+) -> None:
+    """Journey: a parent cancels a grok sub-agent whose turn already ended.
+
+    The child's ACP process stays resident after the turn, so the cancel must
+    still reach the runner's hard-stop and release it, whether the parent's
+    work entry is ``completed`` or was evicted after the parent read the result.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_idle_grok_parent"
+    child_id = "conv_idle_grok_child"
+    spec = _harness_spec("grok")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    runner_server = _empty_ok_server_client()
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_resolver,
+        server_client=runner_server,
+    )
+    posted: list[dict[str, Any]] = []
+    try:
+        async with _runner_client(app) as runner:
+
+            async def _parent_server(request: httpx.Request) -> httpx.Response:
+                if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+                    return httpx.Response(
+                        200, json={"id": child_id, "parent_session_id": parent_id, "labels": {}}
+                    )
+                if request.method == "POST" and request.url.path.endswith("/events"):
+                    body = json.loads(request.content)
+                    posted.append(body)
+                    forwarded = await runner.post(request.url.path, json=body)
+                    return httpx.Response(forwarded.status_code)
+                return httpx.Response(404)
+
+            created = await runner.post(
+                "/v1/sessions",
+                json={"session_id": child_id, "agent_id": "agent_grok", "sub_agent_name": "grok"},
+            )
+            assert created.status_code == 201, created.text
+            await pm.get_client(child_id, "grok")
+            entry = subagent_work.register_subagent_work(
+                parent_session_id=parent_id, child_session_id=child_id, agent="grok", title="work"
+            )
+            entry.status = "completed"
+            if parent_view == "drained":
+                subagent_work.unregister_subagent_work(child_id)
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(_parent_server), base_url="http://server"
+            ) as parent_server:
+                result = await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=parent_server,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        await runner_server.aclose()
+
+    assert not result.startswith("Error"), result
+    assert posted == [{"type": "stop_session", "data": {}}]
+    assert pm.released == [child_id]
