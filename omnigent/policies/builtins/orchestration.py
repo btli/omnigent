@@ -523,7 +523,9 @@ def headless_subagent_purpose_guard(
 
     The orchestrator delegates all work through sub-agents, so each dispatch must be
     tagged with an explicit ``args.purpose`` drawn from *allowed_purposes*.
-    The policy fails loud on an unmarked or out-of-set purpose, keeping
+    A continuation of an existing child by ``session_id`` may omit the purpose
+    (its role was declared at creation); a purpose it does supply is still
+    validated. The policy fails loud on an unmarked or out-of-set purpose, keeping
     dispatches intentional rather than letting the model spawn a sub-agent
     with no declared role.
 
@@ -546,6 +548,13 @@ def headless_subagent_purpose_guard(
         if args is None:
             return _ALLOW
         child_args = args.get("args")
+        session_id = args.get("session_id")
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and not (isinstance(child_args, dict) and "purpose" in child_args)
+        ):
+            return _ALLOW
         if not isinstance(child_args, dict):
             return _decision("DENY", f"{deny_reason} Missing object args with purpose.")
         purpose = child_args.get("purpose")
