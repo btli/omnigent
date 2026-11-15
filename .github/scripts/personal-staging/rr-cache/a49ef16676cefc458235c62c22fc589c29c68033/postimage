@@ -876,7 +876,7 @@ class TunnelRegistry:
                                 on_sent=on_sent,
                             )
                             session.outbound_queue.put_nowait(frame)
-                            if binary:
+                            if binary and request_id is not None:
                                 session.binary_pending_sends.add(request_id)
                                 session.binary_waiting_response.add(request_id)
                             if request_id is not None:
