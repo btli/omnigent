@@ -43,6 +43,7 @@ class Feature(StrEnum):
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
+    AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
@@ -111,6 +112,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.24.0",
+        frontend_visible=False,
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.AUTOMATIONS,
+        description="Automations across the API, UI, agent tools and background schedulers",
+        owner="server",
+        review_by_release="0.27.0",
         frontend_visible=False,
         default_enabled=True,
     ),
@@ -248,19 +257,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.WORKSPACE_DIRECT_ACCESS,
         description=(
-            "Owners read a session's workspace straight from its host's local socket; "
-            "the server and the host must both enable it"
+            "Owners read a session's workspace straight from its host's socket, "
+            "with a short-lived token this server issues"
         ),
         owner="server",
         review_by_release="0.27.0",
-        frontend_visible=False,
+        frontend_visible=True,
     ),
     FeatureDefinition(
         feature=Feature.WORKSPACE_API_SERVER_ACCESS,
         description="Serve the workspace API through the server, answered by the session's host",
         owner="server",
         review_by_release="0.27.0",
-        frontend_visible=False,
+        frontend_visible=True,
     ),
 )
 
