@@ -2,3 +2,4 @@
 #
 # PR numbers only. Blank lines and `#` comments are ignored. A listed PR is
 # held out of every ring's composition until removed.
+9138              # held out: upstream #14134 now ships its byte-range download backend; awaiting rescope
