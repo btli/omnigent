@@ -2126,6 +2126,75 @@ async def test_delete_cleanup_failure_still_returns_success_off_event_loop(
     assert store.get(created["id"]) is None
 
 
+@pytest.mark.parametrize("task_deleted", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_update_writes_off_the_event_loop_and_a_cancel_waits_for_it(
+    auth_client, auth_app, db_uri, monkeypatch, cancelled, task_deleted
+):
+    import threading
+
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    scheduler = auth_app.state.scheduled_task_scheduler
+    assert scheduler.next_run_at(created["id"]) is not None
+    request_thread = threading.get_ident()
+    update = SqlAlchemyScheduledTaskStore.update
+    writing, release = threading.Event(), threading.Event()
+    write_threads: list[int] = []
+
+    def slow_update(self, scheduled_task_id, **kwargs):
+        write_threads.append(threading.get_ident())
+        writing.set()
+        assert release.wait(15)
+        if task_deleted:
+            # Deleted while the request switched its agent, so the update finds no task.
+            self.delete(scheduled_task_id)
+        return update(self, scheduled_task_id, **kwargs)
+
+    copy_id = uuid.uuid4().hex
+    deleted_agents: list[str] = []
+    # Stands in for another user's agent, which binding copies for the task.
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "agent_for_user", lambda *args: SimpleNamespace(id=copy_id)
+    )
+    monkeypatch.setattr(
+        SqlAlchemyAgentStore, "delete", lambda self, agent_id: deleted_agents.append(agent_id)
+    )
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "update", slow_update)
+    pending = asyncio.ensure_future(
+        auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME), "state": "paused"},
+            headers=_headers(),
+        )
+    )
+    try:
+        assert await asyncio.to_thread(writing.wait, 15)
+        if cancelled:
+            # As when the client disconnects: the request waits for the write.
+            pending.cancel()
+            await asyncio.wait([pending], timeout=0.5)
+            assert not pending.done()
+    finally:
+        release.set()
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    else:
+        assert (await pending).status_code == (404 if task_deleted else 200)
+    assert write_threads and request_thread not in write_threads
+    # A cancelled request still finishes what follows the write.
+    saved = SqlAlchemyScheduledTaskStore(db_uri).get(created["id"])
+    if task_deleted:
+        assert saved is None
+        assert deleted_agents == [copy_id]
+    else:
+        assert (saved.agent_id, saved.state) == (copy_id, "paused")
+        assert deleted_agents == []
+        assert scheduler.next_run_at(created["id"]) is None
+
+
 @pytest.mark.parametrize("operation", ["create", "update"])
 async def test_schedule_search_failure_returns_400_and_rolls_back(
     auth_client,
@@ -2349,7 +2418,10 @@ async def test_list_runs_includes_conversation_read_state_fields(
     import uuid
 
     from omnigent.runtime import pending_elicitations
-    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+    from omnigent.stores.conversation_store import (
+        RUNNER_LIVENESS_TTL_S,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     _make_user(db_uri)
@@ -2482,21 +2554,36 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert waiting_run["conversation_pending_approvals"] == 0
     assert conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count == 2
 
-    # Continuing the same session reports its current total on every run.
+    # Continuing the same session reports its current total on every run, but its
+    # live status only on the run the session is attributed to now.
+    continued_id = uuid.uuid4().hex
     _seed_run(
         db_uri,
         task_id,
-        uuid.uuid4().hex,
+        continued_id,
         scheduled_at=2500,
         status="succeeded",
         conversation_id=conv.id,
     )
     conv_store.set_session_usage(conv.id, {"total_cost_usd": 2.5})
+    conv_store.set_session_live_status(conv.id, "running")
+    conv_store.set_labels(conv.id, {SCHEDULED_TASK_RUN_LABEL_KEY: continued_id})
+    shared_elicitation_id = uuid.uuid4().hex
+    pending_elicitations.record_publish(
+        conv.id,
+        {"type": "response.elicitation_request", "elicitation_id": shared_elicitation_id},
+    )
     resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
     assert resp.status_code == 200
-    shared = [row for row in resp.json()["runs"] if row["conversation_id"] == conv.id]
+    shared = {row["id"]: row for row in resp.json()["runs"] if row["conversation_id"] == conv.id}
     assert len(shared) == 2
-    assert all(row["session_cost_usd"] == 2.5 for row in shared)
+    assert all(row["session_cost_usd"] == 2.5 for row in shared.values())
+    assert shared[continued_id]["conversation_status"] == "running"
+    assert shared[succeeded_id]["conversation_status"] is None
+    assert shared[succeeded_id]["status"] == "succeeded"
+    assert shared[continued_id]["conversation_pending_approvals"] == 1
+    assert shared[succeeded_id]["conversation_pending_approvals"] == 0
+    pending_elicitations.resolve(conv.id, shared_elicitation_id)
 
 
 @pytest.mark.usefixtures("clean_session_read_state")
