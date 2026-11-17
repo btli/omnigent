@@ -78,6 +78,7 @@ const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -135,6 +136,7 @@ const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
+const { createSshTargetChecks } = require("./sshTargets");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -164,14 +166,13 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on for macOS users with managed features enabled. */
+/** V2 defaults on for macOS users. */
 function serverSelectorV2Enabled() {
   // If enforced by the environment variable, enable.
   if (serverSelectorV2EnvForced()) {
     return true;
   }
   const savedPreference = loadSettings().server_selector_v2 ?? null;
-  const isDatabricksManaged = databricksInternalFeaturesEnabled();
 
   // Respect the user's preference.
   if (savedPreference !== null) {
@@ -179,17 +180,7 @@ function serverSelectorV2Enabled() {
   }
 
   // Enable on macOS only.
-  if (process.platform !== "darwin") {
-    return false;
-  }
-
-  // Enable on managed devices.
-  if (isDatabricksManaged) {
-    return true;
-  }
-
-  // Otherwise, disable.
-  return false;
+  return process.platform === "darwin";
 }
 
 /** Which setup page to load — the server selector when enabled. */
@@ -360,6 +351,27 @@ const arcaIdentities = createArcaIdentityStore();
 // Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
 const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
 const workspaceSshForwards = createWorkspaceSshForwards();
+const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+
+/**
+ * Ask, in a dialog the page can't draw over, before SSH runs with a destination
+ * the page suggested. Null when there is no window to ask in.
+ */
+async function approveSshTarget(win, serverUrl, alias) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Read this session's files over SSH from "${alias}"?`,
+    detail:
+      `${new URL(serverUrl).host} says this session's host runs on the SSH destination "${alias}". ` +
+      "Omnigent would connect with your SSH config and keys, check that the host is there, and read files from it directly instead of through the server.\n\n" +
+      `Allow only if you recognize "${alias}".`,
+  });
+  return response === 1;
+}
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -3151,7 +3163,11 @@ function newWindow() {
   const current = win?.webContents.getURL();
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
+  createWindow(current, {
+    ephemeral: win ? windows.get(win)?.ephemeral === true : false,
+    serverUrl: (win && windows.get(win)?.serverUrl) || undefined,
+  });
 }
 
 /**
@@ -5393,6 +5409,14 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     return workspaceSocketRequest(request, {
       sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      verifySshTarget: serverUrl
+        ? (hostId, alias, proves) =>
+            sshTargetChecks.verify(serverUrl, hostId, alias, {
+              approve: () =>
+                approveSshTarget(BrowserWindow.fromWebContents(event.sender), serverUrl, alias),
+              proves,
+            })
+        : undefined,
       forwards: workspaceSshForwards,
     });
   });
@@ -5583,11 +5607,37 @@ function registerIpc() {
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  // Every window's view of each session's browser tabs, and the
+  // routing of a tab's calls to the one window with its page
+  // (browserTabs.js).
+  const windowShowsServer = (win) => {
+    const origin = windows.get(win)?.origin;
+    return !!origin && originOf(win.webContents.getURL()) === origin;
+  };
+  const browserTabs = registerBrowserTabsIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    windows: () => windows,
+    windowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    // A window that navigated to a foreign page keeps its pinned origin.
+    showsServer: windowShowsServer,
+    // Tabs belong to a server, so two servers on one origin share none.
+    serverOf: (state) =>
+      (state.serverUrl && normalizeSavedServerUrl(state.serverUrl).replace(/\/+$/, "")) ||
+      state.origin,
+  });
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    showsServerForEvent: (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return !!win && windowShowsServer(win);
+    },
+    routeViewForEvent: browserTabs.route, // a tab's one page, in its window
+    whileOpeningView: browserTabs.whileOpening,
+    refuseCloseForEvent: browserTabs.refuseClose,
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;

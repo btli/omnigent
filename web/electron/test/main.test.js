@@ -721,7 +721,8 @@ function loadNavigationHarness({
     module,
     process: {
       ...process,
-      platform: platform ?? (internalFeatures ? "darwin" : process.platform),
+      // Pinned so the default selector page does not depend on the test machine.
+      platform: platform ?? (internalFeatures ? "darwin" : "linux"),
       env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
@@ -3176,13 +3177,13 @@ describe("server selector default", () => {
       { recent_servers: ["https://team.example.com/"] },
       true,
     ],
-    ["new public macOS install", {}, null, false],
-    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
+    ["new public macOS install", {}, null, true],
+    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, true],
     [
       "managed server presets without managed features",
       { managedServers: ["https://team.example.com/"] },
       null,
-      false,
+      true,
     ],
     ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
     ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
@@ -3192,7 +3193,7 @@ describe("server selector default", () => {
       null,
       true,
     ],
-    ["unpackaged public macOS build", { isPackaged: false }, null, false],
+    ["unpackaged public macOS build", { isPackaged: false }, null, true],
     ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
     [
       "explicit V2 preference outside the default rollout",
@@ -6066,5 +6067,18 @@ describe("Close menu item", () => {
     clickClose();
     assert.equal(sentCloses(), 1);
     assert.equal(closes, 1);
+  });
+});
+
+describe("New Window keeps its source's server (src/main.js)", () => {
+  it("gives a window cloned on a conversation the source's server, not the conversation's URL", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
 });
