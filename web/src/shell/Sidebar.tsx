@@ -1447,7 +1447,7 @@ function SidebarImpl({
       >
         {mobileLayout && effectiveOpen && (
           <OmniGlassSurface
-            variant="menu"
+            variant="drawer"
             borderRadius={0}
             className="sidebar-glass-surface -z-10"
           />
