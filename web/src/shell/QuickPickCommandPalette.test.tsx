@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
+import type * as ConversationsModule from "@/hooks/useConversations";
 
 // Behavior specific to the QuickPick palette; CommandPalette.quickPick.test.tsx runs
 // every shared CommandPalette case against it.
@@ -13,7 +14,8 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ session_search_scope: true }),
 }));
 const useConversations = vi.fn();
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: () => ({ isFetching: false }),
   useProjects: () => ({ data: [] }),
