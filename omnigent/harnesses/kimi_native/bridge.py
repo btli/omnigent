@@ -481,6 +481,14 @@ def _permission_option_row(line: str) -> bool:
     return any(normalized == option or normalized.startswith(f"{option} ") for option in options)
 
 
+def _permission_menu_header(line: str) -> bool:
+    # Shell prompts ask "Run this command?"; MCP tool prompts ask "Approve <tool>?".
+    text = line.strip()
+    return text.startswith("▶ Run this command?") or (
+        text.startswith("▶ Approve ") and text.endswith("?")
+    )
+
+
 def _menu_rule(line: str) -> bool:
     return bool(line.strip()) and set(line.strip()) <= {"─"}
 
@@ -496,7 +504,7 @@ def _menu_candidate(
     header_indices = {
         index
         for index, line in enumerate(lines)
-        if index not in editor_indices and line.strip().startswith("▶ Run this command?")
+        if index not in editor_indices and _permission_menu_header(line)
     }
     footer_indices = {
         index

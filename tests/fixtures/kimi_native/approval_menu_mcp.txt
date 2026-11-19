@@ -1,0 +1,15 @@
+ ● Using sys_session_send · MCP/omnigent (worker)
+ ──────────────────────────────────────────────────────────────────────────────
+   ▶ Approve mcp__omnigent__sys_session_send?
+
+   Approve mcp__omnigent__sys_session_send
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────
+ dummy thinking  <scratch>/kimi-fixture
+                                                         context: 4% (31.4k/1M)

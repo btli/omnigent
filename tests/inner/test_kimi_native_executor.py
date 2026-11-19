@@ -309,12 +309,14 @@ class TestApprovalKeystroke:
         )
         return sent
 
+    # The MCP menu is Kimi's prompt before an Omnigent relay tool call.
+    @pytest.mark.parametrize("menu", ["approval_menu.txt", "approval_menu_mcp.txt"])
     def test_injects_digit_when_menu_present(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, menu: str
     ) -> None:
         sent = self._stub_tmux(
             monkeypatch,
-            pane=_fixture("approval_menu.txt"),
+            pane=_fixture(menu),
             after_key_pane=_fixture("first_boot_empty.txt"),
         )
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
