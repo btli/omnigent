@@ -2999,6 +2999,132 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("relay_outcome", ["advertised", "not_advertised", "insecure_bridge_root"])
+async def test_auto_create_kimi_registers_omnigent_relay_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    relay_outcome: str,
+) -> None:
+    """
+    The Omnigent tool relay is up and registered before the Kimi pane starts.
+
+    Kimi lists MCP tools once at startup, so the relay must have advertised
+    before spawn and the session home's ``mcp.json`` must already carry the
+    reserved ``omnigent`` server. When the relay does not come up, or the bridge
+    dir fails secure validation, Kimi still launches with today's global MCP
+    config and no dead ``omnigent`` server.
+    """
+    import omnigent.harnesses.kimi_native.forwarder as kimi_fwd_mod
+    import omnigent.harnesses.kimi_native.main as kimi_mod
+    from omnigent.harnesses.codex_native.bridge import OMNIGENT_MCP_TOOL_TIMEOUT_S
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.app import _auto_create_kimi_terminal
+
+    session_id = "a3d7f9222c7ac0f45ba2736b57b51f99"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # Production shape: <uid-scoped temp>/kimi-native.
+    uid_scoped = tmp_path / "omnigent-test"
+    if relay_outcome == "insecure_bridge_root":
+        (tmp_path / "redirected").mkdir()
+        uid_scoped.symlink_to(tmp_path / "redirected")
+    monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", uid_scoped / "kimi-native")
+    bridge_dir = kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    user_home = tmp_path / "user-kimi"
+    user_home.mkdir()
+    (user_home / "config.toml").write_text('default_model = "kimi-code/x"\n', encoding="utf-8")
+    user_mcp = user_home / "mcp.json"
+    user_mcp.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "docs": {"command": "docs-mcp", "env": {"DOCS_TOKEN": "user-secret"}},
+                    "omnigent": {"command": "user-shadow"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    user_mcp_before = user_mcp.read_bytes()
+    monkeypatch.setenv("KIMI_CODE_HOME", str(user_home))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
+
+    async def _sleeping_forwarder(**_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={"workspace": str(workspace)}, request=httpx.Request("GET", url)
+            )
+
+    events: list[str] = []
+    relay_calls: list[dict[str, Any]] = []
+
+    async def _relay(session_id: str, **kwargs: Any) -> None:
+        events.append("relay")
+        relay_calls.append({"session_id": session_id, **kwargs})
+        if relay_outcome == "advertised":
+            (bridge_dir / "tool_relay.json").write_text("{}", encoding="utf-8")
+
+    mcp_at_spawn: list[Path] = []
+
+    class _FakeResourceRegistry(SessionResourceRegistry):
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, session_id: str, terminal_name: str, session_key: str, spec: Any, **_kw: Any
+        ) -> SessionResourceView:
+            events.append("spawn")
+            mcp_at_spawn.append(Path(spec.env["KIMI_CODE_HOME"]) / "mcp.json")
+            return SessionResourceView(
+                id="terminal_kimi_main", type="terminal", session_id=session_id, name="Kimi"
+            )
+
+    try:
+        await _auto_create_kimi_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+            ensure_comment_relay=_relay,
+        )
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    assert user_mcp.read_bytes() == user_mcp_before
+    (session_mcp,) = mcp_at_spawn
+    if relay_outcome == "insecure_bridge_root":
+        assert events == ["spawn"]
+        assert "failed secure validation" in caplog.text
+    else:
+        assert events == ["relay", "spawn"]
+        assert relay_calls == [
+            {"session_id": session_id, "explicit_bridge_dir": bridge_dir, "await_notify": False}
+        ]
+    if relay_outcome != "advertised":
+        # Today's state: the user's global MCP config, no dead relay server.
+        assert session_mcp.is_symlink()
+        assert session_mcp.resolve() == user_mcp.resolve()
+        return
+
+    assert not session_mcp.is_symlink()
+    assert session_mcp.stat().st_mode & 0o777 == 0o600
+    servers = json.loads(session_mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert servers["docs"] == {"command": "docs-mcp", "env": {"DOCS_TOKEN": "user-secret"}}
+    relay_entry = servers["omnigent"]
+    assert relay_entry["args"][-3:] == ["serve-mcp", "--bridge-dir", str(bridge_dir)]
+    assert relay_entry["toolTimeoutMs"] == OMNIGENT_MCP_TOOL_TIMEOUT_S * 1000
+    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

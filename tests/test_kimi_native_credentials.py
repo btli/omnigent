@@ -129,6 +129,92 @@ def test_build_session_home_drops_stale_global_sessions_symlink(
     assert (user_home / "session_index.jsonl").read_text(encoding="utf-8")
 
 
+def _relay_session_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """Return ``(bridge_dir, session_home)`` under a production-shaped kimi bridge root."""
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge
+
+    monkeypatch.setattr(kimi_bridge, "_BRIDGE_ROOT", tmp_path / "omnigent-test" / "kimi-native")
+    bridge_dir = kimi_bridge.bridge_dir_for_session_id("conv_relay")
+    bridge_dir.mkdir(mode=0o700, parents=True)
+    return bridge_dir, bridge_dir / "kimi-code-home"
+
+
+def _relay_servers(bridge_dir: Path) -> dict[str, dict[str, object]]:
+    return {"omnigent": {"command": "/py", "args": ["serve-mcp", "--bridge-dir", str(bridge_dir)]}}
+
+
+def test_build_session_home_replaces_stale_global_mcp_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A home built before relay wiring links ``mcp.json`` to the global file;
+    enabling the relay must replace the link, never write through it."""
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    user_mcp = user_home / "mcp.json"
+    user_mcp.write_text('{"mcpServers": {"docs": {"command": "docs-mcp"}}}', encoding="utf-8")
+    user_mcp_before = user_mcp.read_bytes()
+    bridge_dir, session_home = _relay_session_home(tmp_path, monkeypatch)
+    build_kimi_session_home(session_home, bridge_dir=bridge_dir)
+    assert (session_home / "mcp.json").is_symlink()
+
+    build_kimi_session_home(
+        session_home, bridge_dir=bridge_dir, omnigent_mcp_servers=_relay_servers(bridge_dir)
+    )
+
+    session_mcp = session_home / "mcp.json"
+    assert not session_mcp.is_symlink()
+    assert session_mcp.stat().st_mode & 0o777 == 0o600
+    assert set(json.loads(session_mcp.read_text(encoding="utf-8"))["mcpServers"]) == {
+        "docs",
+        "omnigent",
+    }
+    assert user_mcp.read_bytes() == user_mcp_before
+
+
+def test_build_session_home_writes_relay_only_mcp_config_for_invalid_global(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable global ``mcp.json`` is skipped with a warning that names the
+    path but never its contents."""
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    (user_home / "mcp.json").write_text('{"mcpServers": {"x": "user-secret"', encoding="utf-8")
+    bridge_dir, session_home = _relay_session_home(tmp_path, monkeypatch)
+
+    build_kimi_session_home(
+        session_home, bridge_dir=bridge_dir, omnigent_mcp_servers=_relay_servers(bridge_dir)
+    )
+
+    payload = json.loads((session_home / "mcp.json").read_text(encoding="utf-8"))
+    assert payload == {"mcpServers": _relay_servers(bridge_dir)}
+    assert str(user_home / "mcp.json") in caplog.text
+    assert "JSONDecodeError" in caplog.text
+    assert "user-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("global_mcp", [True, False])
+def test_build_session_home_restores_global_mcp_when_relay_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, global_mcp: bool
+) -> None:
+    """Without relay wiring, a previously generated ``mcp.json`` gives way to the
+    pre-relay state: the global symlink, or no file at all."""
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    if global_mcp:
+        (user_home / "mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    bridge_dir, session_home = _relay_session_home(tmp_path, monkeypatch)
+    session_home.mkdir()
+    (session_home / "mcp.json").write_text(
+        json.dumps({"mcpServers": _relay_servers(bridge_dir)}), encoding="utf-8"
+    )
+
+    build_kimi_session_home(session_home, bridge_dir=bridge_dir)
+
+    session_mcp = session_home / "mcp.json"
+    if global_mcp:
+        assert session_mcp.is_symlink()
+        assert session_mcp.resolve() == (user_home / "mcp.json").resolve()
+    else:
+        assert not session_mcp.exists() and not session_mcp.is_symlink()
+
+
 def test_build_session_home_without_user_home_writes_hooks_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

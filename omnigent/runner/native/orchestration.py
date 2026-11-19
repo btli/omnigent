@@ -4868,6 +4868,50 @@ async def _auto_create_qwen_terminal(
     return terminal_view
 
 
+async def _start_kimi_omnigent_relay(
+    session_id: str,
+    bridge_dir: Path,
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: _EnsureCommentRelay | None,
+) -> dict[str, _JsonObject] | None:
+    """Start the Omnigent tool relay for a kimi-native pane before it launches.
+
+    Kimi lists MCP tools once at startup and ignores ``list_changed``, so the
+    relay must have advertised ``tool_relay.json`` before the pane starts.
+
+    :returns: The ``mcpServers`` entries to register, or ``None`` to launch Kimi
+        without Omnigent tools.
+    """
+    from omnigent.harnesses.kimi_native.bridge import (
+        omnigent_mcp_servers,
+        omnigent_relay_advertised,
+        prepare_omnigent_relay_bridge,
+    )
+
+    if server_client is None or ensure_comment_relay is None:
+        return None
+    try:
+        await asyncio.to_thread(prepare_omnigent_relay_bridge, bridge_dir)
+    except (OSError, RuntimeError):
+        _logger.warning(
+            "kimi-native: bridge dir failed secure validation; skipping Omnigent MCP "
+            "wiring for session %s.",
+            session_id,
+            exc_info=True,
+        )
+        return None
+    await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
+    if not omnigent_relay_advertised(bridge_dir):
+        _logger.warning(
+            "kimi-native: Omnigent tool relay did not start; launching Kimi without "
+            "Omnigent tools for session %s.",
+            session_id,
+        )
+        return None
+    return omnigent_mcp_servers(bridge_dir)
+
+
 async def _auto_create_kimi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -4896,23 +4940,23 @@ async def _auto_create_kimi_terminal(
     supervise_kimi_forwarder`) tails kimi's per-session ``wire.jsonl`` transcript
     and mirrors each user prompt + assistant reply into the Omnigent chat, so the
     response shows in the web UI — not only the embedded terminal. Tool calls and
-    reasoning are NOT mirrored (the embedded terminal renders those). NO MCP
-    plumbing (upstream kimi has no per-spawn MCP config).
+    reasoning are NOT mirrored (the embedded terminal renders those). Omnigent
+    tools reach Kimi through the shared MCP relay, registered in the session
+    home's private ``mcp.json`` once the relay is up (Kimi has no MCP flag).
 
     :param session_id: Session/conversation identifier.
     :param resource_registry: Session resource registry for launching the
         terminal.
     :param publish_event: Runner session event publisher.
-    :param server_client: Runner Omnigent server client (used only for the
-        workspace snapshot read).
-    :param ensure_comment_relay: Unused; kept for call-site parity with the
-        other native auto-create helpers.
+    :param server_client: Runner Omnigent server client (workspace snapshot
+        read; also gates the Omnigent tool relay).
+    :param ensure_comment_relay: Starts the session's Omnigent tool relay;
+        ``None`` launches Kimi without Omnigent tools.
     :param agent_spec: The session's resolved agent spec. Its ``os_env`` is
         inherited by the terminal so a declared sandbox is honoured (model
         pinning via the kimi TUI is a follow-up).
     :returns: Created terminal resource view.
     """
-    del ensure_comment_relay
     from omnigent.harnesses.kimi_native.bridge import (
         bridge_dir_for_session_id,
         write_hook_config,
@@ -4972,9 +5016,16 @@ async def _auto_create_kimi_terminal(
         headers=_runner_headers,
         session_id=session_id,
     )
+    omnigent_mcp_servers = await _start_kimi_omnigent_relay(
+        session_id,
+        bridge_dir,
+        server_client=server_client,
+        ensure_comment_relay=ensure_comment_relay,
+    )
     kimi_env = build_kimi_session_home(
         bridge_dir / "kimi-code-home",
         bridge_dir=bridge_dir,
+        omnigent_mcp_servers=omnigent_mcp_servers,
     )
     # Inherit the agent's os_env so its declared sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here

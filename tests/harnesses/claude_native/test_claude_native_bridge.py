@@ -480,6 +480,35 @@ def test_trusted_parent_accepts_qwen_native_bridge_dir(
     assert trusted == claude_native_bridge._absolute_syntactic_path(qwen_root.parent.parent)
 
 
+def test_trusted_parent_accepts_kimi_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts kimi-native bridge dirs.
+
+    kimi-native keeps its relay files (``bridge.json``, ``tool_relay.json``) and
+    the session ``mcp.json`` under ``$TMPDIR/omnigent-<uid>/kimi-native``. Without
+    the kimi branch, ``_ensure_secure_dir`` raises ``not under an allowed bridge
+    root`` and kimi-native sessions launch without Omnigent tools.
+    """
+    from omnigent.harnesses.kimi_native import bridge as kimi_native_bridge
+
+    # Distinct claude root so the kimi target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    kimi_root = tmp_path / "omnigent-test" / "kimi-native"
+    monkeypatch.setattr(kimi_native_bridge, "_BRIDGE_ROOT", kimi_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(kimi_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    assert trusted == claude_native_bridge._absolute_syntactic_path(kimi_root.parent.parent)
+
+
 def test_trusted_parent_accepts_kiro_native_bridge_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -910,6 +910,13 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(qwen_root.parent.parent)
 
+    from omnigent.harnesses.kimi_native.bridge import bridge_root as kimi_bridge_root
+
+    kimi_root = _absolute_syntactic_path(kimi_bridge_root())
+    if target.is_relative_to(kimi_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/kimi-native).
+        return _absolute_syntactic_path(kimi_root.parent.parent)
+
     from omnigent.harnesses.hermes_native.bridge import bridge_root as hermes_bridge_root
 
     hermes_root = _absolute_syntactic_path(hermes_bridge_root())
@@ -961,7 +968,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
-        f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, "
+        f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {kimi_root!s}, {hermes_root!s}, "
         f"{opencode_root!s}, {kiro_root!s}, {acp_root!s}, {router_root!s})"
     )
 

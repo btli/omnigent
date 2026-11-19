@@ -12,7 +12,9 @@ runner points the launched ``kimi`` process at a session-scoped home that:
   never adopt a parallel session's log — and
 - carries a ``config.toml`` that is the user's config text with two Omnigent
   ``[[hooks]]`` appended — a ``PreToolUse`` deny-gate and a ``PermissionRequest``
-  read-only surface, both dispatched to :mod:`omnigent.harnesses.kimi_native.hook`.
+  read-only surface, both dispatched to :mod:`omnigent.harnesses.kimi_native.hook`,
+- and, when the runner's tool relay is up, a private ``mcp.json`` holding the
+  user's global MCP servers plus the reserved ``omnigent`` relay server.
 
 Outside opted-in CI, appending hooks keeps the user's config byte-for-byte.
 CI adds provider-scoped request headers to the private config copy first.
@@ -21,11 +23,13 @@ CI adds provider-scoped request headers to the private config copy first.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import shlex
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 from omnigent.databricks_ai_gateway import (
@@ -33,10 +37,13 @@ from omnigent.databricks_ai_gateway import (
     gateway_request_tag_headers,
     with_ci_request_tags,
 )
+from omnigent.util.json_types import JsonObject
 
 #: Env var Kimi Code reads to locate its data dir (config.toml + oauth + …).
 KIMI_CODE_HOME_ENV_VAR = "KIMI_CODE_HOME"
 _CONFIG_FILE = "config.toml"
+#: User-level MCP server registry Kimi reads from ``$KIMI_CODE_HOME``.
+_MCP_CONFIG_FILE = "mcp.json"
 #: Global-home entries kept session-private instead of symlinked: config.toml
 #: is rebuilt with the Omnigent hooks, and the sessions store + its index stay
 #: per-session so parallel kimi sessions cannot adopt each other's wire logs.
@@ -172,6 +179,7 @@ def build_kimi_session_home(
     *,
     bridge_dir: Path,
     python_executable: str | None = None,
+    omnigent_mcp_servers: Mapping[str, JsonObject] | None = None,
 ) -> dict[str, str]:
     """Materialize a session-scoped ``KIMI_CODE_HOME`` with Omnigent hooks.
 
@@ -187,6 +195,9 @@ def build_kimi_session_home(
     :param bridge_dir: The kimi-native bridge dir the hook commands read.
     :param python_executable: Interpreter for the hook commands (see
         :func:`render_kimi_hooks_toml`).
+    :param omnigent_mcp_servers: Relay server entries to register in a private
+        ``mcp.json`` merged over the user's global servers; ``None`` keeps the
+        global ``mcp.json`` symlink and drops a previously generated file.
     :returns: ``{"KIMI_CODE_HOME": str(session_home)}`` to merge into the
         launched kimi process env.
     """
@@ -195,10 +206,17 @@ def build_kimi_session_home(
         os.chmod(session_home, 0o700)
 
     user_home = resolve_user_kimi_home()
+    mcp_config = session_home / _MCP_CONFIG_FILE
+    if omnigent_mcp_servers is None and _is_generated_mcp_config(mcp_config, bridge_dir):
+        # Relay wiring is off now: restore the global symlink (relinked below).
+        with contextlib.suppress(OSError):
+            mcp_config.unlink()
     base_config = ""
     if user_home.is_dir():
         for entry in user_home.iterdir():
             if entry.name in _PRIVATE_ENTRIES:
+                continue
+            if entry.name == _MCP_CONFIG_FILE and omnigent_mcp_servers is not None:
                 continue
             link = session_home / entry.name
             if link.exists() or link.is_symlink():
@@ -225,5 +243,58 @@ def build_kimi_session_home(
     (session_home / _CONFIG_FILE).write_text(
         with_kimi_ci_request_tags(base_config) + hooks, encoding="utf-8"
     )
+    if omnigent_mcp_servers is not None:
+        _write_session_mcp_config(mcp_config, user_home / _MCP_CONFIG_FILE, omnigent_mcp_servers)
 
     return {KIMI_CODE_HOME_ENV_VAR: str(session_home)}
+
+
+def _is_generated_mcp_config(path: Path, bridge_dir: Path) -> bool:
+    """Return whether *path* is a regular file registering this bridge's relay."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers")
+    except (OSError, ValueError, AttributeError):
+        return False
+    if not isinstance(servers, dict):
+        return False
+    return any(
+        isinstance(entry, dict)
+        and isinstance(args := entry.get("args"), list)
+        and "serve-mcp" in args
+        and str(bridge_dir) in args
+        for entry in servers.values()
+    )
+
+
+def _write_session_mcp_config(
+    path: Path, user_config: Path, omnigent_mcp_servers: Mapping[str, JsonObject]
+) -> None:
+    """Write a private ``mcp.json``: the user's servers plus the reserved relay servers.
+
+    The user's entries (including any env/header secrets) are copied into an
+    owner-only file. An inherited symlink is unlinked first so the write can
+    never land in the user's global file.
+    """
+    from omnigent.harnesses.claude_native.bridge import _write_json_file
+
+    payload: JsonObject = {}
+    if user_config.exists():
+        try:
+            loaded = json.loads(user_config.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict) or not isinstance(loaded.get("mcpServers", {}), dict):
+                raise ValueError("mcpServers is not an object")
+            payload = loaded
+        except (OSError, ValueError) as exc:
+            # Never log the contents: user entries can carry credentials.
+            logging.getLogger(__name__).warning(
+                "Ignoring unreadable Kimi MCP config %s (%s)", user_config, type(exc).__name__
+            )
+    user_servers = payload.get("mcpServers", {})
+    servers: JsonObject = dict(user_servers) if isinstance(user_servers, dict) else {}
+    servers.update(omnigent_mcp_servers)
+    payload = {**payload, "mcpServers": servers}
+    if path.is_symlink():
+        path.unlink()
+    _write_json_file(path, payload)

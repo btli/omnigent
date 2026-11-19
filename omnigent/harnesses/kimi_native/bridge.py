@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from omnigent._platform import stable_user_id
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -185,6 +185,44 @@ def write_hook_config(
     with contextlib.suppress(OSError):
         os.chmod(tmp, 0o600)
     os.replace(tmp, bridge_dir / _HOOK_CONFIG_FILE)
+
+
+def prepare_omnigent_relay_bridge(bridge_dir: Path) -> None:
+    """Harden *bridge_dir* and write the token ``serve-mcp`` reads at startup.
+
+    :param bridge_dir: The kimi-native bridge dir.
+    :raises RuntimeError: If an ancestor fails owner-only validation.
+    :raises OSError: If the token file cannot be written.
+    """
+    from omnigent.harnesses.claude_native.bridge import ensure_secure_dir
+    from omnigent.harnesses.codex_native.bridge import write_mcp_bridge_config
+
+    ensure_secure_dir(bridge_dir)
+    write_mcp_bridge_config(bridge_dir)
+
+
+def omnigent_relay_advertised(bridge_dir: Path) -> bool:
+    """Return whether the runner's tool relay has advertised into *bridge_dir*."""
+    from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
+
+    return (bridge_dir / _TOOL_RELAY_FILE).is_file()
+
+
+def omnigent_mcp_servers(bridge_dir: Path) -> dict[str, _JsonObject]:
+    """Return Kimi ``mcpServers`` entries that run the Omnigent relay's ``serve-mcp``.
+
+    :param bridge_dir: The kimi-native bridge dir holding ``bridge.json``.
+    :returns: ``{"omnigent": {command, args, env, toolTimeoutMs}}``.
+    """
+    from omnigent.harnesses.claude_native.bridge import build_mcp_config
+    from omnigent.harnesses.codex_native.bridge import OMNIGENT_MCP_TOOL_TIMEOUT_S
+
+    servers = cast("dict[str, _JsonObject]", build_mcp_config(bridge_dir)["mcpServers"])
+    # Kimi ends an MCP call after 60s by default; Omnigent tools can wait on a person.
+    return {
+        name: {**entry, "toolTimeoutMs": OMNIGENT_MCP_TOOL_TIMEOUT_S * 1000}
+        for name, entry in servers.items()
+    }
 
 
 def read_hook_config(bridge_dir: Path) -> _JsonObject:
