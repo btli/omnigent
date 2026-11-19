@@ -208,7 +208,6 @@ def build_kimi_session_home(
     user_home = resolve_user_kimi_home()
     mcp_config = session_home / _MCP_CONFIG_FILE
     if omnigent_mcp_servers is None and _is_generated_mcp_config(mcp_config, bridge_dir):
-        # Relay wiring is off now: restore the global symlink (relinked below).
         with contextlib.suppress(OSError):
             mcp_config.unlink()
     base_config = ""
@@ -280,21 +279,22 @@ def _write_session_mcp_config(
     from omnigent.harnesses.claude_native.bridge import _write_json_file
 
     payload: JsonObject = {}
+    user_servers: JsonObject = {}
     if user_config.exists():
         try:
             loaded = json.loads(user_config.read_text(encoding="utf-8"))
-            if not isinstance(loaded, dict) or not isinstance(loaded.get("mcpServers", {}), dict):
+            if not isinstance(loaded, dict) or not isinstance(
+                loaded_servers := loaded.get("mcpServers", {}), dict
+            ):
                 raise ValueError("mcpServers is not an object")
             payload = loaded
+            user_servers = loaded_servers
         except (OSError, ValueError) as exc:
             # Never log the contents: user entries can carry credentials.
             logging.getLogger(__name__).warning(
                 "Ignoring unreadable Kimi MCP config %s (%s)", user_config, type(exc).__name__
             )
-    user_servers = payload.get("mcpServers", {})
-    servers: JsonObject = dict(user_servers) if isinstance(user_servers, dict) else {}
-    servers.update(omnigent_mcp_servers)
-    payload = {**payload, "mcpServers": servers}
+    payload["mcpServers"] = {**user_servers, **omnigent_mcp_servers}
     if path.is_symlink():
         path.unlink()
     _write_json_file(path, payload)
