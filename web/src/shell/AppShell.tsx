@@ -1187,18 +1187,6 @@ function AppShellImpl() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
-  const {
-    panelWidth: inlinePanelWidth,
-    preferredContentWidth: preferredConversationWidth,
-    handleProps: inlinePanelHandleProps,
-    isDragging: inlinePanelResizing,
-  } = useResizableInlinePanel(
-    rootSessionId,
-    inlinePanelMinWidth,
-    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
-    rootSessionResolved,
-    canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
-  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -3225,6 +3213,19 @@ function AppShellImpl() {
     focusWorkspaceTabsOnOpenRef.current = false;
     focusWorkspaceTabs();
   }, [workspacePanelVisible, focusWorkspaceTabs]);
+  const {
+    panelWidth: inlinePanelWidth,
+    preferredContentWidth: preferredConversationWidth,
+    handleProps: inlinePanelHandleProps,
+    isDragging: inlinePanelResizing,
+  } = useResizableInlinePanel(
+    rootSessionId,
+    inlinePanelMinWidth,
+    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
+    workspacePanelVisible && !mobileViewport,
+    rootSessionResolved,
+    canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
+  );
 
   return (
     <AppShellRootProviders
