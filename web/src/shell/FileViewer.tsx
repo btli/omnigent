@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import {
   revealInFileManager,
@@ -356,6 +357,8 @@ interface PendingLeave {
 
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** A comment whose thread opens with the file, as a `?comment=` link asks for. */
+  linkedCommentId?: string;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -400,7 +403,7 @@ interface FileViewerProps {
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
-   * "X/N" index won't line up with the list. Defaults to "recent".
+   * "X/N" index won't line up with the list. Defaults to the panel's default sort.
    */
   sort?: ChangedSort;
 }
@@ -429,6 +432,7 @@ export function FileViewer(props: FileViewerProps) {
 
 function FileViewerBody({
   syncUrl = true,
+  linkedCommentId,
   position,
   open,
   mediaActive = true,
@@ -446,7 +450,7 @@ function FileViewerBody({
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
-  sort = "recent",
+  sort = DEFAULT_FILES_PANEL_PREFERENCES.sort,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
@@ -464,7 +468,9 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
+  const initialCommentIdRef = useRef(
+    linkedCommentId ?? (syncUrl ? searchParams.get("comment") : null),
+  );
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -970,7 +976,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
-  const effectiveDiffActive = diffActive || isDeletedFile;
+  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
+  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
+  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
   const requestedDiff =
     open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
@@ -1270,7 +1278,7 @@ function FileViewerBody({
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
     if (!syncUrl || !open || !isActiveViewport) return;
-    const wantDiff = diffActive && isDiffAvailable;
+    const wantDiff = diffActive && !commentLinkFileView && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
     setSearchParams(
@@ -1285,7 +1293,16 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    diffActive,
+    commentLinkFileView,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1489,6 +1506,7 @@ function FileViewerBody({
         guardDirty(() => {
           dismissFilePosition(position);
           setDismissedPosition(position);
+          setCommentLinkFileView(false);
           setDiffActive(viewMode !== "diff");
         }),
     });

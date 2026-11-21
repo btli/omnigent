@@ -330,6 +330,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_failure_from_runner_response,
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
+    _optional_error_text,
     _owner_from_grants,
     _owns_host_runner,
     _parse_background_tasks,
@@ -486,6 +487,7 @@ from omnigent.util.session_lifecycle import (
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
 if TYPE_CHECKING:
+    from omnigent.entities.workflow import Workflow
     from omnigent.server.host_session_recovery import HostSessionRecoverer
 
 
@@ -1784,18 +1786,18 @@ def _build_session_response(
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 
     native_usage_baseline = None
-    if harness == "pi-native" or (
+    if harness in ("pi-native", "claude-native") or (
         _is_codex_native_subagent(conv) and is_side_chat_child(conv.labels)
     ):
         own_usage = conv.session_usage or {}
         cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
+        # Claude-native stores Claude Code's own billing total, so it is always complete.
+        cost_complete = harness == "claude-native" or own_usage.get("native_cost_complete") is True
         native_usage_baseline = NativeUsageBaseline(
             cumulative_input_tokens=int(own_usage.get("input_tokens", 0) or 0) + cached,
             cumulative_output_tokens=int(own_usage.get("output_tokens", 0) or 0),
             cumulative_cache_read_input_tokens=cached,
-            cumulative_cost_usd=own_usage.get("total_cost_usd")
-            if own_usage.get("native_cost_complete") is True
-            else None,
+            cumulative_cost_usd=own_usage.get("total_cost_usd") if cost_complete else None,
         )
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
@@ -8149,7 +8151,7 @@ def _runner_reject_detail(response: httpx.Response) -> str:
     """
     Describe a runner's refusal of a forwarded event, for the user-visible error.
 
-    The runner's error bodies are ``{"error": <code>, "detail": <text>}``, but a
+    Runner errors carry a flat code/detail pair or a nested error object. A
     proxy or an unhandled path can return any shape, so this falls back to a
     body preview and finally to the bare status code — the caller needs a
     non-empty message either way. Tolerates response fakes that expose only
@@ -8167,6 +8169,9 @@ def _runner_reject_detail(response: httpx.Response) -> str:
     if isinstance(payload, dict):
         raw_detail = payload.get("detail")
         raw_code = payload.get("error")
+        if isinstance(raw_code, dict):
+            raw_detail = _optional_error_text(raw_code.get("message")) or raw_detail
+            raw_code = raw_code.get("code")
         detail = raw_detail.strip() if isinstance(raw_detail, str) and raw_detail.strip() else None
         code = raw_code.strip() if isinstance(raw_code, str) and raw_code.strip() else None
     if detail is None and code is not None:
@@ -12760,6 +12765,17 @@ async def _inherited_mcp_labels(
     return inherited
 
 
+def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) -> str | None:
+    """The new session's title: the caller's, else a top-level run's workflow name.
+
+    A child's title is its sub-agent name, unique under its parent, so a child the
+    caller doesn't name keeps the store's placeholder.
+    """
+    if body.title is not None or workflow is None or body.parent_session_id is not None:
+        return body.title
+    return workflow.name
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -13573,7 +13589,7 @@ async def _create_session_from_existing_agent(
         with creation_stage("create_persistence_ms"):
             conv = conversation_store.create_conversation(
                 agent_id=agent.id,
-                title=body.title,
+                title=_created_session_title(body, workflow),
                 parent_conversation_id=body.parent_session_id,
                 runner_id=inherited_runner_id,
                 kind="sub_agent" if body.parent_session_id else "default",

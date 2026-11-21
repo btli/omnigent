@@ -1,6 +1,9 @@
 // The workspace sidebar's tab strip and the selected place's content.
 
 import { WorkspacePlaceView } from "./placeViews/WorkspacePlaceView";
+import { TerminalTabStatus } from "./TerminalTabStatus";
+import { type TerminalTabConnection, terminalTabSpins } from "./terminalTabConnection";
+import { useTerminalTabConnections } from "./useTerminalTabConnection";
 import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
@@ -57,7 +60,7 @@ import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
-import { closeBrowserView } from "@/hooks/useBrowserTabs";
+import { closeBrowserView, forgetBrowserTab } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import { supportsSideChat } from "@/lib/sideChat";
@@ -142,6 +145,8 @@ export interface WorkspaceTabsPanelProps {
   pending?: boolean;
   width: number;
   inert?: boolean;
+  /** The rail is about to go inert, which its host defers; focus is kept out until it does. */
+  inertPending?: boolean;
   open?: boolean;
   animateVisibility?: boolean;
   resizing?: boolean;
@@ -245,6 +250,7 @@ function WorkspaceTabsPanelImpl({
   pending = false,
   width,
   inert,
+  inertPending,
   open = true,
   animateVisibility = false,
   resizing = false,
@@ -302,16 +308,58 @@ function WorkspaceTabsPanelImpl({
     tabIds: [tab.id],
   }));
   const stripValue = selectedTabId ?? "";
-  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
+  // The rail goes inert a frame late (WorkspaceTabsHost); focus stays out meanwhile.
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false, undefined, {
+    pending: inertPending ?? !open,
+  });
 
   const terminalsKnown = terminalKeys !== null;
   const terminalSignature = terminalKeys?.join("\n") ?? "";
   const {
     terminals,
     listCompleteAt,
+    isFetching: terminalsFetching,
     error: terminalsError,
   } = useTerminals(pending ? null : conversationId);
   const terminalsLoaded = (listCompleteAt ?? 0) > 0 && terminalsError === null;
+  const shellOf = (tab: WorkspaceTab, key: string) => ({
+    key,
+    inventory: store.resourceState(tab.id),
+  });
+  // One resolved connection per shell tab, which its body and its strip icon share.
+  const tabConnections = useTerminalTabConnections(conversationId, store.shellWaits, {
+    liveness: liveness?.kind ?? "unknown",
+    // A failed list that's being asked for again connects until the answer comes.
+    listFailed: terminalsError !== null && !terminalsFetching,
+    shells: knownTabs.flatMap((tab) =>
+      tab.binding?.kind === "terminal" ? [shellOf(tab, tab.binding.key)] : [],
+    ),
+  });
+  const retryTerminals = tabConnections.tryAgain;
+  const resumeSession = () => void tabConnections.resumeSession();
+  // Shell tabs that have shown their terminal, by tab and shell, so a failed list refresh
+  // keeps them mounted. Recorded after commit and pruned to the tabs still open.
+  const shellTabKeys = knownTabs.flatMap((tab) =>
+    tab.binding?.kind === "terminal" ? [attachedShellKey(tab.id, tab.binding.key)] : [],
+  );
+  const liveShellTabKeys = knownTabs.flatMap((tab) =>
+    tab.binding?.kind === "terminal" && store.resourceState(tab.id) === "live"
+      ? [attachedShellKey(tab.id, tab.binding.key)]
+      : [],
+  );
+  const shellTabsSignature = shellTabKeys.join("\n");
+  const liveShellTabsSignature = liveShellTabKeys.join("\n");
+  const [attachedShells, setAttachedShells] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    const openShells = new Set(shellTabsSignature ? shellTabsSignature.split("\n") : []);
+    const live = liveShellTabsSignature ? liveShellTabsSignature.split("\n") : [];
+    setAttachedShells((previous) => {
+      const next = new Set([...previous].filter((key) => openShells.has(key)));
+      for (const key of live) next.add(key);
+      const unchanged = next.size === previous.size && [...next].every((key) => previous.has(key));
+      return unchanged ? previous : next;
+    });
+  }, [shellTabsSignature, liveShellTabsSignature]);
   useEffect(() => {
     if (pending) return;
     store.setTerminalInventory(
@@ -392,7 +440,11 @@ function WorkspaceTabsPanelImpl({
       agentName: place.kind === "agent" ? agentLabels[subagentTabId(place.id)] : undefined,
       // Side chats are numbered in strip order, as the classic strip numbers them.
       chatTitle: place.kind === "chat" ? `Side chat ${chatTabs.indexOf(tab) + 1}` : undefined,
-      connecting: false,
+      // An attached shell shows its terminal, so its icon follows that, not the list.
+      connecting:
+        binding?.kind === "terminal" &&
+        !attachedShells.has(attachedShellKey(tab.id, binding.key)) &&
+        terminalTabSpins(tabConnections.connectionOf(shellOf(tab, binding.key))),
       // A session file tab's place among the changes; a range lists other files.
       changedFiles: place.kind === "changes" && !place.range ? orderedChangedPaths : undefined,
     });
@@ -547,14 +599,17 @@ function WorkspaceTabsPanelImpl({
     }
     return undefined;
   };
-  /** A browser view goes after its tab, without holding the strip; a failure only says so. */
+  /**
+   * A browser view goes after its tab, without holding the strip; a failure only says so.
+   * Forgetting it is awaited so a failed save reaches the store's release log.
+   */
   const releaseFor = (tab: WorkspaceTab) => {
     const binding = tab.binding;
     if (binding?.kind !== "browser-view") return undefined;
     return async () => {
       const closed = await closeBrowserView(conversationId, binding.viewKey);
-      if (!closed)
-        toast.error("Couldn't close the browser page. It may keep running until you quit.");
+      if (closed) await forgetBrowserTab(conversationId, binding.viewKey);
+      else toast.error("Couldn't close the browser page. It may keep running until you quit.");
       return closed;
     };
   };
@@ -817,6 +872,7 @@ function WorkspaceTabsPanelImpl({
               permissionLevel,
             }}
             position={session.fileRequest(tab.id)?.position}
+            landing={store.landing(tab.id)}
             registerLeaveGuard={leaveGuardRegistrar(tab.id)}
           />
         );
@@ -863,9 +919,31 @@ function WorkspaceTabsPanelImpl({
             }
           />
         );
-      case "terminal":
-        if (tab.binding?.kind !== "terminal" || store.resourceState(tab.id) !== "live") {
-          return <Unavailable text="This shell has ended." />;
+      case "terminal": {
+        const shellState = store.resourceState(tab.id);
+        // Until the shell list confirms it, a shell isn't ended; an attached one stays put.
+        if (
+          tab.binding?.kind !== "terminal" ||
+          shellState === "gone" ||
+          (shellState !== "live" && !attachedShells.has(attachedShellKey(tab.id, tab.binding.key)))
+        ) {
+          const connection: TerminalTabConnection =
+            tab.binding?.kind === "terminal"
+              ? tabConnections.connectionOf(shellOf(tab, tab.binding.key))
+              : { kind: "ended" };
+          return (
+            <TerminalTabStatus
+              connection={connection}
+              sandboxNotice={tabConnections.sandboxNotice(connection)}
+              onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
+              resumingSession={tabConnections.resumingSession}
+              onTryAgain={retryTerminals}
+              // Only the owner can attach a runner, so only the owner gets the command.
+              localReconnectCommand={
+                isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
+              }
+            />
+          );
         }
         return (
           <RailTerminalView
@@ -875,6 +953,7 @@ function WorkspaceTabsPanelImpl({
             autoFocus={active && autoFocusTerminalKey === tab.binding.key}
           />
         );
+      }
       case "web": {
         if (!showBrowserTab || tab.binding?.kind !== "browser-view") {
           return <Unavailable text="Web pages open in the desktop app." />;
@@ -946,7 +1025,8 @@ function WorkspaceTabsPanelImpl({
       data-workspace-design="tabs"
       data-collapsed={width === 0 || undefined}
       data-maximized={maximized || undefined}
-      data-state={open ? "open" : "closed"}
+      // Its own name, not data-state: a data-state change restyles everything inside the rail.
+      data-rail-state={open ? "open" : "closed"}
       data-animate-visibility={animateVisibility || undefined}
       data-resizing={resizing || undefined}
       className={
@@ -1215,6 +1295,11 @@ function AttentionBar({
       </Button>
     </div>
   );
+}
+
+/** Names a shell tab showing one shell; a tab rebound to another shell is a new entry. */
+function attachedShellKey(tabId: TabId, terminalKey: string): string {
+  return `${tabId}\u0000${terminalKey}`;
 }
 
 function Unavailable({ text }: { text: string }) {
