@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import {
   revealInFileManager,
@@ -347,8 +348,17 @@ function useToolbarOverflow(actionsKey: string): {
 // FileViewer
 // ---------------------------------------------------------------------------
 
+/** The Unsaved changes dialog's pending choice; `answersHost` marks a host's leave question. */
+interface PendingLeave {
+  apply: () => void;
+  cancel?: () => void;
+  answersHost?: boolean;
+}
+
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** A comment whose thread opens with the file, as a `?comment=` link asks for. */
+  linkedCommentId?: string;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -381,6 +391,11 @@ interface FileViewerProps {
   viewport?: "desktop" | "mobile";
   /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
+  /**
+   * Registers the question a host asks before it leaves this file, while the editor has
+   * unsaved edits. It asks this viewer's own Unsaved changes dialog; returns the unregister.
+   */
+  registerLeaveGuard?: (guard: () => Promise<"leave" | "cancel">) => () => void;
   /** Set while the viewer fills the workspace full screen; Escape then exits full screen. */
   onExitFullScreen?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
@@ -388,7 +403,7 @@ interface FileViewerProps {
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
-   * "X/N" index won't line up with the list. Defaults to "recent".
+   * "X/N" index won't line up with the list. Defaults to the panel's default sort.
    */
   sort?: ChangedSort;
 }
@@ -417,6 +432,7 @@ export function FileViewer(props: FileViewerProps) {
 
 function FileViewerBody({
   syncUrl = true,
+  linkedCommentId,
   position,
   open,
   mediaActive = true,
@@ -424,6 +440,7 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
+  registerLeaveGuard,
   onExitFullScreen,
   onNavigateTo,
   onShare,
@@ -433,7 +450,7 @@ function FileViewerBody({
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
-  sort = "recent",
+  sort = DEFAULT_FILES_PANEL_PREFERENCES.sort,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
@@ -451,7 +468,9 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
+  const initialCommentIdRef = useRef(
+    linkedCommentId ?? (syncUrl ? searchParams.get("comment") : null),
+  );
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -553,10 +572,13 @@ function FileViewerBody({
   // Brief "copied" feedback for the copy-link button.
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
-  const [pendingAction, setPendingAction] = useState<{
-    apply: () => void;
-    cancel?: () => void;
-  } | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingLeave | null>(null);
+  // Mirrors the dialog's action, so a newer request can answer the one it replaces.
+  const pendingActionRef = useRef<PendingLeave | null>(null);
+  const showPendingAction = useCallback((next: PendingLeave | null) => {
+    pendingActionRef.current = next;
+    setPendingAction(next);
+  }, []);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
@@ -611,13 +633,46 @@ function FileViewerBody({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isEditorDirty]);
 
-  const guardDirty = useCallback((action: () => void, cancel?: () => void) => {
-    if (isEditorDirtyRef.current) {
-      setPendingAction({ apply: action, cancel });
-      return;
-    }
-    action();
-  }, []);
+  const guardDirty = useCallback(
+    (action: () => void, cancel?: () => void, answersHost = false) => {
+      if (isEditorDirtyRef.current) {
+        const replaced = pendingActionRef.current;
+        showPendingAction({ apply: action, cancel, answersHost });
+        // A host still waiting on the dialog hears "cancel": a newer request took its place.
+        if (replaced?.answersHost) replaced.cancel?.();
+        return;
+      }
+      action();
+    },
+    [showPendingAction],
+  );
+
+  // A host leaving the file, such as a tab closing, asks the same question first.
+  useEffect(() => {
+    if (!isEditorDirty || !registerLeaveGuard) return undefined;
+    const waiting = new Set<(answer: "leave" | "cancel") => void>();
+    const unregister = registerLeaveGuard(
+      () =>
+        new Promise((resolve) => {
+          const answer = (choice: "leave" | "cancel") => {
+            waiting.delete(answer);
+            resolve(choice);
+          };
+          waiting.add(answer);
+          guardDirty(
+            () => answer("leave"),
+            () => answer("cancel"),
+            true,
+          );
+        }),
+    );
+    return () => {
+      unregister();
+      // Unmounting, or the edits going away, answers a question still open.
+      if (waiting.size > 0 && pendingActionRef.current?.answersHost) showPendingAction(null);
+      for (const answer of [...waiting]) answer("cancel");
+    };
+  }, [isEditorDirty, registerLeaveGuard, guardDirty, showPendingAction]);
 
   useEffect(
     () => () => {
@@ -921,7 +976,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
-  const effectiveDiffActive = diffActive || isDeletedFile;
+  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
+  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
+  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
   const requestedDiff =
     open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
@@ -1221,7 +1278,7 @@ function FileViewerBody({
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
     if (!syncUrl || !open || !isActiveViewport) return;
-    const wantDiff = diffActive && isDiffAvailable;
+    const wantDiff = diffActive && !commentLinkFileView && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
     setSearchParams(
@@ -1236,7 +1293,16 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    diffActive,
+    commentLinkFileView,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1440,6 +1506,7 @@ function FileViewerBody({
         guardDirty(() => {
           dismissFilePosition(position);
           setDismissedPosition(position);
+          setCommentLinkFileView(false);
           setDiffActive(viewMode !== "diff");
         }),
     });
@@ -2170,7 +2237,7 @@ function FileViewerBody({
         onOpenChange={(isOpen) => {
           if (!isOpen) {
             pendingAction?.cancel?.();
-            setPendingAction(null);
+            showPendingAction(null);
           }
         }}
       >
@@ -2186,7 +2253,7 @@ function FileViewerBody({
               variant="outline"
               onClick={() => {
                 pendingAction?.cancel?.();
-                setPendingAction(null);
+                showPendingAction(null);
               }}
             >
               Keep editing
@@ -2196,7 +2263,7 @@ function FileViewerBody({
               onClick={() => {
                 handleDirtyChange(false);
                 pendingAction?.apply();
-                setPendingAction(null);
+                showPendingAction(null);
               }}
             >
               Discard changes
