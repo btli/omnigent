@@ -169,6 +169,18 @@ jobs:
             echo "state=$(jq -r '.state // ""' "$plan")"
           } >> "$GITHUB_OUTPUT"
 
+      # The homelab migration autopromoter (k3s-infra
+      # k8s/omnigent-migration-autopromoter) reads this to find a blocked
+      # candidate, checkpoint production's database, and re-dispatch with
+      # approve_migration. Uploaded for every outcome, before refused stops.
+      - name: Upload promote plan
+        if: always() && steps.plan.outputs.action != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promote-plan
+          path: ${{ runner.temp }}/plan.json
+          retention-days: 14
+
       - name: Stop on refused plan
         if: steps.plan.outputs.action == 'refused'
         run: |

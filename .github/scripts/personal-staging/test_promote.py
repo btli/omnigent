@@ -719,3 +719,18 @@ def test_status_plan_takes_event_values_only_through_env():
     [alert] = [s for s in steps if s.get("name") == "Alert on a failed soak verdict"]
     assert "steps.plan.outputs.action == 'ignored'" in alert["if"]
     assert 'msg="soak $STATE for $sha ($nightly) — $RUN_URL"' in alert["run"]
+
+
+def test_plan_is_uploaded_for_the_migration_autopromoter():
+    # The homelab migration autopromoter reads `promote-plan` to find a
+    # blocked candidate; it must exist for every outcome the plan step wrote,
+    # including refused (which fails the job before later steps run).
+    steps = _promote_workflow()["jobs"]["promote"]["steps"]
+    names = [s.get("name") for s in steps]
+    [upload] = [s for s in steps if s.get("name") == "Upload promote plan"]
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert upload["with"]["name"] == "promote-plan"
+    assert upload["with"]["path"] == "${{ runner.temp }}/plan.json"
+    assert "always()" in upload["if"]
+    assert "steps.plan.outputs.action != ''" in upload["if"]
+    assert names.index("Upload promote plan") == names.index("Plan") + 1
