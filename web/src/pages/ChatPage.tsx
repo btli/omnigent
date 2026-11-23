@@ -104,7 +104,6 @@ import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   takeFailedSendDraft,
-  composerAttachmentKey,
   consumePendingInitialPrompt,
   holdsInitialDraft,
   isStaleTempConvId,
@@ -139,9 +138,7 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
-  fileMentionToken,
   findMentionTokens,
-  newFileMentionToken,
   mergeTaggedDrafts,
   presentMentions,
   recallSessionMentions,
@@ -1235,7 +1232,6 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1379,7 +1375,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1575,7 +1570,6 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
-  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1891,7 +1885,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           alone — this surface's composer and chrome below bail out. */}
           <EditSentMessageContext.Provider value={composerReadOnly ? null : editSentMessage}>
             <Transcript
-              hostId={hostId}
               setConversationEl={setConversationEl}
               containerEl={containerEl}
               scroller={scroller}
@@ -3212,9 +3205,12 @@ function ComposerImpl(
     attachMention,
     openMentionDir,
     mentionedSessions,
-    setMentionedSessions,
     attachSession,
     mentionTokens,
+    tagFiles,
+    ownedMentionTokens,
+    resetMentions,
+    noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -3285,38 +3281,19 @@ function ComposerImpl(
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // tagged items and inline tokens, deduping against what's already tagged,
-  // then clear the store queue so they aren't re-applied. Placed after
-  // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  // then clear the store queue so they aren't re-applied.
   taggedMentionsRef.current = { files: mentionedItems, sessions: mentionedSessions };
-  restoreTaggedMentionsRef.current = (mentions) => {
-    setMentionedItems(mentions?.files ?? []);
-    setMentionedSessions(mentions?.sessions ?? []);
-  };
+  restoreTaggedMentionsRef.current = resetMentions;
   // Read at drain time without re-running the effect on every keystroke.
-  const mentionedItemsRef = useRef(mentionedItems);
-  mentionedItemsRef.current = mentionedItems;
-  const mentionTokensRef = useRef(mentionTokens);
-  mentionTokensRef.current = mentionTokens;
+  const tagFilesRef = useRef(tagFiles);
+  tagFilesRef.current = tagFiles;
+  const ownedMentionTokensRef = useRef(ownedMentionTokens);
+  ownedMentionTokensRef.current = ownedMentionTokens;
   useEffect(() => {
     if (pendingComposerAttachments.length === 0) return;
-    // Dedup against already-tagged items AND within this batch, and give each
-    // new item a token no tagged file or session already uses.
-    const known = new Map(mentionedItemsRef.current.map((it) => [composerAttachmentKey(it), it]));
-    const taken = [...mentionTokensRef.current];
-    const fresh: MentionItem[] = [];
-    const tokens: string[] = [];
-    for (const attachment of pendingComposerAttachments) {
-      const key = composerAttachmentKey(attachment);
-      let item = known.get(key);
-      if (!item) {
-        item = { ...attachment, token: newFileMentionToken(attachment, taken) };
-        known.set(key, item);
-        fresh.push(item);
-        taken.push(fileMentionToken(item));
-      }
-      tokens.push(fileMentionToken(item));
-    }
-    if (fresh.length > 0) setMentionedItems((prev) => [...prev, ...fresh]);
+    const tokens = tagFilesRef.current(pendingComposerAttachments);
+    // The hook's own scan set, released spellings included, so both agree on what's present.
+    const taken = [...ownedMentionTokensRef.current(), ...tokens];
     // Each attachment lands as an inline token at the end of the draft.
     editText(null, (prev) => {
       // Scan with every known token at once, longest first, so a file token is
@@ -3336,8 +3313,7 @@ function ComposerImpl(
     // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
     // resets the queue, but this closes the non-switch unmount paths too.
     return () => useChatStore.getState().clearPendingComposerAttachments();
-    // setMentionedItems is a stable useState setter (from useMentionBrowser).
-  }, [pendingComposerAttachments, setMentionedItems, editText]);
+  }, [pendingComposerAttachments, editText]);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
@@ -3403,6 +3379,7 @@ function ComposerImpl(
       filesRef.current.every((f) => restoredSendDraft.files.includes(f));
     if (valueRef.current !== expected || !filesUnedited) return;
     replaceText("");
+    restoreTaggedMentionsRef.current(undefined);
     attachmentsRef.current.replaceFiles([]);
     dirtyRef.current = false;
     if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
@@ -4182,8 +4159,7 @@ function ComposerImpl(
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
-    setMentionedItems([]);
-    setMentionedSessions([]);
+    resetMentions();
     if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
   };
@@ -4268,8 +4244,7 @@ function ComposerImpl(
   const restoreRecalledText = (text: string, replyDraft?: StoredReplyDraft) => {
     const recalled = recallComposerDraft(text, replyDraft);
     replaceText(recalled.text, recalled.replyDraft);
-    setMentionedSessions(recalled.sessions);
-    setMentionedItems([]);
+    resetMentions({ files: [], sessions: recalled.sessions });
   };
 
   const applyRecall = (ta: ComposerTextTarget, recalled: ComposerDraft) => {
@@ -4402,6 +4377,7 @@ function ComposerImpl(
 
   const handleTextChange = (id: string | null, e: ComposerInputEvent) => {
     const input = e.currentTarget;
+    noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
     editText(id, input.value);
     dirtyRef.current = true;

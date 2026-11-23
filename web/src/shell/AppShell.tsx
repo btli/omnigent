@@ -1,5 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { PaneLoading } from "@/components/PageLoading";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
@@ -40,7 +41,12 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
-import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
+import {
+  PROJECT_LABEL_KEY,
+  type Conversation,
+  useProjects,
+  useSyncMutedProjects,
+} from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
@@ -72,6 +78,8 @@ import {
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -155,7 +163,6 @@ import { ChatHeader } from "./ChatHeader";
 import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
-import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
@@ -702,9 +709,17 @@ function AppShellImpl() {
     },
     [cancelRightPanelVisibilityMotion],
   );
+  // Whether the rail can show here and how far it widens the window, for the shell's setting.
+  const rightSidebarWindowRef = useRef({ canShow: false, width: (): number => 0 });
+  useEffect(() => {
+    resetRightSidebarWindowTracking();
+  }, [conversationId]);
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;
+    // Only in-session opens and closes resize the window; a session switch restores its rail.
+    const rail = rightSidebarWindowRef.current;
+    if (rail.canShow) reportRightSidebarVisibility(open, open ? rail.width() : 0);
     if (rightPanelMotionTimerRef.current !== null) {
       window.clearTimeout(rightPanelMotionTimerRef.current);
     }
@@ -759,6 +774,8 @@ function AppShellImpl() {
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
   const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
+  // Mirror muted projects into the store that notifications and rows read.
+  useSyncMutedProjects();
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
@@ -1189,6 +1206,7 @@ function AppShellImpl() {
   }, [rootSessionId, rootSessionResolved]);
   const {
     panelWidth: inlinePanelWidth,
+    widthInWiderWindow: inlinePanelWidthInWiderWindow,
     preferredContentWidth: preferredConversationWidth,
     handleProps: inlinePanelHandleProps,
     isDragging: inlinePanelResizing,
@@ -1248,6 +1266,10 @@ function AppShellImpl() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  rightSidebarWindowRef.current = {
+    canShow: Boolean(conversationId) && hasRailContent,
+    width: inlinePanelWidthInWiderWindow,
+  };
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
@@ -2465,24 +2487,25 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     revealTabsSidebar,
   ]);
-  // The chat's task preview, a task's marker, or the agent's first plan asks
-  // for this session's Tasks tab: open the rail on it, or its drawer on a phone
-  // unless the agent asked, then clear the one-shot request.
+  // A click on the task preview or a task's marker, the agent's first plan, or opening a
+  // session with tasks asks for its Tasks tab; clear the one-shot request, then show it.
   const tasksTabToOpen = useSessionTasksActions((state) => state.tasksTabToOpen);
   useEffect(() => {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
-    const automatic = useSessionTasksActions.getState().tasksTabAutoOpen;
-    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabAutoOpen: false });
+    const requestedBy = useSessionTasksActions.getState().tasksTabRequestedBy;
+    useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabRequestedBy: "click" });
     if (!railTabsAvailable.tasks) return;
     if (isMobileViewport()) {
-      // A drawer the agent opened would cover the chat it's working in.
-      if (automatic) return;
+      // Only a click opens the phone drawer; automatic requests would cover the chat.
+      if (requestedBy !== "click") return;
       if (!tabsModeRef.current) {
         openTasksPanel();
         return;
       }
     }
     selectRightRailTab("tasks");
+    // The rail keeps the session's saved open state, else the Workspace panel default.
+    if (requestedBy === "session-open") return;
     if (tabsModeRef.current) revealTabsSidebar();
     else setRightPanelOpenAnimated(true);
   });
@@ -3409,7 +3432,6 @@ function AppShellImpl() {
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
                     workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
-                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}
@@ -3501,7 +3523,10 @@ function AppShellImpl() {
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>
-                        <Outlet />
+                        {/* A lazy page loading its chunk must not suspend the whole shell. */}
+                        <Suspense fallback={<PaneLoading />}>
+                          <Outlet />
+                        </Suspense>
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
