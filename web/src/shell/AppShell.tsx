@@ -72,6 +72,8 @@ import {
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -155,7 +157,6 @@ import { ChatHeader } from "./ChatHeader";
 import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
-import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
@@ -702,9 +703,17 @@ function AppShellImpl() {
     },
     [cancelRightPanelVisibilityMotion],
   );
+  // Whether the rail can show here and how far it widens the window, for the shell's setting.
+  const rightSidebarWindowRef = useRef({ canShow: false, width: (): number => 0 });
+  useEffect(() => {
+    resetRightSidebarWindowTracking();
+  }, [conversationId]);
   const setRightPanelOpenAnimated = useCallback((open: boolean) => {
     if (rightPanelOpenRef.current === open) return;
     rightPanelOpenRef.current = open;
+    // Only in-session opens and closes resize the window; a session switch restores its rail.
+    const rail = rightSidebarWindowRef.current;
+    if (rail.canShow) reportRightSidebarVisibility(open, open ? rail.width() : 0);
     if (rightPanelMotionTimerRef.current !== null) {
       window.clearTimeout(rightPanelMotionTimerRef.current);
     }
@@ -1189,6 +1198,7 @@ function AppShellImpl() {
   }, [rootSessionId, rootSessionResolved]);
   const {
     panelWidth: inlinePanelWidth,
+    widthInWiderWindow: inlinePanelWidthInWiderWindow,
     preferredContentWidth: preferredConversationWidth,
     handleProps: inlinePanelHandleProps,
     isDragging: inlinePanelResizing,
@@ -1248,6 +1258,10 @@ function AppShellImpl() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  rightSidebarWindowRef.current = {
+    canShow: Boolean(conversationId) && hasRailContent,
+    width: inlinePanelWidthInWiderWindow,
+  };
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
@@ -3409,7 +3423,6 @@ function AppShellImpl() {
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
                     workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
-                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}
