@@ -4513,6 +4513,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            scheduled_task_store=scheduled_task_store,
         ),
         prefix="/v1",
         tags=["workflows"],
@@ -5427,8 +5428,8 @@ def create_app(
                         else:
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
                         # A crash can leave a persisted count absent from the live index.
-                        session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
+                        session_live_state.reconcile_pending_count(
+                            conv.id, conv.pending_elicitation_count, runner_id=runner_id
                         )
                         cached_sandbox = _session_sandbox_status_cache.get(conv.id)
                         # A reconnect proves readiness only for a launch already marked failed.

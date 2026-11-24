@@ -65,7 +65,10 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { DesktopAppHandoffPage } from "@/components/DesktopAppHandoffPage";
+import { useDesktopAppHandoff } from "@/hooks/useDesktopAppHandoff";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isSessionWindow } from "@/lib/sessionWindow";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -124,6 +127,7 @@ import { browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
 import { agentBrowserTabId } from "@/components/BrowserPane/agentTools/agentTabs";
 import { useRevealBrowserOnAgentTabs } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
+import { startSavingBrowserPages } from "@/lib/browserTabPages";
 import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
@@ -192,7 +196,7 @@ import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { resolveDefaultShell } from "./preferredShell";
-import { WorkspacePanel } from "./WorkspacePanel";
+import { type ShellCloseCallbacks, WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { TasksTabOnOpen } from "./TasksTabOnOpen";
 import {
@@ -414,6 +418,11 @@ function AppShellImpl() {
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const pendingConversation = conversationId != null && serverConversationId == null;
+  const handedOverConversation = useDesktopAppHandoff(
+    serverConversationId,
+    !isCanvasPathname(location.pathname, rebasePath("/canvas")) &&
+      !new URLSearchParams(location.search).has("file"),
+  );
   // With tabs enabled, links, pages and shells open there. The session ref stays null
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
@@ -1073,14 +1082,25 @@ function AppShellImpl() {
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
   // Tab key awaiting a close confirmation, or null. Closing a tab kills the
   // terminal, so a user-initiated close routes through a confirm modal first.
-  const [terminalPendingClose, setTerminalPendingClose] = useState<string | null>(null);
-  // While a close is in flight, grey the tab being killed so the delay between
-  // confirming and the tab disappearing (the DELETE round-trip + its
-  // ``resource.deleted``) reads as "closing", not frozen.
-  const closingTerminalKey =
-    deleteTerminalMutation.isPending && deleteTerminalMutation.variables
-      ? `terminal:${deleteTerminalMutation.variables}`
-      : null;
+  const [terminalPendingClose, setTerminalPendingClose] = useState<{
+    keys: string[];
+    callbacks?: ShellCloseCallbacks;
+  } | null>(null);
+  // While a close is in flight, grey the tabs being killed so the delay between
+  // confirming and a tab disappearing (the DELETE round-trip + its
+  // ``resource.deleted``) reads as "closing", not frozen. A bulk close kills
+  // several shells at once, and the mutation's ``variables`` holds only the last.
+  const [killingTerminalIds, setKillingTerminalIds] = useState<readonly string[]>([]);
+  const deletingTerminalId = deleteTerminalMutation.isPending
+    ? deleteTerminalMutation.variables
+    : undefined;
+  const closingTerminalKeys = useMemo(
+    () =>
+      [
+        ...new Set([...killingTerminalIds, ...(deletingTerminalId ? [deletingTerminalId] : [])]),
+      ].map((id) => `terminal:${id}`),
+    [killingTerminalIds, deletingTerminalId],
+  );
   // A user-initiated "+"→Shell create: snapshot the shell tabs present when it
   // starts so the effect below can focus the newly-created shell the instant
   // its tab lands in the list. That's decoupled from the create POST, which on
@@ -1287,6 +1307,9 @@ function AppShellImpl() {
   useEffect(() => {
     resyncBrowserSuppression();
   }, []);
+
+  // Keep each browser tab's address and title after the shell destroys its view.
+  useEffect(() => startSavingBrowserPages(), []);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -2386,15 +2409,18 @@ function AppShellImpl() {
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
-      const remaining = openPanels.filter((panel) => panel !== tab);
-      setOpenPanels(remaining);
-      if (rightRailTab === tab) {
-        setRightRailTab(
-          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+      // Functional updates, so closing several panels in one pass drops them all.
+      setOpenPanels((previous) => {
+        const remaining = previous.filter((panel) => panel !== tab);
+        setRightRailTab((current) =>
+          current === tab
+            ? (remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab)
+            : current,
         );
-      }
+        return remaining;
+      });
     },
-    [openPanels, rightRailTab, fallbackWorkspaceTab, railTabsAvailable],
+    [fallbackWorkspaceTab, railTabsAvailable],
   );
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
@@ -2720,8 +2746,12 @@ function AppShellImpl() {
 
   // User clicked a tab's "x". Closing a tab kills the underlying terminal, so
   // confirm first rather than acting immediately.
-  const requestCloseTerminal = useCallback((key: string) => {
-    setTerminalPendingClose(key);
+  const requestCloseTerminal = useCallback((key: string, callbacks?: ShellCloseCallbacks) => {
+    setTerminalPendingClose({ keys: [key], callbacks });
+  }, []);
+  // A bulk tab close asks once for all of its shells.
+  const requestCloseTerminals = useCallback((keys: string[], callbacks?: ShellCloseCallbacks) => {
+    if (keys.length > 0) setTerminalPendingClose({ keys, callbacks });
   }, []);
   // Confirmed close: kill the terminal (DELETE). The `session.resource.deleted`
   // delta + the mutation's cache prune drop it from the list, so its tab
@@ -2729,18 +2759,31 @@ function AppShellImpl() {
   // previous, else the next) so the rail doesn't snap back to Files; when none
   // remain the selection clears.
   const confirmCloseTerminal = useCallback(() => {
-    const key = terminalPendingClose;
-    if (key === null) return;
+    if (terminalPendingClose === null) return;
+    const { keys, callbacks } = terminalPendingClose;
     setTerminalPendingClose(null);
     setSelectedTerminalKey((active) => {
-      if (active !== key) return active;
-      const idx = openTerminals.indexOf(key);
-      const remaining = openTerminals.filter((k) => k !== key);
-      if (remaining.length === 0) return null;
-      return remaining[idx - 1] ?? remaining[idx] ?? remaining[0];
+      if (active === null || !keys.includes(active)) return active;
+      const idx = openTerminals.indexOf(active);
+      const kept = (key: string) => !keys.includes(key);
+      return (
+        openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
+        openTerminals.slice(idx + 1).find(kept) ??
+        null
+      );
     });
-    const info = terminals.find((t) => terminalTabKey(t) === key);
-    if (info && conversationId) deleteTerminalMutation.mutate(info.id);
+    if (!conversationId) return;
+    callbacks?.onConfirmed?.();
+    for (const key of keys) {
+      const info = terminals.find((t) => terminalTabKey(t) === key);
+      if (!info) continue;
+      setKillingTerminalIds((ids) => [...ids, info.id]);
+      // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+      deleteTerminalMutation
+        .mutateAsync(info.id)
+        .catch(() => callbacks?.onFailed?.(key))
+        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
+    }
   }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
 
   // The active shell selection is sticky: it changes only on explicit user
@@ -3259,6 +3302,8 @@ function AppShellImpl() {
       }}
       fileViewer={fileViewerContextValue}
     >
+      {/* Covers the page until the user chooses to stay in the browser. */}
+      {handedOverConversation && <DesktopAppHandoffPage conversationId={handedOverConversation} />}
       {/* One for the whole window, so a grid of sidebars runs each request once. */}
       {/* A host that breaks only disables the file actions. */}
       {tabsSidebar && (
@@ -3672,8 +3717,9 @@ function AppShellImpl() {
                       autoFocusTerminalRef.current.conversationId === conversationId &&
                       autoFocusTerminalRef.current.key === selectedTerminalKey
                     }
-                    closingTerminalKey={closingTerminalKey}
+                    closingTerminalKeys={closingTerminalKeys}
                     onCloseTerminal={requestCloseTerminal}
+                    onCloseTerminals={requestCloseTerminals}
                     maximized={rightPanelMaximized}
                     onToggleMaximized={toggleRightPanelMaximized}
                     permissionLevel={permissionLevel}
@@ -3789,9 +3835,12 @@ function AppShellImpl() {
           )}
           <CloseShellDialog
             open={terminalPendingClose !== null}
+            shellCount={terminalPendingClose?.keys.length}
             shellLabel={(() => {
-              if (terminalPendingClose === null) return null;
-              const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose);
+              if (terminalPendingClose?.keys.length !== 1) return null;
+              const info = terminals.find(
+                (t) => terminalTabKey(t) === terminalPendingClose.keys[0],
+              );
               if (!info) return null;
               return terminalDisplayLabel(info);
             })()}
@@ -3854,11 +3903,12 @@ function AppShellImpl() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold is
- * Tailwind's `md` breakpoint, used in the Sidebar's responsive classes.
+ * Initial sidebar open state — open on desktop, closed on mobile and in a
+ * popped-out session window, which shows just its session. SSR-safe (returns
+ * false when window is undefined). The threshold is Tailwind's `md` breakpoint,
+ * used in the Sidebar's responsive classes.
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return isDesktopLayout();
+  return isDesktopLayout() && !isSessionWindow();
 }
