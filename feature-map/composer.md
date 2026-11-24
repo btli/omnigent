@@ -21,7 +21,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the same send, history, and completion keys. Side chats and New Chat follow
   the same choice. Mobile widths always use the plain text box. It also stays
   while the editor loads, and stays if loading fails; a failed load retries on
-  window focus, at most once a minute.
+  window focus, at most once a minute. In this editor a paste of files becomes one
+  chip per file at the caret, named after the file it sends as. A plain-text
+  paste of 40 lines or 4,000 characters becomes a `pasted-text.txt` chip. Chips
+  show in the main chat and New Chat; side-chat pastes stay in the tray. A draft
+  that leaves the editor (switching sessions, a new-session handoff, a recovered
+  send) keeps each chip's file as a tray attachment with its `@name` text
+  unchanged.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -271,7 +277,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
-  be removed. Supported native coding agents receive binary attachments, including
+  be removed. With the CodeMirror editor, pasted files and large text are chips
+  at the caret instead (see `codemirror-input`). Supported native coding agents receive binary attachments, including
   MP4 uploads up to 50 MiB, as local files.
   State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
@@ -289,6 +296,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session pill opens that session. The new-session composer lists the same
   sessions (no subagents yet) with the same title search; its files come from
   the host directory listing only, without the recursive workspace search.
+  Behind `chat_composer_codemirror`, a question card's custom answer takes the
+  same session tags (no files, no subagents); the answer goes to the agent with the
+  markers and tool hint, and the answered card shows them as pills.
   States: file listing still loading (Enter holds; a pending session search
   does not hold it), no match (Enter sends the literal text), late results
   arriving (the highlighted row stays put), a file and a session with the same
@@ -367,12 +377,6 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   each message once. If the sandbox never comes up, each saved message stays in
   the transcript marked **Not delivered**, live and after reload. **Copy message
   to new session** opens New Chat with its text and attachments.
-- `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
-  missing or expired dbcert preserves the draft and shows a yellow refresh
-  banner instead of provisioning. Skip continues the current launch without
-  waiting for the check. Refresh is explicit; launch needs another submit after
-  renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
-  CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
   something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
@@ -525,12 +529,6 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
 and opens the composer with its prompt`).
 
-- In the managed desktop app, choose **Arclet Sandbox** and submit a task with
-  missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
-  banner, finish browser sign-in, then submit the preserved task again. Sending
-  alone must not open the browser, and renewal alone must not create a sandbox.
-  While **Checking laptop credentials…** is visible, **Skip** starts that launch
-  without waiting for verification or opening sign-in. Later launches check again.
 - On a deployment whose launches can report that the user needs to act, start a
   managed session whose launch needs you, e.g. a sandbox still waiting for its
   owner's credentials. The session's chat
@@ -1181,16 +1179,6 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   `tests/server/integration/test_managed_startup_inputs.py` checks native
   transcript ownership, bundle uploads, recovery, access revocation and deletion,
   plus failed inputs in the snapshot.
-- **`arclet-dbcert`, desktop new-session composer (own environment):**
-  `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
-  native bridge, CLI process, and local server with a fake dbcert executable and
-  machine policy. Follow `web/electron/e2e/README.md` for build and recording
-  prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
-  needs a manual managed-desktop check. Component tests in
-  `web/src/shell/NewChatDialog.test.tsx` and
-  `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
-  results after skipping, retry, dismissal, check errors, and older shells.
 - **`launch-action-required`, session chat transcript:**
   `tests/browser_ui/chat/test_status_indicators.py::test_action_banner_follows_the_launch`
   shows the snapshot's instructions in the banner and clears it when the stream
@@ -1215,12 +1203,6 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
-  managed features enabled on the server. Browsers, older shells, other sandbox
-  providers, and already-connected hosts skip this check. Refreshing a host's
-  credential from the session banner does not prove new-session gating works.
-  Skip bypasses only this launch's check; it does not renew credentials or
-  guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code
   reports it; Omnigent's own sandbox providers never do. Its text comes from the
   deployment, so check the wording there rather than in the web UI.
