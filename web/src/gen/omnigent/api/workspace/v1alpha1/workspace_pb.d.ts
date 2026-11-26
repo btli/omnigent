@@ -848,6 +848,19 @@ export declare type ResolveWorkingCopyBaseRequest = Message<"omnigent.api.worksp
    * @generated from field: omnigent.api.workspace.v1alpha1.Comparison comparison = 1;
    */
   comparison?: Comparison | undefined;
+
+  /**
+   * The repository to compare: a directory relative to the workspace root,
+   * such as a worktree inside it. Empty for the workspace's own repository.
+   * Paths in the request and response are then relative to that directory.
+   * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace, and for any folder when the workspace
+   * lies inside a larger repository. Feature "comparison.repository".
+   *
+   * @generated from field: string repository = 2;
+   */
+  repository: string;
 };
 
 /**
@@ -1021,6 +1034,19 @@ export declare type ListWorkingCopyChangesRequest = Message<"omnigent.api.worksp
    * @generated from field: omnigent.api.workspace.v1alpha1.Comparison comparison = 1;
    */
   comparison?: Comparison | undefined;
+
+  /**
+   * The repository to compare: a directory relative to the workspace root,
+   * such as a worktree inside it. Empty for the workspace's own repository.
+   * Paths in the request and response are then relative to that directory.
+   * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace, and for any folder when the workspace
+   * lies inside a larger repository. Feature "comparison.repository".
+   *
+   * @generated from field: string repository = 2;
+   */
+  repository: string;
 };
 
 /**
@@ -1092,6 +1118,19 @@ export declare type ReadBaseFileRequest = Message<"omnigent.api.workspace.v1alph
    * @generated from field: uint64 maximum_bytes = 4;
    */
   maximumBytes: bigint;
+
+  /**
+   * The repository to compare: a directory relative to the workspace root,
+   * such as a worktree inside it. Empty for the workspace's own repository.
+   * Paths in the request and response are then relative to that directory.
+   * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace, and for any folder when the workspace
+   * lies inside a larger repository. Feature "comparison.repository".
+   *
+   * @generated from field: string repository = 5;
+   */
+  repository: string;
 };
 
 /**
@@ -1167,6 +1206,18 @@ export declare const ReadLinkTextResponseSchema: GenMessage<ReadLinkTextResponse
  * @generated from message omnigent.api.workspace.v1alpha1.ListRepositoryRefsRequest
  */
 export declare type ListRepositoryRefsRequest = Message<"omnigent.api.workspace.v1alpha1.ListRepositoryRefsRequest"> & {
+  /**
+   * The repository to compare: a directory relative to the workspace root,
+   * such as a worktree inside it. Empty for the workspace's own repository.
+   * Paths in the request and response are then relative to that directory.
+   * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace, and for any folder when the workspace
+   * lies inside a larger repository. Feature "comparison.repository".
+   *
+   * @generated from field: string repository = 1;
+   */
+  repository: string;
 };
 
 /**
@@ -1224,6 +1275,19 @@ export declare type ListBranchCommitsRequest = Message<"omnigent.api.workspace.v
    * @generated from field: string head_revision = 2;
    */
   headRevision: string;
+
+  /**
+   * The repository to compare: a directory relative to the workspace root,
+   * such as a worktree inside it. Empty for the workspace's own repository.
+   * Paths in the request and response are then relative to that directory.
+   * INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+   * directory, or belongs to a repository other than the workspace's own and
+   * its worktrees inside the workspace, and for any folder when the workspace
+   * lies inside a larger repository. Feature "comparison.repository".
+   *
+   * @generated from field: string repository = 3;
+   */
+  repository: string;
 };
 
 /**
@@ -3790,6 +3854,26 @@ export declare type ReadPullRequestImageResponse = Message<"omnigent.api.workspa
 export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequestImageResponse>;
 
 /**
+ * Attached to a refused pull request call's error: why it was refused, for a client to act on.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.PullRequestFailure
+ */
+export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
+  /**
+   * One of "comment_changed", "pull_request_changed" or "invalid_input".
+   *
+   * @generated from field: string reason = 1;
+   */
+  reason: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PullRequestFailure.
+ * Use `create(PullRequestFailureSchema)` to create a new message.
+ */
+export declare const PullRequestFailureSchema: GenMessage<PullRequestFailure>;
+
+/**
  * @generated from enum omnigent.api.workspace.v1alpha1.EntryType
  */
 export enum EntryType {
@@ -4660,8 +4744,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof DisableAutoMergeResponseSchema;
   },
   /**
-   * Adds a draft comment on a line or range to the pending review, starting one if needed,
-   * or a draft reply in a review conversation to the viewer's pending review.
+   * Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+   * viewer's pending review; it must already exist, so start one with StartPendingReview.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.AddPendingReviewComment
    */
@@ -4962,7 +5046,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof UpdatePendingReviewCommentResponseSchema;
   },
   /**
-   * Uploads a file to link from a comment.
+   * Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+   * encoding: JSON's base64 makes the body a third larger, past the request limit.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.UploadAttachment
    */

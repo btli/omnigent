@@ -186,8 +186,8 @@ service WorkspaceService {
   // Turns off the pull request's auto-merge.
   rpc DisableAutoMerge(DisableAutoMergeRequest) returns (DisableAutoMergeResponse);
 
-  // Adds a draft comment on a line or range to the pending review, starting one if needed,
-  // or a draft reply in a review conversation to the viewer's pending review.
+  // Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+  // viewer's pending review; it must already exist, so start one with StartPendingReview.
   rpc AddPendingReviewComment(AddPendingReviewCommentRequest) returns (AddPendingReviewCommentResponse);
 
   // Adds the session user's reaction to a comment.
@@ -298,7 +298,8 @@ service WorkspaceService {
   // Changes a draft comment in the viewer's pending review, only while its text is as last read.
   rpc UpdatePendingReviewComment(UpdatePendingReviewCommentRequest) returns (UpdatePendingReviewCommentResponse);
 
-  // Uploads a file to link from a comment.
+  // Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+  // encoding: JSON's base64 makes the body a third larger, past the request limit.
   rpc UploadAttachment(UploadAttachmentRequest) returns (UploadAttachmentResponse);
 }
 
@@ -689,6 +690,15 @@ message WorkingCopyBase {
 
 message ResolveWorkingCopyBaseRequest {
   Comparison comparison = 1;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 2;
 }
 
 message ResolveWorkingCopyBaseResponse {
@@ -764,6 +774,15 @@ message WorkingFileMetadata {
 
 message ListWorkingCopyChangesRequest {
   Comparison comparison = 1;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 2;
 }
 
 // Files sorted by path, by byte value; at most 10,000.
@@ -789,6 +808,15 @@ message ReadBaseFileRequest {
   // Bytes to read at most; 0 means the server's limit. A larger blob sends
   // only metadata, with `truncated` set.
   uint64 maximum_bytes = 4;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 5;
 }
 
 // As ReadFileResponse: metadata first, then the bytes in order.
@@ -810,7 +838,16 @@ message ReadLinkTextResponse {
   bytes target = 1;
 }
 
-message ListRepositoryRefsRequest {}
+message ListRepositoryRefsRequest {
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 1;
+}
 
 // Short branch and tag names, local branches first. At most 1,000.
 message ListRepositoryRefsResponse {
@@ -829,6 +866,15 @@ message ListBranchCommitsRequest {
   // The commit whose commits are listed; empty means HEAD. Feature
   // "branch_commits.head": a server without it lists HEAD's commits.
   string head_revision = 2;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 3;
 }
 
 message BranchCommit {
@@ -1525,4 +1571,10 @@ message ReadPullRequestImageResponse {
   PullRequestImageMetadata metadata = 1;
   // The next part of the image. Concatenate every message's `data`.
   bytes data = 2;
+}
+
+// Attached to a refused pull request call's error: why it was refused, for a client to act on.
+message PullRequestFailure {
+  // One of "comment_changed", "pull_request_changed" or "invalid_input".
+  string reason = 1;
 }
