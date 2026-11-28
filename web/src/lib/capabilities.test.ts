@@ -303,6 +303,8 @@ describe.each([
   "scheduled_task_workflow_id",
   "workflow_sharing",
   "gadget_sharing",
+  "gadget_copy",
+  "gadget_templates",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

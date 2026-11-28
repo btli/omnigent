@@ -429,6 +429,16 @@ export function workflowSharingAvailable(info: ServerInfo | "loading"): boolean 
  * Whether the server has gadgets, keeps their grants and has other users to share
  * them with; a viewer also needs manage access to the gadget.
  */
+/** Whether the server makes copies of gadgets; an older server that doesn't say can't. */
+export function gadgetCopyAvailable(info: ServerInfo | "loading"): boolean {
+  return isFeatureEnabled(info, "gadgets") && info !== "loading" && info.gadget_copy === true;
+}
+
+/** Whether gadgets can be shared as templates: gadget sharing, on a server that says it can. */
+export function gadgetTemplatesAvailable(info: ServerInfo | "loading"): boolean {
+  return gadgetSharingAvailable(info) && info !== "loading" && info.gadget_templates === true;
+}
+
 export function gadgetSharingAvailable(info: ServerInfo | "loading"): boolean {
   return (
     isFeatureEnabled(info, "gadgets") &&

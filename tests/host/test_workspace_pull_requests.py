@@ -28,6 +28,7 @@ from omnigent.runner import (
     github_lifecycle,
     github_lookup,
     github_merge_queue,
+    github_native_stack,
     github_resource,
     github_reviews,
     github_search,
@@ -397,7 +398,7 @@ _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "SetPullRequestAccount": (
         pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat"),
         "set_pr_preference",
-        _pr_target(account="octocat", remote=None),
+        _pr_target(account="octocat", remote=None, account_rights=False),
     ),
     "MergePullRequest": (
         pb.MergePullRequestRequest(pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD),
@@ -564,9 +565,14 @@ _QUEUE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     ),
     "DequeuePullRequest": (pb.DequeuePullRequestRequest(pr_url=_PR), "dequeue", {}),
 }
-# The stack read: a valid request, the github_stack function it runs, and its arguments.
+# The stack reads: a valid request, the function it runs, and its arguments.
 _STACK_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "GetPullRequestStack": (pb.GetPullRequestStackRequest(pr_url=_PR), "pull_request_stack", {}),
+    "GetPullRequestNativeStack": (
+        pb.GetPullRequestNativeStackRequest(pr_url=_PR),
+        "pull_request_native_stack",
+        {},
+    ),
 }
 # The searches for the owner's reviewer picker and editor: a request, its function, arguments.
 _SEARCH_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
@@ -613,7 +619,7 @@ def record_github_changes(
             if table is _QUEUE_CALLS:
                 module = github_merge_queue
             elif table is _STACK_CALLS:
-                module = github_stack
+                module = github_stack if hasattr(github_stack, function) else github_native_stack
             elif table is _SEARCH_CALLS:
                 module = github_search
             else:
@@ -1470,7 +1476,12 @@ async def test_merge_as_an_account_needs_one(
 
 # Each read: a request, the reader method it runs, and the arguments that method gets.
 _READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
-    "GetPullRequest": (pb.GetPullRequestRequest(pr_url=_PR), "github_info", (_SESSION, _PR), {}),
+    "GetPullRequest": (
+        pb.GetPullRequestRequest(pr_url=_PR),
+        "github_info",
+        (_SESSION, _PR),
+        {"account_rights": False},
+    ),
     "ListPullRequestFiles": (
         pb.ListPullRequestFilesRequest(pr_url=_PR, head_sha=_HEAD, base_sha=_BASE),
         "github_changes",
@@ -1651,7 +1662,9 @@ async def test_a_review_read_carries_the_accounts_rights_only_when_the_server_as
         assert comment["reactions"] == [{"content": "HEART", "count": 2}]
 
 
-@pytest.mark.parametrize("case", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize(
+    "case", ["GetPullRequest", "ListReviewThreads", "ListReviewThreadComments"]
+)
 async def test_the_servers_account_rights_reach_the_review_reader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -1671,3 +1684,15 @@ async def test_the_servers_account_rights_reach_the_review_reader(
 
     assert code is None, message
     assert calls == [(reader_method, args, {"account_rights": True})]
+
+
+async def test_the_servers_account_rights_reach_the_overview_an_account_change_answers_with(
+    tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request, function, kwargs = _OWNER_CALLS["SetPullRequestAccount"]
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "SetPullRequestAccount", request.SerializeToString(), account_rights=True)
+    )
+
+    assert code is None, message
+    assert owner_calls == [(function, str(tmp_path.resolve()), {**kwargs, "account_rights": True})]
