@@ -15,6 +15,8 @@ from omnigent.runner import (
     github_images,
     github_lifecycle,
     github_merge_queue,
+    github_native_stack,
+    github_resource,
     github_reviews,
     github_stack,
     pr_resource,
@@ -297,6 +299,17 @@ def _comment_fields(kind: object, comment_id: object) -> dict[str, Any]:
     return {"kind": kind, "comment_id": comment_id}
 
 
+def _change_comment(
+    change: Any, root: str, reference: PullRequestRef, fields: dict[str, Any], **values: Any
+) -> dict[str, Any]:
+    """Run ``change``; a conversation comment's next reads skip gh's cache, even if it failed."""
+    try:
+        return change(root, reference, **fields, **values)
+    finally:
+        if fields["kind"] == "issue":
+            github_resource.conversation_changed(reference.url)
+
+
 def edit_comment(
     root: str,
     *,
@@ -310,12 +323,13 @@ def edit_comment(
     """Change your own comment's text, only while it still reads as the client last saw it."""
     fields = _comment_fields(kind, comment_id)
     text = _body(body)
-    return github_reviews.edit_comment(
+    return _change_comment(
+        github_reviews.edit_comment,
         root,
         _target(session_id, pr_url),
+        fields,
         body=text,
         expected_body_sha256=_sha256(expected_body_sha256),
-        **fields,
     )
 
 
@@ -324,7 +338,9 @@ def delete_comment(
 ) -> dict[str, Any]:
     """Delete your own comment."""
     fields = _comment_fields(kind, comment_id)
-    return github_reviews.delete_comment(root, _target(session_id, pr_url), **fields)
+    return _change_comment(
+        github_reviews.delete_comment, root, _target(session_id, pr_url), fields
+    )
 
 
 def add_reaction(
@@ -338,8 +354,12 @@ def add_reaction(
 ) -> dict[str, Any]:
     """Add the host account's reaction to a comment."""
     fields = _comment_fields(kind, comment_id)
-    return github_reviews.add_reaction(
-        root, _target(session_id, pr_url), content=str(content), **fields
+    return _change_comment(
+        github_reviews.add_reaction,
+        root,
+        _target(session_id, pr_url),
+        fields,
+        content=str(content),
     )
 
 
@@ -354,8 +374,12 @@ def remove_reaction(
 ) -> dict[str, Any]:
     """Remove the host account's reaction from a comment."""
     fields = _comment_fields(kind, comment_id)
-    return github_reviews.remove_reaction(
-        root, _target(session_id, pr_url), content=str(content), **fields
+    return _change_comment(
+        github_reviews.remove_reaction,
+        root,
+        _target(session_id, pr_url),
+        fields,
+        content=str(content),
     )
 
 
@@ -384,6 +408,13 @@ def get_pull_request_stack(
 ) -> dict[str, Any]:
     """The stack around the pull request, found through its branches."""
     return github_stack.pull_request_stack(root, _target(session_id, pr_url))
+
+
+def get_pull_request_native_stack(
+    root: str, *, session_id: str | None, pr_url: str | None
+) -> dict[str, Any]:
+    """GitHub's own record of the stack the pull request is in, where its host has one."""
+    return github_native_stack.pull_request_native_stack(root, _target(session_id, pr_url))
 
 
 def set_pull_request_state(

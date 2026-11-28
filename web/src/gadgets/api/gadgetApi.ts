@@ -17,6 +17,8 @@ export interface GadgetPermissions {
   write_data: boolean;
   publish: boolean;
   manage: boolean;
+  /** Make one's own gadget from it under New gadget; older servers omit it. */
+  use_template?: boolean;
 }
 
 export interface Gadget {
@@ -45,6 +47,8 @@ export interface GadgetContent {
    * (never a login or email). Older servers omit it.
    */
   viewer?: { id: string; display_name: string | null };
+  /** Collections where each viewer keeps their own records; older servers omit it. */
+  collection_scopes?: Record<string, "viewer">;
 }
 
 /** A rule across records that the server checks on every write (see `gadgets_constraints.py`). */
@@ -72,6 +76,8 @@ export interface CreateGadgetRevisionRequest {
   sdk_version: 1;
   capabilities: GadgetCapability[];
   collections: Record<string, Record<string, unknown>>;
+  /** Collections where each viewer keeps their own records; the others are shared. */
+  collection_scopes?: Record<string, "shared" | "viewer">;
   /** Markdown for agents: what the collections mean, conventions and common tasks. */
   guide?: string;
   constraints?: GadgetConstraint[];
@@ -222,6 +228,10 @@ function parseGadget(value: unknown): Gadget {
       write_data: permissions.write_data === true,
       publish: permissions.publish === true,
       manage: permissions.manage === true,
+      // Older servers don't say; leave it out rather than claim false.
+      ...(permissions.use_template !== undefined && {
+        use_template: permissions.use_template === true,
+      }),
     },
     ...createdAt,
   };
@@ -251,6 +261,15 @@ function parseContent(value: unknown): GadgetContent {
             id: viewer.id,
             display_name: typeof viewer.display_name === "string" ? viewer.display_name : null,
           },
+        }
+      : {}),
+    ...(isRecord(value.collection_scopes)
+      ? {
+          collection_scopes: Object.fromEntries(
+            Object.entries(value.collection_scopes)
+              .filter(([, scope]) => scope === "viewer")
+              .map(([name]) => [name, "viewer" as const]),
+          ),
         }
       : {}),
   };
@@ -332,6 +351,42 @@ export async function listSharedGadgets(signal?: AbortSignal): Promise<SharedGad
   return items.map(parseSharedGadget);
 }
 
+/** A gadget shared with the viewer as a template only: they can make their own from it. */
+export interface GadgetTemplateShare {
+  id: string;
+  name: string;
+  /** The owner's display name. */
+  owner_email: string;
+}
+
+/** Every gadget shared with the viewer as a template only, for New gadget. */
+export async function listGadgetTemplateShares(
+  signal?: AbortSignal,
+): Promise<GadgetTemplateShare[]> {
+  const { items } = await everyPage(`${GADGETS_PATH}/templates`, {}, signal, "gadget templates");
+  return items.flatMap((item) =>
+    isRecord(item) &&
+    typeof item.id === "string" &&
+    typeof item.name === "string" &&
+    typeof item.owner_email === "string"
+      ? [{ id: item.id, name: item.name, owner_email: item.owner_email }]
+      : [],
+  );
+}
+
+/**
+ * Makes a gadget the viewer owns from a gadget shared with them as a template: its current
+ * published code and starter data. Resolves the new gadget.
+ */
+export async function createGadgetFromTemplate(appId: string): Promise<Gadget> {
+  return parseGadget(
+    await gadgetRequest(`${appPath(appId)}/from-template`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  );
+}
+
 export async function getGadget(appId: string, signal?: AbortSignal): Promise<Gadget> {
   return parseGadget(await gadgetRequest(appPath(appId), { signal }));
 }
@@ -341,6 +396,25 @@ export async function createGadget(name: string): Promise<Gadget> {
     await gadgetRequest(GADGETS_PATH, {
       method: "POST",
       body: JSON.stringify({ name }),
+    }),
+  );
+}
+
+/**
+ * Makes a copy the viewer owns of a published gadget they can read: its published code and,
+ * with `includeData`, its records. The copy keeps no link to the source. Resolves the copy.
+ */
+export async function copyGadget(
+  appId: string,
+  options: { name?: string; includeData: boolean },
+): Promise<Gadget> {
+  return parseGadget(
+    await gadgetRequest(`${appPath(appId)}/copy`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...(options.name !== undefined ? { name: options.name } : {}),
+        include_data: options.includeData,
+      }),
     }),
   );
 }
@@ -370,6 +444,22 @@ export async function createGadgetRevision(
   });
   if (!isRecord(body) || typeof body.id !== "string") {
     throw malformed("revision");
+  }
+  // A server from before per-viewer collections drops the scopes and keeps every collection
+  // shared; it answers without naming them, and such a revision must not be published.
+  const wanted = Object.entries(revision.collection_scopes ?? {}).filter(
+    ([, scope]) => scope === "viewer",
+  );
+  if (wanted.length > 0) {
+    const kept = isRecord(body.collection_scopes) ? body.collection_scopes : {};
+    const keptAll =
+      Object.keys(kept).length === wanted.length &&
+      wanted.every(([name]) => kept[name] === "viewer");
+    if (!keptAll) {
+      throw new Error(
+        "This server doesn’t support per-viewer collections, so this version keeps every collection shared.",
+      );
+    }
   }
   return { id: body.id };
 }

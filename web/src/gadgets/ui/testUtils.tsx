@@ -30,6 +30,8 @@ export const GADGETS_INFO: ServerInfo = {
   features: { gadgets: true },
   // A server whose store keeps gadget grants; tests of one without them override it.
   gadget_sharing: true,
+  gadget_copy: true,
+  gadget_templates: true,
 };
 
 /** Shows the router's current location, for asserting where a click navigated. */

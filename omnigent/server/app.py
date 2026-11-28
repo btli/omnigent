@@ -440,6 +440,13 @@ class ServerInfoResponse(BaseModel):
     # Gadgets can be shared through ``/v1/gadgets/{id}/permissions``: needs
     # ``gadgets`` and a store that keeps gadget grants.
     gadget_sharing: bool = False
+    # POST /v1/gadgets/{id}/copy makes a copy; needs ``gadgets``. Absent on older servers,
+    # which clients treat as unsupported.
+    gadget_copy: bool = False
+    # Gadgets can be shared "Can use as template" and made from under New gadget
+    # (/v1/gadgets/templates, /v1/gadgets/{id}/from-template): needs ``gadget_sharing``.
+    # Absent on older servers, which clients treat as unsupported.
+    gadget_templates: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -4262,6 +4269,9 @@ def create_app(
                 and stores_workflow_grants(permission_store),
                 "gadgets": app.state.gadgets_available(),
                 "gadget_sharing": app.state.gadgets_available()
+                and stores_gadget_grants(permission_store),
+                "gadget_copy": app.state.gadgets_available(),
+                "gadget_templates": app.state.gadgets_available()
                 and stores_gadget_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,

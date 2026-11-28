@@ -3949,7 +3949,7 @@
             "type": "boolean"
           },
           "level": {
-            "description": "`1` (Can view), `2` (Can edit) or `3` (Can manage), as an integer.",
+            "description": "`0` (Can use as template), `1` (Can view), `2` (Can edit) or `3` (Can manage), as an integer.",
             "format": "int64",
             "title": "Level",
             "type": "integer"
@@ -4010,7 +4010,7 @@
             "type": "string"
           },
           "level": {
-            "description": "`1` (Can view), `2` (Can edit) or `3` (Can manage).",
+            "description": "`0` (Can use as template), `1` (Can view), `2` (Can edit) or `3` (Can manage).",
             "format": "int64",
             "title": "Level",
             "type": "integer"
@@ -8197,9 +8197,19 @@
               }
             ]
           },
+          "gadget_copy": {
+            "default": false,
+            "title": "Gadget Copy",
+            "type": "boolean"
+          },
           "gadget_sharing": {
             "default": false,
             "title": "Gadget Sharing",
+            "type": "boolean"
+          },
+          "gadget_templates": {
+            "default": false,
+            "title": "Gadget Templates",
             "type": "boolean"
           },
           "gadgets": {
@@ -18586,6 +18596,43 @@
         ]
       }
     },
+    "/v1/gadgets/templates": {
+      "get": {
+        "description": "A page of gadgets shared with the caller as templates only, `{\"items\", \"next_cursor\"}`, each `{\"id\", \"name\", \"owner_email\", \"shared_via\"}`. A page can be\nshort and continue.",
+        "operationId": "gadget_templates_v1_gadgets_templates_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Gadget Templates",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
     "/v1/gadgets/{app_id}": {
       "delete": {
         "description": "Delete a gadget for everyone; needs manage permission. With `?if_unbuilt=true`\nonly while it was never published nor taken by the caller's gadget session:\n`{\"deleted\": false}` when it was kept.",
@@ -19283,6 +19330,66 @@
         ]
       }
     },
+    "/v1/gadgets/{app_id}/copy": {
+      "post": {
+        "description": "Make a copy the caller owns of a published gadget they can read, from\n`{\"name\"?, \"include_data\"?}`: its published code and, with `include_data`, its\nrecords. Answers the copy with 201.",
+        "operationId": "copy_gadget_v1_gadgets__app_id__copy_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "include_data": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Copy Gadget",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
     "/v1/gadgets/{app_id}/describe": {
       "get": {
         "description": "What an agent reads before working with the records: the published revision's\nguide, collection schemas, constraints and actions, without its HTML.",
@@ -19319,6 +19426,63 @@
           }
         },
         "summary": "Describe",
+        "tags": [
+          "gadgets"
+        ]
+      }
+    },
+    "/v1/gadgets/{app_id}/from-template": {
+      "post": {
+        "description": "Make a gadget the caller owns from one they can use as a template, from\n`{\"name\"?}`: its published code and starter data. Answers the new gadget with 201.",
+        "operationId": "create_from_template_v1_gadgets__app_id__from_template_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create From Template",
         "tags": [
           "gadgets"
         ]

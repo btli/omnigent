@@ -198,6 +198,8 @@ async def test_requests_need_an_identity_and_a_json_body(
     info = (await client.get("/v1/info", headers=_as(ALICE))).json()
     assert info["features"]["gadgets"] is True
     assert info["gadgets"] is True and info["gadget_sharing"] is True
+    assert info["gadget_copy"] is True
+    assert info["gadget_templates"] is True
 
 
 def _own_session(stores: SimpleNamespace, owner: str = ALICE) -> str:
@@ -353,6 +355,7 @@ async def test_sharing_follows_the_grant_levels(client: httpx.AsyncClient) -> No
         "write_data": False,
         "publish": False,
         "manage": False,
+        "use_template": True,
     }
     shared = (await client.get("/v1/gadgets/shared", headers=_as(BOB))).json()["items"]
     assert [(item["id"], item["shared_via"], item["owner_email"]) for item in shared] == [
@@ -964,3 +967,69 @@ def test_the_published_api_states_the_statuses_and_nullable_fields_the_routes_us
     fields = update["requestBody"]["content"]["application/json"]["schema"]["properties"]
     assert fields["summary"]["type"] == ["string", "null"]
     assert fields["session_id"]["type"] == ["string", "null"]
+
+
+async def test_a_viewer_copies_a_shared_gadget_with_its_data(client: httpx.AsyncClient) -> None:
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    created = await client.post(
+        f"{base}/rpc",
+        json=_rpc(gadget, "create", id="t1", value={"title": "Shared"}, operation_id="a1"),
+        headers=_as(ALICE),
+    )
+    assert created.status_code == 200, created.text
+    assert (await client.post(f"{base}/copy", json={}, headers=_as(BOB))).status_code == 404
+    await client.put(f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE))
+
+    copied = await client.post(f"{base}/copy", json={"include_data": True}, headers=_as(BOB))
+
+    assert copied.status_code == 201, copied.text
+    copy = copied.json()
+    assert copy["owner_id"] == BOB and copy["permissions"]["manage"] is True
+    listed = await client.post(
+        f"/v1/gadgets/{copy['id']}/rpc", json=_rpc(copy, "list"), headers=_as(BOB)
+    )
+    assert [item["value"] for item in listed.json()["result"]["items"]] == [{"title": "Shared"}]
+    assert (await client.get(f"/v1/gadgets/{copy['id']}", headers=_as(ALICE))).status_code == 404
+
+
+async def test_a_template_grantee_creates_their_own_gadget_without_opening_it(
+    client: httpx.AsyncClient,
+) -> None:
+    gadget = await _published(client)
+    base = f"/v1/gadgets/{gadget['id']}"
+    granted = await client.put(
+        f"{base}/permissions", json={"user_id": BOB, "level": 0}, headers=_as(ALICE)
+    )
+    assert granted.status_code == 200, granted.text and granted.json()["level"] == 0
+
+    assert (await client.get(base, headers=_as(BOB))).status_code == 404
+    assert (await client.get("/v1/gadgets/shared", headers=_as(BOB))).json()["items"] == []
+    templates = (await client.get("/v1/gadgets/templates", headers=_as(BOB))).json()["items"]
+    assert [(item["id"], item["owner_email"]) for item in templates] == [(gadget["id"], ALICE)]
+
+    made = await client.post(f"{base}/from-template", json={}, headers=_as(BOB))
+    assert made.status_code == 201, made.text
+    assert made.json()["owner_id"] == BOB and made.json()["published_revision"]
+    assert (
+        await client.post(f"{base}/from-template", json={}, headers=_as("carol@example.com"))
+    ).status_code == 404
+
+
+async def test_template_routes_are_off_where_gadgets_cant_be_shared(
+    stores: SimpleNamespace, tmp_path: Path
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    unshared = SimpleNamespace(
+        **{**vars(stores), "permissions": SqlAlchemyPermissionStore(stores.db_uri)}
+    )
+    async for client in _client(_app(unshared, tmp_path)):
+        info = (await client.get("/v1/info")).json()
+        assert info["gadget_sharing"] is False and info["gadget_templates"] is False
+        gadget = await _published(client)
+        listed = await client.get("/v1/gadgets/templates", headers=_as(ALICE))
+        made = await client.post(
+            f"/v1/gadgets/{gadget['id']}/from-template", json={}, headers=_as(ALICE)
+        )
+        assert listed.status_code == 403 and made.status_code == 403, (listed.text, made.text)

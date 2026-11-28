@@ -126,6 +126,7 @@ def _set_account(
         remote=None,
         session_id=call.session_id,
         pr_url=request.pr_url,
+        account_rights=call.account_rights,
     )
 
 
@@ -225,7 +226,7 @@ _MERGE_QUEUE_OPS: dict[str, PullRequestOp] = {
 
 PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "GetPullRequest": lambda reader, call, request: reader.github_info(
-        call.session_id, _url(request)
+        call.session_id, _url(request), account_rights=call.account_rights
     ),
     "ListPullRequestFiles": lambda reader, call, request: reader.github_changes(
         call.session_id,
@@ -334,6 +335,8 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     **_MERGE_QUEUE_OPS,
     # The stack read lists the repository's other pull requests as the host's account.
     "GetPullRequestStack": _named(pr_actions.get_pull_request_stack),
+    # GitHub's own stack, where the host's schema has stacks; members are data only.
+    "GetPullRequestNativeStack": _named(pr_actions.get_pull_request_native_stack),
     # Read the URLs the request names, never the session's or the vouch's pull requests.
     "LookupPullRequest": lambda reader, _call, request: github_lookup.lookup_pull_request(
         _root(reader), pr_url=request.pr_url
