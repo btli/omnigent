@@ -19,5 +19,5 @@
 #
 9473              # bot replacement for closed #9423 (Workspace rail viewer insets)
 10032             # bot replacement for closed #10024 (desktop downloads keep request headers)
-branch:pin/12428-rebased-1127   # #12428 (michael-berk, project color-or-emoji marks) as rebased onto upstream 4819fb81 inside btli #13023
+branch:pin/12428-rebased-1128   # #12428 (michael-berk, project color-or-emoji marks) as rebased onto upstream f789ce7e inside btli #13023
 6109              # bbqiu genie CLI harness, rebased onto upstream c0d9f527 (head 425b2ba0); btli genie PRs stack on it
